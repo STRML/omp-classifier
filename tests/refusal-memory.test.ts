@@ -1,6 +1,7 @@
 /**
  * Refusal memory across rewording (issue #30): a command this session refused
- * (UNSAFE / PARSE_ERROR / human denial / critical / cap) is remembered by
+ * (UNSAFE / human denial / critical / cap / a PARSE_ERROR whose reply had
+ * content) is remembered by
  * normalized target, injected into the next classify record as priorRefusal,
  * and a SAFE that lands anyway on a refused target still prompts. A user
  * approval lifts the memory; the store holds 20 targets per session, oldest
@@ -12,7 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { normalizeRefusalTarget } from "../index";
+import { normalizeRefusalTarget, refusalWorthRemembering } from "../index";
 import type { DecisionRecord } from "../index";
 import {
 	selectCalls,
@@ -77,6 +78,18 @@ describe("normalizeRefusalTarget", () => {
 	test("rewordings of one action share a target; unlike actions differ", () => {
 		expect(normalizeRefusalTarget("rm -rf x")).toBe(normalizeRefusalTarget("rm -f ./x"));
 		expect(normalizeRefusalTarget("rm -rf x")).not.toBe(normalizeRefusalTarget("git reset --hard"));
+	});
+});
+
+describe("refusalWorthRemembering", () => {
+	test("UNSAFE always; PARSE_ERROR only when the reply said something", () => {
+		expect(refusalWorthRemembering({ verdict: "UNSAFE", reason: "x" })).toBe(true);
+		expect(refusalWorthRemembering({ verdict: "SAFE", reason: "" })).toBe(false);
+		expect(refusalWorthRemembering({ verdict: "UNSURE", reason: "x" })).toBe(false);
+		expect(refusalWorthRemembering({ verdict: "PARSE_ERROR", reason: "no content", rawReply: "(empty reply)" })).toBe(false);
+		expect(refusalWorthRemembering({ verdict: "PARSE_ERROR", reason: "not a verdict", rawReply: "" })).toBe(false);
+		expect(refusalWorthRemembering({ verdict: "PARSE_ERROR", reason: "not a verdict" })).toBe(false);
+		expect(refusalWorthRemembering({ verdict: "PARSE_ERROR", reason: "not a verdict", rawReply: "I cannot assist with that." })).toBe(true);
 	});
 });
 
@@ -150,4 +163,5 @@ describe("refusal memory", () => {
 		const prior = recordOf(22).priorRefusal as { target: string };
 		expect(prior.target).toBe("rm f21");
 	});
+
 });

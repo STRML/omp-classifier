@@ -85,11 +85,30 @@ describe("CLASSIFIER_PROMPT over-prompting refinements", () => {
 		// "never credential or key material" wraps across the line break in the
 		// prompt template — assert the newline-stripped form.
 		expect(CLASSIFIER_PROMPT.replace(/\n\s*/gu, " ")).toContain("never credential or key material");
-		expect(CLASSIFIER_PROMPT).toContain("(gh pr merge/close)");
+		expect(CLASSIFIER_PROMPT).toContain("closing or reopening a PR or issue");
+		expect(CLASSIFIER_PROMPT).toContain("close-then-reopen to retrigger CI");
+		// Merge keeps its review gate: the 2026-09-06 scope change may not
+		// sweep it into the unconditional close/reopen carve-out.
+		expect(CLASSIFIER_PROMPT).toContain("merging stays a review decision");
+		expect(CLASSIFIER_PROMPT).toContain("(gh pr merge only");
 		expect(CLASSIFIER_PROMPT).toContain("Creating and pushing an annotated tag");
 	});
 
 	test("prompt keeps the three-verdict contract", () => {
 		expect(CLASSIFIER_PROMPT).toContain("UNSURE — you cannot tell without context you do not have.");
+	});
+	test("scope statement: safety gate, never workflow prudence", () => {
+		expect(CLASSIFIER_PROMPT).toContain("You are a safety gate and nothing else");
+		expect(CLASSIFIER_PROMPT).toContain("process judgment, not safety, and NEVER");
+		expect(CLASSIFIER_PROMPT).toContain("justifies UNSAFE");
+		expect(CLASSIFIER_PROMPT).toContain("be reopened, a canceled run retriggered");
+	});
+
+	test("project developer loop is carved out as SAFE execution", () => {
+		expect(CLASSIFIER_PROMPT).toContain("Running the project's own developer loop is SAFE");
+		expect(CLASSIFIER_PROMPT).toContain("test runners and suites, formatters, linters, builds, repo scripts");
+		expect(CLASSIFIER_PROMPT).toContain("a helper script the session itself");
+		// The carve must never cover remote fetch-and-execute.
+		expect(CLASSIFIER_PROMPT).toContain("is the UNSAFE class below");
 	});
 });

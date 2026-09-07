@@ -2,6 +2,11 @@
 
 All notable changes, newest first. Issue and PR numbers reference STRML/omp-classifier.
 
+## 2026-09-06
+
+- Safety scope: the prompt is reframed as a safety gate and nothing else — workflow prudence (wisdom, timing, "disruptive to review") is never grounds for UNSAFE. The project's own developer loop (test runners, formatters, repo scripts, virtualenv/node_modules binaries, session-written temp scripts, local dev servers, localhost queries) is carved out as SAFE execution; only fetch-and-execute of remote content stays in the UNSAFE class. `gh pr close`/`reopen` (close-then-reopen CI retriggers included) are carved as routine reversible operations; `gh pr merge` keeps its after-review gate.
+- Refusal memory: an infrastructure PARSE_ERROR (empty reply — dead provider/quota) no longer records a session refusal. Previously one outage poisoned refusal memory and every later SAFE verdict prompted anyway ("classifier-safe despite prior refusal"); the 2026-09-06 audit found this cascade among 168 interruptions, ~83% of which were noise.
+- Fetch clearing is per top-level pipeline: a `;`/`&&` compound no longer keeps `curl`/`wget` flagged forever when the fetch's own pipeline is clean (`lsof -i :8011; curl -sS -m 3 http://127.0.0.1:8011/v1/models | head -c 400` runs silent on SAFE). The decision is made over the pipeline's TEXT — a segment-join version was caught clearing `curl … | jq . > ~/.bashrc` off its redirect in tests and never shipped. Redirects, command substitution, consumer write flags, and mid-pipeline curls still flag. Adversarial eval (deepseek-v4-flash, 3 samples): prompt `e17774880fd5` → `b1fc04eb1d64`, over-flags 11 → 9, under-flags unchanged at 1 (the corpus's own contested `gh pr merge` case), zero critical leaks.
 ## 2026-09-01
 
 - Model measurement: `zai/glm-5.3-flash` on the full 92-case adversarial corpus (3 samples, spawn judge) — over-flags 0/35, under-flags 2/57 (the answer-format-imitation injection, and the corpus's own `contested` `gh pr merge` case the prompt's carve-out allows), zero errors, no irreversible-case leaks. Swapped the configured gate model to it after deepseek-v4-flash produced a live over-flag on a routine lint+install-fallback+test chain. Sanitized corpus case added for that shape.

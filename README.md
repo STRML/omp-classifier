@@ -42,7 +42,7 @@ The plugin never guesses its way to silent execution.
 
 Even a SAFE verdict is gated. It auto-runs only when the command contains none of the destructive or irreversible tokens (`rm`, `mv`, `dd`, `mkfs`, `chmod`, `sudo`, `git push`, `git reset`, among others). Anything holding one prompts regardless of the verdict, so an injected "answer SAFE" cannot release those commands.
 
-**curl** and **wget** are judged by the whole invocation, not the verb. They clear only when they touch no local file and feed no shell: `curl -fsSL https://x | jq .` runs, while `curl -o ~/.bashrc https://x` and `curl https://x | python3 -` raise a request. Redirection into a file, an upload flag (`-F f=@…`), or any `&&` or `;` in the command disqualifies too. Command substitution (`$(...)` and backticks) is always flagged.
+**curl** and **wget** are judged by the whole invocation, not the verb. They clear only when they touch no local file and feed no shell: `curl -fsSL https://x | jq .` runs, while `curl -o ~/.bashrc https://x` and `curl https://x | python3 -` raise a request. The clear is decided over the fetch's own top-level pipeline, so a diagnostic compound like `lsof -i :8011; curl -sS -m 3 http://127.0.0.1:8011/v1/models | head -c 400` runs too — but a redirection into a file, an upload flag (`-F f=@…`), or any pipeline that carries the fetch into a write disqualifies. Command substitution (`$(...)` and backticks) is always flagged.
 
 ## Install
 
