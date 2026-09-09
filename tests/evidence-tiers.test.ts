@@ -3,8 +3,8 @@
  * `evidence` object whose fields are typed by their channel — userMessages
  * (the session's recent user words, gated by `evidenceUserMessages`),
  * operatorContext (the requesting agent's own explanation, single-line,
- * capped, never authorizing). Off by default: with the default config the
- * record has no evidence field at all, even when a branch exists.
+ * capped, never authorizing). The default config attaches the newest three
+ * user messages; 0 restores the no-evidence shape entirely.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
 import { CLASSIFIER_PROMPT, collectUserEvidence } from "../index";
@@ -54,15 +54,14 @@ const userEntry = (content: string | Array<Record<string, unknown>>): BranchEntr
 });
 
 describe("default config", () => {
-	test("the record carries no evidence field even when a branch exists", async () => {
+	test("the record carries the newest three user messages by default", async () => {
 		const ctx = makeCtx({
 			sessionId: nextSession(),
-			branch: [userEntry("please check the build"), userEntry("now run the tests")],
+			branch: [userEntry("one"), userEntry("two"), userEntry("three"), userEntry("four")],
 		});
 		await fire("tool_call", makeEvent("git status"), ctx);
 		expect(modelCalls.length).toBe(1);
-		expect(modelCalls[0].request.messages[0].content).not.toContain('"evidence"');
-		expect(recordOf().evidence).toBeUndefined();
+		expect(evidenceOf().userMessages).toEqual(["two", "three", "four"]);
 	});
 });
 
@@ -128,16 +127,24 @@ describe("operatorContext", () => {
 });
 
 describe("bounds", () => {
-	test("values above the ceiling fall back to 0 (no evidence)", async () => {
+	test("values above the ceiling fall back to the default 3", async () => {
 		writeConfigFile({ evidenceUserMessages: 9 });
 		const ctx = makeCtx({ sessionId: nextSession(), branch: [userEntry("check"), userEntry("again")] });
 		await fire("tool_call", makeEvent("git status"), ctx);
 		expect(modelCalls.length).toBe(1);
-		expect(recordOf().evidence).toBeUndefined();
+		expect(evidenceOf().userMessages).toEqual(["check", "again"]);
 	});
 
-	test("negative values fall back to 0 (no evidence)", async () => {
+	test("negative values fall back to the default 3", async () => {
 		writeConfigFile({ evidenceUserMessages: -1 });
+		const ctx = makeCtx({ sessionId: nextSession(), branch: [userEntry("check"), userEntry("again"), userEntry("third"), userEntry("fourth")] });
+		await fire("tool_call", makeEvent("git status"), ctx);
+		expect(modelCalls.length).toBe(1);
+		expect(evidenceOf().userMessages).toEqual(["again", "third", "fourth"]);
+	});
+
+	test("zero sends no evidence at all", async () => {
+		writeConfigFile({ evidenceUserMessages: 0 });
 		const ctx = makeCtx({ sessionId: nextSession(), branch: [userEntry("check")] });
 		await fire("tool_call", makeEvent("git status"), ctx);
 		expect(modelCalls.length).toBe(1);

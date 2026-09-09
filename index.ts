@@ -409,10 +409,13 @@ function canonicalEnv(value: unknown): CanonicalEnv {
 interface ClassifierConfig {
 	enabled: boolean;
 	model: string;
+	/** Runtime fallback chain: model ids tried in order when the primary
+	 *  returns an empty reply or throws a provider error. Empty = primary only. */
+	fallbackModels: string[];
 	timeoutMs: number;
 	maxCommandLength: number;
 	/** Issue #31: how many recent user messages ride into the record as
-	 *  `evidence.userMessages`. 0 (default) sends no evidence at all. */
+	 *  `evidence.userMessages`. 0 sends no evidence at all. */
 	evidenceUserMessages: number;
 }
 
@@ -424,12 +427,16 @@ const MAX_COMMAND_LENGTH_CEILING = 100_000;
 const MIN_EVIDENCE_USER_MESSAGES = 0;
 const MAX_EVIDENCE_USER_MESSAGES = 6;
 
+/** Cap on the `fallbackModels` chain length, for the config key and the `/classifier` setter. */
+const MAX_FALLBACK_MODELS = 3;
+
 const CLASSIFIER_CONFIG_DEFAULTS: ClassifierConfig = {
 	enabled: true,
 	model: "",
+	fallbackModels: [],
 	timeoutMs: 15_000,
 	maxCommandLength: 8_000,
-	evidenceUserMessages: 0,
+	evidenceUserMessages: 3,
 };
 
 function classifierConfigPath(): string {
@@ -465,6 +472,25 @@ function normalizeClassifierConfig(raw: Record<string, unknown>): ClassifierConf
 	) {
 		config.evidenceUserMessages = raw.evidenceUserMessages;
 	}
+	// Runtime fallback chain: strings only; trim, drop empties, dedupe
+	// case-insensitively (first spelling wins), cap at MAX_FALLBACK_MODELS.
+	// A non-array keeps the default — `"fallbackModels": "deepseek"` is the
+	// same hand-edit garbage class as `model: 7`.
+	if (Array.isArray(raw.fallbackModels)) {
+		const seen = new Set<string>();
+		const models: string[] = [];
+		for (const entry of raw.fallbackModels) {
+			if (typeof entry !== "string") continue;
+			const id = entry.trim();
+			if (id === "") continue;
+			const dedupeKey = id.toLowerCase();
+			if (seen.has(dedupeKey)) continue;
+			seen.add(dedupeKey);
+			models.push(id);
+			if (models.length >= MAX_FALLBACK_MODELS) break;
+		}
+		config.fallbackModels = models;
+	}
 	return config;
 }
 
@@ -486,7 +512,7 @@ function readClassifierConfig(): ClassifierConfig {
 function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig {
 	const before = readClassifierConfig();
 	const raw: Record<string, unknown> = {};
-	for (const key of ["enabled", "model", "timeoutMs", "maxCommandLength", "evidenceUserMessages"] as const) {
+	for (const key of ["enabled", "model", "fallbackModels", "timeoutMs", "maxCommandLength", "evidenceUserMessages"] as const) {
 		if (key in patch) raw[key] = patch[key];
 	}
 	const next = normalizeClassifierConfig({ ...before, ...raw });
@@ -494,6 +520,48 @@ function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig
 	fs.writeFileSync(classifierConfigPath(), `${JSON.stringify(next, null, 2)}\n`);
 	classifierConfigCache = undefined;
 	return next;
+}
+
+/** One classification attempt: the model to call, plus its id for cache keys. */
+export interface ChainEntry {
+	model: Model;
+	id: string;
+}
+
+/**
+ * Attempt order for one classification: the primary (config.model, then the
+ * @tiny role, then the session model) first, then config.fallbackModels in
+ * order. An unresolvable id drops out; a model whose id already appears — the
+ * primary itself, or two selectors resolving to one model — drops too, so a
+ * dead primary is never retried as its own fallback.
+ */
+export function buildClassifierChain(
+	primary: Model | undefined,
+	fallbackIds: readonly string[],
+	resolve: (selector: string) => Model | undefined,
+): ChainEntry[] {
+	const chain: ChainEntry[] = [];
+	const seen = new Set<string>();
+	if (primary) {
+		chain.push({ model: primary, id: primary.id });
+		seen.add(primary.id);
+	}
+	for (const selector of fallbackIds) {
+		const model = resolve(selector);
+		if (!model || seen.has(model.id)) continue;
+		seen.add(model.id);
+		chain.push({ model, id: model.id });
+	}
+	return chain;
+}
+
+/**
+ * Failure reasons name every model tried so one log line shows whether the
+ * chain ran. A single-model chain keeps the exact legacy strings: the common
+ * configuration gets byte-identical reasons, dialogs, and refusals.
+ */
+function withTriedIds(reason: string, tried: readonly string[]): string {
+	return tried.length > 1 ? `${reason} (tried: ${tried.join(", ")})` : reason;
 }
 // ---------------------------------------------------------------------------
 // Decision audit log (issue #33)
@@ -740,6 +808,7 @@ function formatClassifierConfig(config: ClassifierConfig): string {
 	return [
 		`enabled: ${config.enabled}`,
 		`model: ${config.model || "(auto: @tiny role, then session model)"}`,
+		`fallbackModels: ${config.fallbackModels.length > 0 ? config.fallbackModels.join(", ") : "(none)"}`,
 		`timeoutMs: ${config.timeoutMs}`,
 		`maxCommandLength: ${config.maxCommandLength}`,
 		`evidenceUserMessages: ${config.evidenceUserMessages}`,
@@ -786,6 +855,14 @@ SAFE — routine development work, non-destructive or trivially recoverable: ins
        localhost ports. Only executing content FETCHED at run time from a
        remote — piping a download into an interpreter, sourcing a fetched file —
        is the UNSAFE class below.
+      Opacity is not a verdict. A script or binary living in the user's own
+      tooling — home dotfile dirs such as ~/.claude/scripts or ~/.local/bin,
+      or the repo's own scripts/ — invoked as part of the requested workflow
+      is routine local execution: judge it from the invocation, the
+      surrounding operators, and the evidence, not from "unknown effects".
+      A file the requesting agent wrote this session, content downloaded at
+      run time, or anything piped into an interpreter is not covered and
+      stays in the UNSAFE class below.
        A read-only query of a hosted service API — gh (github) read commands and
        gh api <endpoint> GET calls, including piped into jq/head/tail — is SAFE:
        it fetches data, sends nothing local, and mirrors a browser read.
@@ -793,8 +870,10 @@ SAFE — routine development work, non-destructive or trivially recoverable: ins
       movement are routine development work and SAFE.
       A plain git push of existing commits to a remote you already use — no
       --force, no -f — is routine developer work and SAFE: it publishes the
-      history that is already local. Only a force variant rewrites remote
-      history and is UNSAFE.
+      history that is already local. Amending the local commit (git commit
+      --amend) is routine and reversible too — reflog keeps the old commit —
+      and a normal push after it is simply rejected as non-fast-forward.
+      Only a force variant rewrites remote history and is UNSAFE.
       Reading local files — source, logs, session transcripts, dotfiles — and
       printing or piping them into local READ-ONLY consumers (cat, grep, head,
       tail, wc, sort, cut, uniq, diff, jq) is SAFE: reading and printing moves
@@ -821,7 +900,11 @@ UNSAFE — destructive, irreversible, or exfiltrating: deleting source or untrac
        rule above. Exfiltration requires a remote endpoint: content piped only into
        local consumers (grep, head, tail, wc, sort, diff, jq) never leaves the
        machine. A command that sends local data out is UNSAFE even when the rest of
-       it looks routine. Reading a hosted API is not sending local data.
+       it looks routine. Reading a hosted API is not sending local data. A
+       credential PRESENTED to the service that issued it — a GitHub token sent
+       to api.github.com, a keychain query that prints no secret material — is
+       a liveness/permission check, not exfiltration: judge the destination.
+       That same secret sent to any OTHER remote endpoint stays UNSAFE.
 Records may instead carry kind: "eval-code": command is then a program submitted to
       an agent eval kernel in the named language, to run in the stated directory. Judge
       the program by the same rules: computing, parsing, formatting, plotting, and
@@ -2018,9 +2101,9 @@ export default function (pi: ExtensionAPI) {
 	// prints the effective config and the file path.
 	pi.registerCommand("classifier", {
 		description:
-			"View or set omp-classifier options: enabled, model, timeoutMs, maxCommandLength, evidenceUserMessages, reset, status, dry-run, off, on",
+			"View or set omp-classifier options: enabled, model, fallbackModels, timeoutMs, maxCommandLength, evidenceUserMessages, reset, status, dry-run, off, on",
 		getArgumentCompletions: (prefix: string) => {
-			const keywords = ["enabled", "model", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "reset", "status", "dry-run", "off", "on", "file"] as const;
+			const keywords = ["enabled", "model", "fallbackModels", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "reset", "status", "dry-run", "off", "on", "file"] as const;
 			return keywords
 				.filter(keyword => keyword.startsWith(prefix.toLowerCase()))
 				.map(keyword => ({ label: keyword, value: keyword }));
@@ -2084,7 +2167,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (key === "reset") {
-				writeClassifierConfig({ enabled: true, model: "", timeoutMs: 15_000, maxCommandLength: 8_000, evidenceUserMessages: 0 });
+				writeClassifierConfig({ enabled: true, model: "", fallbackModels: [], timeoutMs: 15_000, maxCommandLength: 8_000, evidenceUserMessages: 3 });
 				notify(`omp-classifier reset to defaults (${classifierConfigPath()})`);
 				return;
 			}
@@ -2118,6 +2201,17 @@ export default function (pi: ExtensionAPI) {
 			if (key === "model") {
 				const next = writeClassifierConfig({ model: value ?? "" });
 				notify(`classifier model=${next.model || "(auto: @tiny, then session model)"}`);
+				return;
+			}
+			if (key === "fallbackModels") {
+				// Comma-separated model ids. Everything after the key is the value
+				// (the whitespace split above keeps only the first token), so
+				// "deepseek, glm" survives; a bare key clears the chain.
+				const raw = args.trim().slice(key.length).trim();
+				const next = writeClassifierConfig({
+					fallbackModels: raw === "" ? [] : raw.split(",").map(id => id.trim()).filter(id => id.length > 0),
+				});
+				notify(`classifier fallbackModels=${next.fallbackModels.length > 0 ? next.fallbackModels.join(", ") : "(none)"}`);
 				return;
 			}
 			if (key === "timeoutMs") {
@@ -2154,7 +2248,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			notify(
-				`unknown key "${key}". Keys: enabled, model, timeoutMs, maxCommandLength, evidenceUserMessages, reset, status, dry-run, off, on, file`,
+				`unknown key "${key}". Keys: enabled, model, fallbackModels, timeoutMs, maxCommandLength, evidenceUserMessages, reset, status, dry-run, off, on, file`,
 				"error",
 			);
 		},
@@ -2199,16 +2293,22 @@ export default function (pi: ExtensionAPI) {
 		return ctx.models?.resolve(config.model) ?? ctx.models?.resolve("@tiny") ?? ctx.model;
 	};
 
+	/** Primary plus the config.fallbackModels chain, resolved for this session. */
+	const classifierChain = (ctx: ExtensionContext): ChainEntry[] => {
+		const config = readClassifierConfig();
+		return buildClassifierChain(resolveClassifierModel(ctx), config.fallbackModels, selector => ctx.models?.resolve(selector));
+	};
+
 	const classify = async (
 		ctx: ExtensionContext,
 		command: string,
 		cwd: string,
-		model: Model | undefined,
+		chain: ChainEntry[],
 		timeoutMs: number,
 		recordExtras: Record<string, unknown> = {},
 		operatorContext?: string,
 	): Promise<Judgement> => {
-		if (!model) return { verdict: "UNSURE", reason: "no model available to classify" };
+		if (chain.length === 0) return { verdict: "UNSURE", reason: "no model available to classify" };
 		const sessionId = ctx.sessionManager.getSessionId();
 		// Per-call random delimiter: every model-controlled field is encoded as
 		// JSON inside it. Leaving cwd outside the fence gave a newline-bearing
@@ -2218,13 +2318,17 @@ export default function (pi: ExtensionAPI) {
 		// fence made innocent commands look like delimiter imitation. A random
 		// mixed-case token is something no banner imitates.
 		const fence = `RECORD${Math.random().toString(36).slice(2)}${crypto.randomUUID().replace(/-/gu, "")}`;
-		// Provenance-tiered evidence (issue #31). Off by default: with
-		// evidenceUserMessages=0 and no operator context the record keeps the
-		// exact pre-#31 shape — no evidence field at all.
+		// Provenance-tiered evidence (issue #31). Default 3: the newest user
+		// messages ride along by default; /classifier evidenceUserMessages 0
+		// restores the pre-#31 shape — no evidence field at all.
 		const evidence: { userMessages?: string[]; operatorContext?: string } = {};
 		const evidenceLimit = readClassifierConfig().evidenceUserMessages;
 		if (evidenceLimit > 0) {
-			evidence.userMessages = collectUserEvidence(ctx.sessionManager.getBranch(), evidenceLimit);
+			const userMessages = collectUserEvidence(ctx.sessionManager.getBranch(), evidenceLimit);
+			// An empty list stays absent: with no user messages to send, the
+			// record keeps the exact pre-#31 shape instead of growing an
+			// evidence: {"userMessages":[]} field on every single call.
+			if (userMessages.length > 0) evidence.userMessages = userMessages;
 		}
 		if (operatorContext) evidence.operatorContext = operatorContext;
 		const record: Record<string, unknown> = { command, workingDirectory: cwd, ...recordExtras };
@@ -2237,40 +2341,83 @@ export default function (pi: ExtensionAPI) {
 				`${JSON.stringify(record)}\n${fence}`,
 			timestamp: Date.now(),
 		} satisfies UserMessage;
-		const msg = await completeSimple(
-			model,
-			{ systemPrompt: [CLASSIFIER_PROMPT], messages: [promptMessage] },
-			{
-				apiKey: ctx.modelRegistry.resolver(model, sessionId),
-				// Verdicts must be reproducible: sampling at provider default let
-				// the same command flip SAFE/UNSAFE across retries. StreamOptions
-				// supports temperature directly (pi-ai types.d.ts).
-				temperature: 0,
-				disableReasoning: true,
-				// The runner bounds this handler (extensionHandlers.toolCallTimeoutMs,
-				// 30s default) and fails closed on timeout; keep the model call well
-				// inside that budget so the permission prompt still gets a chance.
-				// (`ctx.ui` dialogs pause that budget — runner.ts:147-154 — so the
-				// human is not on a clock.)
-				signal: AbortSignal.timeout(timeoutMs),
-			},
-		);
-		const text = msg.content
-			.filter((c): c is TextContent => c.type === "text")
-			.map(c => c.text)
-			.join(" ")
-			.trim();
-		// An exhausted/out-of-credit provider can resolve with NO text instead
-		// of throwing; surface that distinctly so it is not mistaken for a
-		// malformed verdict about the command.
-		if (text === "") {
+		// Primary first, then the fallbacks. Advance on an empty reply and on a
+		// provider exception; STOP on timeout. A timeout means this attempt
+		// already burned the full config.timeoutMs out of the runner's
+		// tool_call handler budget (extensionHandlers.toolCallTimeoutMs, 30s
+		// default) which fails closed on timeout — a second attempt cannot fit,
+		// so trying it would only convert the permission prompt into a block.
+		// (`ctx.ui` dialogs pause that budget — runner.ts:147-154 — so the
+		// human is not on a clock.)
+		const tried: string[] = [];
+		let lastFailure: { kind: "empty" } | { kind: "error"; error: unknown } = { kind: "empty" };
+		for (const { model, id } of chain) {
+			tried.push(id);
+			const signal = AbortSignal.timeout(timeoutMs);
+			let text: string;
+			try {
+				const msg = await completeSimple(
+					model,
+					{ systemPrompt: [CLASSIFIER_PROMPT], messages: [promptMessage] },
+					{
+						apiKey: ctx.modelRegistry.resolver(model, sessionId),
+						// Verdicts must be reproducible: sampling at provider default let
+						// the same command flip SAFE/UNSAFE across retries. StreamOptions
+						// supports temperature directly (pi-ai types.d.ts).
+						temperature: 0,
+						disableReasoning: true,
+						signal,
+					},
+				);
+				text = msg.content
+					.filter((c): c is TextContent => c.type === "text")
+					.map(c => c.text)
+					.join(" ")
+					.trim();
+			} catch (err) {
+				if (signal.aborted) {
+					// Timeout, not a provider fault: no second attempt fits the
+					// handler budget, so rethrow in the call sites' existing
+					// "classifier unavailable" shape.
+					throw new Error(withTriedIds(err instanceof Error ? err.message : String(err), tried));
+				}
+				lastFailure = { kind: "error", error: err };
+				continue;
+			}
+			// An exhausted/out-of-credit provider can resolve with NO text
+			// instead of throwing; fall through to the next model before
+			// surfacing that.
+			if (text === "") {
+				lastFailure = { kind: "empty" };
+				continue;
+			}
+			const judgement = parseJudgement(text);
+			// A non-empty unparseable reply is a model-formatting problem, not an
+			// outage — not a reason to advance (the next model judged nothing
+			// wrong with the command either). Return it in the existing
+			// PARSE_ERROR shape; the gate will not cache it.
+			if (judgement.verdict === "PARSE_ERROR") {
+				return { ...judgement, reason: withTriedIds(judgement.reason, tried) };
+			}
+			// One classification = one judgement: the first verdict any model in
+			// the chain produces is THE verdict; callers log and cache it once.
+			return judgement;
+		}
+		// Chain exhausted. The all-empty case keeps the legacy reason prefix
+		// (log greps key on it) with the tried list appended; any other
+		// exhaustion rethrows the last provider error in the call sites'
+		// existing "classifier unavailable" shape.
+		if (lastFailure.kind === "empty") {
 			return {
 				verdict: "PARSE_ERROR",
-				reason: "classifier model returned no content — check the model's provider credits/quota",
+				reason: withTriedIds(
+					"classifier model returned no content — check the model's provider credits/quota",
+					tried,
+				),
 				rawReply: "(empty reply)",
 			};
 		}
-		return parseJudgement(text);
+		throw new Error(withTriedIds(lastFailure.error instanceof Error ? lastFailure.error.message : String(lastFailure.error), tried));
 	};
 
 	/**
@@ -2574,6 +2721,7 @@ export default function (pi: ExtensionAPI) {
 		const configSignature = [
 			config.enabled,
 			config.model,
+			JSON.stringify(config.fallbackModels),
 			config.timeoutMs,
 			config.maxCommandLength,
 			config.evidenceUserMessages,
@@ -2682,9 +2830,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			const cwd = ctx.cwd;
 			const target = { command: evalCode, cwd, envKeys: [], pty: false, timeout: undefined as number | undefined, async: false };
-			const resolvedModel = resolveClassifierModel(ctx);
+			const chain = classifierChain(ctx);
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
-			const cacheKey = JSON.stringify(["eval", resolvedModel?.id ?? "(none)", cwd, language, evalCode]);
+			// The whole chain is the identity, not just the primary: a verdict
+			// earned under fallback A must not be reused under fallback B.
+			const cacheKey = JSON.stringify(["eval", chain.map(entry => entry.id), cwd, language, evalCode]);
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
 			// session off, so it must hold here too, not only for bash.
@@ -2702,7 +2852,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				let classifyError = "";
 				const cached = scoped.get(cacheKey);
-				const judgement = cached ?? (await classify(ctx, evalCode, cwd, resolvedModel, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, operatorContext).catch(
+				const judgement = cached ?? (await classify(ctx, evalCode, cwd, chain, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, operatorContext).catch(
 					(err: unknown) => {
 						classifyError = err instanceof Error ? err.message : String(err);
 						pi.logger.warn(`classifier: classify failed: ${classifyError}`);
@@ -2904,14 +3054,14 @@ export default function (pi: ExtensionAPI) {
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
 			// Every execution-affecting input is part of the identity. JSON avoids
 			// collisions when a value contains whichever delimiter text we choose.
-			// The resolved classifier model is part of the identity: a session
-			// whose @tiny role or live model changes must not reuse a SAFE that
-			// a different model produced. Resolution is per-session state, so
-			// this lives in the per-session key rather than the global
-			// config-signature clear.
-			const resolvedModel = resolveClassifierModel(ctx);
+			// The resolved classifier chain is part of the identity: a session
+			// whose @tiny role, live model, or fallbackModels changes must not
+			// reuse a SAFE that a different chain produced. Resolution is
+			// per-session state, so this lives in the per-session key rather
+			// than the global config-signature clear.
+			const chain = classifierChain(ctx);
 			const cacheKey = JSON.stringify([
-				resolvedModel?.id ?? "(none)", cwd, env.key, pty, timeout, async, command,
+				chain.map(entry => entry.id), cwd, env.key, pty, timeout, async, command,
 			]);
 			// Refusal memory (issue #30): a reworded command meets its session's
 			// prior refusal. The record tells the model; the SAFE branch below
@@ -3049,7 +3199,7 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			let classifyError = "";
-			const judgement = cached ?? (await classify(ctx, command, cwd, resolvedModel, config.timeoutMs, recordExtras, operatorContext).catch((err: unknown) => {
+			const judgement = cached ?? (await classify(ctx, command, cwd, chain, config.timeoutMs, recordExtras, operatorContext).catch((err: unknown) => {
 				// Provider errors (quota exhausted, auth, HTTP failures) previously
 				// vanished into an opaque "unavailable". Keep the message so the
 				// permission dialog says WHY.

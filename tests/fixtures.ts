@@ -36,6 +36,25 @@ export function setClassifierThrows(value: boolean): void {
 export function setClassifierDelay(ms: number): void {
 	classifierDelayMs = ms;
 }
+/** Script per-call replies: consumed in order, then `classifierReply` takes
+ *  over. An empty string models the empty-reply outage path. */
+let classifierReplyQueue: string[] | undefined;
+export function setClassifierReplies(values: string[]): void {
+	classifierReplyQueue = [...values];
+}
+/** Make the next `count` completions throw (provider-exception path); later
+ *  calls behave normally again. */
+let classifierFailuresLeft = 0;
+export function setClassifierFailures(count: number): void {
+	classifierFailuresLeft = count;
+}
+let classifierAttempts = 0;
+/** completeSimple invocations, including ones aborted before completing —
+ *  the only way to see that a timeout did NOT trigger a fallback attempt. */
+export function classifierAttemptCount(): number {
+	return classifierAttempts;
+}
+
 let classifierThrows = false;
 let classifierDelayMs = 5;
 
@@ -169,7 +188,13 @@ mock.module("@oh-my-pi/pi-ai", () => ({
 	withOAuthAccess: missingExportStub,
 	wrapFetchForCch: missingExportStub,
 	completeSimple: async (model: unknown, request: unknown, options: unknown) => {
+		classifierAttempts += 1;
 		if (classifierThrows) throw new Error("model call failed");
+		if (classifierFailuresLeft > 0) {
+			classifierFailuresLeft -= 1;
+			throw new Error("model call failed");
+		}
+		const reply = classifierReplyQueue?.shift() ?? classifierReply;
 		const signal = (options as { signal?: AbortSignal } | undefined)?.signal;
 		await new Promise<void>((resolve, reject) => {
 			if (signal?.aborted) {
@@ -184,7 +209,7 @@ mock.module("@oh-my-pi/pi-ai", () => ({
 			request: request as CapturedModelCall["request"],
 			options: options as CapturedModelCall["options"],
 		});
-		return { content: [{ type: "text", text: classifierReply }] };
+		return { content: [{ type: "text", text: reply }] };
 	},
 }));
 
@@ -200,7 +225,6 @@ export async function fireCommand(name: string, args: string, ctx: ExtensionCont
 	if (!handler) throw new Error(`no command registered for "/${name}"`);
 	return await handler(args, ctx);
 }
-
 /** Load the plugin with a fake pi; returns a fire() bound to it. */
 export async function loadPlugin(settings: Record<string, unknown>): Promise<void> {
 	loggerWarnings.length = 0;
@@ -208,6 +232,14 @@ export async function loadPlugin(settings: Record<string, unknown>): Promise<voi
 	handlers.clear();
 	registeredCommands.clear();
 	modelCalls.length = 0;
+	// Every stub knob resets here: each test file's beforeEach loadPlugin()
+	// then starts from the pristine default, so no file can inherit another's
+	// scripted state no matter what order bun runs them in. Files wanting a
+	// non-default reply set it AFTER loadPlugin.
+	classifierReply = "SAFE";
+	classifierReplyQueue = undefined;
+	classifierFailuresLeft = 0;
+	classifierAttempts = 0;
 	const mod = await import("../index.ts");
 	mod.default({
 		pi: { settings },
@@ -418,9 +450,18 @@ export function useTempConfigFile(): string {
 	return testConfigPath;
 }
 
+let lastConfigMtimeMs = 0;
+
 export function writeConfigFile(raw: Record<string, unknown>): void {
 	const target = useTempConfigFile();
 	fs.writeFileSync(target, JSON.stringify(raw));
+	// The plugin's config cache is keyed on mtimeMs; coarse-granularity
+	// filesystems (the codebase flags 1-2s on NFS) can stamp two rapid writes
+	// with the same tick, silently skipping a re-read. Force a strictly
+	// increasing mtime so every write is always seen.
+	const mtimeMs = Math.max(Date.now(), lastConfigMtimeMs + 1);
+	fs.utimesSync(target, mtimeMs / 1000, mtimeMs / 1000);
+	lastConfigMtimeMs = mtimeMs;
 }
 
 export function removeConfigFile(): void {
