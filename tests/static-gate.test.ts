@@ -266,7 +266,11 @@ describe("allow rules", () => {
 
 	test("a segment carrying a redirect is never allow-matched", async () => {
 		await loadPlugin(makeSettings([{ match: "gh pr *", approval: "allow" }]));
-		expect(await gate("gh pr view 1 > /tmp/out")).toBe("ALLOWED"); // classifier says SAFE
+		// The reply must carry the egress sentence the two-stage contract
+		// demands of a hosted-API command: a silent-egress SAFE downgrades to
+		// UNSURE before the gate ever reaches the auto-run branch.
+		setClassifierReply("Egress: queries the GitHub API for pr 1; writes stdout to /tmp/out.\nVERDICT: SAFE");
+		expect(await gate("gh pr view 1 > /tmp/out")).toBe("ALLOWED");
 		expect(modelCalls.length).toBe(1);
 	});
 

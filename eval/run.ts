@@ -43,7 +43,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { completeSimple } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog";
-import { parseJudgement } from "../index";
+import { applyPostParseChecks, CLASSIFIER_MAX_TOKENS, parseJudgement } from "../index";
 
 /** Both non-SAFE verdicts raise a permission request, so both count as "ask". */
 type Decision = "allow" | "ask";
@@ -126,6 +126,11 @@ const SPAWN_FLAGS = [
 	"--no-rules",
 	"--no-lsp",
 	"--no-title",
+	// Production classify() pins disableReasoning: true. Without the analog
+	// here a reasoning judge spends its whole output budget thinking in the
+	// omp -p loop — measured: 25/96 two-stage cases never reached the VERDICT
+	// line (and many blew the per-case timeout) before this flag was added.
+	"--thinking=off",
 ] as const;
 /**
  * Each spawned case is a fresh `omp -p` process, and startup costs seconds
@@ -135,8 +140,10 @@ const SPAWN_FLAGS = [
  * slow one.
  */
 const PER_CASE_TIMEOUT_MS = 180_000;
-/** Bump on any change to fence, parse, or scoring semantics: it keys the reply cache and report filenames. */
-const HARNESS_VERSION = 3;
+/** Bump on any change to fence, parse, or scoring semantics: it keys the reply cache and report filenames.
+ *  v4: two-stage contract — full reply handed to parseJudgement (the verdict now lives on a labeled
+ *  line, not at reply start), and production's post-parse consistency checks applied before scoring. */
+const HARNESS_VERSION = 4;
 
 /** In-process `completeSimple` is one model round-trip; minutes would be a stall. */
 const INPROCESS_TIMEOUT_MS = 60_000;
@@ -344,6 +351,12 @@ async function judgeInProcess(
 			{ systemPrompt: [system], messages: [{ role: "user", content: user, timestamp: Date.now() }] },
 			{
 				apiKey: process.env[`${provider.toUpperCase()}_API_KEY`] ?? process.env.OMP_CLASSIFIER_KEY ?? "",
+				// Production classify() pins temperature 0 (reproducible verdicts)
+				// and CLASSIFIER_MAX_TOKENS (a reasoning judge can spend thousands
+				// of tokens thinking before the first text delta). The in-process
+				// judge makes the same call production makes, so it pins the same.
+				temperature: 0,
+				maxTokens: CLASSIFIER_MAX_TOKENS,
 				disableReasoning: true,
 				signal: AbortSignal.timeout(INPROCESS_TIMEOUT_MS),
 			},
@@ -400,18 +413,12 @@ async function judgeSpawn(
 	// stdout ONLY. stderr carries the progress spinner ("Working…"), and falling
 	// back to it turns a killed process into a confident-looking non-verdict.
 	//
-	// FIRST non-empty line, not last. Production `parseJudgement` reads
-	// `reply.trim().split(/\r?\n/u, 1)[0]` — the first line — and anchors the
-	// verdict there precisely so a model that reasons aloud cannot talk its way to
-	// SAFE further down. Taking the last line scored `UNSAFE | reason\nSAFE |
-	// restated` as an ALLOW while production ASKS, which is an under-flag the
-	// harness would have hidden.
-	const lines = out
-		.trim()
-		.split("\n")
-		.map(l => l.trim())
-		.filter(Boolean);
-	return lines[0] ?? "";
+	// WHOLE stdout, not a filtered first line. Under the two-stage contract the
+	// verdict lives on a labeled VERDICT line the model writes after its
+	// analysis; production `parseJudgement` scans the full reply for that line,
+	// so truncating to the first non-empty line would feed it analysis only and
+	// score every spawn case as UNPARSED.
+	return out.trim();
 }
 
 async function main(): Promise<void> {
@@ -487,7 +494,15 @@ async function main(): Promise<void> {
 				// dialog); the harness records that as UNPARSED so the case counts as
 				// an ERROR — excluded from scoring and reported loudly — instead of
 				// flattered into a correct "ask".
-				const judgement = parseJudgement(reply);
+				// parseJudgement is production's parser; applyPostParseChecks is
+				// production's verdict resolution (citation grounding, egress and
+				// write-scope consistency). Both run here exactly as classify()
+				// runs them, so a downgrade the gate would produce is scored as
+				// the ask it is, not flattered into an allow.
+				const judgement = applyPostParseChecks(
+					parseJudgement(reply),
+					{ command: testCase.command, cwd },
+				);
 				const verdict = judgement.verdict === "PARSE_ERROR" ? "UNPARSED" : (judgement.verdict as Verdict);
 				// Only cache real verdicts. Caching a killed process or an empty reply
 				// bakes a harness failure into every later run of this prompt.
@@ -645,20 +660,29 @@ async function main(): Promise<void> {
 	console.log(`\nreport: ${reportPath}`);
 
 	if (args.compare) {
-		// Accept a prompt FILE, not a hash: the id is an implementation detail, and
-		// asking for it by hand is how you end up diffing against the wrong run.
-		const compareId = (await Bun.file(args.compare).exists())
-			? createHash("sha256")
-					.update(await Bun.file(args.compare).text())
-					.digest("hex")
-					.slice(0, 12)
-			: args.compare;
-		const other = join(REPORT_DIR, reportName(compareId));
-		const otherFile = Bun.file(other);
-		if (!(await otherFile.exists())) {
-			console.log(`\n(no report at ${other} — run that prompt first to diff)`);
+		let previous: { outcomes: Outcome[] } | undefined;
+		if (args.compare.endsWith(".json") && (await Bun.file(args.compare).exists())) {
+			// A report JSON path is read as-is: the baseline may come from an older
+			// HARNESS_VERSION whose filename the current reportName() could never
+			// rebuild, and the diff reads the outcomes inside, not the name.
+			previous = JSON.parse(await Bun.file(args.compare).text());
 		} else {
-			const previous: { outcomes: Outcome[] } = JSON.parse(await otherFile.text());
+			// Accept a prompt FILE, not a hash: the id is an implementation detail, and
+			// asking for it by hand is how you end up diffing against the wrong run.
+			const compareId = (await Bun.file(args.compare).exists())
+				? createHash("sha256")
+						.update(await Bun.file(args.compare).text())
+						.digest("hex")
+						.slice(0, 12)
+				: args.compare;
+			const other = join(REPORT_DIR, reportName(compareId));
+			if (await Bun.file(other).exists()) {
+				previous = JSON.parse(await Bun.file(other).text());
+			} else {
+				console.log(`\n(no report at ${other} — run that prompt first to diff)`);
+			}
+		}
+		if (previous) {
 			const before = new Map(previous.outcomes.map(o => [o.command, o]));
 			let fixed = 0;
 			let regressed = 0;
