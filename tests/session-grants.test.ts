@@ -295,7 +295,7 @@ describe("grant target strictness (gate fix)", () => {
 		const sid = nextSession();
 		const first = await prompted("pkill -f MyApp", ALLOW_SESSION, sid);
 		expect(resultText(first.result)).toBe("ALLOWED");
-		expect(selectCalls(first.ctx)[0][1]).toHaveLength(3); // grantable: three options
+		expect(selectCalls(first.ctx)[0][1]).toHaveLength(4); // grantable: Allow once/session/always, Deny
 
 		const secondCtx = makeCtx({ sessionId: sid, hasUI: true });
 		const second = await fire("tool_call", makeEvent("pkill -f MyApp"), secondCtx);
@@ -324,12 +324,14 @@ describe("grant target strictness (gate fix)", () => {
 		expect(modelCalls.length).toBe(2);
 	});
 
-	test("a compound command is offered only Allow once / Deny", async () => {
+	test("a compound command is offered Allow once / Always allow / Deny — never a session grant", async () => {
 		const sid = nextSession();
 		const ctx = makeCtx({ sessionId: sid, hasUI: true });
 		const result = await fire("tool_call", makeEvent("git status && git push --force"), ctx);
 		expect(refusalOf(result).layer).toBe("dialog");
-		expect(selectCalls(ctx)[0][1].map(option => option.label)).toEqual(["Allow once", "Deny"]);
+		// No strict key exists for a compound, so "Allow for session" is hidden;
+		// the exact-text persistent grant covers the full line instead.
+		expect(selectCalls(ctx)[0][1].map(option => option.label)).toEqual(["Allow once", "Always allow", "Deny"]);
 	});
 
 	test("normalizeGrantTarget unit table", () => {

@@ -302,9 +302,12 @@ export interface CtxOptions {
 	branch?: ReadonlyArray<{ type: string; message?: { role?: string; content?: unknown } }>;
 }
 
-/** The three labels the plugin's permission dialog offers (issue #32). */
+/** The labels the plugin's permission dialog offers. "Always allow" is
+ *  bash-only and kill-switchable (persistentGrants config key); "Allow for
+ *  session" needs a strict grant key (issue #32). */
 export const ALLOW_ONCE = "Allow once";
 export const ALLOW_SESSION = "Allow for session";
+export const ALWAYS_ALLOW = "Always allow";
 export const DENY = "Deny";
 
 export function makeCtx(options: CtxOptions = {}): ExtensionContext {
