@@ -349,7 +349,10 @@ async function judgeInProcess(
 		// the provider-visible fields (compat, cost, input) match a bundled
 		// entry — and keep scoring the exact production judge instead of
 		// silently drifting to another model. Keep the spec in sync with
-		// `providers.zai.models[id=glm-5.3-flash]` in models.yml.
+		// `providers.zai.models[id=glm-5.3-flash]` in models.yml, whose apiKey
+		// is the "!security find-generic-password -s zai -w" keychain
+		// indirection, supplied to this script as ZAI_API_KEY — never read or
+		// printed here.
 		model = buildModel({
 			id: "glm-5.3-flash",
 			name: "GLM 5.3 Flash (Z.ai Coding Plan)",
