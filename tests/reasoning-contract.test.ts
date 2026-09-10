@@ -142,6 +142,7 @@ describe("checkEgressConsistency", () => {
 	test("declaring no egress while the command reaches a remote downgrades", () => {
 		const j = checkEgressConsistency(parseJudgement(safeReply("No network egress. Copies files locally.")), "ssh backup-host rsync -a ./data backup:/data");
 		expect(j.verdict).toBe("UNSURE");
+		expect(j.reason).toBe("declared scope contradicts command (network)");
 	});
 
 	test("analysis that addresses egress passes", () => {
@@ -157,20 +158,18 @@ describe("checkEgressConsistency", () => {
 		expect(checkEgressConsistency(silent, "curl -s https://api.github.com/repos/o/r | jq .").verdict).toBe("SAFE");
 	});
 
-	test("a non-read-only curl (POST) is outbound even with silent analysis", () => {
+	test("a non-read-only curl (POST) with a silent analysis defers to the verdict", () => {
 		const j = checkEgressConsistency(parseJudgement(safeReply("Sends a payload.")), "curl -s -X POST --data @out.json https://api.example.com/hooks");
-		expect(j.verdict).toBe("UNSURE");
+		expect(j.verdict).toBe("SAFE");
 	});
 
 	test("commands with no network verb are never contradicted", () => {
 		expect(checkEgressConsistency(parseJudgement("VERDICT: SAFE"), "git status && ls -la").verdict).toBe("SAFE");
 	});
 
-	test("silent analysis on an outbound command downgrades", () => {
+	test("silent analysis on an outbound command defers to the verdict", () => {
 		const j = checkEgressConsistency(parseJudgement(safeReply("Echoes a line.")), "ssh deploy@server.example.com uptime");
-		expect(j.verdict).toBe("UNSURE");
-		expect(j.reason).toBe("declared scope contradicts command (network)");
-		expect(j.noCache).toBe(true);
+		expect(j.verdict).toBe("SAFE");
 	});
 
 	test("a read-shaped gh invocation clears like a fetched read", () => {
@@ -178,8 +177,8 @@ describe("checkEgressConsistency", () => {
 		expect(checkEgressConsistency(silent, "gh pr view 5").verdict).toBe("SAFE");
 	});
 
-	test("gh api with an explicit write verb stays outbound", () => {
-		const silent = parseJudgement(safeReply("Echoes a line."));
+	test("gh api write with an affirmative no-egress claim downgrades", () => {
+		const silent = parseJudgement(safeReply("No network egress."));
 		expect(checkEgressConsistency(silent, "gh api repos/o/r -X POST -f title=test").verdict).toBe("UNSURE");
 	});
 	const cwd = "/Users/you/sites/project";
@@ -230,7 +229,7 @@ describe("checkEgressConsistency", () => {
 });
 describe("applyPostParseChecks", () => {
 	test("first fired check wins and non-SAFE verdicts pass through", () => {
-		const downgraded = applyPostParseChecks(parseJudgement("VERDICT: SAFE"), {
+		const downgraded = applyPostParseChecks(parseJudgement(safeReply("No network egress.")), {
 			command: "gh api repos/o/r -X POST -f title=t",
 			cwd: "/w",
 		});
@@ -274,13 +273,13 @@ describe("live gate integration", () => {
 		expect(selectCalls(ctx)).toHaveLength(0);
 	});
 
-	test("silent analysis on a hosted-API write dialogs with the egress reason", async () => {
-		setClassifierReply("VERDICT: SAFE");
+	test("no-egress analysis on a hosted-API write dialogs with the egress reason", async () => {
+		setClassifierReply(safeReply("No network egress."));
 		const ctx = makeCtx({ sessionId: "reasoning-egress", hasUI: true });
 		const result = await fire("tool_call", makeEvent("gh api repos/o/r -X POST -f title=test"), ctx);
 		expect(result).toBeDefined();
 		expect(selectCalls(ctx)).toHaveLength(1);
-		expect(dialogFor(ctx)).toContain("declared scope contradicts command (network)");
+		expect(dialogFor(ctx)).toContain("judge approved, but its analysis claimed no network while the command contacts one");
 	});
 
 	test("read-shaped gh commands still auto-run on a bare verdict", async () => {

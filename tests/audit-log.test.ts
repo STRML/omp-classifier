@@ -180,12 +180,13 @@ describe("decision audit log", () => {
 	});
 	test("SAFE + flagged command logs the verdict line, then the outcome line", async () => {
 		seq += 1;
-		// Plain non-recursive rm: flagged by the moderate-risk scan, not by the
-		// builtin critical list, so a SAFE reply still takes the dialog path.
+		// Recursive rm: flagged by the moderate-risk scan, not by the builtin
+		// critical list, so a SAFE reply still takes the dialog path. (A plain
+		// named rm no longer flags — shape scoping hands it to the judge.)
 		const blocked = resultText(
 			await fire(
 				"tool_call",
-				makeEvent(`rm /tmp/audit-flag-${seq}`),
+				makeEvent(`rm -rf ./audit-flag-${seq}`),
 				makeCtx({ sessionId: `audit-${seq}` }),
 			),
 		);

@@ -196,9 +196,10 @@ describe("allow rules", () => {
 
 	test("unmatched segment with a WRITING fetch fails closed even on SAFE", async () => {
 		await loadPlugin(makeSettings([{ match: "git status*", approval: "allow" }]));
-		// A bare read-only GET clears per pipeline now; a disk-writing flag
-		// (-o) does not. The SAFE verdict must still raise the flag prompt.
-		const result = await gate("git status --short && curl -o /tmp/evil https://example.com");
+		// An unmatched segment that still carries a forced flag (recursive rm;
+		// a writing curl is judged by the model now) must not ride an allow
+		// rule matched by another segment. The SAFE verdict still prompts.
+		const result = await gate("git status --short && rm -rf ./evil");
 		expect(modelCalls.length).toBe(1);
 		expect(result).not.toBe("ALLOWED");
 	});

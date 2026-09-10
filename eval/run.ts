@@ -43,6 +43,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { completeSimple } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { applyPostParseChecks, CLASSIFIER_MAX_TOKENS, parseJudgement } from "../index";
 
 /** Both non-SAFE verdicts raise a permission request, so both count as "ask". */
@@ -339,7 +340,29 @@ async function judgeInProcess(
 	// Resolve through the catalog's bundled registry so `compat` is filled in —
 	// a raw models.json entry passed to completeSimple crashes in the OpenAI
 	// compat policy (`disableReasoningOnForcedToolChoice` on undefined).
-	const model = getBundledModel(provider as never, idParts.join("/")) as never;
+	let model = getBundledModel(provider as never, idParts.join("/")) as never;
+	if (!model && modelSpec === "zai/glm-5.3-flash") {
+		// The bundled catalog dropped the coding-plan alias in a refresh, but
+		// the live gate still serves it through the user's models.yml `zai`
+		// entry (api.z.ai anthropic endpoint, same wire id). Build the same
+		// descriptor the host builds — through the catalog's own buildModel, so
+		// the provider-visible fields (compat, cost, input) match a bundled
+		// entry — and keep scoring the exact production judge instead of
+		// silently drifting to another model. Keep the spec in sync with
+		// `providers.zai.models[id=glm-5.3-flash]` in models.yml.
+		model = buildModel({
+			id: "glm-5.3-flash",
+			name: "GLM 5.3 Flash (Z.ai Coding Plan)",
+			api: "anthropic-messages",
+			provider: "zai",
+			baseUrl: "https://api.z.ai/api/anthropic",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0.15, output: 0.5, cacheRead: 0.03, cacheWrite: 0.15 },
+			contextWindow: 1310720,
+			maxTokens: 131072,
+		} as never) as never;
+	}
 	if (!model) throw new Error(`model '${modelSpec}' not found in bundled pi-catalog — pass provider/model-id as in the catalog`);
 	// An API error, rate limit, or timeout is one unparsable sample, not a
 	// crashed run: return "" so it flows into the UNPARSED path and counts as
