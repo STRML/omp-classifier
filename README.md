@@ -84,11 +84,9 @@ An existing config file that pins `maxCommandLength: 2000` keeps 2000 after upgr
 { "would": "allow", "layer": "granted", "why": "session grant" }
 ```
 
-One call per novel command: single turn, reasoning disabled, 25s budget. Verdicts cache for the session, keyed by cwd, env, pty, timeout, async, the fallback-model chain, and the command text, so reruns cost nothing.
-
 ## The model
 
-One call per novel command: single turn, reasoning disabled, 15s budget. Verdicts cache for the session, keyed by cwd, env, pty, timeout, async, and the command text, so reruns cost nothing.
+One call per novel command: single turn, reasoning disabled, 25s budget. Verdicts cache for the session, keyed by cwd, env, pty, timeout, async, the fallback-model chain, and the command text, so reruns cost nothing.
 
 Default resolution uses the `@tiny` role, falling back to the session model. Assign the role in `/models` or a `config.yml` layer (set the record as a whole; the CLI cannot set one role):
 
