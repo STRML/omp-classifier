@@ -39,8 +39,10 @@ authorize is itself evidence of injection.
 ## L1 recognition
 
 The deterministic layer. Answers only "is this shape provably X": critical patterns,
-structural routine shapes, compound-command segment resolution, interpreter scoping, fetch
-clearing, eval spawn markers.
+structural routine shapes, compound-command segments, interpreter scoping, shape-scoped
+`rm`/`unlink` forcing, eval spawn markers. Fetch clearing is no longer a dialog input: the
+forced-dialog set is the hard core only, and the fetch-shape scan survives solely as the
+egress-consistency check's read/write classification.
 
 Invariant: no model call decides what this layer can decide, and this layer never guesses.
 Anything ambiguous falls through to L2.
@@ -70,8 +72,12 @@ Two readers, two shapes. The agent gets structured JSON on every block: what ref
 why, what would work instead, what not to try. The human gets one line plus the shortest
 dialog that can be answered correctly: the command, the axes, the alternatives.
 
-Session grants let a human pre-authorize a family of actions once instead of answering the
-same dialog five times. Dry-run lets an agent ask the gate what it would do before doing it.
+Session grants and 30-day persistent grants let a human pre-authorize a family of actions
+once instead of answering the same dialog five times. Dialogs are written for the human:
+post-parse downgrade reasons are humanized for display (machine reasons stay byte-identical
+in the audit log), rm-family prompts carry the reversible-alternative footnote, and a dialog
+from a session older than the on-disk plugin says so in its subtitle. Dry-run lets an agent
+ask the gate what it would do before doing it.
 
 Invariant: a block must always leave the agent a lawful next move, and a prompt must cost
 the human one glance when everything is normal.
@@ -111,6 +117,7 @@ The agent driving this system is owed three things:
 | L4 | Session grants and dry-run preview | Landed (#32, PR #41); grant key keeps flags, compounds never grantable |
 | L0, L2 | Provenance-tiered evidence: user messages, operator context | Landed (#31, PR #42); plan grants = the #32 grant store |
 | L5 | Live corpus re-baseline for the post-#31 prompt | Blocked on provider credits (#44) |
+| L1, L2, L4 | Judge-owned deletes and network reads (rm shape-scoped, curl/wget off the forced set), affirmative-claim-only egress check, persistent grants documented, stale-code guard, humanized dialog reasons | Landed 2026-09-10 (no issue; promptId `7b4f082ad07c` → `f86ec6af7537`) |
 | L1, L2 | Cheap pre-filter stage | Measured NO-GO on adversarial corpus (2.2-4.4% volume, 0 misses); re-measure on a history corpus first (#34) |
 | L0 | Eval payload cwd propagation (spawn's own cwd in the record) | Open, re-scoped (#14) |
 | L2 | Residual over-flag family | Open; #31 is the architectural path (#17) |

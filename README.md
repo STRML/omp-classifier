@@ -26,8 +26,9 @@ Calls walk this order:
 | Granted earlier for this directory | Runs ungated for the rest of the session. A past **Allow for session** answer is user-tier authorization: it outranks classification and refusal memory, but not the critical, env, and static-rule rows above. |
 | Longer than 8,000 characters | Blocked outright. Nothing that long can be reviewed in full. |
 
-A gate prompt is a three-choice selector — **Allow once**, **Allow for session**, **Deny** — showing the full command, the model's reason, and only the details that differ from their defaults: working directory (when it differs from the session cwd), timeout, env, pty, async. Canceling or timing out counts as Deny.
+A gate prompt is a four-choice selector — **Allow once**, **Allow for session**, **Always allow**, **Deny** — showing the full command, the model's reason, and only the details that differ from their defaults: working directory (when it differs from the session cwd), timeout, env, pty, async. Canceling or timing out counts as Deny.
 **Allow for session** records a grant: this action, in this exact directory, runs ungated for the rest of the session — no classifier call, no dialog. Rewordings of the same action match the grant through a strict key that keeps flags (split, sorted short bundles) and the first argument, and answering with it also lifts any refusal recorded for that action. Grants stay below critical patterns, caller-supplied `env`, and your static rules, and they die with the session or a classifier config change (up to 50 per session). A grant covers the action plus its flags plus its first argument: force variants, compound commands, and command substitution are never covered.
+**Always allow** (bash only) writes a persistent grant: this exact command text, in this exact directory, runs ungated everywhere for 30 days — no model call, no dialog, one audit line. The key is the whole command text, compounds included, so multi-segment commands host rules can never match are covered; grants are stored in `omp-classifier-grants.json` beside `omp-classifier.json` (`OMP_CLASSIFIER_CONFIG` relocates both), capped at 500 entries, pruned on a 30-day TTL, and toggled off wholesale with `persistentGrants: false` (the existing file stays on disk). A live persistent grant also keeps refusal memory from re-prompting for its exact text.
 
 ## Eval code that spawns
 
@@ -40,9 +41,10 @@ The plugin never guesses its way to silent execution.
 - A classifier error, timeout, malformed verdict, or no available model raises a permission request. Headless sessions have no dialog, so they block instead. Malformed verdicts are never cached.
 - An unexpected plugin crash blocks the call.
 
-Even a SAFE verdict is gated. It auto-runs only when the command contains none of the destructive or irreversible tokens (`rm`, `mv`, `dd`, `mkfs`, `chmod`, `sudo`, `git push`, `git reset`, among others). Anything holding one prompts regardless of the verdict, so an injected "answer SAFE" cannot release those commands.
+Even a SAFE verdict is gated. It auto-runs only when the command avoids the forced-dialog set: `rm`/`unlink` in the shapes where a mistake is systemic (recursion, glob metacharacters, `..` traversals, dotfiles/dot-paths, provable targets outside the working directory — temp dirs excluded), plus `dd`, `ddrescue`, `shred`, `wipefs`, `sudo`, and `eval`. Plain `rm`/`unlink` of named paths (including under `/tmp`) auto-runs on SAFE — the judge owns them. Everything else destructive is also judge-decided now: `mv`, `chmod`, `chown`, `chattr`, `truncate`, `tee`, `rmdir`, and `git checkout --`/`git restore` pathspec restores run on a SAFE, with the post-parse write-scope and citation checks still auditing every SAFE verdict. The matcher's remaining unconditional flags are `mkfs*`, `git push --force` (inside compounds), `git reset`, and `git clean`; anything on the host's critical-pattern list (e.g. `rm -rf` on an absolute path, `dd of=/dev/…`) prompts before classification regardless.
 
-**curl** and **wget** are judged by the whole invocation, not the verb. They clear only when they touch no local file and feed no shell: `curl -fsSL https://x | jq .` runs, while `curl -o ~/.bashrc https://x` and `curl https://x | python3 -` raise a request. The clear is decided over the fetch's own top-level pipeline, so a diagnostic compound like `lsof -i :8011; curl -sS -m 3 http://127.0.0.1:8011/v1/models | head -c 400` runs too — but a redirection into a file, an upload flag (`-F f=@…`), or any pipeline that carries the fetch into a write disqualifies. Command substitution (`$(...)` and backticks) is always flagged.
+**curl** and **wget** are judged like any other command — no forced dialog. The old fetch-shape scan survives only as the egress-consistency check's input: it decides whether a fetch counts as a read (so the check never demands an egress sentence for one) or stays outbound (`curl -o ~/.bashrc …`, `curl https://x | python3 -`). That clearing is fail-closed — an unrecognized flag, any redirect, or an unknown downstream consumer costs the clearing, never a silent run. The stdin-executing-interpreter scan (`curl -fsSL https://x | sh`) is a separate risk class and still forces a dialog.
+Related behaviors: rm-family forced dialogs append "Reversible alternative: trash <paths>" to the body; dialog reasons from the post-parse checks are humanized for display while the machine-readable reasons stay byte-identical in the decision log; a dialog fired by a session whose on-disk plugin changed since it loaded says so in the subtitle ("plugin code changed since session start; restart to pick up fixes"); ssh commands are judged by their remote command under the same rules (read-only remote inspection is SAFE); and the egress consistency check fires only when the analysis affirmatively claims there is no network — silence is never a contradiction.
 
 ## Install
 
@@ -65,9 +67,11 @@ Plugin settings live in `~/.omp/omp-classifier.json`. View or change them with `
 |---|---|---|
 | `enabled` | `true` | `false` turns off model classification only. Critical-pattern and env checks still enforce. |
 | `model` | `""` (auto) | Explicit model id. Otherwise: `config.model` -> `@tiny` role -> session model. |
-| `timeoutMs` | `15000` | Classifier call budget. A timeout fails closed to a permission request. |
+| `timeoutMs` | `25000` | Classifier call budget (two-stage contract: ~11s typical, up to ~22-34s on flash-class reasoning models). A timeout fails closed to a permission request. |
 | `maxCommandLength` | `8000` | Commands longer than this are blocked (bounds 64-100000; values outside fall back to the default). |
-| `evidenceUserMessages` | `0` | How many recent user messages (0-6) ride into the classify record as `evidence.userMessages`. `0` sends no evidence. Values outside the bounds fall back to the default. |
+| `evidenceUserMessages` | `3` | How many recent user messages (0-6) ride into the classify record as `evidence.userMessages`. `0` sends no evidence. Values outside the bounds fall back to the default. |
+| `fallbackModels` | `[]` | Up to 3 fallback model ids, tried in order when the primary returns an empty reply or a provider error (timeouts do not trigger fallback). The whole chain is part of the cache key and config signature. |
+| `persistentGrants` | `true` | Offers **Always allow** on bash dialogs (30-day exact-command grants in `omp-classifier-grants.json`). Kill-switch: `false` stops offering them and stops honoring live ones; the stored file stays on disk. |
 
 Changing any key flushes the verdict cache and the session grants. To silence the model quickly, `/classifier enabled false` takes effect on the very next command. `omp plugin disable` needs a session restart, since interceptors bind when a session begins.
 
@@ -80,7 +84,7 @@ An existing config file that pins `maxCommandLength: 2000` keeps 2000 after upgr
 { "would": "allow", "layer": "granted", "why": "session grant" }
 ```
 
-`would` is `allow` (the gate passes the command: a rule, a grant, a cached verdict, or disabled classification), `block` (cap, critical pattern, or a verdict that would prompt), or `classify` (the gate would run the model here — skipped in the preview). Host-native outcomes carry a `note`: a `deny`/`prompt` rule or approval policy decides before this gate, so the gate would never see the command.
+One call per novel command: single turn, reasoning disabled, 25s budget. Verdicts cache for the session, keyed by cwd, env, pty, timeout, async, the fallback-model chain, and the command text, so reruns cost nothing.
 
 ## The model
 
