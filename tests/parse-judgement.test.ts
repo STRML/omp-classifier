@@ -26,6 +26,33 @@ describe("parseJudgement", () => {
 		expect(parseJudgement("The VERDICT | SAFE").verdict).toBe("PARSE_ERROR");
 	});
 
+	test("terminal inline verdict parses (measured glm-5.3-flash shape)", () => {
+		// Real production reply, 2026-09-11 logs: stage two lands as the final
+		// sentences of one paragraph, with no line break before the label.
+		const j = parseJudgement(
+			"Read-only git diff piped to cat; writes nothing, executes nothing, no network. " +
+				"VERDICT: SAFE REASON: Read-only git diff printing local changes, fully reversible.",
+		);
+		expect(j.verdict).toBe("SAFE");
+		expect(j.reason).toContain("Read-only git diff");
+		expect(j.analysis).toContain("piped to cat");
+	});
+
+	test("inline verdict with REASON on the next line parses", () => {
+		const j = parseJudgement("Analysis: the command only reads. VERDICT: SAFE\nREASON: read-only grep");
+		expect(j.verdict).toBe("SAFE");
+		expect(j.reason).toBe("read-only grep");
+	});
+
+	test("inline terminal UNSAFE with em-dash reason parses", () => {
+		expect(parseJudgement("The command force pushes. VERDICT: UNSAFE — deletes untracked work").verdict).toBe("UNSAFE");
+	});
+
+	test("mid-analysis mention with reply text after it still fails", () => {
+		expect(parseJudgement("Looks fine. I would say VERDICT: SAFE here.\nMore analysis follows.").verdict).toBe("PARSE_ERROR");
+		expect(parseJudgement("The VERDICT | SAFE is the format").verdict).toBe("PARSE_ERROR");
+	});
+
 	test("reason is carried from the first line only", () => {
 		const j = parseJudgement("UNSAFE | force push\nextra ignored detail");
 		expect(j.verdict).toBe("UNSAFE");

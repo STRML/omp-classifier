@@ -1139,6 +1139,44 @@ export function parseJudgement(reply: string): Judgement {
 			rawReply: truncated(collapsed, 200),
 		};
 	}
+	// Terminal fallback: the same contract in one paragraph. Measured
+	// production shape (2026-09-11 logs: 61 spurious dialogs in one
+	// afternoon on judge zai/glm-5.3-flash): the analysis runs as a single
+	// sentence group and stage two lands as the paragraph's final sentences
+	// — "…no egress. VERDICT: SAFE REASON: read-only." — with no line break
+	// before the label, so the line scan above never sees it. The verdict
+	// must still own the tail of the reply: after the token, only the
+	// same-line reason, an optional REASON line, then whitespace. A
+	// mid-analysis mention followed by more reply text ("the verdict should
+	// be SAFE because…\n<writes>") still fails closed, and the legacy
+	// prose-prefixed anchors stay closed: the token must sit at reply start
+	// or directly after sentence punctuation/newline ("…reads. VERDICT:
+	// SAFE"), never after a bare word ("The VERDICT | SAFE" is prose, not a
+	// verdict echo). Only a labeled token at the reply's tail is stage two.
+	const VERDICT_TOKEN_RE = /\bVERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b/giu;
+	let lastToken: RegExpExecArray | undefined;
+	for (let m = VERDICT_TOKEN_RE.exec(reply); m; m = VERDICT_TOKEN_RE.exec(reply)) lastToken = m;
+	if (lastToken && /(?:^|[.!?;:][ \t]*|\r?\n[ \t]*)$/u.test(reply.slice(0, lastToken.index))) {
+		const tail = reply.slice(lastToken.index);
+		const shaped =
+			/^VERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b([^\n]*?)(?:\n?[ \t]*REASON\b[^\n]*)?[\s*`]*$/iu.exec(tail);
+		if (shaped) {
+			let reason = shaped[2].trim()
+				.replace(/^[\s|:.,;\-*`–—]+/u, "")
+				.replace(/^REASON\b[:| \t-]*/iu, "")
+				.trim();
+			if (reason === "") {
+				const reasonLine = /\n?[ \t]*REASON\b[:| \t-]*([^\n]*)$/iu.exec(tail);
+				if (reasonLine) reason = reasonLine[1].trim();
+			}
+			return {
+				verdict: lastToken[1].toUpperCase() as Verdict,
+				reason: truncated(reason.replace(/\s+/gu, " "), 160),
+				analysis: truncated(reply.slice(0, lastToken.index).replace(/\s+/gu, " ").trim(), 2000),
+				rawReply: truncated(collapsed, 200),
+			};
+		}
+	}
 	return {
 		verdict: "PARSE_ERROR",
 		reason: "classifier reply had no VERDICT line",
@@ -1149,16 +1187,22 @@ export function parseJudgement(reply: string): Judgement {
 /**
  * Whether a non-SAFE verdict reflects the command's CONTENT and so belongs in
  * refusal memory (issue #30), whose premise is that a reworded payload
- * re-meets the session's prior judgment. An infrastructure PARSE_ERROR — the
- * outage path answers "(empty reply)" for a dead provider — judged nothing;
- * recording it made every later SAFE verdict prompt anyway ("classifier-safe
- * despite prior refusal") for the rest of the session.
+ * re-meets the session's prior judgment. Only UNSAFE and refusal-shaped
+ * PARSE_ERROR replies qualify. A PARSE_ERROR whose reply still carries a
+ * VERDICT label engaged the contract and failed only the format — measured
+ * 2026-09-11: those were inline-verdict analyses that read SAFE, and
+ * recording them as refusals poisoned memory with degenerate targets
+ * ("const {") that forced "despite prior refusal" dialogs on routine
+ * re-runs all session. Infrastructure replies ("(empty reply)", provider
+ * outages) judged nothing and are never remembered.
  */
 export function refusalWorthRemembering(judgement: Judgement): boolean {
 	if (judgement.verdict === "UNSAFE") return true;
 	if (judgement.verdict !== "PARSE_ERROR") return false;
 	const reply = (judgement.rawReply ?? "").trim();
-	return reply !== "" && reply !== "(empty reply)";
+	if (reply === "" || reply === "(empty reply)") return false;
+	if (/\bVERDICT\b/iu.test(reply)) return false;
+	return /\b(?:cannot|can't|won't|will not|refus(?:e|ing|al)|unable to)\b/iu.test(reply);
 }
 
 function truncated(value: string, max: number): string {
@@ -1263,6 +1307,26 @@ const NO_EGRESS_RE =
  */
 const GH_WRITE_MARKERS = /(?:^|\s)(?:-X|--method=?)\s*(?:POST|PUT|PATCH|DELETE)\b|(?:^|\s)-[fF]\s|(?:^|\s)--field(?:=|\s)|(?:^|\s)--input(?:=|\s)/iu;
 
+/**
+ * True when every fetch target in the command is loopback. Data aimed at
+ * localhost cannot leave the machine, so such a fetch is not outbound network
+ * for the egress consistency check — `curl -w '%{http_code}' localhost:8000`
+ * with an honest "no external requests" analysis must not be downgraded for
+ * "contradicting" a scope claim that is in fact correct. Explicit scheme'd
+ * URLs are checked each; with none present, a bare loopback host token clears
+ * the command and any other bare host stays outbound.
+ */
+function fetchIsLoopbackOnly(stage: string): boolean {
+	const urlRe = /https?:\/\/[^\s"'<>]+/giu;
+	let sawUrl = false;
+	for (const m of stage.matchAll(urlRe)) {
+		sawUrl = true;
+		if (!/^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]|[\w.-]+\.localhost)(?::\d+)?(?:[/?#]|\.\s|\s|$)/iu.test(m[0])) return false;
+	}
+	if (sawUrl) return true;
+	return /(?:^|[\s"'])(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:[/?#]|\.\s|[\s"']|$)/iu.test(stage);
+}
+
 export function commandHasOutboundNetwork(command: string): boolean {
 	const normalized = command.replace(/\\\r?\n/gu, "");
 	for (const text of splitTopLevelCommands(normalized)) {
@@ -1272,7 +1336,7 @@ export function commandHasOutboundNetwork(command: string): boolean {
 		let skipped = 0;
 		while (skipped < leadWords.length && /^[a-z_][a-z0-9_]*=/iu.test(leadWords[skipped])) skipped++;
 		const lead = commandBasename((leadWords[skipped] ?? "").toLowerCase());
-		if ((lead === "curl" || lead === "wget") && isPlainReadOnlyFetch(inert)) continue;
+		if ((lead === "curl" || lead === "wget") && (isPlainReadOnlyFetch(inert) || fetchIsLoopbackOnly(inert))) continue;
 		if (lead === "gh" && !GH_WRITE_MARKERS.test(inert)) continue;
 		if (NETWORK_VERBS[lead]) return true;
 		for (let i = 1; i < stages.length; i++) {

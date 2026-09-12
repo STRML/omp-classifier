@@ -1,7 +1,7 @@
 /**
  * Refusal memory across rewording (issue #30): a command this session refused
- * (UNSAFE / human denial / critical / cap / a PARSE_ERROR whose reply had
- * content) is remembered by
+ * (UNSAFE / human denial / critical / cap / a refusal-shaped PARSE_ERROR) is
+ * remembered by
  * normalized target, injected into the next classify record as priorRefusal,
  * and a SAFE that lands anyway on a refused target still prompts. A user
  * approval lifts the memory; the store holds 20 targets per session, oldest
@@ -82,7 +82,7 @@ describe("normalizeRefusalTarget", () => {
 });
 
 describe("refusalWorthRemembering", () => {
-	test("UNSAFE always; PARSE_ERROR only when the reply said something", () => {
+	test("UNSAFE always; PARSE_ERROR only when refusal-shaped and verdict-free", () => {
 		expect(refusalWorthRemembering({ verdict: "UNSAFE", reason: "x" })).toBe(true);
 		expect(refusalWorthRemembering({ verdict: "SAFE", reason: "" })).toBe(false);
 		expect(refusalWorthRemembering({ verdict: "UNSURE", reason: "x" })).toBe(false);
@@ -90,6 +90,17 @@ describe("refusalWorthRemembering", () => {
 		expect(refusalWorthRemembering({ verdict: "PARSE_ERROR", reason: "not a verdict", rawReply: "" })).toBe(false);
 		expect(refusalWorthRemembering({ verdict: "PARSE_ERROR", reason: "not a verdict" })).toBe(false);
 		expect(refusalWorthRemembering({ verdict: "PARSE_ERROR", reason: "not a verdict", rawReply: "I cannot assist with that." })).toBe(true);
+	});
+
+	test("PARSE_ERROR carrying a VERDICT label is never remembered", () => {
+		// Measured 2026-09-11: inline-verdict analyses that read SAFE were
+		// recorded as refusals, poisoning targets ("const {") and forcing
+		// "despite prior refusal" dialogs on routine re-runs.
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "Writes nothing, deletes nothing. VERDICT: SAFE REASON: read-only.",
+		})).toBe(false);
 	});
 });
 

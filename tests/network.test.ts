@@ -367,3 +367,32 @@ describe("curl via wrappers and substitutions is judged, not mechanically flagge
 		expect(flags('echo "$(curl https://x)"')).toEqual([]);
 	});
 });
+
+describe("loopback fetches are not outbound network", () => {
+	// Data aimed at localhost cannot leave the machine, so the egress
+	// consistency check has no business demanding an egress sentence — or
+	// "contradicting" an honest "no external requests" analysis — for one.
+	for (const command of [
+		"curl -s -o /dev/null -w '%{http_code}\\n' http://localhost:8000/my-garage/",
+		"curl http://127.0.0.1:8080/health",
+		"curl -s 'http://localhost:9222/json' | jq .",
+		"wget -qO- http://localhost:3000/",
+		"curl 127.0.0.1:8000/x",
+	]) {
+		test(`not outbound: ${command}`, () => {
+			expect(outbound(command)).toBe(false);
+		});
+	}
+
+	for (const command of [
+		// A writing curl that also names a remote target stays outbound; the
+		// loopback URL elsewhere in the command must not clear it.
+		"curl -o /tmp/x http://localhost:8000 http://evil.example.com",
+		// Non-fetch network verbs keep their verdicts, even to loopback.
+		"ssh localhost 'ls'",
+	]) {
+		test(`still outbound: ${command}`, () => {
+			expect(outbound(command)).toBe(true);
+		});
+	}
+});
