@@ -95,11 +95,11 @@ interface Judgement {
 	refusalShaped?: boolean;
 }
 
-	/** A verdict assertion: label + verdict word, but NOT the prompt's format
-	 *  spec echo ("VERDICT: SAFE|UNSAFE|UNSURE"), whose second alternative is
-	 *  another option, never a decision. */
-const VERDICT_ASSERTION_RE =
-	/\bVERDICT\b[:| \t-]*(?:SAFE|UNSAFE|UNSURE)\b(?![^\n.;!?]*\b(?:SAFE|UNSAFE|UNSURE)\b)/u;
+/** The prompt's format spec echoed back — two verdict words within a few
+ *  characters ("SAFE|UNSAFE", "safe or unsure") — is a template, never a
+ *  decision. Case-insensitive on purpose: "verdict: safe|unsafe|unsure" is
+ *  the same echo in lowercase. */
+const TEMPLATE_ECHO_RE = /\b(?:safe|unsafe|unsure)\b.{0,6}(?:safe|unsafe|unsure)\b/iu;
 /** Refusal language. parseJudgement decides this on the FULL reply. */
 const REFUSAL_SHAPED_RE = /\b(?:cannot|can't|won't|will not|refus(?:e|ing|al)|unable to)\b/iu;
 
@@ -1137,7 +1137,7 @@ export function parseJudgement(reply: string): Judgement {
 		// The separator class eats "|", so the prompt's format spec
 		// ("VERDICT: SAFE|UNSAFE|UNSURE") leaves a second verdict word in the
 		// remainder: a template echo, never a decision.
-		if ((labeled[2].match(/\b(?:SAFE|UNSAFE|UNSURE)\b/g) ?? []).length >= 2) continue;
+		if (TEMPLATE_ECHO_RE.test(labeled[2])) continue;
 		let reason = labeled[2].trim()
 			// Same separator family the legacy shape allows, plus the em/en dashes
 			// models reach for when the REASON rides the verdict line.
@@ -1174,11 +1174,14 @@ export function parseJudgement(reply: string): Judgement {
 	const VERDICT_TOKEN_RE = /\bVERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b/giu;
 	let lastToken: RegExpExecArray | undefined;
 	for (let m = VERDICT_TOKEN_RE.exec(reply); m; m = VERDICT_TOKEN_RE.exec(reply)) lastToken = m;
-	if (lastToken && /(?:^|[.!?;][ \t]*|\r?\n[ \t]*)$/u.test(reply.slice(0, lastToken.index))) {
+	const boundaryOk =
+		lastToken !== undefined &&
+		/(?:^|[.!?;][ \t]*|\r?\n[ \t]*)$/u.test(reply.slice(0, lastToken.index));
+	if (lastToken !== undefined && boundaryOk) {
 		const tail = reply.slice(lastToken.index);
 		const shaped =
 			/^VERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b([^\n]*?)(?:\n?[ \t]*REASON\b[^\n]*)?[\s*`]*$/iu.exec(tail);
-		if (shaped && (shaped[2].match(/\b(?:SAFE|UNSAFE|UNSURE)\b/g) ?? []).length < 2) {
+		if (shaped && !TEMPLATE_ECHO_RE.test(shaped[2])) {
 			let reason = shaped[2].trim()
 				.replace(/^[\s|:.,;\-*`–—]+/u, "")
 				.replace(/^REASON\b[:| \t-]*/iu, "")
@@ -1201,7 +1204,10 @@ export function parseJudgement(reply: string): Judgement {
 		// Decided on the FULL reply: rawReply is capped at 200 chars, and a
 		// long malformed reply can carry a late VERDICT label the window
 		// drops, which refusal memory must not misread as absence.
-		hasVerdictToken: VERDICT_ASSERTION_RE.test(reply),
+		// A terminal, boundary-clean token the parser still rejected (extra
+		// tail text, spec echo) means the model tried to decide and failed:
+		// refusal memory must know. Mentions away from the tail are prose.
+		hasVerdictToken: boundaryOk,
 		refusalShaped: REFUSAL_SHAPED_RE.test(reply),
 		rawReply: truncated(collapsed, 200),
 	};
@@ -1226,7 +1232,7 @@ export function refusalWorthRemembering(judgement: Judgement): boolean {
 	if (reply === "" || reply === "(empty reply)") return false;
 	// parseJudgement decides the token question on the full reply (see the
 	// field); hand-built judgements fall back to the truncated window.
-	if (judgement.hasVerdictToken ?? VERDICT_ASSERTION_RE.test(reply)) return false;
+	if (judgement.hasVerdictToken ?? false) return false;
 	return judgement.refusalShaped ?? REFUSAL_SHAPED_RE.test(reply);
 }
 
@@ -1332,131 +1338,12 @@ const NO_EGRESS_RE =
  */
 const GH_WRITE_MARKERS = /(?:^|\s)(?:-X|--method=?)\s*(?:POST|PUT|PATCH|DELETE)\b|(?:^|\s)-[fF]\s|(?:^|\s)--field(?:=|\s)|(?:^|\s)--input(?:=|\s)/iu;
 
-/** The loopback clear is allowlist-first: a flag is permitted only when it is
- *  recognized here as benign — unknown flags (every current and future
- *  proxy/socks/resolve/config variant included) fail closed, so a new curl or
- *  wget flag can never silently widen the exemption. Redirects stay allowed:
- *  the read tables allow -L for any host, and where a redirect lands is the
- *  judge's domain, not the egress scan's. */
-const CURL_LOOPBACK_FLAGS: Record<string, true> = {
-	"-s": true, "-S": true, "-f": true, "-L": true, "-k": true, "-i": true,
-	"-I": true, "-v": true, "-4": true, "-6": true, "-N": true, "-g": true,
-	"-#": true, "-G": true,
-	"--silent": true, "--show-error": true, "--fail": true,
-	"--fail-with-body": true, "--location": true, "--insecure": true,
-	"--include": true, "--head": true, "--verbose": true, "--compressed": true,
-	"--http1.1": true, "--http2": true, "--no-buffer": true, "--ipv4": true,
-	"--ipv6": true, "--globoff": true, "--no-progress-meter": true,
-	"--progress-bar": true, "--get": true, "--tlsv1.2": true, "--tlsv1.3": true,
-};
-const WGET_LOOPBACK_FLAGS: Record<string, true> = {
-	"-q": true, "-S": true, "-v": true, "-4": true, "-6": true, "-N": true,
-	"--quiet": true, "--verbose": true, "--spider": true,
-	"--server-response": true, "--no-check-certificate": true,
-	"--content-on-error": true, "--inet4-only": true, "--inet6-only": true,
-};
-const LOOPBACK_FLAGS: Record<"curl" | "wget", Record<string, true>> = {
-	curl: CURL_LOOPBACK_FLAGS,
-	wget: WGET_LOOPBACK_FLAGS,
-};
-/** Recognized benign value-taking flags: their values are skipped, never
- *  read as targets. `--url` is handled separately — its value IS a target. */
-const CURL_LOOPBACK_VALUE_FLAGS: Record<string, true> = {
-	"-A": true, "-d": true, "-e": true, "-H": true, "-m": true, "-o": true,
-	"-r": true, "-u": true, "-X": true,
-	"--connect-timeout": true, "--data": true, "--data-raw": true,
-	"--data-urlencode": true, "--header": true, "--json": true,
-	"--limit-rate": true, "--max-time": true, "--output": true, "--range": true,
-	"--referer": true, "--request": true, "--retry": true, "--retry-delay": true,
-	"--retry-max-time": true, "--user": true, "--user-agent": true, "--write-out": true,
-};
-const WGET_LOOPBACK_VALUE_FLAGS: Record<string, true> = {
-	"--timeout": true, "--connect-timeout": true, "--read-timeout": true,
-	"--tries": true, "--user-agent": true, "--header": true,
-	"--max-redirect": true, "--method": true, "--body-data": true,
-	"--compression": true, "-O": true, "-P": true, "-T": true, "-o": true,
-	"-w": true, "--output-document": true,
-};
-const LOOPBACK_VALUE_FLAGS: Record<"curl" | "wget", Record<string, true>> = {
-	curl: CURL_LOOPBACK_VALUE_FLAGS,
-	wget: WGET_LOOPBACK_VALUE_FLAGS,
-};
-/** A single fetch target aimed at the loopback interface. */
-const LOOPBACK_TARGET_RE = /^(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|\[::1\]|[\w.-]+\.localhost)(?::\d+)?(?:[/?#]|$)/iu;
-
-/**
- * The loopback clear is allowlist-first: every flag must be recognized
- * benign (no-value) or benign-and-value-taking, exactly one operand may
- * remain, and that operand must be a loopback URL/host — so proxies,
- * --resolve/--connect-to rewrites, --config/--input-file sources, mirror
- * sweeps, and unknown future flags all fail closed by construction. The
- * caller clears only when the command is a single pipeline stage (a
- * downstream `| ssh host` can send the output to a remote endpoint) and
- * passes any environment assignment prefix (http_proxy=…).
- */
-function fetchIsLoopbackOnly(
-	leadVerb: "curl" | "wget",
-	args: readonly string[],
-	envAssignmentPrefix: boolean,
-): boolean {
-	if (envAssignmentPrefix) return false;
-	// An ambient proxy (http_proxy/HTTPS_PROXY/ALL_PROXY in this process)
-	// routes even loopback-targeted fetches through a remote hop: the clear
-	// only holds when none is set.
-	if (
-		["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"].some(
-			name => (process.env[name] ?? "").trim() !== "",
-		)
-	) {
-		return false;
-	}
-	const flags = LOOPBACK_FLAGS[leadVerb];
-	const values = LOOPBACK_VALUE_FLAGS[leadVerb];
-	const targets: string[] = [];
-	for (let k = 0; k < args.length; k++) {
-		const arg = args[k];
-		if (!arg.startsWith("-")) {
-			targets.push(arg);
-			continue;
-		}
-		const base = arg.startsWith("--") ? arg.split("=", 1)[0] : arg;
-		if (leadVerb === "curl" && base === "--url") {
-			// The value IS a fetch target, separated or `=`-attached.
-			targets.push(arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : (args[++k] ?? ""));
-			continue;
-		}
-		if (leadVerb === "curl" && (base === "-w" || base === "--write-out")) {
-			// `%output{path}` writes a local file from the format string, so
-			// the value is admitted only as literals and %{simple_name}
-			// variables — the spec-echo of the whole alternatives list fails.
-			const value = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : (args[++k] ?? "");
-			if (!/^(?:[^%]|%\{[a-z0-9_]+\})*$/iu.test(value)) return false;
-			continue;
-		}
-		if (leadVerb === "wget" && bundleIsWgetStdout(arg)) continue;
-		if (leadVerb === "wget" && bundleIsWgetStdoutSplit(arg, args[k + 1])) {
-			// The split value is `-` (stdout), never a target.
-			k++;
-			continue;
-		}
-		if (!arg.startsWith("--") && arg.length > 2) {
-			// A short bundle: every letter must be a recognized no-value
-			// flag; value-taking or unknown letters fail closed.
-			for (const flag of expandShortBundle(arg)) {
-				if (!flags[flag]) return false;
-			}
-			continue;
-		}
-		if (values[base]) {
-			if (!arg.includes("=")) k++;
-			continue;
-		}
-		// Allowlist-first: an unrecognized flag fails closed.
-		if (!flags[base]) return false;
-	}
-	if (targets.length !== 1) return false;
-	return LOOPBACK_TARGET_RE.test(targets[0]);
-}
+/** Write-out format strings can write local files (`%output{path}`, curl
+ *  8.3+), which is why `-w`/`--write-out` is absent from the read-only flag
+ *  table. A format string made only of literals and `%{simple_name}`
+ *  variables carries no such channel; this predicate admits exactly that.
+ *  Anything else — %output, %% escapes, unknown syntax — fails closed. */
+const WRITE_OUT_CLEAN_RE = /^(?:[^%]|%\{[a-z0-9_]+\})*$/iu;
 
 export function commandHasOutboundNetwork(command: string): boolean {
 	const normalized = command.replace(/\\\r?\n/gu, "");
@@ -1467,14 +1354,7 @@ export function commandHasOutboundNetwork(command: string): boolean {
 		let skipped = 0;
 		while (skipped < leadWords.length && /^[a-z_][a-z0-9_]*=/iu.test(leadWords[skipped])) skipped++;
 		const lead = commandBasename((leadWords[skipped] ?? "").toLowerCase());
-		if (lead === "curl" || lead === "wget") {
-			if (isPlainReadOnlyFetch(inert)) continue;
-			// Loopback-only fetches cannot egress on their own, but a
-			// downstream stage can: `curl localhost | ssh host cat` hands the
-			// output to a remote endpoint. Clear single-stage commands only;
-			// piped loopback fetches keep the full outbound treatment.
-			if (stages.length === 1 && fetchIsLoopbackOnly(lead, leadWords.slice(skipped + 1), skipped > 0)) continue;
-		}
+		if ((lead === "curl" || lead === "wget") && isPlainReadOnlyFetch(inert)) continue;
 		if (lead === "gh" && !GH_WRITE_MARKERS.test(inert)) continue;
 		if (NETWORK_VERBS[lead]) return true;
 		for (let i = 1; i < stages.length; i++) {
@@ -2205,6 +2085,12 @@ function isPlainReadOnlyFetch(command: string): boolean {
 				if (fetch === "curl" && (arg === "-o" || arg === "--output")) {
 					if (args[k + 1] !== "/dev/null") return false;
 					k++;
+					continue;
+				}
+				if (fetch === "curl" && (arg === "-w" || arg === "--write-out" || arg.startsWith("--write-out="))) {
+					const value = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : (args[k + 1] ?? "");
+					if (!WRITE_OUT_CLEAN_RE.test(value)) return false;
+					if (!arg.includes("=")) k++;
 					continue;
 				}
 				if (arg === "--output=/dev/null") continue;

