@@ -87,6 +87,9 @@ interface Judgement {
 	noCache?: boolean;
 	/** First 200 chars of the raw model reply, for diagnostics on PARSE_ERROR. */
 	rawReply?: string;
+	/** The FULL reply contained a VERDICT token, decided before the 200-char
+	 *  rawReply truncation so refusal memory cannot miss a late label. */
+	hasVerdictToken?: boolean;
 }
 
 /** Per-session cache: sessionId -> `${cwd}\0${env}\0${pty}\0${command}` -> judgement. */
@@ -1180,6 +1183,10 @@ export function parseJudgement(reply: string): Judgement {
 	return {
 		verdict: "PARSE_ERROR",
 		reason: "classifier reply had no VERDICT line",
+		// Decided on the FULL reply: rawReply is capped at 200 chars, and a
+		// long malformed reply can carry a late VERDICT label the window
+		// drops, which refusal memory must not misread as absence.
+		hasVerdictToken: /\bVERDICT\b/iu.test(reply),
 		rawReply: truncated(collapsed, 200),
 	};
 }
@@ -1201,7 +1208,9 @@ export function refusalWorthRemembering(judgement: Judgement): boolean {
 	if (judgement.verdict !== "PARSE_ERROR") return false;
 	const reply = (judgement.rawReply ?? "").trim();
 	if (reply === "" || reply === "(empty reply)") return false;
-	if (/\bVERDICT\b/iu.test(reply)) return false;
+	// parseJudgement decides the token question on the full reply (see the
+	// field); hand-built judgements fall back to the truncated window.
+	if (judgement.hasVerdictToken ?? /\bVERDICT\b/iu.test(reply)) return false;
 	return /\b(?:cannot|can't|won't|will not|refus(?:e|ing|al)|unable to)\b/iu.test(reply);
 }
 
@@ -1314,7 +1323,10 @@ const GH_WRITE_MARKERS = /(?:^|\s)(?:-X|--method=?)\s*(?:POST|PUT|PATCH|DELETE)\
  * with an honest "no external requests" analysis must not be downgraded for
  * "contradicting" a scope claim that is in fact correct. Explicit scheme'd
  * URLs are checked each; with none present, a bare loopback host token clears
- * the command and any other bare host stays outbound.
+ * the command and any other bare host stays outbound. The caller clears only
+ * when the command is a single pipeline stage: a downstream `| ssh host` can
+ * send the loopback output to a remote endpoint, and this function never
+ * inspects later stages.
  */
 function fetchIsLoopbackOnly(stage: string): boolean {
 	const urlRe = /https?:\/\/[^\s"'<>]+/giu;
@@ -1336,7 +1348,14 @@ export function commandHasOutboundNetwork(command: string): boolean {
 		let skipped = 0;
 		while (skipped < leadWords.length && /^[a-z_][a-z0-9_]*=/iu.test(leadWords[skipped])) skipped++;
 		const lead = commandBasename((leadWords[skipped] ?? "").toLowerCase());
-		if ((lead === "curl" || lead === "wget") && (isPlainReadOnlyFetch(inert) || fetchIsLoopbackOnly(inert))) continue;
+		if (lead === "curl" || lead === "wget") {
+			if (isPlainReadOnlyFetch(inert)) continue;
+			// Loopback-only fetches cannot egress on their own, but a
+			// downstream stage can: `curl localhost | ssh host cat` hands the
+			// output to a remote endpoint. Clear single-stage commands only;
+			// piped loopback fetches keep the full outbound treatment.
+			if (stages.length === 1 && fetchIsLoopbackOnly(inert)) continue;
+		}
 		if (lead === "gh" && !GH_WRITE_MARKERS.test(inert)) continue;
 		if (NETWORK_VERBS[lead]) return true;
 		for (let i = 1; i < stages.length; i++) {

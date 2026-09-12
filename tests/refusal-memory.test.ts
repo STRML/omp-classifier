@@ -102,6 +102,16 @@ describe("refusalWorthRemembering", () => {
 			rawReply: "Writes nothing, deletes nothing. VERDICT: SAFE REASON: read-only.",
 		})).toBe(false);
 	});
+	test("a late VERDICT label beyond the 200-char rawReply window still blocks memory", () => {
+		// The field is decided on the full reply; the truncated window cannot
+		// re-admit a refusal-shaped reply whose label it never sees.
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I cannot assist with that.",
+			hasVerdictToken: true,
+		})).toBe(false);
+	});
 });
 
 describe("refusal memory", () => {
