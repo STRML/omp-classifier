@@ -108,6 +108,49 @@ const prompted = async (command: string, answer: string, sessionId: string, cwd?
 };
 
 describe("persistent grants", () => {
+	test("legacy leading-cd consent cannot authorize either native execution mode", async () => {
+		const command = "cd child && ./script.sh";
+		writeStore({ version: 1, grants: [{ cmd: command, cwd: "/workspace/child", ts: Date.now() }] });
+		const implicit = await fire("tool_call", makeEvent(command), makeCtx({
+			sessionId: nextSession(), hasUI: true,
+		}));
+		expect(refusalOf(implicit).layer).toBe("dialog");
+		const explicit = await fire("tool_call", makeEvent(command, { cwd: "/workspace/child" }), makeCtx({
+			sessionId: nextSession(), hasUI: true,
+		}));
+		expect(refusalOf(explicit).layer).toBe("dialog");
+	});
+
+	test("a current-format grant missing its native execution mode requires fresh consent", async () => {
+		const command = "./script.sh";
+		writeStore({ version: 3, grants: [{ cmd: command, cwd: "/workspace", ts: Date.now(), envFingerprint: "" }] });
+		const result = await fire("tool_call", makeEvent(command), makeCtx({
+			sessionId: nextSession(), hasUI: true,
+		}));
+		expect(refusalOf(result).layer).toBe("dialog");
+	});
+
+	test("a cached SAFE verdict cannot cross native cd execution modes", async () => {
+		const command = "cd child && ./script.sh";
+		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true });
+		setClassifierReply("SAFE");
+		expect(await fire("tool_call", makeEvent(command), ctx)).toBeUndefined();
+		setClassifierReply("UNSAFE | different execution context");
+		const changed = await fire("tool_call", makeEvent(command, { cwd: "/workspace/child" }), ctx);
+		expect(refusalOf(changed).layer).toBe("dialog");
+	});
+
+	test("the previous environment-only store format requires fresh consent", async () => {
+		const command = "./script.sh";
+		writeStore({ version: 2, grants: [{
+			cmd: command, cwd: "/workspace", ts: Date.now(), envFingerprint: "", cwdFromCommand: false,
+		}] });
+		const result = await fire("tool_call", makeEvent(command), makeCtx({
+			sessionId: nextSession(), hasUI: true,
+		}));
+		expect(refusalOf(result).layer).toBe("dialog");
+	});
+
 	test("Always allow writes the store, allows this call, and shows the full option ladder", async () => {
 		const sid = nextSession();
 		const command = `git branch -D feature-${sid}`;
@@ -119,7 +162,6 @@ describe("persistent grants", () => {
 		expect(options.map(option => option.label)).toEqual([ALLOW_ONCE, ALLOW_SESSION, ALWAYS_ALLOW, DENY]);
 
 		const store = readStore();
-		expect(store.version).toBe(1);
 		expect(store.grants).toHaveLength(1);
 		expect(store.grants[0].cmd).toBe(command);
 		expect(store.grants[0].cwd).toBe("/workspace");
@@ -326,15 +368,14 @@ describe("persistent grants", () => {
 		const answerCtx = makeCtx({ sessionId: sid, hasUI: true, selectResult: ALWAYS_ALLOW });
 		expect(resultText(await fire("tool_call", makeEvent("git branch -D corrupt"), answerCtx))).toBe("ALLOWED");
 		const store = readStore();
-		expect(store.version).toBe(1);
 		expect(store.grants.map(grant => grant.cmd)).toEqual(["git branch -D corrupt"]);
 	});
 
 	test("a wrong-version store is ignored wholesale", async () => {
 		const sid = nextSession();
-		writeStore({ version: 2, grants: [{ cmd: "git branch -D v2", cwd: "/workspace", ts: Date.now() }] });
+		writeStore({ version: 999, grants: [{ cmd: "git branch -D future", cwd: "/workspace", ts: Date.now() }] });
 		const ctx = makeCtx({ sessionId: sid, hasUI: true });
-		const result = await fire("tool_call", makeEvent("git branch -D v2"), ctx);
+		const result = await fire("tool_call", makeEvent("git branch -D future"), ctx);
 		expect(refusalOf(result).layer).toBe("dialog");
 		expect(modelCalls.length).toBe(1);
 	});

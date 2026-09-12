@@ -2,6 +2,13 @@
 
 All notable changes, newest first. Issue and PR numbers reference STRML/omp-classifier.
 
+## Unreleased
+
+- Fix repeated environment-override prompts after **Allow for session** or **Always allow** by matching exact command, directory, and canonical environment fingerprint. Empty `env: {}` follows the ordinary no-env path.
+- Bind all persistent grants and cached verdicts to native leading-`cd` extraction mode so implicit and explicit directories cannot share authorization for different executions. Preserve unambiguous legacy grants; legacy leading-`cd` grants require fresh consent.
+- Write persistent store version 3 so earlier version-1 and version-2 readers cannot silently discard environment or execution-mode restrictions. Version-2 stores require fresh consent. Reject malformed scope fields without widening consent.
+- Prevent late dialog answers from restoring cleared session grants or granting a different live session. Critical prompts offer only **Allow once** / **Deny**; unoffered grant choices fail closed.
+
 ## 2026-09-10
 
 - Egress consistency fires only on an affirmative "no network egress" claim. The keyword-absence arm (an analysis that never mentioned egress) caused ~40 of the 50 "declared scope contradicts command (network)" dialogs in the previous day's decision window — the judge named the remote host but never used a literal keyword, and the scanner treated silence as contradiction, inverting the code's own "when unsure, do NOT fire" doctrine. `EGRESS_DISCUSSED_RE` is deleted; the egress bullet in the prompt now requires naming concrete endpoints (gh contacts api.github.com, ssh contacts the host it connects to). New prompt paragraph: ssh is judged by the remote command under the same rules — read-only remote inspection (SELECT queries, grep, sed -n prints, ls, log reads) is SAFE, remote mutations follow the normal rules, and local data sent through ssh follows the exfiltration rules. Root cause of the dialogs themselves: every fire — including the 2026-09-10 14:27Z gh compound — came from one GCU session started 2026-09-09T17:53Z, bound to the intermediate uncommitted check-without-carve-out build that predated the on-disk carve-out (19:05Z) and commit `c72b445` (19:37:04Z); HEAD == origin/main == the working tree, and the current code provably cannot fire on that command.
