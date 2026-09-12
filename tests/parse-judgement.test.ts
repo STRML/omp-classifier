@@ -94,8 +94,14 @@ describe("parseJudgement", () => {
 	});
 
 	test("reason is carried from the first line only", () => {
-		const j = parseJudgement("UNSAFE | force push\nextra ignored detail");
+		const j = parseJudgement("UNSAFE | force push");
 		expect(j.verdict).toBe("UNSAFE");
-		expect(j.reason).not.toContain("extra");
+		expect(j.reason).toBe("force push");
+	});
+	test("a one-line verdict does not ride trailing reply text", () => {
+		// Tail ownership: chatter after the verdict line voids it.
+		expect(parseJudgement("UNSAFE | force push\nextra ignored detail").verdict).toBe("PARSE_ERROR");
+		expect(parseJudgement("SAFE\nunvalidated trailing text").verdict).toBe("PARSE_ERROR");
+		expect(parseJudgement("SAFE\nREASON: read-only").verdict).toBe("SAFE");
 	});
 });

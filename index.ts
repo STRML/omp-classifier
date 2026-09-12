@@ -99,11 +99,10 @@ interface Judgement {
  *  characters ("SAFE|UNSAFE", "safe or unsure") — is a template, never a
  *  decision. Case-insensitive on purpose: "verdict: safe|unsafe|unsure" is
  *  the same echo in lowercase. */
-const TEMPLATE_ECHO_RE = /\b(?:safe|unsafe|unsure)\b.{0,6}(?:safe|unsafe|unsure)\b/iu;
+const TEMPLATE_ECHO_RE = /\b(?:safe|unsafe|unsure)\b[\s\S]{0,6}(?:safe|unsafe|unsure)\b/iu;
 /** Refusal language. parseJudgement decides this on the FULL reply. */
 const REFUSAL_SHAPED_RE =
-	/\b(?:i|we)\s+(?:cannot|can't|won't|will not|am unable|are unable|must decline|declined? to|refuse|refusing)\b/iu;
-
+	/\b(?:i|we)\s+(?:cannot|can't|won't|will not|am unable|are unable|am refusing|am declining|must decline|declined? to|refuse|refusing)\b/iu;
 /** Per-session cache: sessionId -> `${cwd}\0${env}\0${pty}\0${command}` -> judgement. */
 const cache = new Map<string, Map<string, Judgement>>();
 // Effective-config signature of the last gate run. The classifier config
@@ -1123,6 +1122,20 @@ export function parseJudgement(reply: string): Judgement {
 		.replace(/^VERDICT\b[:| \t-]*/iu, "");
 	const legacy = /^(SAFE|UNSAFE|UNSURE)\b[\s|:.,-]*(.*)$/iu.exec(stripped.trim());
 	if (legacy && !echoReply) {
+		// The verdict owns the reply: only an optional REASON line and blank
+		// lines may follow, so trailing text cannot ride a one-line verdict.
+		const rest = lines.slice(1);
+		const reasonNext = rest.length > 0 && /^REASON\b/iu.test(rest[0].trim());
+		const trailing = (reasonNext ? rest.slice(1) : rest).some(l => l.trim() !== "");
+		if (trailing) {
+			return {
+				verdict: "PARSE_ERROR" as Verdict,
+				reason: "classifier reply had no VERDICT line",
+				hasVerdictToken: false,
+				refusalShaped: REFUSAL_SHAPED_RE.test(reply),
+				rawReply: truncated(collapsed, 200),
+			};
+		}
 		return {
 			verdict: legacy[1].toUpperCase() as Verdict,
 			reason: truncated(legacy[2].trim().replace(/\s+/gu, " "), 160),
@@ -1144,6 +1157,13 @@ export function parseJudgement(reply: string): Judgement {
 		// ("VERDICT: SAFE|UNSAFE|UNSURE") leaves a second verdict word in the
 		// remainder: a template echo, never a decision.
 		if (echoReply) break;
+		// The verdict line owns the reply tail: only an optional REASON line
+		// and blank lines may follow, so unvalidated trailing text cannot
+		// ride a verdict past the post-parse checks.
+		const after = lines.slice(i + 1);
+		const reasonNext = after.length > 0 && /^REASON\b/iu.test(after[0].trim());
+		const trailing = (reasonNext ? after.slice(1) : after).some(l => l.trim() !== "");
+		if (trailing) continue;
 		let reason = labeled[2].trim()
 			// Same separator family the legacy shape allows, plus the em/en dashes
 			// models reach for when the REASON rides the verdict line.
@@ -2074,8 +2094,14 @@ function isPlainReadOnlyFetch(command: string): boolean {
 		// walks (quoting solved there), membership by exact token: a regex
 		// over raw command text re-learns every quoting and spelling case
 		// the tokenizer already answers.
-		const sendsData = args.some(a => {
+		const sendsData = args.some((a, k) => {
 			const token = a.startsWith("--") ? a.split("=", 1)[0] : a;
+			// A method selector sends only when the method actually mutates:
+			// GET/HEAD selectors stay reads.
+			if (token === "-X" || token === "--request" || token === "--method") {
+				const value = a.includes("=") ? a.slice(a.indexOf("=") + 1) : (args[k + 1] ?? "");
+				return !/^(?:GET|HEAD)\b/iu.test(value);
+			}
 			if (SEND_DATA_FLAGS[token]) return true;
 			return a.startsWith("-") && !a.startsWith("--") && a.length > 2 &&
 				expandShortBundle(a).some(f => SEND_DATA_FLAGS[f] === true);
