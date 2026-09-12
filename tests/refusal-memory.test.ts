@@ -146,6 +146,29 @@ describe("refusalWorthRemembering", () => {
 			rawReply: "I cannot decide. Required format: VERDICT: SAFE or UNSAFE or UNSURE.",
 		})).toBe(true);
 	});
+	test("a terminal spec echo through the production path is remembered", () => {
+		// Codex round 6: the production parseJudgement sets hasVerdictToken
+		// from the terminal boundary — but a spec echo is the format, not a
+		// decision, so suppression must not fire and the refusal is kept.
+		const j = parseJudgement("I cannot assist. VERDICT: SAFE|UNSAFE|UNSURE");
+		expect(j.verdict).toBe("PARSE_ERROR");
+		expect(j.hasVerdictToken).toBe(false);
+		expect(refusalWorthRemembering(j)).toBe(true);
+	});
+	test("subjectless cannot is analysis prose, not a refusal", () => {
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "This command cannot modify files.",
+		})).toBe(false);
+	});
+	test("decline language is refusal-shaped", () => {
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I must decline to assist.",
+		})).toBe(true);
+	});
 });
 
 describe("refusal memory", () => {
