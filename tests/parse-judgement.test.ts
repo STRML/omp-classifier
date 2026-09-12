@@ -75,6 +75,14 @@ describe("parseJudgement", () => {
 		const j = parseJudgement("Reads one log file. VERDICT: SAFE — avoids unsafe effects");
 		expect(j.verdict).toBe("SAFE");
 	});
+	test("format echoes fail in every spelling and path", () => {
+		// Codex round 7: two alternatives, mixed case, word-joined — the
+		// whole-reply echo rule catches what per-remainder counts missed.
+		expect(parseJudgement("VERDICT: SAFE|UNSAFE").verdict).toBe("PARSE_ERROR");
+		expect(parseJudgement("VERDICT: SAFE|unsafe|unsure").verdict).toBe("PARSE_ERROR");
+		expect(parseJudgement("I cannot decide. VERDICT: SAFE or UNSAFE").verdict).toBe("PARSE_ERROR");
+		expect(parseJudgement("I cannot decide. verdict: safe|unsafe|unsure").verdict).toBe("PARSE_ERROR");
+	});
 	test("PARSE_ERROR reports verdict tokens from beyond the rawReply window", () => {
 		// rawReply is capped at 200 chars; hasVerdictToken is decided on the
 		// full reply so refusal memory cannot misread a late label as absent.

@@ -102,7 +102,7 @@ interface Judgement {
 const TEMPLATE_ECHO_RE = /\b(?:safe|unsafe|unsure)\b.{0,6}(?:safe|unsafe|unsure)\b/iu;
 /** Refusal language. parseJudgement decides this on the FULL reply. */
 const REFUSAL_SHAPED_RE =
-	/\b(?:i|we)\s+(?:cannot|can't|won't|will not)\b|\bunable to\b|\bdeclin(?:e|ing|ed)\b|\brefus(?:e|ing|al)\b/iu;
+	/\b(?:i|we)\s+(?:cannot|can't|won't|will not|am unable|are unable|must decline|declined? to|refuse|refusing)\b/iu;
 
 /** Per-session cache: sessionId -> `${cwd}\0${env}\0${pty}\0${command}` -> judgement. */
 const cache = new Map<string, Map<string, Judgement>>();
@@ -1105,6 +1105,11 @@ as its own line. A reply with analysis but no VERDICT line is a format failure.`
 export function parseJudgement(reply: string): Judgement {
 	const collapsed = reply.replace(/\s+/gu, " ").trim();
 	const lines = reply.split(/\r?\n/u);
+	// The prompt's format spec echoed anywhere in the reply — two verdict
+	// words within a few characters, any case ("SAFE|UNSAFE", "safe or
+	// unsure") — is a template, never a decision. One rule for every parse
+	// path: an echoing reply yields no verdict at all.
+	const echoReply = TEMPLATE_ECHO_RE.test(reply);
 	// Legacy shape first: the reply OPENS with the verdict token. Strip leading
 	// FORMATTING characters only (markdown emphasis, bullets, quotes, spaces):
 	// `**SAFE**` is a verdict, not an evasion. Anything that keeps a
@@ -1117,7 +1122,7 @@ export function parseJudgement(reply: string): Judgement {
 		.replace(/^[^\w\r\n]+/u, "")
 		.replace(/^VERDICT\b[:| \t-]*/iu, "");
 	const legacy = /^(SAFE|UNSAFE|UNSURE)\b[\s|:.,-]*(.*)$/iu.exec(stripped.trim());
-	if (legacy && (legacy[2].match(/\b(?:SAFE|UNSAFE|UNSURE)\b/g) ?? []).length < 2) {
+	if (legacy && !echoReply) {
 		return {
 			verdict: legacy[1].toUpperCase() as Verdict,
 			reason: truncated(legacy[2].trim().replace(/\s+/gu, " "), 160),
@@ -1138,7 +1143,7 @@ export function parseJudgement(reply: string): Judgement {
 		// The separator class eats "|", so the prompt's format spec
 		// ("VERDICT: SAFE|UNSAFE|UNSURE") leaves a second verdict word in the
 		// remainder: a template echo, never a decision.
-		if (TEMPLATE_ECHO_RE.test(labeled[2])) continue;
+		if (echoReply) break;
 		let reason = labeled[2].trim()
 			// Same separator family the legacy shape allows, plus the em/en dashes
 			// models reach for when the REASON rides the verdict line.
@@ -1184,7 +1189,7 @@ export function parseJudgement(reply: string): Judgement {
 		const tail = reply.slice(lastToken.index);
 		const shaped =
 			/^VERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b([^\n]*?)(?:\n?[ \t]*REASON\b[^\n]*)?[\s*`]*$/iu.exec(tail);
-		if (shaped && !TEMPLATE_ECHO_RE.test(shaped[2])) {
+		if (shaped && !echoReply) {
 			let reason = shaped[2].trim()
 				.replace(/^[\s|:.,;\-*`–—]+/u, "")
 				.replace(/^REASON\b[:| \t-]*/iu, "")
@@ -1208,10 +1213,10 @@ export function parseJudgement(reply: string): Judgement {
 		// long malformed reply can carry a late VERDICT label the window
 		// drops, which refusal memory must not misread as absence. A
 		// terminal, boundary-clean token the parser still rejected (extra
-		// tail text) means the model tried to decide and failed: refusal
-		// memory must know. A spec echo ("VERDICT: SAFE|UNSAFE|UNSURE") is
-		// the format, not a decision — mentions are prose, and prose keeps
-		// refusal-memory protection.
+		// tail text, or a spec echo) means the model tried to decide and
+		// failed: refusal memory must know. A spec echo is the format, not
+		// a decision — mentions are prose, and prose keeps refusal-memory
+		// protection.
 		hasVerdictToken: verdictToken,
 		refusalShaped: REFUSAL_SHAPED_RE.test(reply),
 		rawReply: truncated(collapsed, 200),
@@ -1349,11 +1354,14 @@ const GH_WRITE_MARKERS = /(?:^|\s)(?:-X|--method=?)\s*(?:POST|PUT|PATCH|DELETE)\
  *  variables carries no such channel; this predicate admits exactly that.
  *  Anything else — %output, %% escapes, unknown syntax — fails closed. */
 const WRITE_OUT_CLEAN_RE = /^(?:[^%@$`]|%\{[a-z0-9_]+\})*$/iu;
-/** A request that sends data or mutates: discarding the RESPONSE (/dev/null)
- *  does not make it a read — the request still hits the wire. The
+/** Send-data flags: a request carrying one is not a read even when the
+ *  response lands in the null device — the body still hits the wire. The
  *  null-device clearing branches stand down when one of these is present. */
-const SEND_DATA_RE =
-	/(?:^|[\s"'])(?:-d|--data(?:-raw|--urlencode)?|--json|-F|--form)(?=[\s=]|$)|--method(?:=|\s+)(?:POST|PUT|PATCH|DELETE)\b|--body-data(?:=|\s)|--post-file\b|(?:^|\s)-X\s*(?:POST|PUT|PATCH|DELETE)\b/iu;
+const SEND_DATA_FLAGS: Record<string, true> = {
+	"-d": true, "--data": true, "--data-raw": true, "--data-urlencode": true,
+	"--json": true, "-F": true, "--form": true, "--request": true, "-X": true,
+	"--method": true, "--body-data": true, "--post-file": true,
+};
 
 export function commandHasOutboundNetwork(command: string): boolean {
 	const normalized = command.replace(/\\\r?\n/gu, "");
@@ -2062,6 +2070,16 @@ function isPlainReadOnlyFetch(command: string): boolean {
 		const words = segments[0];
 		const verb = words[0].toLowerCase();
 		const args = words.slice(1);
+		// Send-data detection walks the SAME tokenized words the flag table
+		// walks (quoting solved there), membership by exact token: a regex
+		// over raw command text re-learns every quoting and spelling case
+		// the tokenizer already answers.
+		const sendsData = args.some(a => {
+			const token = a.startsWith("--") ? a.split("=", 1)[0] : a;
+			if (SEND_DATA_FLAGS[token]) return true;
+			return a.startsWith("-") && !a.startsWith("--") && a.length > 2 &&
+				expandShortBundle(a).some(f => SEND_DATA_FLAGS[f] === true);
+		});
 
 		if (i === 0) {
 			// Basename, so `/usr/bin/curl -o ~/.bashrc` is still a curl.
@@ -2096,7 +2114,7 @@ function isPlainReadOnlyFetch(command: string): boolean {
 					if (args[k + 1] !== "/dev/null") return false;
 					// A request that sends data or mutates is not a read even
 					// when the response lands in the null device.
-					if (SEND_DATA_RE.test(command)) return false;
+					if (sendsData) return false;
 					k++;
 					continue;
 				}
@@ -2106,8 +2124,8 @@ function isPlainReadOnlyFetch(command: string): boolean {
 					if (!arg.includes("=")) k++;
 					continue;
 				}
-				if (arg === "--output=/dev/null" && !SEND_DATA_RE.test(command)) continue;
-				if (arg === "--output-document=/dev/null" && !SEND_DATA_RE.test(command)) {
+				if (arg === "--output=/dev/null" && !sendsData) continue;
+				if (arg === "--output-document=/dev/null" && !sendsData) {
 					wgetStdout = true;
 					continue;
 				}
@@ -2117,7 +2135,7 @@ function isPlainReadOnlyFetch(command: string): boolean {
 					fetch === "wget" &&
 					(arg === "-O" || arg === "--output-document") &&
 					args[k + 1] === "/dev/null" &&
-					!SEND_DATA_RE.test(command)
+					!sendsData
 				) {
 					wgetStdout = true;
 					k++;

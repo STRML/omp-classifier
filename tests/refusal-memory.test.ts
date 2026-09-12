@@ -146,6 +146,15 @@ describe("refusalWorthRemembering", () => {
 			rawReply: "I cannot decide. Required format: VERDICT: SAFE or UNSAFE or UNSURE.",
 		})).toBe(true);
 	});
+	test("analysis prose with unable-to is not a refusal", () => {
+		// Refusal language needs a first-person subject: "the command is
+		// unable to connect" is an analysis statement, not a refusal.
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "The command is unable to connect.",
+		})).toBe(false);
+	});
 	test("a terminal spec echo through the production path is remembered", () => {
 		// Codex round 6: the production parseJudgement sets hasVerdictToken
 		// from the terminal boundary — but a spec echo is the format, not a

