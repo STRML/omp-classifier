@@ -396,3 +396,36 @@ describe("loopback fetches are not outbound network", () => {
 		});
 	}
 });
+
+describe("null-device fetch targets clear egress on any host", () => {
+	// `-o /dev/null` discards the fetched content: the fetch is a read that
+	// lands nowhere, the same class as stdout. `-w`/`--write-out` stays
+	// excluded on purpose (curl 8.3+ %output{path} writes a file from the
+	// format string with no redirect), so a health check carrying `-w` does
+	// not clear here — a gap costs a dialog, never a silent run.
+	for (const command of [
+		"curl -s -o /dev/null https://api.example.com/health",
+		"curl --output=/dev/null https://x",
+		"wget -O /dev/null https://x",
+		"wget -q --output-document /dev/null https://x",
+		"wget --output-document=/dev/null https://x",
+	]) {
+		test(`not outbound: ${command}`, () => {
+			expect(outbound(command)).toBe(false);
+		});
+	}
+
+	for (const command of [
+		// A real output path stays a write.
+		"curl -o /tmp/fetched https://x",
+		"wget -O out.html https://x",
+		// -w stays excluded wholesale: the deliberate boundary is the whole
+		// flag, not a pattern inside its format string.
+		"curl -w '%{http_code}' -o /dev/null https://x",
+		"curl --write-out=%output{/tmp/x} -o /dev/null https://x",
+	]) {
+		test(`still outbound: ${command}`, () => {
+			expect(outbound(command)).toBe(true);
+		});
+	}
+});

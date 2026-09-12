@@ -2060,6 +2060,31 @@ function isPlainReadOnlyFetch(command: string): boolean {
 				// `O-` to the FIRST value-taking flag in the prefix, so `-oO-`
 				// is `-o O-` (a log file) and `-O` never applies. Honoring the
 				// bundle let `wget -PO-` clear while downloading to ./O-/.
+				// A null-device output target discards the fetched content: the
+				// fetch is still a read, so it clears egress exactly like stdout
+				// would, on any host. `/dev/null` only — a real path stays a
+				// write and fails closed at the allowlist below.
+				if (fetch === "curl" && (arg === "-o" || arg === "--output")) {
+					if (args[k + 1] !== "/dev/null") return false;
+					k++;
+					continue;
+				}
+				if (arg === "--output=/dev/null") continue;
+				if (arg === "--output-document=/dev/null") {
+					wgetStdout = true;
+					continue;
+				}
+				// A `-` value is stdout, handled by the branches below; leave it
+				// to them rather than rejecting it here.
+				if (
+					fetch === "wget" &&
+					(arg === "-O" || arg === "--output-document") &&
+					args[k + 1] === "/dev/null"
+				) {
+					wgetStdout = true;
+					k++;
+					continue;
+				}
 				if (fetch === "wget" && arg === "--spider") {
 					wgetStdout = true;
 					continue;
