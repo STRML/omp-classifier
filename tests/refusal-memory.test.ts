@@ -164,6 +164,18 @@ describe("refusalWorthRemembering", () => {
 		expect(j.hasVerdictToken).toBe(false);
 		expect(refusalWorthRemembering(j)).toBe(true);
 	});
+	test("gerund refusal forms are refusal-shaped", () => {
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I am refusing to assist.",
+		})).toBe(true);
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I am declining to assist.",
+		})).toBe(true);
+	});
 	test("subjectless cannot is analysis prose, not a refusal", () => {
 		expect(refusalWorthRemembering({
 			verdict: "PARSE_ERROR",

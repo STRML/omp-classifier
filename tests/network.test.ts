@@ -382,12 +382,14 @@ describe("validated write-out format strings clear as reads on any host", () => 
 		"wget -O /dev/null https://x",
 		"wget -q --output-document /dev/null https://x",
 		"wget --output-document=/dev/null https://x",
+		// Method selectors are value-aware: GET/HEAD stay reads.
+		"curl -o /dev/null -w '%{http_code}' -X GET https://x",
+		"wget --method=GET -O /dev/null https://x",
 	]) {
 		test(`not outbound: ${command}`, () => {
 			expect(outbound(command)).toBe(false);
 		});
 	}
-
 	for (const command of [
 		// A real output path stays a write.
 		"curl -o /tmp/fetched https://x",
