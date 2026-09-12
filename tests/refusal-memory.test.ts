@@ -112,6 +112,18 @@ describe("refusalWorthRemembering", () => {
 			hasVerdictToken: true,
 		})).toBe(false);
 	});
+
+	test("a refusal that merely mentions the VERDICT format is remembered", () => {
+		// Suppression requires a verdict assertion (label + SAFE/UNSAFE/
+		// UNSURE), not the bare word: a refusal talking about the format is
+		// refusal-shaped and keeps prior-refusal protection.
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I cannot assist. The VERDICT format is required, but I will not provide one.",
+			hasVerdictToken: false,
+		})).toBe(true);
+	});
 });
 
 describe("refusal memory", () => {

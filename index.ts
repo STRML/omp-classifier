@@ -1159,7 +1159,7 @@ export function parseJudgement(reply: string): Judgement {
 	const VERDICT_TOKEN_RE = /\bVERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b/giu;
 	let lastToken: RegExpExecArray | undefined;
 	for (let m = VERDICT_TOKEN_RE.exec(reply); m; m = VERDICT_TOKEN_RE.exec(reply)) lastToken = m;
-	if (lastToken && /(?:^|[.!?;:][ \t]*|\r?\n[ \t]*)$/u.test(reply.slice(0, lastToken.index))) {
+	if (lastToken && /(?:^|[.!?;][ \t]*|\r?\n[ \t]*)$/u.test(reply.slice(0, lastToken.index))) {
 		const tail = reply.slice(lastToken.index);
 		const shaped =
 			/^VERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b([^\n]*?)(?:\n?[ \t]*REASON\b[^\n]*)?[\s*`]*$/iu.exec(tail);
@@ -1186,7 +1186,7 @@ export function parseJudgement(reply: string): Judgement {
 		// Decided on the FULL reply: rawReply is capped at 200 chars, and a
 		// long malformed reply can carry a late VERDICT label the window
 		// drops, which refusal memory must not misread as absence.
-		hasVerdictToken: /\bVERDICT\b/iu.test(reply),
+		hasVerdictToken: /\bVERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b/iu.test(reply),
 		rawReply: truncated(collapsed, 200),
 	};
 }
@@ -1210,7 +1210,7 @@ export function refusalWorthRemembering(judgement: Judgement): boolean {
 	if (reply === "" || reply === "(empty reply)") return false;
 	// parseJudgement decides the token question on the full reply (see the
 	// field); hand-built judgements fall back to the truncated window.
-	if (judgement.hasVerdictToken ?? /\bVERDICT\b/iu.test(reply)) return false;
+	if (judgement.hasVerdictToken ?? /\bVERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b/iu.test(reply)) return false;
 	return /\b(?:cannot|can't|won't|will not|refus(?:e|ing|al)|unable to)\b/iu.test(reply);
 }
 
@@ -1316,27 +1316,91 @@ const NO_EGRESS_RE =
  */
 const GH_WRITE_MARKERS = /(?:^|\s)(?:-X|--method=?)\s*(?:POST|PUT|PATCH|DELETE)\b|(?:^|\s)-[fF]\s|(?:^|\s)--field(?:=|\s)|(?:^|\s)--input(?:=|\s)/iu;
 
+/** Flags that retarget or source a fetch from outside its literal text: the
+ *  loopback clear never survives one. (Redirects stay allowed — the read
+ *  tables allow -L for any host, and where a redirect lands is the judge's
+ *  domain, not the egress scan's.) */
+const CURL_LOOPBACK_DENY: Record<string, true> = {
+	"-x": true, "--proxy": true, "--resolve": true, "--connect-to": true, "-K": true, "--config": true,
+};
+const WGET_LOOPBACK_DENY: Record<string, true> = {
+	"-i": true, "--input-file": true, "-m": true, "--mirror": true, "--proxy": true,
+	"--config": true, "-e": true, "--execute": true,
+};
+/** Benign value-taking flags: their values are skipped, never read as
+ *  targets. `--url` is handled separately — its value IS a target. */
+const CURL_LOOPBACK_VALUE_FLAGS: Record<string, true> = {
+	"-A": true, "-d": true, "-e": true, "-H": true, "-m": true, "-o": true,
+	"-r": true, "-u": true, "-w": true, "-X": true,
+	"--connect-timeout": true, "--data": true, "--data-raw": true,
+	"--data-urlencode": true, "--header": true, "--json": true,
+	"--limit-rate": true, "--max-time": true, "--output": true, "--range": true,
+	"--referer": true, "--request": true, "--retry": true, "--retry-delay": true,
+	"--retry-max-time": true, "--user": true, "--user-agent": true, "--write-out": true,
+};
+const WGET_LOOPBACK_VALUE_FLAGS: Record<string, true> = {
+	"--timeout": true, "--connect-timeout": true, "--read-timeout": true,
+	"--tries": true, "--user-agent": true, "--header": true,
+	"--max-redirect": true, "--method": true, "--body-data": true,
+	"--compression": true, "-O": true, "-P": true, "-T": true, "-o": true,
+	"-w": true, "--output-document": true,
+};
+/** A single fetch target aimed at the loopback interface. */
+const LOOPBACK_TARGET_RE = /^(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|\[::1\]|[\w.-]+\.localhost)(?::\d+)?(?:[/?#]|$)/iu;
+
 /**
- * True when every fetch target in the command is loopback. Data aimed at
- * localhost cannot leave the machine, so such a fetch is not outbound network
- * for the egress consistency check — `curl -w '%{http_code}' localhost:8000`
- * with an honest "no external requests" analysis must not be downgraded for
- * "contradicting" a scope claim that is in fact correct. Explicit scheme'd
- * URLs are checked each; with none present, a bare loopback host token clears
- * the command and any other bare host stays outbound. The caller clears only
- * when the command is a single pipeline stage: a downstream `| ssh host` can
- * send the loopback output to a remote endpoint, and this function never
- * inspects later stages.
+ * Loopback clears nothing that could be retargeted beyond its literal text:
+ * proxies, --resolve/--connect-to rewrites, --config/--input-file sources,
+ * mirror sweeps, wget -e/--execute (wgetrc commands include use_proxy), and
+ * environment assignment prefixes (http_proxy=…) are all denied. Values of
+ * benign value-taking flags are skipped so they cannot pose as targets.
+ * Fail-closed by construction: the clear requires EXACTLY one operand,
+ * shaped as a loopback URL or host. The caller clears only when the command
+ * is a single pipeline stage (a downstream `| ssh host` can send the output
+ * to a remote endpoint) and passes any environment assignment prefix.
  */
-function fetchIsLoopbackOnly(stage: string): boolean {
-	const urlRe = /https?:\/\/[^\s"'<>]+/giu;
-	let sawUrl = false;
-	for (const m of stage.matchAll(urlRe)) {
-		sawUrl = true;
-		if (!/^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]|[\w.-]+\.localhost)(?::\d+)?(?:[/?#]|\.\s|\s|$)/iu.test(m[0])) return false;
+function fetchIsLoopbackOnly(
+	leadVerb: "curl" | "wget",
+	args: readonly string[],
+	envAssignmentPrefix: boolean,
+): boolean {
+	if (envAssignmentPrefix) return false;
+	const deny = leadVerb === "curl" ? CURL_LOOPBACK_DENY : WGET_LOOPBACK_DENY;
+	const values = leadVerb === "curl" ? CURL_LOOPBACK_VALUE_FLAGS : WGET_LOOPBACK_VALUE_FLAGS;
+	const targets: string[] = [];
+	for (let k = 0; k < args.length; k++) {
+		const arg = args[k];
+		if (!arg.startsWith("-")) {
+			targets.push(arg);
+			continue;
+		}
+		const base = arg.startsWith("--") ? arg.split("=", 1)[0] : arg;
+		if (deny[base] || deny[arg]) return false;
+		if (leadVerb === "curl" && base === "--url") {
+			// The value IS a fetch target, separated or `=`-attached.
+			targets.push(arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : (args[++k] ?? ""));
+			continue;
+		}
+		if (leadVerb === "wget" && bundleIsWgetStdout(arg)) continue;
+		if (leadVerb === "wget" && bundleIsWgetStdoutSplit(arg, args[k + 1])) {
+			// The split value is `-` (stdout), never a target.
+			k++;
+			continue;
+		}
+		if (!arg.startsWith("--") && arg.length > 2) {
+			// A short bundle: a deny or value-taking letter fails closed.
+			for (const flag of expandShortBundle(arg)) {
+				if (deny[flag] || values[flag]) return false;
+			}
+			continue;
+		}
+		if (values[base]) {
+			if (!arg.includes("=")) k++;
+			continue;
+		}
 	}
-	if (sawUrl) return true;
-	return /(?:^|[\s"'])(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:[/?#]|\.\s|[\s"']|$)/iu.test(stage);
+	if (targets.length !== 1) return false;
+	return LOOPBACK_TARGET_RE.test(targets[0]);
 }
 
 export function commandHasOutboundNetwork(command: string): boolean {
@@ -1354,7 +1418,7 @@ export function commandHasOutboundNetwork(command: string): boolean {
 			// downstream stage can: `curl localhost | ssh host cat` hands the
 			// output to a remote endpoint. Clear single-stage commands only;
 			// piped loopback fetches keep the full outbound treatment.
-			if (stages.length === 1 && fetchIsLoopbackOnly(inert)) continue;
+			if (stages.length === 1 && fetchIsLoopbackOnly(lead, leadWords.slice(skipped + 1), skipped > 0)) continue;
 		}
 		if (lead === "gh" && !GH_WRITE_MARKERS.test(inert)) continue;
 		if (NETWORK_VERBS[lead]) return true;
