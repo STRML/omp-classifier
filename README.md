@@ -17,18 +17,22 @@ Calls walk this order:
 
 | Match | Result |
 |---|---|
-| Critical pattern | Permission request in every approval mode. No model call. |
-| Caller-supplied `env` | Permission request before any exemption. Env values can carry secrets or choose what runs (`PATH`, `LD_PRELOAD`). |
+| Critical pattern | **Allow once** / **Deny** in every approval mode. No model call or remembered grant. |
+| Nonempty caller-supplied `env` | Reuse only an exact command/directory/environment grant; otherwise request permission without calling the model. Changed values or keys require fresh consent. Empty `env: {}` is treated as no override. |
 | `deny` rule, or approval policy `deny` | Untouched. The native gate blocks it. |
 | `prompt` rule | Untouched. The native gate prompts, in every mode including `yolo`. |
 | Narrow `allow` rule | Untouched. An explicit decision about a specific shape is never re-judged. For a compound line, a `deny`/`prompt` on any segment decides immediately (the native gate blocks or prompts once — no plugin dialog, no classification), an `allow` on every segment runs silent, and only a compound with no deny/prompt decision and an undecided segment classifies. Blanket patterns never vouch for segments; inert fd-dups (`2>&1`) are ignored, but real redirects (`> file`) bar a segment. |
 | Blanket `allow` (`*`, `**`, `* *`) or no matching rule | Classified in every mode. SAFE passes to the native gate; UNSAFE or UNSURE raises a plugin request. |
-| Granted earlier for this directory | Runs ungated for the rest of the session. A past **Allow for session** answer is user-tier authorization: it outranks classification and refusal memory, but not the critical, env, and static-rule rows above. |
+| Granted earlier for this directory | Skip classification and refusal memory for the approved scope. Critical checks and native deny rules still apply; a no-env grant never authorizes an environment override. |
 | Longer than 8,000 characters | Blocked outright. Nothing that long can be reviewed in full. |
 
-A gate prompt is a four-choice selector — **Allow once**, **Allow for session**, **Always allow**, **Deny** — showing the full command, the model's reason, and only the details that differ from their defaults: working directory (when it differs from the session cwd), timeout, env, pty, async. Canceling or timing out counts as Deny.
-**Allow for session** records a grant: this action, in this exact directory, runs ungated for the rest of the session — no classifier call, no dialog. Rewordings of the same action match the grant through a strict key that keeps flags (split, sorted short bundles) and the first argument, and answering with it also lifts any refusal recorded for that action. Grants stay below critical patterns, caller-supplied `env`, and your static rules, and they die with the session or a classifier config change (up to 50 per session). A grant covers the action plus its flags plus its first argument: force variants, compound commands, and command substitution are never covered.
-**Always allow** (bash only) writes a persistent grant: this exact command text, in this exact directory, runs ungated everywhere for 30 days — no model call, no dialog, one audit line. The key is the whole command text, compounds included, so multi-segment commands host rules can never match are covered; grants are stored in `omp-classifier-grants.json` beside `omp-classifier.json` (`OMP_CLASSIFIER_CONFIG` relocates both), capped at 500 entries, pruned on a 30-day TTL, and toggled off wholesale with `persistentGrants: false` (the existing file stays on disk). A live persistent grant also keeps refusal memory from re-prompting for its exact text.
+A gate prompt offers **Allow once**, **Allow for session**, **Always allow**, and **Deny** where applicable, showing the full command, the model's reason, and only the details that differ from their defaults: working directory (when it differs from the session cwd), timeout, env key names, pty, async. Critical-pattern prompts offer only **Allow once** / **Deny** because remembered grants cannot override that check. Canceling, timing out, or returning an option the dialog did not offer counts as Deny.
+**Allow for session** records a grant for this action, directory, and environment. Without an environment override, the existing key keeps flags (split, sorted short bundles) and the first argument. With an override, the command text must match exactly, including later operands and case. Compound commands and command substitution are not session-grantable. Grants die with the session or a classifier config change (up to 50 per session); a late dialog answer cannot restore a cleared grant or place it in a different session. The explicitly approved call can still proceed.
+**Always allow** (bash only, excluding critical patterns) writes a persistent grant for the exact command text, directory, environment, and native leading-`cd` extraction mode, valid across sessions for 30 days. Compounds are included. Grants are stored in `omp-classifier-grants.json` beside `omp-classifier.json` (`OMP_CLASSIFIER_CONFIG` relocates both), capped at 500 entries, pruned on a 30-day TTL, and toggled off wholesale with `persistentGrants: false` (the existing file stays on disk). A live persistent grant also keeps refusal memory from re-prompting for its exact scope.
+
+Environment grants store a SHA256 fingerprint of canonical, sorted caller-supplied name/value pairs; inherited process environment is not covered, and raw environment values are not stored. Every persistent grant also records whether the host extracts a leading `cd`, preventing implicit and explicit working directories from sharing consent when they execute differently. Verdict caches bind the same mode. Legacy version-1 entries without an environment fingerprint remain no-env-only, but legacy leading-`cd` grants require fresh consent because their execution mode was not recorded. Version-2 stores require fresh consent. New writes use store version 3 so earlier readers of versions 1 and 2 ignore the file rather than discard its restrictions. **Downgrading therefore requires fresh approvals.** Missing or malformed fingerprint or execution-mode fields in version-3 entries fail closed.
+
+Grants bind submitted inputs, not file contents or the paths produced by the host's internal-URL expansion. A session-relative value such as `BASH_ENV=local://startup.sh` can resolve differently in another session despite identical input text; use stable filesystem paths when granting persistent consent.
 
 ## Eval code that spawns
 
@@ -128,7 +132,7 @@ The classify record can carry an `evidence` object whose fields have different a
 
 ## Privacy
 
-Classified command text, up to 8,000 characters plus the resolved working directory, goes to your model provider, under its logging and retention policies. Command text can hold private paths, proprietary snippets, inline env assignments, or secrets in flags. Caller-supplied `env` values are never sent; that path asks the human instead.
+Classified command text, up to 8,000 characters plus the resolved working directory, goes to your model provider, under its logging and retention policies. Command text can hold private paths, proprietary snippets, inline env assignments, or secrets in flags. Caller-supplied `env` values are never sent; that path requires human consent or an exact environment-bound grant. The grant file stores an environment digest, not its raw values.
 
 ## Development
 

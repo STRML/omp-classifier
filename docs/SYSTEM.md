@@ -79,6 +79,16 @@ in the audit log), rm-family prompts carry the reversible-alternative footnote, 
 from a session older than the on-disk plugin says so in its subtitle. Dry-run lets an agent
 ask the gate what it would do before doing it.
 
+Environment-bearing grants bind exact command text, directory, and a digest of canonical
+caller-supplied environment pairs; inherited process environment is not covered.
+All persistent grants and verdict caches also bind native leading-cd extraction mode.
+Legacy grants with a leading cd need fresh consent because their execution mode is unknown;
+unambiguous legacy no-env grants retain their scope. Persistent store version 3 makes earlier
+version-1 and version-2 readers reject the file; version-2 grants require fresh consent.
+Session grants retain the
+requesting session's store identity across the dialog await, so a cleared store cannot be
+restored by a late answer. Dialogs offer only usable grants; critical checks remain once-only.
+
 Invariant: a block must always leave the agent a lawful next move, and a prompt must cost
 the human one glance when everything is normal.
 

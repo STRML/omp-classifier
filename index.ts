@@ -61,6 +61,7 @@
  * command carrying a destructive/irreversible token (matchModerateRiskTokens):
  * those raise a permission request even when the model said SAFE.
  */
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -131,12 +132,14 @@ const REFUSAL_CAP = 20;
 
 /** Per-session grants (issue #32): sessionId -> grants, oldest first. A grant
  *  records a user's "Allow for session" answer: this command's normalized
- *  target, in this exact directory, may run without further gating until the
- *  session ends. Config changes clear every store (re-arms the gate). */
+ *  target, in this exact directory and environment, may run without further
+ *  gating until the session ends. Config changes clear every store. */
 interface Grant {
 	normalizedTarget: string;
 	cwd: string;
 	ts: number;
+	/** Empty means no caller-supplied env; otherwise SHA256 of canonical pairs. */
+	envFingerprint: string;
 }
 const grants = new Map<string, Grant[]>();
 const GRANT_CAP = 50;
@@ -438,6 +441,7 @@ function canonicalEnv(value: unknown): CanonicalEnv {
 	const entries = Object.entries(value as Record<string, unknown>)
 		.filter((entry): entry is [string, string] => typeof entry[1] === "string")
 		.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+	if (entries.length === 0) return { key: "", keys: [] };
 	return { key: JSON.stringify(entries), keys: entries.map(([key]) => key) };
 }
 
@@ -2471,11 +2475,13 @@ function normalizeEvalGrantTarget(code: string): string {
  * at all: compound commands, command substitution, and backticks are never
  * covered by a session grant. A grant keyed to one simple shape must not be
  * laundered through a compound line or substitution text the key cannot see.
+ * Env-bearing grants use exact command text, not the normalized shape:
+ * normalization drops later operands and lowercases paths.
  */
-function grantKeyForCommand(command: string): string {
+function grantKeyForCommand(command: string, envFingerprint: string): string {
 	if (bashCommandSegments(command).length > 1) return "";
 	if (command.includes("$(") || command.includes("`")) return "";
-	return normalizeGrantTarget(command);
+	return envFingerprint === "" ? normalizeGrantTarget(command) : command;
 }
 
 function sessionGrants(sessionId: string): Grant[] {
@@ -2488,31 +2494,32 @@ function sessionGrants(sessionId: string): Grant[] {
 }
 
 /** Record a session grant: this command's target, in this exact directory,
- *  may run ungated for the rest of the session. */
-function addGrant(ctx: ExtensionContext, key: string, cwd: string): void {
+ *  under this exact environment, may run ungated for the rest of the session.
+ *  Use the session that requested consent, not a live ctx after the dialog. */
+function addGrant(sessionId: string, key: string, cwd: string, envFingerprint: string): void {
 	try {
-		if (key === "") return;
-		const sessionId = ctx.sessionManager.getSessionId();
+		if (key === "" || sessionId === "") return;
 		const list = sessionGrants(sessionId);
-		// One grant per (target, directory): re-approving refreshes ts and moves
-		// the grant to newest instead of stacking duplicates.
-		const existing = list.findIndex(grant => grant.normalizedTarget === key && grant.cwd === cwd);
+		// Refresh an existing grant without widening its environment scope.
+		const existing = list.findIndex(
+			grant => grant.normalizedTarget === key && grant.cwd === cwd && grant.envFingerprint === envFingerprint,
+		);
 		if (existing !== -1) list.splice(existing, 1);
 		while (list.length >= GRANT_CAP) list.shift();
-		list.push({ normalizedTarget: key, cwd, ts: Date.now() });
+		list.push({ normalizedTarget: key, cwd, envFingerprint, ts: Date.now() });
 	} catch {
-		// No session id, no grant; the caller's decision below is unchanged.
+		// Grant bookkeeping must not change the decision for the approved call.
 	}
 }
 
-/** The session's grant for this command's target and directory, if any. */
-function matchingGrant(ctx: ExtensionContext, key: string, cwd: string): Grant | undefined {
+/** Match the target, directory, and environment; no-env grants never cross over. */
+function matchingGrant(ctx: ExtensionContext, key: string, cwd: string, envFingerprint: string): Grant | undefined {
 	try {
 		if (key === "") return undefined;
 		const cwdInput = cwd ?? "";
 		return grants
 			.get(ctx.sessionManager.getSessionId())
-			?.find(grant => grant.normalizedTarget === key && grant.cwd === cwdInput);
+			?.find(grant => grant.normalizedTarget === key && grant.cwd === cwdInput && grant.envFingerprint === envFingerprint);
 	} catch {
 		return undefined;
 	}
@@ -2523,21 +2530,23 @@ function matchingGrant(ctx: ExtensionContext, key: string, cwd: string): Grant |
 // across sessions for days)
 //
 // A grant records a user's "Always allow" answer: this EXACT command text, in
-// this exact directory, may run without further gating for 30 days across
-// every session. Unlike the session grant above, the key is the whole command
+// this exact directory and environment, may run without further gating for
+// 30 days across every session. Unlike the session grant above, the key is the whole command
 // text — compounds included — because host static allow rules never match a
 // multi-segment command, so `cd X && script` shapes can never be
 // static-allowed and would re-prompt forever. Exactness is the safety
 // argument: the consent covers only text the human actually saw, so an
-// env-prefix spelling (`FOO=1 cmd`), a different cwd, or any edit to the
-// command intentionally does NOT match. Failure modes fail toward "no grant":
+// env-prefix spelling (`FOO=1 cmd`), a different cwd or caller-supplied env, or
+// any edit to the command intentionally does NOT match. Failure modes fail toward "no grant":
 // a missing or corrupt store reads as zero grants (the gate never crashes on
 // it), and a failed write leaves the just-approved call allowed while simply
 // not remembering it.
 // The store is <dirname(omp-classifier.json)>/omp-classifier-grants.json — the
 // config root, beside the config file, so the OMP_CLASSIFIER_CONFIG test
-// override relocates it like every other artifact. Shape: {version: 1,
-// grants: [{cmd, cwd, ts}]}, pretty-printed for human inspection.
+// override relocates it like every other artifact. Version 3 binds environment
+// fingerprints and native leading-cd mode. Unambiguous version-1 grants migrate;
+// version 2 requires fresh consent because its readers discard the mode.
+// Older classifiers ignore version 3 instead of discarding its restrictions.
 // ---------------------------------------------------------------------------
 
 interface PersistentGrant {
@@ -2545,6 +2554,8 @@ interface PersistentGrant {
 	cmd: string;
 	cwd: string;
 	ts: number;
+	envFingerprint: string;
+	cwdFromCommand: boolean;
 }
 
 const PERSISTENT_GRANT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -2566,17 +2577,25 @@ let persistentGrantCache: PersistentGrantCache | undefined;
 function sanitizePersistentGrantFile(raw: unknown): PersistentGrant[] {
 	if (typeof raw !== "object" || raw === null) return [];
 	const file = raw as { version?: unknown; grants?: unknown };
-	if (file.version !== 1 || !Array.isArray(file.grants)) return [];
+	if ((file.version !== 1 && file.version !== 3) || !Array.isArray(file.grants)) return [];
 	const now = Date.now();
 	const grants: PersistentGrant[] = [];
 	for (const entry of file.grants) {
 		if (typeof entry !== "object" || entry === null) continue;
-		const grant = entry as { cmd?: unknown; cwd?: unknown; ts?: unknown };
+		const grant = entry as { cmd?: unknown; cwd?: unknown; ts?: unknown; envFingerprint?: unknown; cwdFromCommand?: unknown };
 		if (typeof grant.cmd !== "string" || grant.cmd === "") continue;
 		if (typeof grant.cwd !== "string") continue;
 		if (typeof grant.ts !== "number" || !Number.isFinite(grant.ts)) continue;
 		if (now - grant.ts >= PERSISTENT_GRANT_TTL_MS) continue;
-		grants.push({ cmd: grant.cmd, cwd: grant.cwd, ts: grant.ts });
+		const envFingerprint = file.version === 1 && grant.envFingerprint === undefined ? "" : grant.envFingerprint;
+		if (typeof envFingerprint !== "string" || (envFingerprint !== "" && !/^[a-f0-9]{64}$/u.test(envFingerprint))) continue;
+		// Legacy cd grants lost whether native bash consumed the prefix. Neither
+		// interpretation can be inferred safely from their command/cwd pair.
+		if (file.version === 1 && extractLeadingCdTarget(grant.cmd) !== null) continue;
+		const cwdFromCommand = file.version === 1 ? false : grant.cwdFromCommand;
+		if (typeof cwdFromCommand !== "boolean") continue;
+		if (cwdFromCommand && extractLeadingCdTarget(grant.cmd) === null) continue;
+		grants.push({ cmd: grant.cmd, cwd: grant.cwd, ts: grant.ts, envFingerprint, cwdFromCommand });
 	}
 	grants.sort((a, b) => a.ts - b.ts);
 	while (grants.length > PERSISTENT_GRANT_CAP) grants.shift();
@@ -2607,34 +2626,39 @@ function loadPersistentGrants(): PersistentGrant[] {
 	}
 }
 
-/** A live (unexpired) grant for this EXACT command text and directory. The
- *  kill-switch short-circuits before any filesystem read. */
-function matchingPersistentGrant(command: string, cwd: string): PersistentGrant | undefined {
+/** Match exact command, directory, environment, and native cd mode. The kill-switch
+ *  short-circuits before any filesystem read. */
+function matchingPersistentGrant(command: string, cwd: string, envFingerprint: string, cwdFromCommand: boolean): PersistentGrant | undefined {
 	if (!readClassifierConfig().persistentGrants) return undefined;
 	const now = Date.now();
 	return loadPersistentGrants().find(
-		grant => grant.cmd === command && grant.cwd === cwd && now - grant.ts < PERSISTENT_GRANT_TTL_MS,
+		grant => grant.cmd === command && grant.cwd === cwd && grant.envFingerprint === envFingerprint &&
+			grant.cwdFromCommand === cwdFromCommand &&
+			now - grant.ts < PERSISTENT_GRANT_TTL_MS,
 	);
 }
 
 /** Record a persistent grant: prune expired entries, refresh-and-move any
- *  duplicate (cmd, cwd), evict oldest past the cap, then write atomically
+ *  duplicate (cmd, cwd, env, native cd mode), evict oldest past the cap, then write atomically
  *  (tmp + rename, so a crash never leaves a torn store). A write failure is
  *  swallowed: the dialog already allowed THIS call, the memory is a bonus. */
-function addPersistentGrant(command: string, cwd: string): void {
+function addPersistentGrant(command: string, cwd: string, envFingerprint: string, cwdFromCommand: boolean): void {
 	if (!readClassifierConfig().persistentGrants) return;
 	try {
 		const now = Date.now();
 		const grants = loadPersistentGrants().filter(grant => now - grant.ts < PERSISTENT_GRANT_TTL_MS);
-		const existing = grants.findIndex(grant => grant.cmd === command && grant.cwd === cwd);
+		const existing = grants.findIndex(
+			grant => grant.cmd === command && grant.cwd === cwd && grant.envFingerprint === envFingerprint &&
+				grant.cwdFromCommand === cwdFromCommand,
+		);
 		if (existing !== -1) grants.splice(existing, 1);
-		grants.push({ cmd: command, cwd, ts: now });
+		grants.push({ cmd: command, cwd, envFingerprint, cwdFromCommand, ts: now });
 		while (grants.length > PERSISTENT_GRANT_CAP) grants.shift();
 		const filePath = path.join(path.dirname(classifierConfigPath()), "omp-classifier-grants.json");
 		fs.mkdirSync(path.dirname(filePath), { recursive: true });
 		const tmp = `${filePath}.${process.pid}.tmp`;
 		try {
-			fs.writeFileSync(tmp, `${JSON.stringify({ version: 1, grants }, null, 2)}\n`);
+			fs.writeFileSync(tmp, `${JSON.stringify({ version: 3, grants }, null, 2)}\n`);
 			fs.renameSync(tmp, filePath);
 		} finally {
 			try {
@@ -3198,6 +3222,8 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			command: string;
 			cwd: string;
 			envKeys: string[];
+			envFingerprint: string;
+			cwdFromCommand: boolean;
 			pty: boolean;
 			timeout: number | undefined;
 			async: boolean;
@@ -3206,6 +3232,8 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 		reason: string,
 		tool: "bash" | "eval" = "bash",
 		logWhyPrefix = "",
+		// Critical checks always re-fire before grants, so offer one-shot consent only.
+		grantable = true,
 	): Promise<{ block: true; reason: string } | undefined> => {
 		const subject = tool === "eval" ? "eval code" : "bash command";
 		const detail = reason ? `${headline}: ${reason}` : headline;
@@ -3268,7 +3296,19 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 		// bash; the whole payload text for eval. Compounds and substitutions are
 		// never grantable — a grant keyed to one shape must not be laundered
 		// through another.
-		const grantKey = tool === "eval" ? normalizeEvalGrantTarget(target.command) : grantKeyForCommand(target.command);
+		let sessionId = "";
+		try {
+			sessionId = ctx.sessionManager.getSessionId();
+		} catch {
+			// Without a stable session identity, only one-shot/persistent consent applies.
+		}
+		const grantKey = tool === "eval" ? normalizeEvalGrantTarget(target.command) : grantKeyForCommand(target.command, target.envFingerprint);
+		const offerSessionGrant = grantable && grantKey !== "" && sessionId !== "";
+		const offerPersistentGrant = grantable && tool === "bash" && readClassifierConfig().persistentGrants;
+		// Clearing/deleting the existing store invalidates this reference, including
+		// when the first-ever grant is still waiting for an answer. No extra epochs.
+		const sessionGrantStore = offerSessionGrant ? sessionGrants(sessionId) : undefined;
+		const environmentScope = target.envFingerprint === "" ? "" : ", under this exact environment";
 		const choice = await ctx.ui.select(
 			`Run ${subject}? (${headline}${stale})\n${buildPermissionBody(target, displayReason, ctx.cwd)}`,
 			[
@@ -3278,32 +3318,36 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 				// for eval. Compounds are never session-grantable — a grant keyed
 				// to one shape must not be laundered through another. The
 				// persistent grant needs no such key: its match IS the whole text.
-				...(grantKey !== ""
-					? [{ label: "Allow for session", description: "This action, in this directory, for the rest of the session" }]
+				...(offerSessionGrant
+					? [{ label: "Allow for session", description: `This action, in this directory${environmentScope}, for the rest of the session` }]
 					: []),
-				...(tool === "bash" && readClassifierConfig().persistentGrants
-					? [{ label: "Always allow", description: "This exact command, in this directory, for 30 days (stored alongside omp-classifier.json)" }]
+				...(offerPersistentGrant
+					? [{ label: "Always allow", description: `This exact command, in this directory${environmentScope}, for 30 days (stored alongside omp-classifier.json)` }]
 					: []),
 				{ label: "Deny" },
 			],
 			// The old confirm default was approve; keep the cursor on it.
 			{ initialIndex: 0 },
 		);
-		if (choice === "Allow once" || choice === "Allow for session" || choice === "Always allow") {
+		// Reject labels this particular dialog never offered.
+		const grantSession = choice === "Allow for session" && offerSessionGrant;
+		const grantPersistent = choice === "Always allow" && offerPersistentGrant;
+		if (choice === "Allow once" || grantSession || grantPersistent) {
 			// The user said yes to this action (issue #30): erase the memory
 			// that its target was refused, so rewordings run clean again. A
 			// persistent grant makes that durable for its exact shape: while it
 			// is live, refusal memory never fires for this text+cwd — the human
 			// outvoted the model, once, for every session.
 			liftRefusals(ctx, target.command);
-			if (choice === "Allow for session") addGrant(ctx, grantKey, target.cwd);
-			if (choice === "Always allow") addPersistentGrant(target.command, target.cwd);
+			const rememberSession = grantSession && grants.get(sessionId) === sessionGrantStore;
+			if (rememberSession) addGrant(sessionId, grantKey, target.cwd, target.envFingerprint);
+			if (grantPersistent) addPersistentGrant(target.command, target.cwd, target.envFingerprint, target.cwdFromCommand);
 			audit(
 				"allow",
-				choice === "Allow for session"
-					? "approved by user (session grant)"
-					: choice === "Always allow"
-						? "approved by user (persistent grant)"
+				rememberSession
+					? `approved by user (session grant${target.envFingerprint === "" ? "" : " (env)"})`
+					: grantPersistent
+						? `approved by user (persistent grant${target.envFingerprint === "" ? "" : " (env)"})`
 						: "approved by user",
 			);
 			return undefined;
@@ -3462,7 +3506,7 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 				};
 			}
 			const cwd = ctx.cwd;
-			const target = { command: evalCode, cwd, envKeys: [], pty: false, timeout: undefined as number | undefined, async: false };
+			const target = { command: evalCode, cwd, envKeys: [], envFingerprint: "", cwdFromCommand: false, pty: false, timeout: undefined as number | undefined, async: false };
 			const chain = classifierChain(ctx);
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
 			// The whole chain is the identity, not just the primary: a verdict
@@ -3471,7 +3515,7 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
 			// session off, so it must hold here too, not only for bash.
-			if (matchingGrant(ctx, normalizeEvalGrantTarget(evalCode), cwd)) {
+			if (matchingGrant(ctx, normalizeEvalGrantTarget(evalCode), cwd, "")) {
 				logDecision({ tool: "eval", decision: "allow", layer: "granted", why: "session grant", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started });
 				return;
 			}
@@ -3676,10 +3720,14 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			const pty = event.input.pty === true;
 			const timeout = typeof event.input.timeout === "number" ? event.input.timeout : undefined;
 			const async = event.input.async === true;
+			// The same raw command/cwd can execute differently when the host
+			// consumes a leading cd. Bind that mode into grants and verdict reuse.
 			const target = {
 				command,
 				cwd,
 				envKeys: env.keys,
+				envFingerprint: env.key === "" ? "" : createHash("sha256").update(env.key).digest("hex"),
+				cwdFromCommand: leadingCd !== null,
 				pty,
 				timeout,
 				async,
@@ -3694,7 +3742,7 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			// than the global config-signature clear.
 			const chain = classifierChain(ctx);
 			const cacheKey = JSON.stringify([
-				chain.map(entry => entry.id), cwd, env.key, pty, timeout, async, command,
+				chain.map(entry => entry.id), cwd, env.key, target.cwdFromCommand, pty, timeout, async, command,
 			]);
 			// Refusal memory (issue #30): a reworded command meets its session's
 			// prior refusal. The record tells the model; the SAFE branch below
@@ -3726,6 +3774,9 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 					target,
 					"critical pattern",
 					"matches a built-in dangerous-command pattern",
+					"bash",
+					"",
+					false,
 				);
 			}
 
@@ -3734,6 +3785,16 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			// prompt/narrow-allow rule that only judged the command string. Env
 			// values are not shown to the classifier — they can hold secrets.
 			if (env.key !== "") {
+				// Only exact command/cwd/env consent can satisfy the environment gate.
+				// Legacy command-only grants cannot reach across this boundary.
+				if (matchingGrant(ctx, grantKeyForCommand(command, target.envFingerprint), cwd, target.envFingerprint)) {
+					logDecision({ tool: "bash", decision: "allow", layer: "granted", why: "session grant (env)", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
+					return;
+				}
+				if (matchingPersistentGrant(command, cwd, target.envFingerprint, target.cwdFromCommand)) {
+					logDecision({ tool: "bash", decision: "allow", layer: "granted", why: "persistent grant (env)", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
+					return;
+				}
 				logDecision({ tool: "bash", decision: "block", layer: "env", why: "environment override: command runs with caller-supplied env; not classified", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
 				return await requestPermission(
 					ctx,
@@ -3815,7 +3876,7 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			// critical-pattern and env-override checks above, which rank the
 			// command itself, and below host static rules, which were configured
 			// explicitly.
-			if (matchingGrant(ctx, grantKeyForCommand(command), cwd)) {
+			if (matchingGrant(ctx, grantKeyForCommand(command, ""), cwd, "")) {
 				logDecision({ tool: "bash", decision: "allow", layer: "granted", why: "session grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
 				return;
 			}
@@ -3831,7 +3892,7 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			// multi-segment command, so `cd X && script` could otherwise never be
 			// remembered), which also means an env-prefixed spelling, a different
 			// cwd, or any edit to the text intentionally does NOT match.
-			if (matchingPersistentGrant(command, cwd)) {
+			if (matchingPersistentGrant(command, cwd, "", target.cwdFromCommand)) {
 				logDecision({ tool: "bash", decision: "allow", layer: "granted", why: "persistent grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
 				return;
 			}
