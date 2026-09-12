@@ -99,7 +99,7 @@ interface Judgement {
 	 *  spec echo ("VERDICT: SAFE|UNSAFE|UNSURE"), whose second alternative is
 	 *  another option, never a decision. */
 const VERDICT_ASSERTION_RE =
-	/\bVERDICT\b[:| \t-]*(?:SAFE|UNSAFE|UNSURE)\b(?![\s|:.,-]*(?:SAFE|UNSAFE|UNSURE)\b)/iu;
+	/\bVERDICT\b[:| \t-]*(?:SAFE|UNSAFE|UNSURE)\b(?![^\n.;!?]*\b(?:SAFE|UNSAFE|UNSURE)\b)/u;
 /** Refusal language. parseJudgement decides this on the FULL reply. */
 const REFUSAL_SHAPED_RE = /\b(?:cannot|can't|won't|will not|refus(?:e|ing|al)|unable to)\b/iu;
 
@@ -1116,7 +1116,7 @@ export function parseJudgement(reply: string): Judgement {
 		.replace(/^[^\w\r\n]+/u, "")
 		.replace(/^VERDICT\b[:| \t-]*/iu, "");
 	const legacy = /^(SAFE|UNSAFE|UNSURE)\b[\s|:.,-]*(.*)$/iu.exec(stripped.trim());
-	if (legacy) {
+	if (legacy && (legacy[2].match(/\b(?:SAFE|UNSAFE|UNSURE)\b/g) ?? []).length < 2) {
 		return {
 			verdict: legacy[1].toUpperCase() as Verdict,
 			reason: truncated(legacy[2].trim().replace(/\s+/gu, " "), 160),
@@ -1137,7 +1137,7 @@ export function parseJudgement(reply: string): Judgement {
 		// The separator class eats "|", so the prompt's format spec
 		// ("VERDICT: SAFE|UNSAFE|UNSURE") leaves a second verdict word in the
 		// remainder: a template echo, never a decision.
-		if ((labeled[2].match(/\b(?:SAFE|UNSAFE|UNSURE)\b/giu) ?? []).length >= 2) continue;
+		if ((labeled[2].match(/\b(?:SAFE|UNSAFE|UNSURE)\b/g) ?? []).length >= 2) continue;
 		let reason = labeled[2].trim()
 			// Same separator family the legacy shape allows, plus the em/en dashes
 			// models reach for when the REASON rides the verdict line.
@@ -1178,7 +1178,7 @@ export function parseJudgement(reply: string): Judgement {
 		const tail = reply.slice(lastToken.index);
 		const shaped =
 			/^VERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b([^\n]*?)(?:\n?[ \t]*REASON\b[^\n]*)?[\s*`]*$/iu.exec(tail);
-		if (shaped && (shaped[2].match(/\b(?:SAFE|UNSAFE|UNSURE)\b/giu) ?? []).length < 2) {
+		if (shaped && (shaped[2].match(/\b(?:SAFE|UNSAFE|UNSURE)\b/g) ?? []).length < 2) {
 			let reason = shaped[2].trim()
 				.replace(/^[\s|:.,;\-*`–—]+/u, "")
 				.replace(/^REASON\b[:| \t-]*/iu, "")
@@ -1363,7 +1363,7 @@ const LOOPBACK_FLAGS: Record<"curl" | "wget", Record<string, true>> = {
  *  read as targets. `--url` is handled separately — its value IS a target. */
 const CURL_LOOPBACK_VALUE_FLAGS: Record<string, true> = {
 	"-A": true, "-d": true, "-e": true, "-H": true, "-m": true, "-o": true,
-	"-r": true, "-u": true, "-w": true, "-X": true,
+	"-r": true, "-u": true, "-X": true,
 	"--connect-timeout": true, "--data": true, "--data-raw": true,
 	"--data-urlencode": true, "--header": true, "--json": true,
 	"--limit-rate": true, "--max-time": true, "--output": true, "--range": true,
@@ -1400,6 +1400,16 @@ function fetchIsLoopbackOnly(
 	envAssignmentPrefix: boolean,
 ): boolean {
 	if (envAssignmentPrefix) return false;
+	// An ambient proxy (http_proxy/HTTPS_PROXY/ALL_PROXY in this process)
+	// routes even loopback-targeted fetches through a remote hop: the clear
+	// only holds when none is set.
+	if (
+		["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"].some(
+			name => (process.env[name] ?? "").trim() !== "",
+		)
+	) {
+		return false;
+	}
 	const flags = LOOPBACK_FLAGS[leadVerb];
 	const values = LOOPBACK_VALUE_FLAGS[leadVerb];
 	const targets: string[] = [];
@@ -1413,6 +1423,14 @@ function fetchIsLoopbackOnly(
 		if (leadVerb === "curl" && base === "--url") {
 			// The value IS a fetch target, separated or `=`-attached.
 			targets.push(arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : (args[++k] ?? ""));
+			continue;
+		}
+		if (leadVerb === "curl" && (base === "-w" || base === "--write-out")) {
+			// `%output{path}` writes a local file from the format string, so
+			// the value is admitted only as literals and %{simple_name}
+			// variables — the spec-echo of the whole alternatives list fails.
+			const value = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : (args[++k] ?? "");
+			if (!/^(?:[^%]|%\{[a-z0-9_]+\})*$/iu.test(value)) return false;
 			continue;
 		}
 		if (leadVerb === "wget" && bundleIsWgetStdout(arg)) continue;

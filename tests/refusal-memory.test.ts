@@ -138,6 +138,14 @@ describe("refusalWorthRemembering", () => {
 		expect(j.refusalShaped).toBe(true);
 		expect(refusalWorthRemembering(j)).toBe(true);
 	});
+	test("word-joined format alternatives are not a verdict assertion", () => {
+		// Codex round 4: "SAFE or UNSAFE or UNSURE" is the spec in prose.
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I cannot decide. Required format: VERDICT: SAFE or UNSAFE or UNSURE.",
+		})).toBe(true);
+	});
 });
 
 describe("refusal memory", () => {

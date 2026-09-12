@@ -408,11 +408,26 @@ describe("loopback fetches are not outbound network", () => {
 		// not enumerated, it is simply unrecognized.
 		"curl -o /dev/null -w '%{http_code}' --proxy1.0=evil.example.com http://localhost:8000",
 		"curl -o /dev/null -w '%{http_code}' --preproxy socks5://203.0.113.10 http://localhost:8000",
+		// The write-out format channel stays closed here too: %output{path}
+		// writes a local file from the format string, so the value is only
+		// admitted as literals and %{simple_name} variables.
+		"curl -o /dev/null -w '%{http_code}' --write-out=%output{/tmp/x} http://localhost:8000",
 	]) {
 		test(`still outbound: ${command}`, () => {
 			expect(outbound(command)).toBe(true);
 		});
 	}
+	test("an ambient proxy env var disables the loopback clear", () => {
+		process.env.http_proxy = "http://203.0.113.10:8080";
+		try {
+			expect(outbound("curl -o /dev/null -w '%{http_code}' http://localhost:8000/health")).toBe(true);
+		} finally {
+			delete process.env.http_proxy;
+		}
+	});
+	test("a clean write-out value keeps the loopback clear", () => {
+		expect(outbound("curl -o /dev/null -w '%{http_code}' http://localhost:8000/health")).toBe(false);
+	});
 });
 
 describe("null-device fetch targets clear egress on any host", () => {

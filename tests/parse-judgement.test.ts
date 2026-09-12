@@ -66,6 +66,15 @@ describe("parseJudgement", () => {
 		expect(parseJudgement("I cannot decide. VERDICT: SAFE|UNSAFE|UNSURE").verdict).toBe("PARSE_ERROR");
 		expect(parseJudgement("I cannot decide.\nVERDICT: SAFE|UNSAFE|UNSURE").verdict).toBe("PARSE_ERROR");
 	});
+	test("the legacy one-line path rejects the format spec echo", () => {
+		// Codex round 4: the reply-START path ran before the template check.
+		expect(parseJudgement("VERDICT: SAFE|UNSAFE|UNSURE").verdict).toBe("PARSE_ERROR");
+	});
+	test("lowercase prose near the verdict is not a template echo", () => {
+		// The echo count is case-sensitive: contract tokens are uppercase.
+		const j = parseJudgement("Reads one log file. VERDICT: SAFE — avoids unsafe effects");
+		expect(j.verdict).toBe("SAFE");
+	});
 	test("PARSE_ERROR reports verdict tokens from beyond the rawReply window", () => {
 		// rawReply is capped at 200 chars; hasVerdictToken is decided on the
 		// full reply so refusal memory cannot misread a late label as absent.
