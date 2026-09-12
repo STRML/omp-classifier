@@ -90,7 +90,18 @@ interface Judgement {
 	/** The FULL reply contained a VERDICT token, decided before the 200-char
 	 *  rawReply truncation so refusal memory cannot miss a late label. */
 	hasVerdictToken?: boolean;
+	/** The FULL reply carried refusal language; decided alongside
+	 *  hasVerdictToken so the rawReply window cannot hide either. */
+	refusalShaped?: boolean;
 }
+
+	/** A verdict assertion: label + verdict word, but NOT the prompt's format
+	 *  spec echo ("VERDICT: SAFE|UNSAFE|UNSURE"), whose second alternative is
+	 *  another option, never a decision. */
+const VERDICT_ASSERTION_RE =
+	/\bVERDICT\b[:| \t-]*(?:SAFE|UNSAFE|UNSURE)\b(?![\s|:.,-]*(?:SAFE|UNSAFE|UNSURE)\b)/iu;
+/** Refusal language. parseJudgement decides this on the FULL reply. */
+const REFUSAL_SHAPED_RE = /\b(?:cannot|can't|won't|will not|refus(?:e|ing|al)|unable to)\b/iu;
 
 /** Per-session cache: sessionId -> `${cwd}\0${env}\0${pty}\0${command}` -> judgement. */
 const cache = new Map<string, Map<string, Judgement>>();
@@ -1123,6 +1134,10 @@ export function parseJudgement(reply: string): Judgement {
 		const line = lines[i].trim().replace(/^[^\w\r\n]+/u, "").replace(/[\s*`]+$/u, "");
 		const labeled = /^VERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b[\s|:.,-]*(.*)$/iu.exec(line);
 		if (!labeled) continue;
+		// The separator class eats "|", so the prompt's format spec
+		// ("VERDICT: SAFE|UNSAFE|UNSURE") leaves a second verdict word in the
+		// remainder: a template echo, never a decision.
+		if ((labeled[2].match(/\b(?:SAFE|UNSAFE|UNSURE)\b/giu) ?? []).length >= 2) continue;
 		let reason = labeled[2].trim()
 			// Same separator family the legacy shape allows, plus the em/en dashes
 			// models reach for when the REASON rides the verdict line.
@@ -1163,7 +1178,7 @@ export function parseJudgement(reply: string): Judgement {
 		const tail = reply.slice(lastToken.index);
 		const shaped =
 			/^VERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b([^\n]*?)(?:\n?[ \t]*REASON\b[^\n]*)?[\s*`]*$/iu.exec(tail);
-		if (shaped) {
+		if (shaped && (shaped[2].match(/\b(?:SAFE|UNSAFE|UNSURE)\b/giu) ?? []).length < 2) {
 			let reason = shaped[2].trim()
 				.replace(/^[\s|:.,;\-*`–—]+/u, "")
 				.replace(/^REASON\b[:| \t-]*/iu, "")
@@ -1186,7 +1201,8 @@ export function parseJudgement(reply: string): Judgement {
 		// Decided on the FULL reply: rawReply is capped at 200 chars, and a
 		// long malformed reply can carry a late VERDICT label the window
 		// drops, which refusal memory must not misread as absence.
-		hasVerdictToken: /\bVERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b/iu.test(reply),
+		hasVerdictToken: VERDICT_ASSERTION_RE.test(reply),
+		refusalShaped: REFUSAL_SHAPED_RE.test(reply),
 		rawReply: truncated(collapsed, 200),
 	};
 }
@@ -1210,8 +1226,8 @@ export function refusalWorthRemembering(judgement: Judgement): boolean {
 	if (reply === "" || reply === "(empty reply)") return false;
 	// parseJudgement decides the token question on the full reply (see the
 	// field); hand-built judgements fall back to the truncated window.
-	if (judgement.hasVerdictToken ?? /\bVERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b/iu.test(reply)) return false;
-	return /\b(?:cannot|can't|won't|will not|refus(?:e|ing|al)|unable to)\b/iu.test(reply);
+	if (judgement.hasVerdictToken ?? VERDICT_ASSERTION_RE.test(reply)) return false;
+	return judgement.refusalShaped ?? REFUSAL_SHAPED_RE.test(reply);
 }
 
 function truncated(value: string, max: number): string {
@@ -1316,19 +1332,35 @@ const NO_EGRESS_RE =
  */
 const GH_WRITE_MARKERS = /(?:^|\s)(?:-X|--method=?)\s*(?:POST|PUT|PATCH|DELETE)\b|(?:^|\s)-[fF]\s|(?:^|\s)--field(?:=|\s)|(?:^|\s)--input(?:=|\s)/iu;
 
-/** Flags that retarget or source a fetch from outside its literal text: the
- *  loopback clear never survives one. (Redirects stay allowed — the read
- *  tables allow -L for any host, and where a redirect lands is the judge's
- *  domain, not the egress scan's.) */
-const CURL_LOOPBACK_DENY: Record<string, true> = {
-	"-x": true, "--proxy": true, "--resolve": true, "--connect-to": true, "-K": true, "--config": true,
+/** The loopback clear is allowlist-first: a flag is permitted only when it is
+ *  recognized here as benign — unknown flags (every current and future
+ *  proxy/socks/resolve/config variant included) fail closed, so a new curl or
+ *  wget flag can never silently widen the exemption. Redirects stay allowed:
+ *  the read tables allow -L for any host, and where a redirect lands is the
+ *  judge's domain, not the egress scan's. */
+const CURL_LOOPBACK_FLAGS: Record<string, true> = {
+	"-s": true, "-S": true, "-f": true, "-L": true, "-k": true, "-i": true,
+	"-I": true, "-v": true, "-4": true, "-6": true, "-N": true, "-g": true,
+	"-#": true, "-G": true,
+	"--silent": true, "--show-error": true, "--fail": true,
+	"--fail-with-body": true, "--location": true, "--insecure": true,
+	"--include": true, "--head": true, "--verbose": true, "--compressed": true,
+	"--http1.1": true, "--http2": true, "--no-buffer": true, "--ipv4": true,
+	"--ipv6": true, "--globoff": true, "--no-progress-meter": true,
+	"--progress-bar": true, "--get": true, "--tlsv1.2": true, "--tlsv1.3": true,
 };
-const WGET_LOOPBACK_DENY: Record<string, true> = {
-	"-i": true, "--input-file": true, "-m": true, "--mirror": true, "--proxy": true,
-	"--config": true, "-e": true, "--execute": true,
+const WGET_LOOPBACK_FLAGS: Record<string, true> = {
+	"-q": true, "-S": true, "-v": true, "-4": true, "-6": true, "-N": true,
+	"--quiet": true, "--verbose": true, "--spider": true,
+	"--server-response": true, "--no-check-certificate": true,
+	"--content-on-error": true, "--inet4-only": true, "--inet6-only": true,
 };
-/** Benign value-taking flags: their values are skipped, never read as
- *  targets. `--url` is handled separately — its value IS a target. */
+const LOOPBACK_FLAGS: Record<"curl" | "wget", Record<string, true>> = {
+	curl: CURL_LOOPBACK_FLAGS,
+	wget: WGET_LOOPBACK_FLAGS,
+};
+/** Recognized benign value-taking flags: their values are skipped, never
+ *  read as targets. `--url` is handled separately — its value IS a target. */
 const CURL_LOOPBACK_VALUE_FLAGS: Record<string, true> = {
 	"-A": true, "-d": true, "-e": true, "-H": true, "-m": true, "-o": true,
 	"-r": true, "-u": true, "-w": true, "-X": true,
@@ -1345,19 +1377,22 @@ const WGET_LOOPBACK_VALUE_FLAGS: Record<string, true> = {
 	"--compression": true, "-O": true, "-P": true, "-T": true, "-o": true,
 	"-w": true, "--output-document": true,
 };
+const LOOPBACK_VALUE_FLAGS: Record<"curl" | "wget", Record<string, true>> = {
+	curl: CURL_LOOPBACK_VALUE_FLAGS,
+	wget: WGET_LOOPBACK_VALUE_FLAGS,
+};
 /** A single fetch target aimed at the loopback interface. */
 const LOOPBACK_TARGET_RE = /^(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|\[::1\]|[\w.-]+\.localhost)(?::\d+)?(?:[/?#]|$)/iu;
 
 /**
- * Loopback clears nothing that could be retargeted beyond its literal text:
- * proxies, --resolve/--connect-to rewrites, --config/--input-file sources,
- * mirror sweeps, wget -e/--execute (wgetrc commands include use_proxy), and
- * environment assignment prefixes (http_proxy=…) are all denied. Values of
- * benign value-taking flags are skipped so they cannot pose as targets.
- * Fail-closed by construction: the clear requires EXACTLY one operand,
- * shaped as a loopback URL or host. The caller clears only when the command
- * is a single pipeline stage (a downstream `| ssh host` can send the output
- * to a remote endpoint) and passes any environment assignment prefix.
+ * The loopback clear is allowlist-first: every flag must be recognized
+ * benign (no-value) or benign-and-value-taking, exactly one operand may
+ * remain, and that operand must be a loopback URL/host — so proxies,
+ * --resolve/--connect-to rewrites, --config/--input-file sources, mirror
+ * sweeps, and unknown future flags all fail closed by construction. The
+ * caller clears only when the command is a single pipeline stage (a
+ * downstream `| ssh host` can send the output to a remote endpoint) and
+ * passes any environment assignment prefix (http_proxy=…).
  */
 function fetchIsLoopbackOnly(
 	leadVerb: "curl" | "wget",
@@ -1365,8 +1400,8 @@ function fetchIsLoopbackOnly(
 	envAssignmentPrefix: boolean,
 ): boolean {
 	if (envAssignmentPrefix) return false;
-	const deny = leadVerb === "curl" ? CURL_LOOPBACK_DENY : WGET_LOOPBACK_DENY;
-	const values = leadVerb === "curl" ? CURL_LOOPBACK_VALUE_FLAGS : WGET_LOOPBACK_VALUE_FLAGS;
+	const flags = LOOPBACK_FLAGS[leadVerb];
+	const values = LOOPBACK_VALUE_FLAGS[leadVerb];
 	const targets: string[] = [];
 	for (let k = 0; k < args.length; k++) {
 		const arg = args[k];
@@ -1375,7 +1410,6 @@ function fetchIsLoopbackOnly(
 			continue;
 		}
 		const base = arg.startsWith("--") ? arg.split("=", 1)[0] : arg;
-		if (deny[base] || deny[arg]) return false;
 		if (leadVerb === "curl" && base === "--url") {
 			// The value IS a fetch target, separated or `=`-attached.
 			targets.push(arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : (args[++k] ?? ""));
@@ -1388,9 +1422,10 @@ function fetchIsLoopbackOnly(
 			continue;
 		}
 		if (!arg.startsWith("--") && arg.length > 2) {
-			// A short bundle: a deny or value-taking letter fails closed.
+			// A short bundle: every letter must be a recognized no-value
+			// flag; value-taking or unknown letters fail closed.
 			for (const flag of expandShortBundle(arg)) {
-				if (deny[flag] || values[flag]) return false;
+				if (!flags[flag]) return false;
 			}
 			continue;
 		}
@@ -1398,6 +1433,8 @@ function fetchIsLoopbackOnly(
 			if (!arg.includes("=")) k++;
 			continue;
 		}
+		// Allowlist-first: an unrecognized flag fails closed.
+		if (!flags[base]) return false;
 	}
 	if (targets.length !== 1) return false;
 	return LOOPBACK_TARGET_RE.test(targets[0]);

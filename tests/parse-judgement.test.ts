@@ -59,6 +59,13 @@ describe("parseJudgement", () => {
 		// boundary class; only sentence punctuation/newline admits the token.
 		expect(parseJudgement("Unable to decide. Output format: VERDICT: SAFE").verdict).toBe("PARSE_ERROR");
 	});
+	test("the prompt's format spec echoed back is not a verdict", () => {
+		// Codex round 3: "VERDICT: SAFE|UNSAFE|UNSURE" is the format spec, the
+		// separator class eats the pipe, and the first alternative must not
+		// stand in for a decision — terminal or own line.
+		expect(parseJudgement("I cannot decide. VERDICT: SAFE|UNSAFE|UNSURE").verdict).toBe("PARSE_ERROR");
+		expect(parseJudgement("I cannot decide.\nVERDICT: SAFE|UNSAFE|UNSURE").verdict).toBe("PARSE_ERROR");
+	});
 	test("PARSE_ERROR reports verdict tokens from beyond the rawReply window", () => {
 		// rawReply is capped at 200 chars; hasVerdictToken is decided on the
 		// full reply so refusal memory cannot misread a late label as absent.

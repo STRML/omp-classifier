@@ -404,6 +404,10 @@ describe("loopback fetches are not outbound network", () => {
 		"curl -o /dev/null -w '%{http_code}' http://localhost:8000 ftp://203.0.113.10",
 		"wget http://localhost:8000 --input-file=/tmp/urls.txt",
 		"HTTP_PROXY=http://203.0.113.10:8080 curl http://localhost:8000/x",
+		// Unknown flags fail closed (allowlist-first): the proxy family is
+		// not enumerated, it is simply unrecognized.
+		"curl -o /dev/null -w '%{http_code}' --proxy1.0=evil.example.com http://localhost:8000",
+		"curl -o /dev/null -w '%{http_code}' --preproxy socks5://203.0.113.10 http://localhost:8000",
 	]) {
 		test(`still outbound: ${command}`, () => {
 			expect(outbound(command)).toBe(true);

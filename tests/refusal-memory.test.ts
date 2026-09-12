@@ -13,7 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { normalizeRefusalTarget, refusalWorthRemembering } from "../index";
+import { normalizeRefusalTarget, parseJudgement, refusalWorthRemembering } from "../index";
 import type { DecisionRecord } from "../index";
 import {
 	selectCalls,
@@ -123,6 +123,20 @@ describe("refusalWorthRemembering", () => {
 			rawReply: "I cannot assist. The VERDICT format is required, but I will not provide one.",
 			hasVerdictToken: false,
 		})).toBe(true);
+	});
+	test("a quoted format spec is not a verdict assertion", () => {
+		// The assertion rule rejects the spec echo (a second alternative
+		// follows the first), so this refusal keeps prior-refusal protection.
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I cannot assist. Required format: VERDICT: SAFE|UNSAFE|UNSURE",
+		})).toBe(true);
+	});
+	test("refusal language beyond the 200-char window is remembered", () => {
+		const j = parseJudgement(`${"The command reads repository files and prints statistics. ".repeat(8)}I cannot assist with that.`);
+		expect(j.refusalShaped).toBe(true);
+		expect(refusalWorthRemembering(j)).toBe(true);
 	});
 });
 
