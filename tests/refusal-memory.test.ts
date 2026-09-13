@@ -190,6 +190,31 @@ describe("refusalWorthRemembering", () => {
 			rawReply: "I must decline to assist.",
 		})).toBe(true);
 	});
+	test("a verdict followed by trailing reply text is not remembered", () => {
+		// The reply did assert a verdict (even though trailing text voids it
+		// as a decision), so it is not refusal-shaped and must not enter the
+		// refusal store.
+		const j = parseJudgement("VERDICT: SAFE\nI cannot assist.");
+		expect(j.verdict).toBe("PARSE_ERROR");
+		expect(refusalWorthRemembering(j)).toBe(false);
+	});
+	test("first-person refusal forms are refusal-shaped", () => {
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I decline this request.",
+		})).toBe(true);
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I must refuse.",
+		})).toBe(true);
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "We will refuse.",
+		})).toBe(true);
+	});
 });
 
 describe("refusal memory", () => {

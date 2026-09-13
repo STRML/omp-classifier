@@ -95,14 +95,16 @@ interface Judgement {
 	refusalShaped?: boolean;
 }
 
-/** The prompt's format spec echoed back — two verdict words within a few
- *  characters ("SAFE|UNSAFE", "safe or unsure") — is a template, never a
- *  decision. Case-insensitive on purpose: "verdict: safe|unsafe|unsure" is
- *  the same echo in lowercase. */
-const TEMPLATE_ECHO_RE = /\b(?:safe|unsafe|unsure)\b[\s\S]{0,6}(?:safe|unsafe|unsure)\b/iu;
+/** The prompt's format spec echoed back — two verdict words separated only
+ *  by list separators ("SAFE|UNSAFE", "safe, unsafe", a bare newline) or the
+ *  word "or" — is a template, never a decision. Case-insensitive on purpose:
+ *  "verdict: safe|unsafe|unsure" is the same echo in lowercase. Prose that
+ *  merely mentions a verdict word near the decision ("SAFE — no unsafe
+ *  effects") keeps other words between them and does not match. */
+const TEMPLATE_ECHO_RE = /\b(?:safe|unsafe|unsure)\b(?:[\s|/,]+|\s*or\s*)+(?:safe|unsafe|unsure)\b/iu;
 /** Refusal language. parseJudgement decides this on the FULL reply. */
 const REFUSAL_SHAPED_RE =
-	/\b(?:i|we)\s+(?:cannot|can't|won't|will not|am unable|are unable|am refusing|am declining|must decline|declined? to|refuse|refusing)\b/iu;
+	/\b(?:i|we)\s+(?:(?:must|will|would|have to|am going to)\s+)?(?:refuse|refusing|decline|declining|declined? to|cannot|can't|won't|will not|am unable|are unable|am refusing|am declining)\b/iu;
 /** Per-session cache: sessionId -> `${cwd}\0${env}\0${pty}\0${command}` -> judgement. */
 const cache = new Map<string, Map<string, Judgement>>();
 // Effective-config signature of the last gate run. The classifier config
@@ -1128,17 +1130,26 @@ export function parseJudgement(reply: string): Judgement {
 		const reasonNext = rest.length > 0 && /^REASON\b/iu.test(rest[0].trim());
 		const trailing = (reasonNext ? rest.slice(1) : rest).some(l => l.trim() !== "");
 		if (trailing) {
+			// The reply OPENED with a verdict token — a decision attempt at
+			// the strongest boundary — so this is a failed decision, not
+			// prose: refusal memory must not record it (issue #30).
 			return {
 				verdict: "PARSE_ERROR" as Verdict,
 				reason: "classifier reply had no VERDICT line",
-				hasVerdictToken: false,
+				hasVerdictToken: true,
 				refusalShaped: REFUSAL_SHAPED_RE.test(reply),
 				rawReply: truncated(collapsed, 200),
 			};
 		}
+		let reason = legacy[2].trim().replace(/\s+/gu, " ");
+		if (reason === "" && reasonNext) {
+			// `REASON:` on its own line under the one-line verdict.
+			const reasonLine = /^REASON\b[:| \t-]*(.+)$/iu.exec(rest[0].trim());
+			if (reasonLine) reason = reasonLine[1].trim().replace(/\s+/gu, " ");
+		}
 		return {
 			verdict: legacy[1].toUpperCase() as Verdict,
-			reason: truncated(legacy[2].trim().replace(/\s+/gu, " "), 160),
+			reason: truncated(reason, 160),
 			rawReply: truncated(collapsed, 200),
 		};
 	}
@@ -2100,7 +2111,7 @@ function isPlainReadOnlyFetch(command: string): boolean {
 			// GET/HEAD selectors stay reads.
 			if (token === "-X" || token === "--request" || token === "--method") {
 				const value = a.includes("=") ? a.slice(a.indexOf("=") + 1) : (args[k + 1] ?? "");
-				return !/^(?:GET|HEAD)\b/iu.test(value);
+				return !/^(?:GET|HEAD)$/iu.test(value.trim());
 			}
 			if (SEND_DATA_FLAGS[token]) return true;
 			return a.startsWith("-") && !a.startsWith("--") && a.length > 2 &&

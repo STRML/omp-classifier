@@ -93,6 +93,27 @@ describe("parseJudgement", () => {
 		expect(j.rawReply!.includes("VERDICT")).toBe(false);
 	});
 
+	test("the legacy one-line verdict consumes a next-line REASON", () => {
+		const j = parseJudgement("VERDICT: SAFE\nREASON: no network egress");
+		expect(j.verdict).toBe("SAFE");
+		expect(j.reason).toBe("no network egress");
+	});
+	test("tail ownership still applies after the REASON line", () => {
+		// The REASON line is owned, but anything past it still voids the
+		// verdict: the reply stopped deciding and started talking.
+		expect(parseJudgement("VERDICT: SAFE\nREASON: read-only\nextra detail").verdict).toBe("PARSE_ERROR");
+	});
+	test("a reason mentioning unsafe is not a template echo", () => {
+		// Echo counts are case-sensitive: lowercase "unsafe" is a word in the
+		// reason, not the contract alternative that marks a format echo.
+		expect(parseJudgement("Reads files. VERDICT: SAFE — no unsafe effects.").verdict).toBe("SAFE");
+	});
+	test("a verdict followed by trailing reply text is a failed decision", () => {
+		const j = parseJudgement("VERDICT: SAFE\nI cannot assist.");
+		expect(j.verdict).toBe("PARSE_ERROR");
+		expect(j.hasVerdictToken).toBe(true);
+	});
+
 	test("reason is carried from the first line only", () => {
 		const j = parseJudgement("UNSAFE | force push");
 		expect(j.verdict).toBe("UNSAFE");

@@ -410,6 +410,9 @@ describe("validated write-out format strings clear as reads on any host", () => 
 		"wget --body-data=x --output-document=/dev/null https://evil",
 		"curl -d secret -o /dev/null https://x",
 		"curl -X POST -o /dev/null https://x",
+		// Custom method spellings are not GET/HEAD.
+		"curl -o /dev/null -w '%{http_code}' --request GET-FOO https://x",
+		"wget --method=get! -O /dev/null https://x",
 	]) {
 		test(`still outbound: ${command}`, () => {
 			expect(outbound(command)).toBe(true);
