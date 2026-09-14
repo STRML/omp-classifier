@@ -299,7 +299,7 @@ export interface CtxOptions {
 	model?: unknown;
 	/** Session branch entries for evidence collection (issue #31). Empty by
 	 *  default; the gate reads getBranch() only when evidenceUserMessages > 0. */
-	branch?: ReadonlyArray<{ type: string; message?: { role?: string; content?: unknown } }>;
+	branch?: ReadonlyArray<{ type: string; message?: { role?: string; attribution?: string; content?: unknown } }>;
 }
 
 /** The labels the plugin's permission dialog offers. "Always allow" is

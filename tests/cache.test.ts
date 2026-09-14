@@ -144,8 +144,8 @@ describe("session boundaries drop only that session's entries", () => {
 
 describe("cache keys include the evidence fingerprint", () => {
 	// The branch entry shape is the one collectUserEvidence reads (mirrors
-	// evidence-tiers.test.ts): `type: "message"` with a user role.
-	const userEntry = (content: string) => ({ type: "message", message: { role: "user", content } });
+	// evidence-tiers.test.ts): `type: "message"` with a user role, attributed to the user.
+	const userEntry = (content: string) => ({ type: "message", message: { role: "user", attribution: "user", content } });
 
 	test("moved evidence is a different key: the model re-judges", async () => {
 		setClassifierReply('The user said "please ship it". VERDICT: SAFE');

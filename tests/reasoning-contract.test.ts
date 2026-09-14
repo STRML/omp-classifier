@@ -105,9 +105,19 @@ describe("checkCitation", () => {
 		expect(j.noCache).toBe(true);
 	});
 
-	test("empty or absent evidence is a no-op, never a dialog cause", () => {
-		expect(checkCitation(parseJudgement(fabricated), []).verdict).toBe("SAFE");
+	test("absent evidence (switched off) is a no-op, never a dialog cause", () => {
 		expect(checkCitation(parseJudgement(fabricated), undefined).verdict).toBe("SAFE");
+	});
+
+	test("an empty evidence list means no user wrote anything, so a user citation downgrades", () => {
+		const j = checkCitation(parseJudgement(fabricated), []);
+		expect(j.verdict).toBe("UNSURE");
+		expect(j.citationMissing).toEqual(["wipe the production database"]);
+	});
+
+	test("an empty evidence list leaves a SAFE with no user citation alone", () => {
+		const reply = safeReply("Reads the working tree status. No writes, no egress.");
+		expect(checkCitation(parseJudgement(reply), []).verdict).toBe("SAFE");
 	});
 
 	test("quote across a line break in the user message still matches", () => {
@@ -144,6 +154,16 @@ describe("checkCitation", () => {
 
 	test("a grounded citation carries no citationMissing", () => {
 		expect(checkCitation(parseJudgement(cited), messages).citationMissing).toBeUndefined();
+	});
+
+	test("a quote spanning the head/tail elision marker does not match", () => {
+		// collectUserEvidence joins the kept head and tail with "\n…\n". Whitespace
+		// normalization turns that into " … ", so a quote across the seam must be
+		// checked against each side on its own, never the joined string.
+		const kept = `${"a".repeat(1_000)}\n…\n${"b".repeat(1_000)}`;
+		const reply = safeReply(`The user asked to "${"a".repeat(5)} … ${"b".repeat(5)}" per their request.`);
+		const j = checkCitation(parseJudgement(reply), [kept]);
+		expect(j.verdict).toBe("UNSURE");
 	});
 
 	test("UNSAFE and UNSURE verdicts are never touched", () => {
@@ -268,7 +288,7 @@ describe("applyPostParseChecks", () => {
 describe("live gate integration", () => {
 	test("fabricated citation turns a model SAFE into an uncached dialog", async () => {
 		setClassifierReply(safeReply('The user asked to "wipe the production database" per their request.'));
-		const branch = [{ type: "message", message: { role: "user", content: "please deploy the staging build" } }];
+		const branch = [{ type: "message", message: { role: "user", attribution: "user", content: "please deploy the staging build" } }];
 		const ctx = makeCtx({ sessionId: "reasoning-cite", hasUI: true, branch });
 		const first = await fire("tool_call", makeEvent("git status"), ctx);
 		expect(first).toBeDefined();
@@ -282,17 +302,30 @@ describe("live gate integration", () => {
 
 	test("verbatim-grounded citation auto-runs", async () => {
 		setClassifierReply(safeReply('The user asked to "check the working tree status" before committing.'));
-		const branch = [{ type: "message", message: { role: "user", content: "check the working tree status" } }];
+		const branch = [{ type: "message", message: { role: "user", attribution: "user", content: "check the working tree status" } }];
 		const ctx = makeCtx({ sessionId: "reasoning-cite-ok", branch });
 		const result = await fire("tool_call", makeEvent("git status"), ctx);
 		expect(result).toBeUndefined();
 		expect(selectCalls(ctx)).toHaveLength(0);
 	});
 
+	test("an agent-written brief cannot authorize: quoting it dialogs", async () => {
+		// The review-438-corr shape: a headless worker's only user-role message is the brief
+		// its parent agent sent, stamped attribution "agent". Its permission sentence is not
+		// the user's word, so a SAFE that cites it must not auto-run.
+		const brief = `${"Review the PR at head. ".repeat(95)}Clean up your own worktree and scratch.`;
+		setClassifierReply(safeReply('The user said to "clean up your own worktree and scratch" in the brief.'));
+		const branch = [{ type: "message", message: { role: "user", attribution: "agent", content: brief } }];
+		const ctx = makeCtx({ sessionId: "reasoning-cite-agent", hasUI: true, branch });
+		const result = await fire("tool_call", makeEvent("git status"), ctx);
+		expect(result).toBeDefined();
+		expect(selectCalls(ctx)).toHaveLength(1);
+	});
+
 	test("quoting words past the first 2000 chars of a long brief auto-runs", async () => {
 		const brief = `${"Review the PR at head. ".repeat(95)}Clean up your own worktree and scratch.`;
 		setClassifierReply(safeReply('The user said to "clean up your own worktree and scratch" in the brief.'));
-		const branch = [{ type: "message", message: { role: "user", content: brief } }];
+		const branch = [{ type: "message", message: { role: "user", attribution: "user", content: brief } }];
 		const ctx = makeCtx({ sessionId: "reasoning-cite-tail", branch });
 		const result = await fire("tool_call", makeEvent("git status"), ctx);
 		expect(result).toBeUndefined();

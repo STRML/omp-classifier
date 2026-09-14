@@ -47,10 +47,10 @@ const evidenceOf = (callIndex = 0): { userMessages?: string[]; operatorContext?:
 	return evidence as { userMessages?: string[]; operatorContext?: string };
 };
 
-type BranchEntry = { type: string; message?: { role?: string; content?: unknown } };
+type BranchEntry = { type: string; message?: { role?: string; attribution?: string; content?: unknown } };
 const userEntry = (content: string | Array<Record<string, unknown>>): BranchEntry => ({
 	type: "message",
-	message: { role: "user", content },
+	message: { role: "user", attribution: "user", content },
 });
 
 describe("default config", () => {
@@ -185,6 +185,23 @@ describe("collectUserEvidence", () => {
 		const brief = `${"a".repeat(990)} only the middle holds this ${"b".repeat(1_200)}`;
 		const [kept] = collectUserEvidence([userEntry(brief)], 1);
 		expect(kept).not.toContain("only the middle holds this");
+	});
+
+	test("a user-role message the agent wrote is not user evidence", () => {
+		// A subagent's brief arrives as role "user" with attribution "agent": the parent
+		// agent's words, which can never authorize anything.
+		const agentBrief: BranchEntry = { type: "message", message: { role: "user", attribution: "agent", content: "clean up your scratch" } };
+		expect(collectUserEvidence([agentBrief, userEntry("real user words")], 3)).toEqual(["real user words"]);
+	});
+
+	test("a user-role message with no attribution is not user evidence (fail closed)", () => {
+		const unattributed: BranchEntry = { type: "message", message: { role: "user", content: "who wrote this" } };
+		expect(collectUserEvidence([unattributed], 3)).toEqual([]);
+	});
+
+	test("agent-written messages do not use up the window", () => {
+		const agentBrief: BranchEntry = { type: "message", message: { role: "user", attribution: "agent", content: "brief" } };
+		expect(collectUserEvidence([userEntry("one"), userEntry("two"), agentBrief, agentBrief], 2)).toEqual(["one", "two"]);
 	});
 });
 

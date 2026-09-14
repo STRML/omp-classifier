@@ -1288,13 +1288,16 @@ function truncated(value: string, max: number): string {
 	return value.length > max ? `${value.slice(0, max)}…` : value;
 }
 
-/** Cap a long message by keeping its first and last max/2 chars. Briefs open
- *  with context and close with instructions and permissions, so a head-only cut
- *  dropped exactly the words a SAFE verdict cites. */
+/** Joins the kept head and tail of a capped user message. The citation check
+ *  splits on it so a quote can never match across the dropped middle. */
+const EVIDENCE_ELISION = "\n…\n";
+
+/** Cap a long message by keeping its first and last max/2 chars. A user often
+ *  states the actual instruction last, and a head-only cut dropped it. */
 function headAndTail(value: string, max: number): string {
 	if (value.length <= max) return value;
 	const head = Math.floor(max / 2);
-	return `${value.slice(0, head)}\n…\n${value.slice(value.length - (max - head))}`;
+	return `${value.slice(0, head)}${EVIDENCE_ELISION}${value.slice(value.length - (max - head))}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,8 +1328,9 @@ function normalizeCitationText(value: string): string {
  * operatorContext is written by the requesting agent and can never authorize,
  * so it is not a valid source. Fires only when a quoted span inside the citing
  * sentence is absent from every user message; an unquoted paraphrase has no
- * words to verify and does not fire (conservative). With no evidence at all
- * the check is a no-op — it is never a dialog cause on its own.
+ * words to verify and does not fire (conservative). With evidence switched off
+ * the check is a no-op. With evidence on but no user-written message in the
+ * session (an empty list), any quoted user words fail, since none can be the user's.
  */
 const CITATION_RE =
 	/\b(?:the\s+)?(?:user|requester|human|operator)\b[^.!?\n]{0,80}?\b(?:ask(?:ed|s)|request(?:ed|s)|want(?:ed|s)|authoriz(?:ed?|es|ation)|confirm(?:ed|s|ation)|said|says|wrote|specif(?:ied|ies)|instruct(?:ed|s)|demand(?:ed|s))\b|\b(?:at|per|according\s+to|on)\s+the\s+(?:user|requester)(?:'s)?\s+(?:request|instruction|asking|word|direction|behest)\b|\buserMessages?\b|\buser(?:'s)?\s+(?:own\s+words|message)\b/iu;
@@ -1347,7 +1351,12 @@ function citedSpansNotInEvidence(text: string, userMessages: readonly string[], 
 			// (the model quoting the command, not the user): neither cites the
 			// user, so neither fires.
 			if (normalized.split(" ").length < 2 || commandNorm.includes(normalized)) continue;
-			if (!userMessages.some(message => normalizeCitationText(message).includes(normalized))) {
+			// Match inside the kept head or tail of each message, never across the elision:
+			// normalization turns the marker into " … ", which a quote could otherwise span.
+			const found = userMessages.some(message =>
+				message.split(EVIDENCE_ELISION).some(part => normalizeCitationText(part).includes(normalized)),
+			);
+			if (!found) {
 				missing.push(span);
 			}
 		}
@@ -1359,7 +1368,11 @@ function citedSpansNotInEvidence(text: string, userMessages: readonly string[], 
 const MAX_LOGGED_CITATION_SPANS = 3;
 
 export function checkCitation(judgement: Judgement, userMessages: readonly string[] | undefined, command = ""): Judgement {
-	if (judgement.verdict !== "SAFE" || !userMessages || userMessages.length === 0) return judgement;
+	// undefined: evidence is switched off, so there is nothing to check against. An empty
+	// list is different: evidence is on and the session holds no user-written message (a
+	// headless subagent, whose only role-user message is its parent's brief), so any words
+	// the analysis attributes to the user cannot be the user's and must not pass.
+	if (judgement.verdict !== "SAFE" || !userMessages) return judgement;
 	const text = `${judgement.analysis ?? ""}\n${judgement.reason}`;
 	const missing = citedSpansNotInEvidence(text, userMessages, command);
 	if (missing.length === 0) return judgement;
@@ -1614,7 +1627,9 @@ export function checkWriteScopeConsistency(judgement: Judgement, command: string
 export interface PostParseContext {
 	command: string;
 	cwd: string;
-	/** evidence.userMessages as sent in the record; absent = citation no-op. */
+	/** User-written evidence for the citation check. Absent: evidence is switched off,
+	 *  so the check is a no-op. Empty: evidence is on but no user wrote anything, so a
+	 *  quoted user citation downgrades. */
 	userMessages?: readonly string[];
 }
 
@@ -1669,20 +1684,22 @@ function textOf(content: unknown): string {
  * The last `limit` user messages on a session branch, oldest first (issue
  * #31): the user-tier evidence a classify record may carry. Pure over the
  * branch entry array so tests pass a fixture instead of a live session. Only
- * `type: "message"` entries with `role: "user"` count; each is textOf-
- * flattened and capped per EVIDENCE_MESSAGE_MAX_CHARS by keeping its head and
- * tail. The window is the tail: when the branch holds more user messages than
- * `limit`, the newest win.
+ * `type: "message"` entries with `role: "user"` AND `attribution: "user"` count:
+ * a subagent's brief is role "user" but attribution "agent", meaning the parent
+ * agent's words, which can never authorize. A message with no attribution is left
+ * out too (fail closed). Each is textOf-flattened and capped per
+ * EVIDENCE_MESSAGE_MAX_CHARS by keeping its head and tail. The window is the
+ * tail: when the branch holds more user messages than `limit`, the newest win.
  */
 export function collectUserEvidence(
-	branch: ReadonlyArray<{ type: string; message?: { role?: string; content?: unknown } }>,
+	branch: ReadonlyArray<{ type: string; message?: { role?: string; attribution?: string; content?: unknown } }>,
 	limit: number,
 ): string[] {
 	const messages: string[] = [];
 	for (const entry of branch) {
 		if (entry.type !== "message") continue;
 		const message = entry.message;
-		if (message?.role !== "user") continue;
+		if (message?.role !== "user" || message.attribution !== "user") continue;
 		messages.push(headAndTail(textOf(message.content), EVIDENCE_MESSAGE_MAX_CHARS));
 	}
 	return limit > 0 ? messages.slice(-limit) : [];
@@ -3323,7 +3340,11 @@ export default function (pi: ExtensionAPI) {
 			// first parsed verdict. A downgraded verdict is UNSURE with noCache —
 			// dialog, and never cached, because the downgrade follows the
 			// analysis text, which the model can rewrite on a reworded ask.
-			return applyPostParseChecks(parsed, { command, cwd, userMessages: evidence.userMessages });
+			// An empty list, not undefined, when evidence is on but the session holds no
+			// user-written message: checkCitation then refuses quoted "user" words instead of
+			// skipping the check. The record itself keeps omitting the field.
+			const citableUserMessages = evidence.userMessages ?? (readClassifierConfig().evidenceUserMessages > 0 ? [] : undefined);
+			return applyPostParseChecks(parsed, { command, cwd, userMessages: citableUserMessages });
 		}
 		// Chain exhausted. The all-empty case keeps the legacy reason prefix
 		// (log greps key on it) with the tried list appended; any other
