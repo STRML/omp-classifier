@@ -1419,6 +1419,9 @@ function ghApiWrites(args: readonly string[]): boolean {
 		const a = args[k];
 		if (a === "-f" || a === "-F") return true;
 		if ((a.startsWith("-f") || a.startsWith("-F")) && a.length > 2) return true;
+		// Bundled shorts carry the write flag inside (`-ifbody=secret`).
+		if (a.startsWith("-") && !a.startsWith("--") && a.length > 2 &&
+			expandShortBundle(a).some(f => f === "-f" || f === "-F")) return true;
 		if (a === "--field" || a === "--input" || a === "--raw-field") return true;
 		if (a.startsWith("--field=") || a.startsWith("--input=") || a.startsWith("--raw-field=")) return true;
 		let value: string | undefined;
@@ -1426,7 +1429,9 @@ function ghApiWrites(args: readonly string[]): boolean {
 		else if (a.startsWith("--method=")) value = a.slice(9);
 		else if (a.startsWith("-X=")) value = a.slice(3);
 		else if (a.startsWith("-X") && a.length > 2) value = a.slice(2);
-		if (value !== undefined && /^(?:POST|PUT|PATCH|DELETE)$/iu.test(value.trim())) return true;
+		// A method flag means a write unless the value is a literal GET/HEAD;
+		// indeterminate values (`--method="$METHOD"`) fail closed.
+		if (value !== undefined && !/^(?:GET|HEAD)$/iu.test(value.trim())) return true;
 	}
 	return false;
 }

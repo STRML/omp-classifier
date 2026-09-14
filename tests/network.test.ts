@@ -429,6 +429,9 @@ describe("validated write-out format strings clear as reads on any host", () => 
 		"gh api -XPOST repos/o/r",
 		"curl -XPOST -o /dev/null https://x",
 		"gh api repos/o/r -fbody=secret",
+		// gh bundled shorts and indeterminate method values fail closed.
+		"gh api repos/o/r -ifbody=secret",
+		'gh api repos/o/r --method="$METHOD"',
 	]) {
 		test(`still outbound: ${command}`, () => {
 			expect(outbound(command)).toBe(true);
