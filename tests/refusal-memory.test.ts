@@ -1,7 +1,7 @@
 /**
  * Refusal memory across rewording (issue #30): a command this session refused
- * (UNSAFE / human denial / critical / cap / a PARSE_ERROR whose reply had
- * content) is remembered by
+ * (UNSAFE / human denial / critical / cap / a refusal-shaped PARSE_ERROR) is
+ * remembered by
  * normalized target, injected into the next classify record as priorRefusal,
  * and a SAFE that lands anyway on a refused target still prompts. A user
  * approval lifts the memory; the store holds 20 targets per session, oldest
@@ -13,7 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { normalizeRefusalTarget, refusalWorthRemembering } from "../index";
+import { normalizeRefusalTarget, parseJudgement, refusalWorthRemembering } from "../index";
 import type { DecisionRecord } from "../index";
 import {
 	selectCalls,
@@ -82,7 +82,7 @@ describe("normalizeRefusalTarget", () => {
 });
 
 describe("refusalWorthRemembering", () => {
-	test("UNSAFE always; PARSE_ERROR only when the reply said something", () => {
+	test("UNSAFE always; PARSE_ERROR only when refusal-shaped and verdict-free", () => {
 		expect(refusalWorthRemembering({ verdict: "UNSAFE", reason: "x" })).toBe(true);
 		expect(refusalWorthRemembering({ verdict: "SAFE", reason: "" })).toBe(false);
 		expect(refusalWorthRemembering({ verdict: "UNSURE", reason: "x" })).toBe(false);
@@ -90,6 +90,130 @@ describe("refusalWorthRemembering", () => {
 		expect(refusalWorthRemembering({ verdict: "PARSE_ERROR", reason: "not a verdict", rawReply: "" })).toBe(false);
 		expect(refusalWorthRemembering({ verdict: "PARSE_ERROR", reason: "not a verdict" })).toBe(false);
 		expect(refusalWorthRemembering({ verdict: "PARSE_ERROR", reason: "not a verdict", rawReply: "I cannot assist with that." })).toBe(true);
+	});
+
+	test("PARSE_ERROR carrying a VERDICT label is never remembered", () => {
+		// Measured 2026-09-11: inline-verdict analyses that read SAFE were
+		// recorded as refusals, poisoning targets ("const {") and forcing
+		// "despite prior refusal" dialogs on routine re-runs.
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "Writes nothing, deletes nothing. VERDICT: SAFE REASON: read-only.",
+		})).toBe(false);
+	});
+	test("a late VERDICT label beyond the 200-char rawReply window still blocks memory", () => {
+		// The field is decided on the full reply; the truncated window cannot
+		// re-admit a refusal-shaped reply whose label it never sees.
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I cannot assist with that.",
+			hasVerdictToken: true,
+		})).toBe(false);
+	});
+
+	test("a refusal that merely mentions the VERDICT format is remembered", () => {
+		// Suppression requires a verdict assertion (label + SAFE/UNSAFE/
+		// UNSURE), not the bare word: a refusal talking about the format is
+		// refusal-shaped and keeps prior-refusal protection.
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I cannot assist. The VERDICT format is required, but I will not provide one.",
+			hasVerdictToken: false,
+		})).toBe(true);
+	});
+	test("a quoted format spec is not a verdict assertion", () => {
+		// The assertion rule rejects the spec echo (a second alternative
+		// follows the first), so this refusal keeps prior-refusal protection.
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I cannot assist. Required format: VERDICT: SAFE|UNSAFE|UNSURE",
+		})).toBe(true);
+	});
+	test("refusal language beyond the 200-char window is remembered", () => {
+		const j = parseJudgement(`${"The command reads repository files and prints statistics. ".repeat(8)}I cannot assist with that.`);
+		expect(j.refusalShaped).toBe(true);
+		expect(refusalWorthRemembering(j)).toBe(true);
+	});
+	test("word-joined format alternatives are not a verdict assertion", () => {
+		// Codex round 4: "SAFE or UNSAFE or UNSURE" is the spec in prose.
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I cannot decide. Required format: VERDICT: SAFE or UNSAFE or UNSURE.",
+		})).toBe(true);
+	});
+	test("analysis prose with unable-to is not a refusal", () => {
+		// Refusal language needs a first-person subject: "the command is
+		// unable to connect" is an analysis statement, not a refusal.
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "The command is unable to connect.",
+		})).toBe(false);
+	});
+	test("a terminal spec echo through the production path is remembered", () => {
+		// Codex round 6: the production parseJudgement sets hasVerdictToken
+		// from the terminal boundary — but a spec echo is the format, not a
+		// decision, so suppression must not fire and the refusal is kept.
+		const j = parseJudgement("I cannot assist. VERDICT: SAFE|UNSAFE|UNSURE");
+		expect(j.verdict).toBe("PARSE_ERROR");
+		expect(j.hasVerdictToken).toBe(false);
+		expect(refusalWorthRemembering(j)).toBe(true);
+	});
+	test("gerund refusal forms are refusal-shaped", () => {
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I am refusing to assist.",
+		})).toBe(true);
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I am declining to assist.",
+		})).toBe(true);
+	});
+	test("subjectless cannot is analysis prose, not a refusal", () => {
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "This command cannot modify files.",
+		})).toBe(false);
+	});
+	test("decline language is refusal-shaped", () => {
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I must decline to assist.",
+		})).toBe(true);
+	});
+	test("a verdict followed by trailing reply text is not remembered", () => {
+		// The reply did assert a verdict (even though trailing text voids it
+		// as a decision), so it is not refusal-shaped and must not enter the
+		// refusal store.
+		const j = parseJudgement("VERDICT: SAFE\nI cannot assist.");
+		expect(j.verdict).toBe("PARSE_ERROR");
+		expect(refusalWorthRemembering(j)).toBe(false);
+	});
+	test("first-person refusal forms are refusal-shaped", () => {
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I decline this request.",
+		})).toBe(true);
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "I must refuse.",
+		})).toBe(true);
+		expect(refusalWorthRemembering({
+			verdict: "PARSE_ERROR",
+			reason: "classifier reply had no VERDICT line",
+			rawReply: "We will refuse.",
+		})).toBe(true);
 	});
 });
 

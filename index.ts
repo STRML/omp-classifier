@@ -87,8 +87,24 @@ interface Judgement {
 	noCache?: boolean;
 	/** First 200 chars of the raw model reply, for diagnostics on PARSE_ERROR. */
 	rawReply?: string;
+	/** The FULL reply contained a VERDICT token, decided before the 200-char
+	 *  rawReply truncation so refusal memory cannot miss a late label. */
+	hasVerdictToken?: boolean;
+	/** The FULL reply carried refusal language; decided alongside
+	 *  hasVerdictToken so the rawReply window cannot hide either. */
+	refusalShaped?: boolean;
 }
 
+/** The prompt's format spec echoed back — two verdict words separated only
+ *  by list separators ("SAFE|UNSAFE", "safe, unsafe", a bare newline) or the
+ *  word "or" — is a template, never a decision. Case-insensitive on purpose:
+ *  "verdict: safe|unsafe|unsure" is the same echo in lowercase. Prose that
+ *  merely mentions a verdict word near the decision ("SAFE — no unsafe
+ *  effects") keeps other words between them and does not match. */
+const TEMPLATE_ECHO_RE = /\b(?:safe|unsafe|unsure)\b(?:[\s|/,]+|\s*or\s*)+(?:safe|unsafe|unsure)\b/iu;
+/** Refusal language. parseJudgement decides this on the FULL reply. */
+const REFUSAL_SHAPED_RE =
+	/\b(?:i|we)\s+(?:(?:must|will|would|have to|am going to)\s+)?(?:refuse|refusing|decline|declining|declined? to|cannot|can't|won't|will not|am unable|are unable|am refusing|am declining)\b/iu;
 /** Per-session cache: sessionId -> `${cwd}\0${env}\0${pty}\0${command}` -> judgement. */
 const cache = new Map<string, Map<string, Judgement>>();
 // Effective-config signature of the last gate run. The classifier config
@@ -1090,6 +1106,11 @@ as its own line. A reply with analysis but no VERDICT line is a format failure.`
 export function parseJudgement(reply: string): Judgement {
 	const collapsed = reply.replace(/\s+/gu, " ").trim();
 	const lines = reply.split(/\r?\n/u);
+	// The prompt's format spec echoed anywhere in the reply — two verdict
+	// words within a few characters, any case ("SAFE|UNSAFE", "safe or
+	// unsure") — is a template, never a decision. One rule for every parse
+	// path: an echoing reply yields no verdict at all.
+	const echoReply = TEMPLATE_ECHO_RE.test(reply);
 	// Legacy shape first: the reply OPENS with the verdict token. Strip leading
 	// FORMATTING characters only (markdown emphasis, bullets, quotes, spaces):
 	// `**SAFE**` is a verdict, not an evasion. Anything that keeps a
@@ -1102,10 +1123,33 @@ export function parseJudgement(reply: string): Judgement {
 		.replace(/^[^\w\r\n]+/u, "")
 		.replace(/^VERDICT\b[:| \t-]*/iu, "");
 	const legacy = /^(SAFE|UNSAFE|UNSURE)\b[\s|:.,-]*(.*)$/iu.exec(stripped.trim());
-	if (legacy) {
+	if (legacy && !echoReply) {
+		// The verdict owns the reply: only an optional REASON line and blank
+		// lines may follow, so trailing text cannot ride a one-line verdict.
+		const rest = lines.slice(1);
+		const reasonNext = rest.length > 0 && /^REASON\b/iu.test(rest[0].trim());
+		const trailing = (reasonNext ? rest.slice(1) : rest).some(l => l.trim() !== "");
+		if (trailing) {
+			// The reply OPENED with a verdict token — a decision attempt at
+			// the strongest boundary — so this is a failed decision, not
+			// prose: refusal memory must not record it (issue #30).
+			return {
+				verdict: "PARSE_ERROR" as Verdict,
+				reason: "classifier reply had no VERDICT line",
+				hasVerdictToken: true,
+				refusalShaped: REFUSAL_SHAPED_RE.test(reply),
+				rawReply: truncated(collapsed, 200),
+			};
+		}
+		let reason = legacy[2].trim().replace(/\s+/gu, " ");
+		if (reason === "" && reasonNext) {
+			// `REASON:` on its own line under the one-line verdict.
+			const reasonLine = /^REASON\b[:| \t-]*(.+)$/iu.exec(rest[0].trim());
+			if (reasonLine) reason = reasonLine[1].trim().replace(/\s+/gu, " ");
+		}
 		return {
 			verdict: legacy[1].toUpperCase() as Verdict,
-			reason: truncated(legacy[2].trim().replace(/\s+/gu, " "), 160),
+			reason: truncated(reason, 160),
 			rawReply: truncated(collapsed, 200),
 		};
 	}
@@ -1120,6 +1164,17 @@ export function parseJudgement(reply: string): Judgement {
 		const line = lines[i].trim().replace(/^[^\w\r\n]+/u, "").replace(/[\s*`]+$/u, "");
 		const labeled = /^VERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b[\s|:.,-]*(.*)$/iu.exec(line);
 		if (!labeled) continue;
+		// The separator class eats "|", so the prompt's format spec
+		// ("VERDICT: SAFE|UNSAFE|UNSURE") leaves a second verdict word in the
+		// remainder: a template echo, never a decision.
+		if (echoReply) break;
+		// The verdict line owns the reply tail: only an optional REASON line
+		// and blank lines may follow, so unvalidated trailing text cannot
+		// ride a verdict past the post-parse checks.
+		const after = lines.slice(i + 1);
+		const reasonNext = after.length > 0 && /^REASON\b/iu.test(after[0].trim());
+		const trailing = (reasonNext ? after.slice(1) : after).some(l => l.trim() !== "");
+		if (trailing) continue;
 		let reason = labeled[2].trim()
 			// Same separator family the legacy shape allows, plus the em/en dashes
 			// models reach for when the REASON rides the verdict line.
@@ -1139,9 +1194,62 @@ export function parseJudgement(reply: string): Judgement {
 			rawReply: truncated(collapsed, 200),
 		};
 	}
+	// Terminal fallback: the same contract in one paragraph. Measured
+	// production shape (2026-09-11 logs: 61 spurious dialogs in one
+	// afternoon on judge zai/glm-5.3-flash): the analysis runs as a single
+	// sentence group and stage two lands as the paragraph's final sentences
+	// — "…no egress. VERDICT: SAFE REASON: read-only." — with no line break
+	// before the label, so the line scan above never sees it. The verdict
+	// must still own the tail of the reply: after the token, only the
+	// same-line reason, an optional REASON line, then whitespace. A
+	// mid-analysis mention followed by more reply text ("the verdict should
+	// be SAFE because…\n<writes>") still fails closed, and the legacy
+	// prose-prefixed anchors stay closed: the token must sit at reply start
+	// or directly after sentence punctuation/newline ("…reads. VERDICT:
+	// SAFE"), never after a bare word ("The VERDICT | SAFE" is prose, not a
+	// verdict echo). Only a labeled token at the reply's tail is stage two.
+	const VERDICT_TOKEN_RE = /\bVERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b/giu;
+	let lastToken: RegExpExecArray | undefined;
+	for (let m = VERDICT_TOKEN_RE.exec(reply); m; m = VERDICT_TOKEN_RE.exec(reply)) lastToken = m;
+	const boundaryOk =
+		lastToken !== undefined &&
+		/(?:^|[.!?;][ \t]*|\r?\n[ \t]*)$/u.test(reply.slice(0, lastToken.index));
+	let verdictToken = false;
+	if (lastToken !== undefined && boundaryOk) {
+		verdictToken = !TEMPLATE_ECHO_RE.test(reply.slice(lastToken.index));
+		const tail = reply.slice(lastToken.index);
+		const shaped =
+			/^VERDICT\b[:| \t-]*(SAFE|UNSAFE|UNSURE)\b([^\n]*?)(?:\n?[ \t]*REASON\b[^\n]*)?[\s*`]*$/iu.exec(tail);
+		if (shaped && !echoReply) {
+			let reason = shaped[2].trim()
+				.replace(/^[\s|:.,;\-*`–—]+/u, "")
+				.replace(/^REASON\b[:| \t-]*/iu, "")
+				.trim();
+			if (reason === "") {
+				const reasonLine = /\n?[ \t]*REASON\b[:| \t-]*([^\n]*)$/iu.exec(tail);
+				if (reasonLine) reason = reasonLine[1].trim();
+			}
+			return {
+				verdict: lastToken[1].toUpperCase() as Verdict,
+				reason: truncated(reason.replace(/\s+/gu, " "), 160),
+				analysis: truncated(reply.slice(0, lastToken.index).replace(/\s+/gu, " ").trim(), 2000),
+				rawReply: truncated(collapsed, 200),
+			};
+		}
+	}
 	return {
 		verdict: "PARSE_ERROR",
 		reason: "classifier reply had no VERDICT line",
+		// Decided on the FULL reply: rawReply is capped at 200 chars, and a
+		// long malformed reply can carry a late VERDICT label the window
+		// drops, which refusal memory must not misread as absence. A
+		// terminal, boundary-clean token the parser still rejected (extra
+		// tail text, or a spec echo) means the model tried to decide and
+		// failed: refusal memory must know. A spec echo is the format, not
+		// a decision — mentions are prose, and prose keeps refusal-memory
+		// protection.
+		hasVerdictToken: verdictToken,
+		refusalShaped: REFUSAL_SHAPED_RE.test(reply),
 		rawReply: truncated(collapsed, 200),
 	};
 }
@@ -1149,16 +1257,24 @@ export function parseJudgement(reply: string): Judgement {
 /**
  * Whether a non-SAFE verdict reflects the command's CONTENT and so belongs in
  * refusal memory (issue #30), whose premise is that a reworded payload
- * re-meets the session's prior judgment. An infrastructure PARSE_ERROR — the
- * outage path answers "(empty reply)" for a dead provider — judged nothing;
- * recording it made every later SAFE verdict prompt anyway ("classifier-safe
- * despite prior refusal") for the rest of the session.
+ * re-meets the session's prior judgment. Only UNSAFE and refusal-shaped
+ * PARSE_ERROR replies qualify. A PARSE_ERROR whose reply still carries a
+ * VERDICT label engaged the contract and failed only the format — measured
+ * 2026-09-11: those were inline-verdict analyses that read SAFE, and
+ * recording them as refusals poisoned memory with degenerate targets
+ * ("const {") that forced "despite prior refusal" dialogs on routine
+ * re-runs all session. Infrastructure replies ("(empty reply)", provider
+ * outages) judged nothing and are never remembered.
  */
 export function refusalWorthRemembering(judgement: Judgement): boolean {
 	if (judgement.verdict === "UNSAFE") return true;
 	if (judgement.verdict !== "PARSE_ERROR") return false;
 	const reply = (judgement.rawReply ?? "").trim();
-	return reply !== "" && reply !== "(empty reply)";
+	if (reply === "" || reply === "(empty reply)") return false;
+	// parseJudgement decides the token question on the full reply (see the
+	// field); hand-built judgements fall back to the truncated window.
+	if (judgement.hasVerdictToken ?? false) return false;
+	return judgement.refusalShaped ?? REFUSAL_SHAPED_RE.test(reply);
 }
 
 function truncated(value: string, max: number): string {
@@ -1262,6 +1378,21 @@ const NO_EGRESS_RE =
  * that can carry local data out, and stays outbound.
  */
 const GH_WRITE_MARKERS = /(?:^|\s)(?:-X|--method=?)\s*(?:POST|PUT|PATCH|DELETE)\b|(?:^|\s)-[fF]\s|(?:^|\s)--field(?:=|\s)|(?:^|\s)--input(?:=|\s)/iu;
+
+/** Write-out format strings can write local files (`%output{path}`, curl
+ *  8.3+), which is why `-w`/`--write-out` is absent from the read-only flag
+ *  table. A format string made only of literals and `%{simple_name}`
+ *  variables carries no such channel; this predicate admits exactly that.
+ *  Anything else — %output, %% escapes, unknown syntax — fails closed. */
+const WRITE_OUT_CLEAN_RE = /^(?:[^%@$`]|%\{[a-z0-9_]+\})*$/iu;
+/** Send-data flags: a request carrying one is not a read even when the
+ *  response lands in the null device — the body still hits the wire. The
+ *  null-device clearing branches stand down when one of these is present. */
+const SEND_DATA_FLAGS: Record<string, true> = {
+	"-d": true, "--data": true, "--data-raw": true, "--data-urlencode": true,
+	"--json": true, "-F": true, "--form": true, "--request": true, "-X": true,
+	"--method": true, "--body-data": true, "--post-file": true,
+};
 
 export function commandHasOutboundNetwork(command: string): boolean {
 	const normalized = command.replace(/\\\r?\n/gu, "");
@@ -1970,6 +2101,22 @@ function isPlainReadOnlyFetch(command: string): boolean {
 		const words = segments[0];
 		const verb = words[0].toLowerCase();
 		const args = words.slice(1);
+		// Send-data detection walks the SAME tokenized words the flag table
+		// walks (quoting solved there), membership by exact token: a regex
+		// over raw command text re-learns every quoting and spelling case
+		// the tokenizer already answers.
+		const sendsData = args.some((a, k) => {
+			const token = a.startsWith("--") ? a.split("=", 1)[0] : a;
+			// A method selector sends only when the method actually mutates:
+			// GET/HEAD selectors stay reads.
+			if (token === "-X" || token === "--request" || token === "--method") {
+				const value = a.includes("=") ? a.slice(a.indexOf("=") + 1) : (args[k + 1] ?? "");
+				return !/^(?:GET|HEAD)$/iu.test(value.trim());
+			}
+			if (SEND_DATA_FLAGS[token]) return true;
+			return a.startsWith("-") && !a.startsWith("--") && a.length > 2 &&
+				expandShortBundle(a).some(f => SEND_DATA_FLAGS[f] === true);
+		});
 
 		if (i === 0) {
 			// Basename, so `/usr/bin/curl -o ~/.bashrc` is still a curl.
@@ -1996,6 +2143,41 @@ function isPlainReadOnlyFetch(command: string): boolean {
 				// `O-` to the FIRST value-taking flag in the prefix, so `-oO-`
 				// is `-o O-` (a log file) and `-O` never applies. Honoring the
 				// bundle let `wget -PO-` clear while downloading to ./O-/.
+				// A null-device output target discards the fetched content: the
+				// fetch is still a read, so it clears egress exactly like stdout
+				// would, on any host. `/dev/null` only — a real path stays a
+				// write and fails closed at the allowlist below.
+				if (fetch === "curl" && (arg === "-o" || arg === "--output")) {
+					if (args[k + 1] !== "/dev/null") return false;
+					// A request that sends data or mutates is not a read even
+					// when the response lands in the null device.
+					if (sendsData) return false;
+					k++;
+					continue;
+				}
+				if (fetch === "curl" && (arg === "-w" || arg === "--write-out" || arg.startsWith("--write-out="))) {
+					const value = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : (args[k + 1] ?? "");
+					if (!WRITE_OUT_CLEAN_RE.test(value)) return false;
+					if (!arg.includes("=")) k++;
+					continue;
+				}
+				if (arg === "--output=/dev/null" && !sendsData) continue;
+				if (arg === "--output-document=/dev/null" && !sendsData) {
+					wgetStdout = true;
+					continue;
+				}
+				// A `-` value is stdout, handled by the branches below; leave it
+				// to them rather than rejecting it here.
+				if (
+					fetch === "wget" &&
+					(arg === "-O" || arg === "--output-document") &&
+					args[k + 1] === "/dev/null" &&
+					!sendsData
+				) {
+					wgetStdout = true;
+					k++;
+					continue;
+				}
 				if (fetch === "wget" && arg === "--spider") {
 					wgetStdout = true;
 					continue;
