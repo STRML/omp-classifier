@@ -1360,6 +1360,26 @@ function evidenceUserMessages(ctx: ExtensionContext): string[] | undefined {
 	return messages.length > 0 ? messages : undefined;
 }
 
+
+/**
+ * Short evidence fingerprint for the cache keys. A verdict is
+ * evidence-conditional — the record ships the newest user messages and the
+ * prompt grounds cited authorization in them — so evidence that differs AT
+ * ALL is a different decision input, and a key that ignored it let a cached
+ * SAFE outlive its authorization (or survive its revocation). FNV-1a over
+ * the JSON-encoded messages; collision risk on 32 bits is irrelevant next
+ * to the command text already in the key.
+ */
+function evidenceFingerprint(userMessages: readonly string[] | undefined): string {
+	if (!userMessages || userMessages.length === 0) return "";
+	let h = 0x811c9dc5;
+	for (const ch of JSON.stringify(userMessages)) {
+		h ^= ch.codePointAt(0) ?? 0;
+		h = Math.imul(h, 0x01000193);
+	}
+	return (h >>> 0).toString(36);
+}
+
 // --- egress consistency ----------------------------------------------------
 
 /**
@@ -1397,10 +1417,13 @@ function ghApiWrites(args: readonly string[]): boolean {
 	for (let k = 0; k < args.length; k++) {
 		const a = args[k];
 		if (a === "-f" || a === "-F") return true;
-		if (a === "--field" || a === "--input" || a.startsWith("--field=") || a.startsWith("--input=")) return true;
+		if (a.startsWith("-F") && a.length > 2) return true;
+		if (a === "--field" || a === "--input" || a === "--raw-field") return true;
+		if (a.startsWith("--field=") || a.startsWith("--input=") || a.startsWith("--raw-field=")) return true;
 		let value: string | undefined;
 		if (a === "-X" || a === "--method") value = args[k + 1];
 		else if (a.startsWith("--method=")) value = a.slice(9);
+		else if (a.startsWith("-X=")) value = a.slice(3);
 		else if (a.startsWith("-X") && a.length > 2) value = a.slice(2);
 		if (value !== undefined && /^(?:POST|PUT|PATCH|DELETE)$/iu.test(value.trim())) return true;
 	}
@@ -2351,6 +2374,14 @@ function splitOrFallbacks(command: string): string[] {
 		if (ch === "\\" && i + 1 < command.length) {
 			buffer += ch + command[i + 1];
 			i++;
+			continue;
+		}
+		if (ch === "#" && (buffer.length === 0 || /\s$/u.test(buffer))) {
+			// A word-initial `#` opens a comment: nothing after it executes,
+			// so a `||` in comment text must not split (`git status # || ssh`).
+			const end = command.indexOf("\n", i);
+			buffer += end === -1 ? command.slice(i) : command.slice(i, end);
+			i = end === -1 ? command.length : end;
 			continue;
 		}
 		if (ch === "|" && command[i + 1] === "|") {
@@ -3724,7 +3755,7 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
 			// The whole chain is the identity, not just the primary: a verdict
 			// earned under fallback A must not be reused under fallback B.
-			const cacheKey = JSON.stringify(["eval", chain.map(entry => entry.id), cwd, language, evalCode]);
+			const cacheKey = JSON.stringify(["eval", chain.map(entry => entry.id), cwd, language, evalCode, evidenceFingerprint(evidenceUserMessages(ctx))]);
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
 			// session off, so it must hold here too, not only for bash.
@@ -3952,6 +3983,7 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			const chain = classifierChain(ctx);
 			const cacheKey = JSON.stringify([
 				chain.map(entry => entry.id), cwd, env.key, pty, timeout, async, command,
+				evidenceFingerprint(evidenceUserMessages(ctx)),
 			]);
 			// Refusal memory (issue #30): a reworded command meets its session's
 			// prior refusal. The record tells the model; the SAFE branch below
@@ -4094,24 +4126,12 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			}
 
 			const cached = scoped.get(cacheKey);
-			// A cached verdict was validated under the evidence of its own
-			// turn. Evidence grows as the conversation does: a SAFE grounded
-			// in a user authorization must not outlive that authorization.
-			// Re-run the deterministic post-parse checks against the evidence
-			// as of NOW — no model call — and drop the entry when they
-			// downgrade, so the next call re-classifies under current
-			// evidence.
-			let revalidated = cached;
-			if (revalidated) {
-				const checked = applyPostParseChecks(revalidated, { command, cwd, userMessages: evidenceUserMessages(ctx) });
-				if (checked.verdict !== revalidated.verdict) {
-					scoped.delete(cacheKey);
-					revalidated = checked;
-				}
-			}
+			// Evidence is part of the key (evidenceFingerprint): a hit means
+			// the identical evidence window produced this verdict, so no
+			// hit-time revalidation is needed and dry-run stays read-only.
 			// Dry-run probe (issue #32): with nothing cached, the classifier model
 			// would run — report that instead of paying the call.
-			if (dryRun && !revalidated) {
+			if (dryRun && !cached) {
 				return dryRunStop({
 					would: "classify",
 					layer: "classifier",
@@ -4120,7 +4140,7 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 				});
 			}
 			let classifyError = "";
-			const judgement = revalidated ?? (await classify(ctx, command, cwd, chain, config.timeoutMs, recordExtras, operatorContext).catch((err: unknown) => {
+			const judgement = cached ?? (await classify(ctx, command, cwd, chain, config.timeoutMs, recordExtras, operatorContext).catch((err: unknown) => {
 				// Provider errors (quota exhausted, auth, HTTP failures) previously
 				// vanished into an opaque "unavailable". Keep the message so the
 				// permission dialog says WHY.

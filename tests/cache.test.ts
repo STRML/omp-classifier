@@ -142,12 +142,12 @@ describe("session boundaries drop only that session's entries", () => {
 	}
 });
 
-describe("cache hits revalidate against current evidence", () => {
+describe("cache keys include the evidence fingerprint", () => {
 	// The branch entry shape is the one collectUserEvidence reads (mirrors
 	// evidence-tiers.test.ts): `type: "message"` with a user role.
 	const userEntry = (content: string) => ({ type: "message", message: { role: "user", content } });
 
-	test("a cached SAFE grounded in user evidence is re-checked when the evidence moves", async () => {
+	test("moved evidence is a different key: the model re-judges", async () => {
 		setClassifierReply('The user said "please ship it". VERDICT: SAFE');
 		const ctx = makeCtx({
 			sessionId: "evidence-drift",
@@ -166,17 +166,18 @@ describe("cache hits revalidate against current evidence", () => {
 			branch: [userEntry("actually stop everything")],
 		});
 		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), drifted);
-		// Cache hit revalidated under the new evidence: the citation is gone,
-		// so the hit downgrades to a dialog WITHOUT a second model call.
-		expect(modelCalls.length).toBe(1);
+		// Different evidence, different key: the cached SAFE cannot answer,
+		// the model re-judges under the new evidence, and its SAFE loses the
+		// authorization it cites, so the dialog appears.
+		expect(modelCalls.length).toBe(2);
 		expect(selectCalls(drifted).length).toBe(1);
 
-		// The stale entry was dropped: the next call re-classifies.
+		// The downgraded verdict is not cached (noCache): it re-judges again.
 		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), drifted);
-		expect(modelCalls.length).toBe(2);
+		expect(modelCalls.length).toBe(3);
 	});
 
-	test("a cached SAFE whose evidence still holds stays cached", async () => {
+	test("identical evidence stays one cached decision", async () => {
 		setClassifierReply('The user said "please ship it". VERDICT: SAFE');
 		const branch = [userEntry("please ship it")];
 		const ctx = makeCtx({ sessionId: "evidence-stable", cwd: "/repo", hasUI: true, branch });
