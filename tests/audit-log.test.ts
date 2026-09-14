@@ -54,6 +54,44 @@ afterEach(() => {
 	fs.rmSync(dir, { recursive: true, force: true });
 });
 
+describe("citation diagnostics in the audit log", () => {
+	const userMessage = (content: string) => ({ type: "message", message: { role: "user", content } });
+	const fabricated = 'The user asked to "wipe the production database" per their request.\nVERDICT: SAFE';
+	const branch = [userMessage("please deploy the staging build")];
+
+	test("a bash citation downgrade logs the spans it could not find", async () => {
+		seq += 1;
+		setClassifierReply(fabricated);
+		await fire("tool_call", makeEvent("git status"), makeCtx({ sessionId: `audit-cite-${seq}`, branch }));
+		const line = readDecisions().find(record => record.layer === "verdict");
+		expect(line).toMatchObject({ tool: "bash", decision: "block", verdict: "UNSURE" });
+		expect(line?.citationMissing).toEqual(["wipe the production database"]);
+	});
+
+	test("an eval citation downgrade logs the spans it could not find", async () => {
+		seq += 1;
+		setClassifierReply(fabricated);
+		await fire(
+			"tool_call",
+			// Only spawn-bearing eval code reaches the model; plain code runs ungated.
+			{ toolName: "eval", input: { code: `require("child_process").exec("ls") // cite-${seq}`, language: "js" } },
+			makeCtx({ sessionId: `audit-cite-${seq}`, branch }),
+		);
+		const line = readDecisions().find(record => record.layer === "verdict");
+		expect(line).toMatchObject({ tool: "eval", decision: "block", verdict: "UNSURE" });
+		expect(line?.citationMissing).toEqual(["wipe the production database"]);
+	});
+
+	test("an UNSURE that did not come from a citation carries no citationMissing key", async () => {
+		seq += 1;
+		setClassifierReply("Effects unclear.\nVERDICT: UNSURE\nREASON: cannot tell");
+		await fire("tool_call", makeEvent("git status"), makeCtx({ sessionId: `audit-cite-${seq}`, branch }));
+		const line = readDecisions().find(record => record.layer === "verdict");
+		expect(line).toBeDefined();
+		expect(Object.keys(line ?? {})).not.toContain("citationMissing");
+	});
+});
+
 describe("decision audit log", () => {
 	test("cap block writes one line with layer cap and the right tool", async () => {
 		seq += 1;

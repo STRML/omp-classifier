@@ -85,6 +85,10 @@ interface Judgement {
 	analysis?: string;
 	/** Set by a post-parse consistency downgrade: dialog, never cached. */
 	noCache?: boolean;
+	/** Set by the citation downgrade: the quoted spans absent from every user
+	 *  message (at most MAX_LOGGED_CITATION_SPANS), so the audit line says what
+	 *  the model claimed the user wrote. */
+	citationMissing?: string[];
 	/** First 200 chars of the raw model reply, for diagnostics on PARSE_ERROR. */
 	rawReply?: string;
 	/** The FULL reply contained a VERDICT token, decided before the 200-char
@@ -678,6 +682,9 @@ export interface DecisionRecord {
 	ms: number;
 	/** Set when the plugin file changed on disk after this session loaded it. */
 	staleCode?: 0 | 1;
+	/** Set on a citation downgrade: the quoted spans the model attributed to the
+	 *  user that no evidence message contains. Absent on every other line. */
+	citationMissing?: string[];
 }
 
 type DecisionLogInput = Omit<DecisionRecord, "ts">;
@@ -1281,6 +1288,15 @@ function truncated(value: string, max: number): string {
 	return value.length > max ? `${value.slice(0, max)}…` : value;
 }
 
+/** Cap a long message by keeping its first and last max/2 chars. Briefs open
+ *  with context and close with instructions and permissions, so a head-only cut
+ *  dropped exactly the words a SAFE verdict cites. */
+function headAndTail(value: string, max: number): string {
+	if (value.length <= max) return value;
+	const head = Math.floor(max / 2);
+	return `${value.slice(0, head)}\n…\n${value.slice(value.length - (max - head))}`;
+}
+
 // ---------------------------------------------------------------------------
 // Post-parse contract checks (two-stage contract)
 //
@@ -1339,11 +1355,21 @@ function citedSpansNotInEvidence(text: string, userMessages: readonly string[], 
 	return missing;
 }
 
+/** Cap on citationMissing spans: enough to diagnose a false block, never a log dump. */
+const MAX_LOGGED_CITATION_SPANS = 3;
+
 export function checkCitation(judgement: Judgement, userMessages: readonly string[] | undefined, command = ""): Judgement {
 	if (judgement.verdict !== "SAFE" || !userMessages || userMessages.length === 0) return judgement;
 	const text = `${judgement.analysis ?? ""}\n${judgement.reason}`;
-	if (citedSpansNotInEvidence(text, userMessages, command).length === 0) return judgement;
-	return { ...judgement, verdict: "UNSURE", reason: "cited authorization not found in session evidence", noCache: true };
+	const missing = citedSpansNotInEvidence(text, userMessages, command);
+	if (missing.length === 0) return judgement;
+	return {
+		...judgement,
+		verdict: "UNSURE",
+		reason: "cited authorization not found in session evidence",
+		noCache: true,
+		citationMissing: missing.slice(0, MAX_LOGGED_CITATION_SPANS),
+	};
 }
 
 /**
@@ -1644,8 +1670,9 @@ function textOf(content: unknown): string {
  * #31): the user-tier evidence a classify record may carry. Pure over the
  * branch entry array so tests pass a fixture instead of a live session. Only
  * `type: "message"` entries with `role: "user"` count; each is textOf-
- * flattened and truncated per EVIDENCE_MESSAGE_MAX_CHARS. The window is the
- * tail: when the branch holds more user messages than `limit`, the newest win.
+ * flattened and capped per EVIDENCE_MESSAGE_MAX_CHARS by keeping its head and
+ * tail. The window is the tail: when the branch holds more user messages than
+ * `limit`, the newest win.
  */
 export function collectUserEvidence(
 	branch: ReadonlyArray<{ type: string; message?: { role?: string; content?: unknown } }>,
@@ -1656,7 +1683,7 @@ export function collectUserEvidence(
 		if (entry.type !== "message") continue;
 		const message = entry.message;
 		if (message?.role !== "user") continue;
-		messages.push(truncated(textOf(message.content), EVIDENCE_MESSAGE_MAX_CHARS));
+		messages.push(headAndTail(textOf(message.content), EVIDENCE_MESSAGE_MAX_CHARS));
 	}
 	return limit > 0 ? messages.slice(-limit) : [];
 }
@@ -3834,7 +3861,18 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 				}
 				// Two lines on purpose: the verdict itself, then requestPermission's
 				// dialog/headless outcome prefixed "follows verdict".
-				logDecision({ tool: "eval", decision: "block", layer: "verdict", why: `${detail}: ${judgement.reason}`, cmd: evalCode, cwd, verdict: judgement.verdict, cached: cached ? 1 : 0, ms: Date.now() - started });
+				logDecision({
+					tool: "eval",
+					decision: "block",
+					layer: "verdict",
+					why: `${detail}: ${judgement.reason}`,
+					cmd: evalCode,
+					cwd,
+					verdict: judgement.verdict,
+					cached: cached ? 1 : 0,
+					ms: Date.now() - started,
+					...(judgement.citationMissing ? { citationMissing: judgement.citationMissing } : {}),
+				});
 				// A refusal record (issue #30) needs a verdict that judged the
 				// content: UNSAFE always, PARSE_ERROR only when the reply said
 				// something. UNSURE is undecided; only a human denial makes it
@@ -4233,7 +4271,18 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 				// model-formatting problem; the dialog only shows the summary.
 				pi.logger.warn(`classifier: unparseable reply: ${judgement.rawReply ?? "(none)"}`);
 			}
-			logDecision({ tool: "bash", decision: "block", layer: "verdict", why: `${detail}: ${judgement.reason}`, cmd: command, cwd, verdict, cached: cached ? 1 : 0, ms: Date.now() - started });
+			logDecision({
+				tool: "bash",
+				decision: "block",
+				layer: "verdict",
+				why: `${detail}: ${judgement.reason}`,
+				cmd: command,
+				cwd,
+				verdict,
+				cached: cached ? 1 : 0,
+				ms: Date.now() - started,
+				...(judgement.citationMissing ? { citationMissing: judgement.citationMissing } : {}),
+			});
 			// A refusal record (issue #30) needs a verdict that judged the
 			// content: UNSAFE always, PARSE_ERROR only when the reply said
 			// something. UNSURE is undecided; only a human denial makes it

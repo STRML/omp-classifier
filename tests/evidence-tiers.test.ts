@@ -66,7 +66,7 @@ describe("default config", () => {
 });
 
 describe("evidenceUserMessages", () => {
-	test("keeps the newest two user messages, chronological, flattened, truncated", async () => {
+	test("keeps the newest two user messages, chronological, flattened, head and tail of a long one", async () => {
 		writeConfigFile({ evidenceUserMessages: 2 });
 		const long = "y".repeat(2_500);
 		const ctx = makeCtx({
@@ -83,7 +83,7 @@ describe("evidenceUserMessages", () => {
 		await fire("tool_call", makeEvent("git status"), ctx);
 		expect(modelCalls.length).toBe(1);
 		const evidence = evidenceOf();
-		expect(evidence.userMessages).toEqual(["alpha\nbeta", `${"y".repeat(2_000)}…`]);
+		expect(evidence.userMessages).toEqual(["alpha\nbeta", `${"y".repeat(1_000)}\n…\n${"y".repeat(1_000)}`]);
 	});
 });
 
@@ -165,6 +165,26 @@ describe("collectUserEvidence", () => {
 
 	test("limit above the message count keeps everything, oldest first", () => {
 		expect(collectUserEvidence(branch, 10)).toEqual(["one", "two", "three"]);
+	});
+
+	test("a message at the cap passes through unchanged", () => {
+		const exact = "z".repeat(2_000);
+		expect(collectUserEvidence([userEntry(exact)], 1)).toEqual([exact]);
+	});
+
+	test("a long message keeps its head and its tail, where briefs put permissions", () => {
+		const brief = `${"a".repeat(1_500)} ${"b".repeat(600)} clean up your own worktree and scratch`;
+		const [kept] = collectUserEvidence([userEntry(brief)], 1);
+		expect(kept.startsWith("a".repeat(1_000))).toBe(true);
+		expect(kept.endsWith("clean up your own worktree and scratch")).toBe(true);
+		expect(kept).toContain("\n…\n");
+		expect(kept.length).toBe(2_003);
+	});
+
+	test("the middle of a long message is dropped, so a quote across the cut stays unmatched", () => {
+		const brief = `${"a".repeat(990)} only the middle holds this ${"b".repeat(1_200)}`;
+		const [kept] = collectUserEvidence([userEntry(brief)], 1);
+		expect(kept).not.toContain("only the middle holds this");
 	});
 });
 

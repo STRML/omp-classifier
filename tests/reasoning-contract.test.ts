@@ -130,6 +130,22 @@ describe("checkCitation", () => {
 		expect(checkCitation(parseJudgement(reply), ["rebuild the project"]).verdict).toBe("SAFE");
 	});
 
+	test("a downgrade names the quoted spans it could not find", () => {
+		const j = checkCitation(parseJudgement(fabricated), messages);
+		expect(j.citationMissing).toEqual(["wipe the production database"]);
+	});
+
+	test("missing spans are capped at three", () => {
+		const reply = safeReply('The user asked for "alpha one", "bravo two", "charlie three" and "delta four".');
+		const j = checkCitation(parseJudgement(reply), messages);
+		expect(j.verdict).toBe("UNSURE");
+		expect(j.citationMissing).toEqual(["alpha one", "bravo two", "charlie three"]);
+	});
+
+	test("a grounded citation carries no citationMissing", () => {
+		expect(checkCitation(parseJudgement(cited), messages).citationMissing).toBeUndefined();
+	});
+
 	test("UNSAFE and UNSURE verdicts are never touched", () => {
 		const unsafe = parseJudgement('analysis\nVERDICT: UNSAFE\nREASON: deletes work');
 		expect(checkCitation(unsafe, ["anything"]).verdict).toBe("UNSAFE");
@@ -268,6 +284,16 @@ describe("live gate integration", () => {
 		setClassifierReply(safeReply('The user asked to "check the working tree status" before committing.'));
 		const branch = [{ type: "message", message: { role: "user", content: "check the working tree status" } }];
 		const ctx = makeCtx({ sessionId: "reasoning-cite-ok", branch });
+		const result = await fire("tool_call", makeEvent("git status"), ctx);
+		expect(result).toBeUndefined();
+		expect(selectCalls(ctx)).toHaveLength(0);
+	});
+
+	test("quoting words past the first 2000 chars of a long brief auto-runs", async () => {
+		const brief = `${"Review the PR at head. ".repeat(95)}Clean up your own worktree and scratch.`;
+		setClassifierReply(safeReply('The user said to "clean up your own worktree and scratch" in the brief.'));
+		const branch = [{ type: "message", message: { role: "user", content: brief } }];
+		const ctx = makeCtx({ sessionId: "reasoning-cite-tail", branch });
 		const result = await fire("tool_call", makeEvent("git status"), ctx);
 		expect(result).toBeUndefined();
 		expect(selectCalls(ctx)).toHaveLength(0);

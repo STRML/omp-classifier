@@ -2,6 +2,11 @@
 
 All notable changes, newest first. Issue and PR numbers reference STRML/omp-classifier.
 
+## 2026-09-14
+
+- Citation downgrades now record what they could not find. `checkCitation` returns the quoted spans that no user message contains as `Judgement.citationMissing` (at most 3), and the bash and eval verdict lines in decisions.jsonl carry them as a trailing optional `citationMissing` field. The 119 verdict-layer "cited authorization not found in session evidence" blocks logged from 2026-09-10 to 2026-09-14 recorded no span, so none of them could be diagnosed after the fact.
+- `evidence.userMessages` keeps the head and tail of a long message: the first and last 1,000 chars joined by `\n…\n`, where it used to keep the first 2,000. A 2,310-char headless review brief carried its only scratch-work permission ("Clean up your own worktree and scratch") past char 2,000, the cut dropped it, and that session's `/tmp` write was blocked with the citation reason. A quote that spans the dropped middle still fails the check, as before. The evidence fingerprint in cache keys changes for messages over 2,000 chars, so those verdicts miss the cache once. No eval gate ran: the prompt text is unchanged.
+
 ## 2026-09-11
 
 - `parseJudgement` accepts a terminal inline verdict. Measured production shape on judge `zai/glm-5.3-flash` (61 spurious blocks in one afternoon's decision window): the two-stage reply arrives as a single paragraph with stage two as its final sentences — "…no egress. VERDICT: SAFE REASON: read-only." — and no line break before the label, so the line-anchored scan saw a PARSE_ERROR and threw away a decisive verdict. The fallback takes the LAST labeled token and requires it to own the reply's tail (same-line reason, optional `REASON:` line, then whitespace) and to sit at reply start or directly after sentence punctuation/newline — "The VERDICT | SAFE" and mid-analysis mentions followed by more text still fail closed. Analysis is captured for the post-parse checks as the text before the token.
