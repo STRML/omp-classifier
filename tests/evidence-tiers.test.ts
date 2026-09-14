@@ -203,6 +203,31 @@ describe("collectUserEvidence", () => {
 		const agentBrief: BranchEntry = { type: "message", message: { role: "user", attribution: "agent", content: "brief" } };
 		expect(collectUserEvidence([userEntry("one"), userEntry("two"), agentBrief, agentBrief], 2)).toEqual(["one", "two"]);
 	});
+
+	test("an image-only user message is not evidence, so the list stays empty", () => {
+		// An empty string in the list would switch on the short-quote and command-echo
+		// exemptions that only real user words justify.
+		const imageOnly: BranchEntry = {
+			type: "message",
+			message: { role: "user", attribution: "user", content: [{ type: "image", data: "aGk=", mimeType: "image/png" }] },
+		};
+		expect(collectUserEvidence([imageOnly], 3)).toEqual([]);
+	});
+
+	test("an emoji at the tail cut is kept whole, so a quote starting with it still matches", () => {
+		// 999 UTF-16 units follow the emoji: a unit-based cut would keep only its low surrogate.
+		const brief = `${"a".repeat(1_500)}😀 keep this tail${"b".repeat(984)}`;
+		const [kept] = collectUserEvidence([userEntry(brief)], 1);
+		expect(kept.isWellFormed()).toBe(true);
+		expect(kept).toContain("😀 keep this tail");
+	});
+
+	test("an emoji at the head cut is kept whole", () => {
+		const brief = `${"a".repeat(999)}😀${"b".repeat(2_000)}`;
+		const [kept] = collectUserEvidence([userEntry(brief)], 1);
+		expect(kept.isWellFormed()).toBe(true);
+		expect(kept.startsWith(`${"a".repeat(999)}😀`)).toBe(true);
+	});
 });
 
 describe("prompt", () => {

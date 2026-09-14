@@ -259,6 +259,22 @@ describe("/classifier dry-run", () => {
 		expect(report).toMatchObject({ would: "allow", layer: "granted", why: "session grant" });
 	});
 
+	test("a SAFE cached with evidence off is not followed once evidence is on and empty", async () => {
+		// A live call clears the cache on a config change and a dry-run probe does not, so
+		// the key itself must tell "evidence off" from "on, but no user wrote anything".
+		// Otherwise the probe reports a cited SAFE the citation check would now downgrade.
+		writeConfigFile({ evidenceUserMessages: 0 });
+		setClassifierReply('The user said "yes". VERDICT: SAFE');
+		const sid = nextSession();
+		const command = `echo evidence-flip-${sid}`;
+		await fire("tool_call", makeEvent(command), makeCtx({ sessionId: sid }));
+		expect(buildStatusReport().cacheSizes[sid]).toBe(1);
+
+		writeConfigFile({ evidenceUserMessages: 3 });
+		const report = await dryRunReport(command, sid);
+		expect(report).toMatchObject({ would: "classify", layer: "classifier" });
+	});
+
 	test("a cached verdict is followed without a model call, mutating nothing", async () => {
 		setClassifierReply("SAFE");
 		const sid = nextSession();

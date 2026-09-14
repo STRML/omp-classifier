@@ -1295,20 +1295,28 @@ const EVIDENCE_ELISION = "\n…\n";
 /** Cap a long message by keeping its first and last max/2 chars. A user often
  *  states the actual instruction last, and a head-only cut dropped it. */
 function headAndTail(value: string, max: number): string {
-	if (value.length <= max) return value;
+	// Count and cut by code point, so an emoji at either cut is kept whole instead of
+	// leaving a lone surrogate that no quote can match.
+	const points = Array.from(value);
+	if (points.length <= max) return value;
 	const head = Math.floor(max / 2);
-	return `${value.slice(0, head)}${EVIDENCE_ELISION}${value.slice(value.length - (max - head))}`;
+	return `${points.slice(0, head).join("")}${EVIDENCE_ELISION}${points.slice(points.length - (max - head)).join("")}`;
 }
 
+const EVIDENCE_ELISION_POINTS = Array.from(EVIDENCE_ELISION).length;
+
 /** Undo headAndTail for matching: the kept head and tail of a capped message, or the
- *  whole message. A capped message is recognized by its exact shape (cap plus marker
- *  length, marker at the cut), never by searching for the marker, so a short message
- *  the user typed with that text in it is not split. */
+ *  whole message. A capped message is recognized by its exact shape (cap plus marker,
+ *  in code points, with the marker at the cut), never by searching for the marker. An
+ *  uncapped message is at most the cap, so it can never have that shape, and a short
+ *  message the user typed with the marker text in it is not split. */
 function evidenceParts(message: string): string[] {
+	const points = Array.from(message);
 	const head = Math.floor(EVIDENCE_MESSAGE_MAX_CHARS / 2);
 	const capped =
-		message.length === EVIDENCE_MESSAGE_MAX_CHARS + EVIDENCE_ELISION.length && message.startsWith(EVIDENCE_ELISION, head);
-	return capped ? [message.slice(0, head), message.slice(head + EVIDENCE_ELISION.length)] : [message];
+		points.length === EVIDENCE_MESSAGE_MAX_CHARS + EVIDENCE_ELISION_POINTS &&
+		points.slice(head, head + EVIDENCE_ELISION_POINTS).join("") === EVIDENCE_ELISION;
+	return capped ? [points.slice(0, head).join(""), points.slice(head + EVIDENCE_ELISION_POINTS).join("")] : [message];
 }
 
 // ---------------------------------------------------------------------------
@@ -1415,6 +1423,13 @@ function evidenceUserMessages(ctx: ExtensionContext): string[] | undefined {
 	return messages.length > 0 ? messages : undefined;
 }
 
+/** The evidence checkCitation runs against: the collected user messages, an empty
+ *  list when evidence is on but no user wrote anything, undefined when it is off.
+ *  Cache keys hash this, so a verdict never survives a change in citation semantics. */
+function citableEvidence(userMessages: string[] | undefined): string[] | undefined {
+	return userMessages ?? (readClassifierConfig().evidenceUserMessages > 0 ? [] : undefined);
+}
+
 /**
  * Fingerprint of every decision input that is not already in the cache key:
  * the evidence user messages AND the agent-authored operatorContext — both
@@ -1425,7 +1440,9 @@ function evidenceUserMessages(ctx: ExtensionContext): string[] | undefined {
  * command text in the same key does the rest.
  */
 function evidenceFingerprint(userMessages: readonly string[] | undefined, operatorContext?: string): string {
-	const material = JSON.stringify([userMessages ?? [], operatorContext ?? ""]);
+	// null (evidence off) and [] (on, but no user wrote anything) must hash apart: the
+	// citation check skips the first and downgrades against the second.
+	const material = JSON.stringify([userMessages ?? null, operatorContext ?? ""]);
 	let h1 = 0x811c9dc5;
 	let h2 = 0x01000193;
 	for (const ch of material) {
@@ -1716,7 +1733,11 @@ export function collectUserEvidence(
 		if (entry.type !== "message") continue;
 		const message = entry.message;
 		if (message?.role !== "user" || message.attribution !== "user") continue;
-		messages.push(headAndTail(textOf(message.content), EVIDENCE_MESSAGE_MAX_CHARS));
+		const text = textOf(message.content);
+		// An image-only message has no words to quote. Counting it would make the list
+		// non-empty and switch on the citation exemptions meant for real user text.
+		if (text.trim() === "") continue;
+		messages.push(headAndTail(text, EVIDENCE_MESSAGE_MAX_CHARS));
 	}
 	return limit > 0 ? messages.slice(-limit) : [];
 }
@@ -3359,7 +3380,7 @@ export default function (pi: ExtensionAPI) {
 			// An empty list, not undefined, when evidence is on but the session holds no
 			// user-written message: checkCitation then refuses quoted "user" words instead of
 			// skipping the check. The record itself keeps omitting the field.
-			const citableUserMessages = evidence.userMessages ?? (readClassifierConfig().evidenceUserMessages > 0 ? [] : undefined);
+			const citableUserMessages = citableEvidence(evidence.userMessages);
 			return applyPostParseChecks(parsed, { command, cwd, userMessages: citableUserMessages });
 		}
 		// Chain exhausted. The all-empty case keeps the legacy reason prefix
@@ -3833,7 +3854,7 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
 			// The whole chain is the identity, not just the primary: a verdict
 			// earned under fallback A must not be reused under fallback B.
-			const cacheKey = JSON.stringify(["eval", chain.map(entry => entry.id), cwd, language, evalCode, evidenceFingerprint(evidenceUserMessages(ctx), operatorContext)]);
+			const cacheKey = JSON.stringify(["eval", chain.map(entry => entry.id), cwd, language, evalCode, evidenceFingerprint(citableEvidence(evidenceUserMessages(ctx)), operatorContext)]);
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
 			// session off, so it must hold here too, not only for bash.
@@ -4072,7 +4093,7 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			const chain = classifierChain(ctx);
 			const cacheKey = JSON.stringify([
 				chain.map(entry => entry.id), cwd, env.key, pty, timeout, async, command,
-				evidenceFingerprint(evidenceUserMessages(ctx), operatorContext),
+				evidenceFingerprint(citableEvidence(evidenceUserMessages(ctx)), operatorContext),
 			]);
 			// Refusal memory (issue #30): a reworded command meets its session's
 			// prior refusal. The record tells the model; the SAFE branch below
