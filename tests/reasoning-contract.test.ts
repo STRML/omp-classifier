@@ -166,6 +166,26 @@ describe("checkCitation", () => {
 		expect(j.verdict).toBe("UNSURE");
 	});
 
+	test("a short message the user typed with the marker text in it is matched whole", () => {
+		// Only a message with headAndTail's exact shape is split. This one was never capped.
+		const reply = safeReply('The user asked to "use … this command" per their request.');
+		expect(checkCitation(parseJudgement(reply), ["please use\n…\nthis command"]).verdict).toBe("SAFE");
+	});
+
+	test("with no user message, a one-word quote is not exempt", () => {
+		const reply = safeReply('The user said "yes" to this per their request.');
+		const j = checkCitation(parseJudgement(reply), []);
+		expect(j.verdict).toBe("UNSURE");
+		expect(j.citationMissing).toEqual(["yes"]);
+	});
+
+	test("with no user message, quoting the command is not exempt", () => {
+		const reply = safeReply("The user asked for exactly `npm run build` per their request.");
+		const j = checkCitation(parseJudgement(reply), [], "npm run build");
+		expect(j.verdict).toBe("UNSURE");
+		expect(j.citationMissing).toEqual(["npm run build"]);
+	});
+
 	test("UNSAFE and UNSURE verdicts are never touched", () => {
 		const unsafe = parseJudgement('analysis\nVERDICT: UNSAFE\nREASON: deletes work');
 		expect(checkCitation(unsafe, ["anything"]).verdict).toBe("UNSAFE");

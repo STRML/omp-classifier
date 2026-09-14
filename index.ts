@@ -1300,6 +1300,17 @@ function headAndTail(value: string, max: number): string {
 	return `${value.slice(0, head)}${EVIDENCE_ELISION}${value.slice(value.length - (max - head))}`;
 }
 
+/** Undo headAndTail for matching: the kept head and tail of a capped message, or the
+ *  whole message. A capped message is recognized by its exact shape (cap plus marker
+ *  length, marker at the cut), never by searching for the marker, so a short message
+ *  the user typed with that text in it is not split. */
+function evidenceParts(message: string): string[] {
+	const head = Math.floor(EVIDENCE_MESSAGE_MAX_CHARS / 2);
+	const capped =
+		message.length === EVIDENCE_MESSAGE_MAX_CHARS + EVIDENCE_ELISION.length && message.startsWith(EVIDENCE_ELISION, head);
+	return capped ? [message.slice(0, head), message.slice(head + EVIDENCE_ELISION.length)] : [message];
+}
+
 // ---------------------------------------------------------------------------
 // Post-parse contract checks (two-stage contract)
 //
@@ -1341,20 +1352,25 @@ const QUOTE_SPAN_RE = /"([^"]{2,200})"|"([^"]{2,200})"|“([^”]{2,200})”|‘
 /** Sentences are the citation scope: a quote far from the claim is not a citation. */
 function citedSpansNotInEvidence(text: string, userMessages: readonly string[], command: string): string[] {
 	const commandNorm = normalizeCitationText(command);
+	// With no user-written message in the session, nothing quoted can be the user's words.
+	// The two exemptions below only keep noise down against real evidence, so they apply
+	// only when some exists.
+	const userWroteSomething = userMessages.length > 0;
 	const missing: string[] = [];
 	for (const sentence of text.split(/(?:[.!?]|\n)+/u)) {
 		if (!CITATION_RE.test(sentence)) continue;
 		for (const match of sentence.matchAll(QUOTE_SPAN_RE)) {
 			const span = (match[1] ?? match[2] ?? match[3] ?? match[4] ?? match[5] ?? "").trim();
 			const normalized = normalizeCitationText(span).replace(/[.!?,:;]+$/u, "");
+			if (normalized === "") continue;
 			// Too short to verify without noise, or an echo of the command text
 			// (the model quoting the command, not the user): neither cites the
 			// user, so neither fires.
-			if (normalized.split(" ").length < 2 || commandNorm.includes(normalized)) continue;
+			if (userWroteSomething && (normalized.split(" ").length < 2 || commandNorm.includes(normalized))) continue;
 			// Match inside the kept head or tail of each message, never across the elision:
 			// normalization turns the marker into " … ", which a quote could otherwise span.
 			const found = userMessages.some(message =>
-				message.split(EVIDENCE_ELISION).some(part => normalizeCitationText(part).includes(normalized)),
+				evidenceParts(message).some(part => normalizeCitationText(part).includes(normalized)),
 			);
 			if (!found) {
 				missing.push(span);
