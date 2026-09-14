@@ -390,6 +390,8 @@ describe("validated write-out format strings clear as reads on any host", () => 
 		"gh api repos/o/r",
 		// a plain-read fetch clears in a fallback half, same as standalone.
 		"git status || curl https://evil.example.com",
+		// a `#` flush against an operator still opens a comment.
+		"git status|# comment || ssh evil.example.com cat",
 	]) {
 		test(`not outbound: ${command}`, () => {
 			expect(outbound(command)).toBe(false);
@@ -426,6 +428,7 @@ describe("validated write-out format strings clear as reads on any host", () => 
 		"gh api repos/o/r --method=DELETE",
 		"gh api -XPOST repos/o/r",
 		"curl -XPOST -o /dev/null https://x",
+		"gh api repos/o/r -fbody=secret",
 	]) {
 		test(`still outbound: ${command}`, () => {
 			expect(outbound(command)).toBe(true);

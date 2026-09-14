@@ -1360,24 +1360,25 @@ function evidenceUserMessages(ctx: ExtensionContext): string[] | undefined {
 	return messages.length > 0 ? messages : undefined;
 }
 
-
 /**
- * Short evidence fingerprint for the cache keys. A verdict is
- * evidence-conditional — the record ships the newest user messages and the
- * prompt grounds cited authorization in them — so evidence that differs AT
- * ALL is a different decision input, and a key that ignored it let a cached
- * SAFE outlive its authorization (or survive its revocation). FNV-1a over
- * the JSON-encoded messages; collision risk on 32 bits is irrelevant next
- * to the command text already in the key.
+ * Fingerprint of every decision input that is not already in the cache key:
+ * the evidence user messages AND the agent-authored operatorContext — both
+ * ride in the classifier record, so both are decision-conditional. A verdict
+ * is evidence-conditional, and a key that ignored an input let a cached SAFE
+ * outlive its authorization (or survive its revocation). Two independently
+ * mixed 32-bit lanes (FNV-1a and a multiplicative sum) give 64 bits; the
+ * command text in the same key does the rest.
  */
-function evidenceFingerprint(userMessages: readonly string[] | undefined): string {
-	if (!userMessages || userMessages.length === 0) return "";
-	let h = 0x811c9dc5;
-	for (const ch of JSON.stringify(userMessages)) {
-		h ^= ch.codePointAt(0) ?? 0;
-		h = Math.imul(h, 0x01000193);
+function evidenceFingerprint(userMessages: readonly string[] | undefined, operatorContext?: string): string {
+	const material = JSON.stringify([userMessages ?? [], operatorContext ?? ""]);
+	let h1 = 0x811c9dc5;
+	let h2 = 0x01000193;
+	for (const ch of material) {
+		const c = ch.codePointAt(0) ?? 0;
+		h1 = Math.imul(h1 ^ c, 0x01000193);
+		h2 = Math.imul(h2 + c, 0x85ebca6b);
 	}
-	return (h >>> 0).toString(36);
+	return `${(h1 >>> 0).toString(36)}${(h2 >>> 0).toString(36)}`;
 }
 
 // --- egress consistency ----------------------------------------------------
@@ -1417,7 +1418,7 @@ function ghApiWrites(args: readonly string[]): boolean {
 	for (let k = 0; k < args.length; k++) {
 		const a = args[k];
 		if (a === "-f" || a === "-F") return true;
-		if (a.startsWith("-F") && a.length > 2) return true;
+		if ((a.startsWith("-f") || a.startsWith("-F")) && a.length > 2) return true;
 		if (a === "--field" || a === "--input" || a === "--raw-field") return true;
 		if (a.startsWith("--field=") || a.startsWith("--input=") || a.startsWith("--raw-field=")) return true;
 		let value: string | undefined;
@@ -2376,7 +2377,7 @@ function splitOrFallbacks(command: string): string[] {
 			i++;
 			continue;
 		}
-		if (ch === "#" && (buffer.length === 0 || /\s$/u.test(buffer))) {
+		if (ch === "#" && (buffer.length === 0 || /\s$/u.test(buffer) || /[|&;()<>]$/u.test(buffer))) {
 			// A word-initial `#` opens a comment: nothing after it executes,
 			// so a `||` in comment text must not split (`git status # || ssh`).
 			const end = command.indexOf("\n", i);
@@ -3755,7 +3756,7 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
 			// The whole chain is the identity, not just the primary: a verdict
 			// earned under fallback A must not be reused under fallback B.
-			const cacheKey = JSON.stringify(["eval", chain.map(entry => entry.id), cwd, language, evalCode, evidenceFingerprint(evidenceUserMessages(ctx))]);
+			const cacheKey = JSON.stringify(["eval", chain.map(entry => entry.id), cwd, language, evalCode, evidenceFingerprint(evidenceUserMessages(ctx), operatorContext)]);
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
 			// session off, so it must hold here too, not only for bash.
@@ -3983,7 +3984,7 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			const chain = classifierChain(ctx);
 			const cacheKey = JSON.stringify([
 				chain.map(entry => entry.id), cwd, env.key, pty, timeout, async, command,
-				evidenceFingerprint(evidenceUserMessages(ctx)),
+				evidenceFingerprint(evidenceUserMessages(ctx), operatorContext),
 			]);
 			// Refusal memory (issue #30): a reworded command meets its session's
 			// prior refusal. The record tells the model; the SAFE branch below
