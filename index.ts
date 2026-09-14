@@ -1421,7 +1421,7 @@ function ghApiWrites(args: readonly string[]): boolean {
 		if ((a.startsWith("-f") || a.startsWith("-F")) && a.length > 2) return true;
 		// Bundled shorts carry the write flag inside (`-ifbody=secret`).
 		if (a.startsWith("-") && !a.startsWith("--") && a.length > 2 &&
-			expandShortBundle(a).some(f => f === "-f" || f === "-F")) return true;
+			expandShortBundle(a).some(f => f === "-f" || f === "-F" || f === "-X")) return true;
 		if (a === "--field" || a === "--input" || a === "--raw-field") return true;
 		if (a.startsWith("--field=") || a.startsWith("--input=") || a.startsWith("--raw-field=")) return true;
 		let value: string | undefined;
@@ -2321,6 +2321,14 @@ function splitTopLevelCommands(command: string): string[] {
 		if (ch === "\\" && i + 1 < command.length) {
 			buffer += ch + command[i + 1];
 			i++;
+			continue;
+		}
+		if (ch === "#" && (buffer.length === 0 || /\s$/u.test(buffer) || /[|&;()<>]$/u.test(buffer))) {
+			// A comment runs to end of line: `;`/`&`/`||` inside it are text,
+			// not operators (`git status # && ssh host cat` is one command).
+			const end = command.indexOf("\n", i);
+			buffer += end === -1 ? command.slice(i) : command.slice(i, end);
+			i = end === -1 ? command.length : end;
 			continue;
 		}
 		if (ch === ";") {
