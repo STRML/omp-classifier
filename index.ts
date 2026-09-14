@@ -1346,6 +1346,20 @@ export function checkCitation(judgement: Judgement, userMessages: readonly strin
 	return { ...judgement, verdict: "UNSURE", reason: "cited authorization not found in session evidence", noCache: true };
 }
 
+/**
+ * evidence.userMessages exactly as the record carries them: the newest N
+ * user messages (issue #31), absent entirely when the limit is 0 or there
+ * is nothing to send. classify builds its record from this; the cache-hit
+ * path re-reads it so a stored verdict is re-validated against the
+ * evidence of now, not of the turn that produced it.
+ */
+function evidenceUserMessages(ctx: ExtensionContext): string[] | undefined {
+	const limit = readClassifierConfig().evidenceUserMessages;
+	if (limit <= 0) return undefined;
+	const messages = collectUserEvidence(ctx.sessionManager.getBranch(), limit);
+	return messages.length > 0 ? messages : undefined;
+}
+
 // --- egress consistency ----------------------------------------------------
 
 /**
@@ -1353,7 +1367,7 @@ export function checkCitation(judgement: Judgement, userMessages: readonly strin
  * Deliberately narrow: git is excluded even though push/pull touch the
  * network, because the prompt carves plain push out as routine and this check
  * must not become a new over-flag family on it. gh is outbound only when it
- * carries an explicit hosted-API write marker (GH_WRITE_MARKERS); a read or
+ * carries an explicit hosted-API write marker (ghApiWrites); a read or
  * carved workflow write clears like a fetched read.
  */
 const NETWORK_VERBS: Record<string, true> = {
@@ -1371,13 +1385,27 @@ const NO_EGRESS_RE =
 	/\bno\s+(?:network|egress|outbound|internet)\s*(?:access|activity|traffic|connections?|calls?|requests?|communication|I\/?O)?\b|\bno\s+(?:remote|external)\s+(?:access|connections?|calls?|requests?|communication|I\/?O)\b|\b(?:does\s+not|doesn't)\s+(?:access|touch|use|contact|reach)\s+(?:the\s+)?(?:network|internet|any\s+remote)|\bnever\s+(?:accesses|contacts|reaches|touches)\s+(?:the\s+)?(?:network|internet)\b|\boffline\b|\bair[- ]?gapped\b/iu;
 
 /**
- * Explicit hosted-API write markers. A gh invocation without one is a read or
- * a workflow write the prompt itself carves (pr view/comment/edit, api GET) —
- * egress-inert by the same reasoning as a cleared fetch, so a missing egress
- * sentence must not downgrade it. `-X POST`/`-f`/`--field` shape is the one
- * that can carry local data out, and stays outbound.
+ * gh hosted-API write markers, checked on TOKENS (quote-proof): `-X "POST"`
+ * is shell-identical to `-XPOST`, and a raw-text scan misses whichever shape
+ * it does not spell out. A gh invocation without a marker is a read or a
+ * workflow write the prompt itself carves (pr view/comment/edit, api GET) —
+ * egress-inert by the same reasoning as a cleared fetch. `-X POST`/`-f`/
+ * `--field` shape is the one that can carry local data out, and stays
+ * outbound.
  */
-const GH_WRITE_MARKERS = /(?:^|\s)(?:-X|--method=?)\s*(?:POST|PUT|PATCH|DELETE)\b|(?:^|\s)-[fF]\s|(?:^|\s)--field(?:=|\s)|(?:^|\s)--input(?:=|\s)/iu;
+function ghApiWrites(args: readonly string[]): boolean {
+	for (let k = 0; k < args.length; k++) {
+		const a = args[k];
+		if (a === "-f" || a === "-F") return true;
+		if (a === "--field" || a === "--input" || a.startsWith("--field=") || a.startsWith("--input=")) return true;
+		let value: string | undefined;
+		if (a === "-X" || a === "--method") value = args[k + 1];
+		else if (a.startsWith("--method=")) value = a.slice(9);
+		else if (a.startsWith("-X") && a.length > 2) value = a.slice(2);
+		if (value !== undefined && /^(?:POST|PUT|PATCH|DELETE)$/iu.test(value.trim())) return true;
+	}
+	return false;
+}
 
 /** Write-out format strings can write local files (`%output{path}`, curl
  *  8.3+), which is why `-w`/`--write-out` is absent from the read-only flag
@@ -1397,19 +1425,24 @@ const SEND_DATA_FLAGS: Record<string, true> = {
 export function commandHasOutboundNetwork(command: string): boolean {
 	const normalized = command.replace(/\\\r?\n/gu, "");
 	for (const text of splitTopLevelCommands(normalized)) {
-		const inert = text.replace(/(^|\s)2>&1(?=\s|$)/gu, " ");
-		const stages = splitPipeStages(inert);
-		const leadWords = tokenizeShellSegments(stages[0] ?? "")[0] ?? [];
-		let skipped = 0;
-		while (skipped < leadWords.length && /^[a-z_][a-z0-9_]*=/iu.test(leadWords[skipped])) skipped++;
-		const lead = commandBasename((leadWords[skipped] ?? "").toLowerCase());
-		if ((lead === "curl" || lead === "wget") && isPlainReadOnlyFetch(inert)) continue;
-		if (lead === "gh" && !GH_WRITE_MARKERS.test(inert)) continue;
-		if (NETWORK_VERBS[lead]) return true;
-		for (let i = 1; i < stages.length; i++) {
-			const stageLead = commandBasename((tokenizeShellSegments(stages[i])[0]?.[0] ?? "").toLowerCase());
-			if (stageLead === "gh" && !GH_WRITE_MARKERS.test(stages[i])) continue;
-			if (NETWORK_VERBS[stageLead]) return true;
+		// `||` passes splitTopLevelCommands unsplit, so the fallback half of
+		// `false || ssh host cat` would be invisible here; split it locally.
+		for (const segment of splitOrFallbacks(text)) {
+			const inert = segment.replace(/(^|\s)2>&1(?=\s|$)/gu, " ");
+			const stages = splitPipeStages(inert);
+			const leadWords = tokenizeShellSegments(stages[0] ?? "")[0] ?? [];
+			let skipped = 0;
+			while (skipped < leadWords.length && /^[a-z_][a-z0-9_]*=/iu.test(leadWords[skipped])) skipped++;
+			const lead = commandBasename((leadWords[skipped] ?? "").toLowerCase());
+			if ((lead === "curl" || lead === "wget") && isPlainReadOnlyFetch(inert)) continue;
+			if (lead === "gh" && !ghApiWrites(leadWords)) continue;
+			if (NETWORK_VERBS[lead]) return true;
+			for (let i = 1; i < stages.length; i++) {
+				const stageTokens = tokenizeShellSegments(stages[i])[0] ?? [];
+				const stageLead = commandBasename((stageTokens[0] ?? "").toLowerCase());
+				if (stageLead === "gh" && !ghApiWrites(stageTokens)) continue;
+				if (NETWORK_VERBS[stageLead]) return true;
+			}
 		}
 	}
 	return false;
@@ -2109,8 +2142,12 @@ function isPlainReadOnlyFetch(command: string): boolean {
 			const token = a.startsWith("--") ? a.split("=", 1)[0] : a;
 			// A method selector sends only when the method actually mutates:
 			// GET/HEAD selectors stay reads.
-			if (token === "-X" || token === "--request" || token === "--method") {
-				const value = a.includes("=") ? a.slice(a.indexOf("=") + 1) : (args[k + 1] ?? "");
+			// Attached short form too: after shell joining, `-XPOST` IS `-X POST`.
+			if (token === "-X" || token === "--request" || token === "--method" ||
+				(a.startsWith("-X") && a.length > 2)) {
+				const value = a.startsWith("--")
+					? (a.includes("=") ? a.slice(a.indexOf("=") + 1) : (args[k + 1] ?? ""))
+					: (a.length > 2 ? a.slice(2) : (args[k + 1] ?? ""));
 				return !/^(?:GET|HEAD)$/iu.test(value.trim());
 			}
 			if (SEND_DATA_FLAGS[token]) return true;
@@ -2229,7 +2266,7 @@ function isPlainReadOnlyFetch(command: string): boolean {
  * a clean-looking bare curl while the real command wrote ~/.bashrc. A single
  * `|` never splits here — the pipeline is the unit the fetch decision needs.
  * `2>&1` and `<&3` are fd-dups, not background `&`. `||` passes through
- * unsplit and fails downstream (its stages re-tokenize as control).
+ * unsplit; the egress scan splits fallbacks itself (splitOrFallbacks).
  */
 function splitTopLevelCommands(command: string): string[] {
 	const parts: string[] = [];
@@ -2276,6 +2313,50 @@ function splitTopLevelCommands(command: string): string[] {
 		if (ch === "\n") {
 			parts.push(buffer);
 			buffer = "";
+			continue;
+		}
+		buffer += ch;
+	}
+	parts.push(buffer);
+	return parts.map(part => part.trim()).filter(part => part.length > 0);
+}
+
+/**
+ * Quote-aware split on top-level `||`. splitTopLevelCommands leaves `||`
+ * unsplit for its own consumers; the egress scan needs the fallback half —
+ * `false || ssh host cat` executes the ssh — so it splits `||` itself and
+ * scans both sides.
+ */
+function splitOrFallbacks(command: string): string[] {
+	const parts: string[] = [];
+	let buffer = "";
+	let quote: "'" | '"' | undefined;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (quote) {
+			if (ch === "\\" && quote === '"' && i + 1 < command.length) {
+				buffer += ch + command[i + 1];
+				i++;
+				continue;
+			}
+			if (ch === quote) quote = undefined;
+			buffer += ch;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			buffer += ch;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < command.length) {
+			buffer += ch + command[i + 1];
+			i++;
+			continue;
+		}
+		if (ch === "|" && command[i + 1] === "|") {
+			parts.push(buffer);
+			buffer = "";
+			i++;
 			continue;
 		}
 		buffer += ch;
@@ -3089,14 +3170,8 @@ export default function (pi: ExtensionAPI) {
 		// messages ride along by default; /classifier evidenceUserMessages 0
 		// restores the pre-#31 shape — no evidence field at all.
 		const evidence: { userMessages?: string[]; operatorContext?: string } = {};
-		const evidenceLimit = readClassifierConfig().evidenceUserMessages;
-		if (evidenceLimit > 0) {
-			const userMessages = collectUserEvidence(ctx.sessionManager.getBranch(), evidenceLimit);
-			// An empty list stays absent: with no user messages to send, the
-			// record keeps the exact pre-#31 shape instead of growing an
-			// evidence: {"userMessages":[]} field on every single call.
-			if (userMessages.length > 0) evidence.userMessages = userMessages;
-		}
+		const userMessages = evidenceUserMessages(ctx);
+		if (userMessages) evidence.userMessages = userMessages;
 		if (operatorContext) evidence.operatorContext = operatorContext;
 		const record: Record<string, unknown> = { command, workingDirectory: cwd, ...recordExtras };
 		if (Object.keys(evidence).length > 0) record.evidence = evidence;
@@ -4019,9 +4094,24 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 			}
 
 			const cached = scoped.get(cacheKey);
+			// A cached verdict was validated under the evidence of its own
+			// turn. Evidence grows as the conversation does: a SAFE grounded
+			// in a user authorization must not outlive that authorization.
+			// Re-run the deterministic post-parse checks against the evidence
+			// as of NOW — no model call — and drop the entry when they
+			// downgrade, so the next call re-classifies under current
+			// evidence.
+			let revalidated = cached;
+			if (revalidated) {
+				const checked = applyPostParseChecks(revalidated, { command, cwd, userMessages: evidenceUserMessages(ctx) });
+				if (checked.verdict !== revalidated.verdict) {
+					scoped.delete(cacheKey);
+					revalidated = checked;
+				}
+			}
 			// Dry-run probe (issue #32): with nothing cached, the classifier model
 			// would run — report that instead of paying the call.
-			if (dryRun && !cached) {
+			if (dryRun && !revalidated) {
 				return dryRunStop({
 					would: "classify",
 					layer: "classifier",
@@ -4030,7 +4120,7 @@ const DIALOG_REASON_DISPLAY: Record<string, string> = {
 				});
 			}
 			let classifyError = "";
-			const judgement = cached ?? (await classify(ctx, command, cwd, chain, config.timeoutMs, recordExtras, operatorContext).catch((err: unknown) => {
+			const judgement = revalidated ?? (await classify(ctx, command, cwd, chain, config.timeoutMs, recordExtras, operatorContext).catch((err: unknown) => {
 				// Provider errors (quota exhausted, auth, HTTP failures) previously
 				// vanished into an opaque "unavailable". Keep the message so the
 				// permission dialog says WHY.

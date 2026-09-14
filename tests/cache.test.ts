@@ -141,3 +141,49 @@ describe("session boundaries drop only that session's entries", () => {
 		});
 	}
 });
+
+describe("cache hits revalidate against current evidence", () => {
+	// The branch entry shape is the one collectUserEvidence reads (mirrors
+	// evidence-tiers.test.ts): `type: "message"` with a user role.
+	const userEntry = (content: string) => ({ type: "message", message: { role: "user", content } });
+
+	test("a cached SAFE grounded in user evidence is re-checked when the evidence moves", async () => {
+		setClassifierReply('The user said "please ship it". VERDICT: SAFE');
+		const ctx = makeCtx({
+			sessionId: "evidence-drift",
+			cwd: "/repo",
+			hasUI: true,
+			branch: [userEntry("please ship it")],
+		});
+		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), ctx);
+		expect(modelCalls.length).toBe(1);
+		expect(selectCalls(ctx).length).toBe(0);
+
+		const drifted = makeCtx({
+			sessionId: "evidence-drift",
+			cwd: "/repo",
+			hasUI: true,
+			branch: [userEntry("actually stop everything")],
+		});
+		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), drifted);
+		// Cache hit revalidated under the new evidence: the citation is gone,
+		// so the hit downgrades to a dialog WITHOUT a second model call.
+		expect(modelCalls.length).toBe(1);
+		expect(selectCalls(drifted).length).toBe(1);
+
+		// The stale entry was dropped: the next call re-classifies.
+		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), drifted);
+		expect(modelCalls.length).toBe(2);
+	});
+
+	test("a cached SAFE whose evidence still holds stays cached", async () => {
+		setClassifierReply('The user said "please ship it". VERDICT: SAFE');
+		const branch = [userEntry("please ship it")];
+		const ctx = makeCtx({ sessionId: "evidence-stable", cwd: "/repo", hasUI: true, branch });
+		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), ctx);
+		const again = makeCtx({ sessionId: "evidence-stable", cwd: "/repo", hasUI: true, branch });
+		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), again);
+		expect(modelCalls.length).toBe(1);
+		expect(selectCalls(again).length).toBe(0);
+	});
+});
