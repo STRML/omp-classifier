@@ -114,8 +114,8 @@ The agent driving this system is owed three things:
 | L2 | Pin temperature in `classify()` | Landed (#29, PR #37) |
 | L3 | Unified decision audit JSONL and agent-readable status | Landed (#33, PRs #38/#39) |
 | L3 | Refusal memory across rewording | Landed (#30, PR #40); subagent inheritance is a host gap |
-| L4 | Session grants and dry-run preview | Landed (#32, PR #41); grant key keeps flags, compounds never grantable |
-| L0, L2 | Provenance-tiered evidence: user messages, operator context | Landed (#31, PR #42); plan grants = the #32 grant store |
+| L4 | Session grants and dry-run preview | Landed (#32, PR #41); simple actions use strict shape keys, compounds/substitutions use exact-text keys, and unusable grant choices stay hidden |
+| L0, L2 | Provenance-tiered evidence: user messages, operator context, recent tool activity | Landed (#31, PR #42); refusals carry cwd/source/evidence scope and decision logs carry a policy version |
 | L5 | Live corpus re-baseline for the post-#31 prompt | Blocked on provider credits (#44) |
 | L1, L2, L4 | Judge-owned deletes and network reads (rm shape-scoped, curl/wget off the forced set), affirmative-claim-only egress check, persistent grants documented, stale-code guard, humanized dialog reasons | Landed 2026-09-10 (no issue; promptId `7b4f082ad07c` → `f86ec6af7537`) |
 | L1, L2 | Cheap pre-filter stage | Measured NO-GO on adversarial corpus (2.2-4.4% volume, 0 misses); re-measure on a history corpus first (#34) |

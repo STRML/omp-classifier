@@ -7,7 +7,7 @@
  * user messages; 0 restores the no-evidence shape entirely.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
-import { CLASSIFIER_PROMPT, collectUserEvidence } from "../index";
+import { CLASSIFIER_PROMPT, collectToolEvidence, collectUserEvidence } from "../index";
 import {
 	fire,
 	loadPlugin,
@@ -123,6 +123,27 @@ describe("operatorContext", () => {
 		await fire("tool_call", makeEvent("git status", { operatorContext: "  \n\t " }), ctx);
 		expect(modelCalls.length).toBe(1);
 		expect(recordOf().evidence).toBeUndefined();
+	});
+});
+
+describe("tool evidence", () => {
+	test("recent tool calls and results are visible as non-authorizing context", async () => {
+		const branch = [
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", name: "write", arguments: { path: "scripts/check.sh", content: "echo ok" } }],
+				},
+			},
+			{ type: "message", message: { role: "toolResult", toolName: "write", content: "wrote scripts/check.sh" } },
+		] as const;
+		expect(collectToolEvidence(branch)).toContain("scripts/check.sh");
+		const ctx = makeCtx({ sessionId: nextSession(), branch });
+		await fire("tool_call", makeEvent("bash scripts/check.sh"), ctx);
+		const evidence = evidenceOf();
+		expect(evidence.operatorContext).toContain("recent tool evidence (non-authorizing)");
+		expect(evidence.operatorContext).toContain("scripts/check.sh");
 	});
 });
 

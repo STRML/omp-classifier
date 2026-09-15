@@ -117,6 +117,7 @@ describe("session grants", () => {
 		const result = await fire("tool_call", makeEvent("rm -rf /"), ctx);
 		expect(refusalOf(result).layer).toBe("dialog");
 		expect(selectCalls(ctx)[0][0]).toContain("critical pattern");
+		expect(selectCalls(ctx)[0][1].map(option => option.label)).toEqual(["Allow once", "Deny"]);
 		expect(modelCalls.length).toBe(1); // the grant path never classified
 	});
 
@@ -340,14 +341,33 @@ describe("grant target strictness (gate fix)", () => {
 		expect(modelCalls.length).toBe(2);
 	});
 
-	test("a compound command is offered Allow once / Always allow / Deny — never a session grant", async () => {
+	test("a compound command gets an exact session grant, but changed text still gates", async () => {
 		const sid = nextSession();
-		const ctx = makeCtx({ sessionId: sid, hasUI: true });
+		const ctx = makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_SESSION });
 		const result = await fire("tool_call", makeEvent("git status && git push --force"), ctx);
+		expect(result).toBeUndefined();
+		expect(selectCalls(ctx)[0][1].map(option => option.label)).toEqual(["Allow once", "Allow for session", "Always allow", "Deny"]);
+
+		const same = makeCtx({ sessionId: sid, hasUI: true });
+		expect(await fire("tool_call", makeEvent("git status && git push --force"), same)).toBeUndefined();
+		expect(selectCalls(same)).toHaveLength(0);
+
+		const changed = makeCtx({ sessionId: sid, hasUI: true });
+		const changedResult = await fire("tool_call", makeEvent("git status && git push origin main"), changed);
+		expect(refusalOf(changedResult).layer).toBe("dialog");
+		expect(selectCalls(changed)).toHaveLength(1);
+	});
+
+	test("an exact compound grant preserves quoted whitespace", async () => {
+		const sid = nextSession();
+		const original = `printf '%s' "A  B" && echo grant-${sid}`;
+		const first = await prompted(original, ALLOW_SESSION, sid);
+		expect(resultText(first.result)).toBe("ALLOWED");
+
+		const changed = makeCtx({ sessionId: sid, hasUI: true });
+		const result = await fire("tool_call", makeEvent(`printf '%s' "A B" && echo grant-${sid}`), changed);
 		expect(refusalOf(result).layer).toBe("dialog");
-		// No strict key exists for a compound, so "Allow for session" is hidden;
-		// the exact-text persistent grant covers the full line instead.
-		expect(selectCalls(ctx)[0][1].map(option => option.label)).toEqual(["Allow once", "Always allow", "Deny"]);
+		expect(selectCalls(changed)).toHaveLength(1);
 	});
 
 	test("normalizeGrantTarget unit table", () => {

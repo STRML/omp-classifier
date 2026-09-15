@@ -61,6 +61,8 @@ interface Case {
 	kind?: "eval-code";
 	/** Kernel language for kind "eval-code" (py | js | rb | jl). */
 	language?: string;
+	/** Optional provenance evidence for replaying a live decision. */
+	evidence?: { userMessages?: string[]; operatorContext?: string };
 	/** Occurrences in real history; weights over-flag cost. Authored cases are 1. */
 	count?: number;
 	/**
@@ -142,9 +144,8 @@ const SPAWN_FLAGS = [
  */
 const PER_CASE_TIMEOUT_MS = 180_000;
 /** Bump on any change to fence, parse, or scoring semantics: it keys the reply cache and report filenames.
- *  v4: two-stage contract — full reply handed to parseJudgement (the verdict now lives on a labeled
- *  line, not at reply start), and production's post-parse consistency checks applied before scoring. */
-const HARNESS_VERSION = 4;
+ *  v5: replay provenance evidence through the same post-parse checks as the live gate. */
+const HARNESS_VERSION = 5;
 
 /** In-process `completeSimple` is one model round-trip; minutes would be a stall. */
 const INPROCESS_TIMEOUT_MS = 60_000;
@@ -314,6 +315,17 @@ async function loadCorpus(name: string): Promise<Case[]> {
 		}
 		if (c.kind === undefined && c.language !== undefined) {
 			throw new Error(`corpus: language without kind "eval-code" on: ${c.command}`);
+		}
+		if (c.evidence !== undefined) {
+			if (typeof c.evidence !== "object" || c.evidence === null) {
+				throw new Error(`corpus: evidence must be an object on: ${c.command}`);
+			}
+			if (c.evidence.userMessages !== undefined && (!Array.isArray(c.evidence.userMessages) || c.evidence.userMessages.some(message => typeof message !== "string"))) {
+				throw new Error(`corpus: evidence.userMessages must be strings on: ${c.command}`);
+			}
+			if (c.evidence.operatorContext !== undefined && typeof c.evidence.operatorContext !== "string") {
+				throw new Error(`corpus: evidence.operatorContext must be a string on: ${c.command}`);
+			}
 		}
 	}
 	return cases;
@@ -496,12 +508,13 @@ async function main(): Promise<void> {
 				// they answered a different question. Bump on any change to fence,
 				// parse, or scoring semantics.
 				const recordExtras =
-					testCase.kind === "eval-code"
-						? { kind: "eval-code", language: testCase.language ?? "" }
-						: {};
+					{
+						...(testCase.kind === "eval-code" ? { kind: "eval-code", language: testCase.language ?? "" } : {}),
+						...(testCase.evidence ? { evidence: testCase.evidence } : {}),
+					};
 				const key = createHash("sha256")
 					.update(
-						`${HARNESS_VERSION}\0${promptId}\0${args.model}\0${cwd}\0${sample}\0${args.spawn ? SPAWN_FLAGS.join(" ") : "in-process"}\0${testCase.command}\0${testCase.kind ?? "bash"}\0${testCase.language ?? ""}`,
+						`${HARNESS_VERSION}\0${promptId}\0${args.model}\0${cwd}\0${sample}\0${args.spawn ? SPAWN_FLAGS.join(" ") : "in-process"}\0${testCase.command}\0${testCase.kind ?? "bash"}\0${testCase.language ?? ""}\0${JSON.stringify(testCase.evidence ?? null)}`,
 					)
 					.digest("hex");
 				const cacheFile = Bun.file(join(CACHE_DIR, `${key}.txt`));
@@ -527,7 +540,7 @@ async function main(): Promise<void> {
 				// the ask it is, not flattered into an allow.
 				const judgement = applyPostParseChecks(
 					parseJudgement(reply),
-					{ command: testCase.command, cwd },
+					{ command: testCase.command, cwd, userMessages: testCase.evidence?.userMessages },
 				);
 				const verdict = judgement.verdict === "PARSE_ERROR" ? "UNPARSED" : (judgement.verdict as Verdict);
 				// Only cache real verdicts. Caching a killed process or an empty reply

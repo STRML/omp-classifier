@@ -25,6 +25,7 @@ import {
 	makeEvent,
 	makeSettings,
 	modelCalls,
+	refusalOf,
 	setClassifierReply,
 } from "./fixtures";
 
@@ -250,6 +251,35 @@ describe("refusal memory", () => {
 		) as { layer: string };
 		expect(payload.layer).toBe("dialog");
 		expect(readDecisions().some(line => line.why.startsWith("despite prior refusal"))).toBe(true);
+	});
+
+	test("machine refusals are scoped to the reviewed directory", async () => {
+		const sid = nextSession();
+		setClassifierReply("UNSAFE | not approved here");
+		await fire("tool_call", makeEvent("git diff --stat"), makeCtx({ sessionId: sid, cwd: "/workspace" }));
+
+		setClassifierReply("SAFE | read-only diff");
+		const elsewhere = makeCtx({ sessionId: sid, cwd: "/elsewhere" });
+		const result = await fire("tool_call", makeEvent("git diff --name-only"), elsewhere);
+		expect(result).toBeUndefined();
+		expect(selectCalls(elsewhere)).toHaveLength(0);
+		expect(modelCalls.length).toBe(2);
+	});
+
+	test("approval in one directory does not erase a refusal in another", async () => {
+		const sid = nextSession();
+		setClassifierReply("UNSAFE | not approved here");
+		await fire("tool_call", makeEvent("git diff --stat"), makeCtx({ sessionId: sid, cwd: "/workspace" }));
+
+		const elsewhereDenied = makeCtx({ sessionId: sid, cwd: "/elsewhere", hasUI: true, selectResult: DENY });
+		await fire("tool_call", makeEvent("git diff --stat"), elsewhereDenied);
+		setClassifierReply("SAFE | read-only diff");
+		const elsewhere = makeCtx({ sessionId: sid, cwd: "/elsewhere", hasUI: true, selectResult: ALLOW_ONCE });
+		expect(await fire("tool_call", makeEvent("git diff --name-only"), elsewhere)).toBeUndefined();
+
+		const original = makeCtx({ sessionId: sid, cwd: "/workspace", hasUI: true });
+		const result = await fire("tool_call", makeEvent("git diff --name-only"), original);
+		expect(refusalOf(result).layer).toBe("dialog");
 	});
 
 	test("user approval lifts the refusal for the target", async () => {

@@ -219,9 +219,14 @@ describe("only the stage a pipe actually feeds is stdin-fed", () => {
 		expect(flags("cat ./installer | { sh; }")).toContain("| sh");
 	});
 
-	test("inline code executes for every interpreter, not just bash and python", () => {
-		expect(flags('echo hi | node -e "require(0)"')).toContain("| node");
-		expect(flags("echo hi | ruby -e 'puts 1'")).toContain("| ruby");
+	test("inline code executes for every interpreter; visible plain code releases", () => {
+		// The payload travels in the command text, so plain code the
+		// classifier read verbatim releases the flag; risk markers keep it.
+		expect(flags('echo hi | node -e "require(0)"')).toHaveLength(0);
+		expect(flags('echo hi | node -e "require(\'child_process\').exec(\'ls\')"')).toContain("| node");
+		expect(flags('echo hi | python3 -c "print(1)"')).toHaveLength(0);
+		expect(flags("cat ./installer | { sh; }")).toContain("| sh");
+		expect(flags("echo hi | ruby -e 'puts 1'")).toHaveLength(0);
 	});
 });
 
@@ -353,6 +358,19 @@ describe("interpreters fed on stdin flag on their own", () => {
 
 	test("a leading interpreter is not stdin-fed", () => {
 		expect(flags("bash ./script.sh")).not.toContain("| bash");
+	});
+
+	test("visible payloads release the pipe; opaque stdin does not", () => {
+		// An inline -c payload and a heredoc body travel in the command text,
+		// so the classifier read them verbatim: plain code releases the flag,
+		// the same rule the non-piped interpreter path applies. Risk markers
+		// in the payload keep it.
+		expect(flags("git show HEAD:f.json | python3 -c 'import json,sys; json.load(sys.stdin)'")).toHaveLength(0);
+		expect(flags("cat x | python3 - <<'PY'\nprint(1)\nPY")).toHaveLength(0);
+		expect(flags("cat x | python3 - <<'PY'\nimport subprocess\nPY")).toContain("| python3");
+		expect(flags("git show x | python3 -c \"exec(base64.b64decode('cHJpbnQoMSkp'))\"")).toContain("| python3");
+		// No heredoc, no code: stdin stays opaque and the flag stands.
+		expect(flags("cat x | python3 -")).toContain("| python3");
 	});
 });
 
