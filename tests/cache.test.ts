@@ -168,13 +168,14 @@ describe("cache keys include the evidence fingerprint", () => {
 		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), drifted);
 		// Different evidence, different key: the cached SAFE cannot answer,
 		// the model re-judges under the new evidence, and its SAFE loses the
-		// authorization it cites, so the dialog appears.
-		expect(modelCalls.length).toBe(2);
+		// authorization it cites, so the dialog appears. The bounded reviewer adds
+		// a second model pass for that consistency downgrade.
+		expect(modelCalls.length).toBe(3);
 		expect(selectCalls(drifted).length).toBe(1);
 
 		// The downgraded verdict is not cached (noCache): it re-judges again.
 		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), drifted);
-		expect(modelCalls.length).toBe(3);
+		expect(modelCalls.length).toBe(5);
 	});
 
 	test("identical evidence stays one cached decision", async () => {

@@ -20,6 +20,7 @@ import {
 	resultText,
 	refusalOf,
 	selectCalls,
+	setClassifierReplies,
 	ALLOW_ONCE,
 	setClassifierReply,
 	setClassifierThrows,
@@ -87,6 +88,15 @@ describe("verdict routing", () => {
 		const result = await gate("make deploy");
 		expect(result).toContain("classifier unsure");
 		expect(refusalOf(result).layer).toBe("headless");
+	});
+
+	test("an ambiguous primary gets one bounded review before escalating", async () => {
+		setClassifierReplies(["UNSURE", "SAFE | read-only build inspection"]);
+		const result = await gate("make deploy");
+		expect(result).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(2);
+		expect(modelCalls[0].options.disableReasoning).toBe(true);
+		expect(modelCalls[1].options.disableReasoning).toBe(false);
 	});
 
 	test("classifier throw asks with UI, blocks headless", async () => {
@@ -460,12 +470,12 @@ describe("stale-code guard", () => {
 	});
 });
 describe("parse errors are not cached", () => {
-	test("two garbage replies cost two model calls; the gate blocks each time", async () => {
+	test("a garbage primary gets one repair attempt, and repairs are never cached", async () => {
 		setClassifierReply("this is not a verdict at all");
 		await gate("make build");
-		expect(modelCalls.length).toBe(1);
+		expect(modelCalls.length).toBe(2);
 		const second = await gate("make build");
-		expect(modelCalls.length).toBe(2); // not cached
+		expect(modelCalls.length).toBe(4); // neither malformed result is cached
 		expect(second).toContain("classifier parse error");
 	});
 });
