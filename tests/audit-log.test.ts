@@ -132,6 +132,7 @@ describe("decision audit log", () => {
 			layer: "verdict",
 			verdict: "SAFE",
 			cached: 0,
+			policyVersion: "frontier-v1",
 		});
 		expect(lines[0].cmd).toBe(command);
 

@@ -191,11 +191,10 @@ describe("persistent grants", () => {
 		const { ctx, result } = await prompted(compound, ALWAYS_ALLOW, sid);
 		expect(resultText(result)).toBe("ALLOWED");
 
-		// No strict session-grant key exists for a compound, so the session
-		// option is hidden while Always allow is offered — the whole point of
-		// exact-text grants.
+		// Compounds now get an exact session key as well as the persistent exact
+		// key; neither can cover an edited payload.
 		const [, options] = selectCalls(ctx)[0];
-		expect(options.map(option => option.label)).toEqual([ALLOW_ONCE, ALWAYS_ALLOW, DENY]);
+		expect(options.map(option => option.label)).toEqual([ALLOW_ONCE, ALLOW_SESSION, ALWAYS_ALLOW, DENY]);
 
 		// Identical text runs clean, cross-session, with no model call.
 		const later = nextSession();
