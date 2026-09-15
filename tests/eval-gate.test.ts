@@ -145,6 +145,17 @@ describe("eval gate routing", () => {
 		expect(modelCalls.length).toBe(1);
 	});
 
+	test("an assignment-position token is a variable, not a command", async () => {
+		setClassifierReply("SAFE");
+		const result = await gateEval(
+			'const rm = Bun.spawnSync({ cmd: ["node", "--version"] });\nconsole.log(rm.stdout.toString());',
+			{},
+			"js",
+		);
+		expect(result).toBe("ALLOWED");
+		expect(modelCalls.length).toBe(1);
+	});
+
 	test("verdict is cached per payload", async () => {
 		setClassifierReply("SAFE");
 		const code = `import subprocess\nsubprocess.run(["echo", "cache-probe-${seq}"])`;

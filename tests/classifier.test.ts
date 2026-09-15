@@ -234,11 +234,18 @@ describe("moderate-risk overlay", () => {
 			"git push --force origin main",
 			"sudo make install",
 			"python3 -c \"exec(base64.b64decode('cHJpbnQoMSkp'))\"",
-			"git commit --amend -m x",
 		]) {
 			const result = await gate(command);
 			expect(result).toContain("flagged for approval");
 		}
+	});
+
+	test("SAFE on reflog-reversible git work auto-runs", async () => {
+		setClassifierReply("SAFE");
+		// --amend and reset --soft keep the pre-image in the reflog; the
+		// overlay reserves its backstop for reset --hard, clean, and force.
+		expect(await gate("git commit --amend -m x")).toBe("ALLOWED");
+		expect(await gate("git reset --soft HEAD~1")).toBe("ALLOWED");
 	});
 
 	test("flagged SAFE still runs when the user approves interactively", async () => {
@@ -262,10 +269,15 @@ describe("matcher unit spec", () => {
 			["chmod +x script.sh", []],
 			["sudo apt update", ["sudo"]],
 			["curl -O https://x/y", []],
-			["git push --force origin main", ["git push --force"]],
 			["git push origin main", []],
+			["git push --force origin main", ["git push --force"]],
+			["git commit --amend -m x", []],
 			["git reset --hard HEAD", ["git reset"]],
 			["git -c core.hooksPath=/dev/null push --force origin main", ["git push --force"]],
+			["git reset --soft HEAD~1", []],
+			["git reset HEAD~1", []],
+			["git reset --ha HEAD", ["git reset"]],
+			["git clean -fdx", ["git clean"]],
 			["bash -c 'echo hi'", []],
 			["bash -c 'rm -rf x'", ["bash -c"]],
 			["tee /etc/hosts", []],
@@ -302,6 +314,7 @@ describe("matcher unit spec", () => {
 			"cd /tmp && make build",
 			"npm test",
 			"bun run typecheck",
+			"echo '{}' | python3 -c 'import json,sys; json.load(sys.stdin)'",
 			"grep -r TODO src",
 			"cp /tmp/a.txt /tmp/b.txt",
 			'echo "=====ALL DIFF STAT====="',
@@ -354,9 +367,11 @@ describe("matcher unit spec", () => {
 		expect(matchModerateRiskTokens("r\\\nm -rf /tmp/x")).toContain("rm");
 		// Command substitution hides the verb from positional analysis.
 		expect(matchModerateRiskTokens('echo "$(rm important)"')).toContain("rm");
-		// git option positions: value-taking globals and trailing --amend.
+		// git option positions: value-taking globals. Trailing --amend is
+		// reflog-reversible and releases; the overlay keeps --hard, clean,
+		// and force pushes.
 		expect(matchModerateRiskTokens("git -C /repo push --force")).toContain("git push --force");
-		expect(matchModerateRiskTokens("git commit -m x --amend")).toContain("git commit --amend");
+		expect(matchModerateRiskTokens("git commit -m x --amend")).toEqual([]);
 	});
 
 	test("benign lookalikes of the pass-3 fixes stay unflagged", async () => {
