@@ -97,6 +97,44 @@ describe("session grants", () => {
 		expect(lines[lines.length - 1]).toMatchObject({ decision: "allow", layer: "granted", why: "session grant" });
 	});
 
+	test("a later user restriction invalidates the session grant", async () => {
+		const sid = `grant-revoked-${++seq}`;
+		const initialBranch = [
+			{ type: "message", id: "u1", message: { role: "user", attribution: "user", content: "Publish the package for this task." } },
+		] as const;
+		setClassifierReply("UNSAFE");
+		const first = makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_SESSION, branch: initialBranch });
+		await fire("tool_call", makeEvent("npm publish"), first);
+		expect(selectCalls(first)).toHaveLength(1);
+		setClassifierReply("UNSAFE");
+		const narrowedBranch = [
+			...initialBranch,
+			{ type: "message", id: "u2", message: { role: "user", attribution: "user", content: "Do not publish anything now." } },
+		] as const;
+		const second = makeCtx({ sessionId: sid, hasUI: true, branch: narrowedBranch });
+		const result = await fire("tool_call", makeEvent("npm publish"), second);
+		expect(modelCalls).toHaveLength(2);
+		expect(selectCalls(second)).toHaveLength(1);
+		expect(resultText(result)).toContain("classified unsafe");
+	});
+
+	test("harmless progress messages do not invalidate a session grant", async () => {
+		const sid = `grant-progress-${++seq}`;
+		const initialBranch = [{ type: "message", id: "u1", message: { role: "user", attribution: "user", content: "Publish the package for this task." } }] as const;
+		const first = makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_SESSION, branch: initialBranch });
+		setClassifierReply("UNSAFE");
+		await fire("tool_call", makeEvent("npm publish"), first);
+		const progressBranch = [
+			...initialBranch,
+			{ type: "message", id: "u2", message: { role: "user", attribution: "user", content: "continue" } },
+			{ type: "message", id: "u3", message: { role: "user", attribution: "user", content: "status?" } },
+		] as const;
+		const second = makeCtx({ sessionId: sid, hasUI: true, branch: progressBranch });
+		await fire("tool_call", makeEvent("npm publish"), second);
+		expect(selectCalls(second)).toHaveLength(0);
+		expect(modelCalls).toHaveLength(1);
+	});
+
 	test("a grant honors cwd: same command in another directory classifies again", async () => {
 		const sid = nextSession();
 		await prompted(`git branch -D feature-${sid}`, ALLOW_SESSION, sid);

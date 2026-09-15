@@ -316,7 +316,7 @@ describe("live gate integration", () => {
 		// noCache: the downgraded UNSURE must not replay from the verdict cache —
 		// the model is consulted again and asks again.
 		await fire("tool_call", makeEvent("git status"), ctx);
-		expect(modelCalls.length).toBe(2);
+		expect(modelCalls.length).toBe(4);
 		expect(selectCalls(ctx)).toHaveLength(2);
 	});
 

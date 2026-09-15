@@ -51,17 +51,19 @@ Anything ambiguous falls through to L2.
 
 One fenced record: command or payload, resolved cwd, provenance-tiered evidence. Structured
 verdict: decision plus reversibility, scope, confidence, injection flag. Decode parameters
-pinned (temperature, reasoning) so one call answers one question.
+are pinned (temperature, reasoning); ambiguous, injection-shaped, inconsistent, and malformed
+primary replies receive one bounded second review within the same deadline.
 
-Invariant: the prompt is content-hashed (promptId). Every prompt change runs the corpus
-before it ships.
+Invariant: the primary and review policy are content-hashed (policy hash/promptId). Every
+prompt or parser change runs the replay-aware corpus before it ships.
 
 ## L3 memory
 
 - Verdict cache: exact-input keyed, per session, config-signature cleared.
 - Refusal memory: what this session was denied, fed back so rewording cannot launder a
   refusal into a fresh judgment.
-- Decision audit: one JSONL line per decision, every path, every axis.
+- Decision audit: one JSONL line per decision, every path, every axis, with session/decision
+  ids, policy identity, model/review telemetry, approval outcome, and timing.
 
 Invariant: a cache entry answers only the exact input it was made for. Refusals lift only
 by user action, never by retry.
@@ -84,10 +86,12 @@ the human one glance when everything is normal.
 
 ## L5 self-measurement
 
-The corpus is the immune system. Live failures become cases; the harness replays them
-against every prompt or cap change; an irreversible case judged SAFE fails the run.
+The corpus is the immune system. Live failures become cases; the harness replays the
+primary, bounded review, deterministic tail, grants/refusals, and host handoff against
+every prompt or cap change; an irreversible action that would run silently fails the run.
 
-Invariant: no change ships to L1 or L2 without a before/after run keyed by promptId.
+Invariant: no change ships to L1 or L2 without a before/after run keyed by promptId and
+policy hash, including interruption and latency counters.
 
 ## L6 control plane
 
@@ -104,7 +108,7 @@ The agent driving this system is owed three things:
    the system. Over-flagging is a tax paid in human turns; the measurement tracks it as
    such.
 3. **Every judgment is replayable.** Any verdict can be re-derived later from its record:
-   same input, same prompt version, same evidence.
+   same input, same policy version/hash, same evidence, same deterministic tail.
 
 ## Roadmap
 
@@ -121,4 +125,5 @@ The agent driving this system is owed three things:
 | L1, L2 | Cheap pre-filter stage | Measured NO-GO on adversarial corpus (2.2-4.4% volume, 0 misses); re-measure on a history corpus first (#34) |
 | L0 | Eval payload cwd propagation (spawn's own cwd in the record) | Open, re-scoped (#14) |
 | L2 | Residual over-flag family | Open; #31 is the architectural path (#17) |
+| L0–L6 | Frontier completion: bounded review, durable task scope, shared replay, held-out measurement, and policy/session observability | Landed on `finish/issue-55` |
 | L0 | Kernel-level spawn interception (structural scan fix) | Open; documented gap in README Limits (#13) |

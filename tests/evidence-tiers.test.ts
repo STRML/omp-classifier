@@ -7,7 +7,7 @@
  * user messages; 0 restores the no-evidence shape entirely.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
-import { CLASSIFIER_PROMPT, collectToolEvidence, collectUserEvidence } from "../index";
+import { CLASSIFIER_PROMPT, collectTaskEvidence, collectToolEvidence, collectUserEvidence } from "../index";
 import {
 	fire,
 	loadPlugin,
@@ -175,6 +175,20 @@ describe("bounds", () => {
 
 describe("collectUserEvidence", () => {
 	const branch = [userEntry("one"), { type: "compact", id: "c1" }, userEntry("two"), userEntry("three")];
+
+	test("task evidence retains an old scope instruction and a newer restriction", () => {
+		const snapshot = collectTaskEvidence(
+			[
+				{ type: "message", id: "m1", message: { role: "user", attribution: "user", content: "For this task, update only the generated build output." } },
+				{ type: "message", id: "m2", message: { role: "user", attribution: "user", content: "continue" } },
+				{ type: "message", id: "m3", message: { role: "user", attribution: "user", content: "status?" } },
+				{ type: "message", id: "m4", message: { role: "user", attribution: "user", content: "Do not touch source files." } },
+			],
+			1,
+		);
+		expect(snapshot.ids).toEqual(["m1", "m4"]);
+		expect(snapshot.messages).toEqual(["For this task, update only the generated build output.", "Do not touch source files."]);
+	});
 
 	test("empty branch yields an empty list", () => {
 		expect(collectUserEvidence([], 3)).toEqual([]);

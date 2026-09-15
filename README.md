@@ -67,7 +67,7 @@ Plugin settings live in `~/.omp/omp-classifier.json`. View or change them with `
 |---|---|---|
 | `enabled` | `true` | `false` turns off model classification only. Critical-pattern and env checks still enforce. |
 | `model` | `""` (auto) | Explicit model id. Otherwise: `config.model` -> `@tiny` role -> session model. |
-| `timeoutMs` | `25000` | Classifier call budget (two-stage contract: ~11s typical, up to ~22-34s on flash-class reasoning models). A timeout fails closed to a permission request. |
+| `timeoutMs` | `25000` | Whole classification budget, including the bounded second review for ambiguous, injection-shaped, inconsistent, or malformed replies. A timeout fails closed to a permission request. |
 | `maxCommandLength` | `8000` | Commands longer than this are blocked (bounds 64-100000; values outside fall back to the default). |
 | `evidenceUserMessages` | `3` | How many recent user messages (0-6) ride into the classify record as `evidence.userMessages`. `0` sends no evidence. Values outside the bounds fall back to the default. |
 | `fallbackModels` | `[]` | Up to 3 fallback model ids, tried in order when the primary returns an empty reply or a provider error (timeouts do not trigger fallback). The whole chain is part of the cache key and config signature. |
@@ -86,7 +86,9 @@ An existing config file that pins `maxCommandLength: 2000` keeps 2000 after upgr
 
 ## The model
 
-One call per novel command: single turn, reasoning disabled, 25s budget. Verdicts cache for the session, keyed by cwd, env, pty, timeout, async, the fallback-model chain, and the command text, so reruns cost nothing.
+Novel commands use a bounded two-pass judge. The primary pass is fast and reasoning-disabled; only an ambiguous, injection-shaped, internally inconsistent, or malformed result gets one reviewer pass within the same 25s deadline. A reviewer never turns a flagged injection into silent execution, and a failed reviewer leaves the primary safety posture in place. Verdicts cache for the session, keyed by cwd, env, pty, timeout, async, the fallback-model chain, the task evidence fingerprint, and the command text, so reruns cost nothing while a changed user scope invalidates the cache and session grants.
+
+Every decision carries a stable policy version/hash, session and decision identifiers, model id, timing, and (when used) review trigger in `decisions.jsonl`. `/classifier status` exposes the live policy hash and the recent tail. The deterministic replay tail is shared by the live gate and the evaluation harness, so caps, environment overrides, risk overlays, prior refusals, interactive prompts, and headless blocks are measured the same way.
 
 Default resolution uses the `@tiny` role, falling back to the session model. Assign the role in `/models` or a `config.yml` layer (set the record as a whole; the CLI cannot set one role):
 
@@ -116,7 +118,7 @@ Avoid cursor-provider models (`composer-*`, `gpt-5.4-nano-*`, `gemini-3.7-flash-
 
 ## Evidence
 
-The classify record can carry an `evidence` object whose fields have different authors, and the prompt judges each field by its channel. `evidenceUserMessages` attaches the session's last N user messages — the user's own words, the only tier that may authorize an action. Only messages the host stamps `attribution: "user"` count, so the brief a parent agent sends its subagent never does. A message longer than 2,000 characters keeps its first and last 1,000, and a quoted citation has to fit inside one of those two pieces. Every tool call may also carry `operatorContext`: the requesting agent's explanation of intent, flattened to one line, capped at 500 characters, and never able to authorize anything. Recent tool calls/results are added as bounded, explicitly non-authorizing context so a script written earlier in the session is not invisible to the next review. Model refusals are scoped to the reviewed cwd and evidence fingerprint; human denials remain sticky until approval in that same scope. The channel decides provenance: content claiming authorization from the wrong channel is itself an injection signal, judged by the same rules as the command text.
+The classify record can carry an `evidence` object whose fields have different authors, and the prompt judges each field by its channel. `evidenceUserMessages` attaches the task's most recent user messages plus older scope/restriction anchors, with stable message ids. The user's own words are the only tier that may authorize an action. Only messages the host stamps `attribution: "user"` count, so the brief a parent agent sends its subagent never does. A message longer than 2,000 characters keeps its first and last 1,000, and a quoted citation has to fit inside one of those two pieces. Every tool call may also carry `operatorContext`: the requesting agent's explanation of intent, flattened to one line, capped at 500 characters, and never able to authorize anything. Recent tool calls/results are added as bounded, explicitly non-authorizing context so a script written earlier in the session is not invisible to the next review. Model refusals and session grants are scoped to the reviewed cwd and evidence fingerprint; later user restrictions invalidate them. Human denials remain sticky until approval in that same scope. The channel decides provenance: content claiming authorization from the wrong channel is itself an injection signal, judged by the same rules as the command text.
 
 ## Limits
 
@@ -139,5 +141,16 @@ bun run typecheck  # against pinned published host types
 ```
 
 CI runs both on every push and PR. Verdict quality against live models is evaluated separately (`eval/`, tracked in issue #2).
+
+The replay-aware harness also ships a deterministic 500-action held-out benign set
+(25 task sequences × 20 routine steps), with task ids and step ids in each record:
+
+```bash
+bun eval/run.ts --prompt live --corpus heldout --samples 3
+```
+
+Reports include final host handoff, review/recovery counts, approval overrides,
+interruption rates, and p50/p95 latency. Treat generated held-out numbers as a
+repeatable regression fixture, not as a substitute for fresh production history.
 
 MIT licensed.

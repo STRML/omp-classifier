@@ -147,13 +147,13 @@ describe("retry rules through the gate", () => {
 		expect(chainIds()).toEqual(["deepseek"]);
 	});
 
-	test("a malformed non-empty reply is returned as-is, not retried", async () => {
+	test("a malformed non-empty reply gets one bounded repair review", async () => {
 		writeConfigFile({ fallbackModels: ["deepseek"] });
 		setClassifierReplies(["this is not a verdict at all", "SAFE"]);
 		const result = await gate("make build");
-		expect(result).toContain("classifier parse error");
-		expect(result).not.toContain("(tried:");
-		expect(chainIds()).toEqual(["tiny"]);
+		expect(result).toBe("ALLOWED");
+		expect(classifierAttemptCount()).toBe(2);
+		expect(chainIds()).toEqual(["tiny", "tiny"]);
 	});
 
 	test("timeout on the primary stops the chain: no second attempt", async () => {

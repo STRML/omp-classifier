@@ -26,7 +26,7 @@ import {
 	setClassifierReply,
 	useTempConfigFile,
 } from "./fixtures";
-import { buildStatusReport, type DecisionRecord } from "../index";
+import { buildStatusReport, CLASSIFIER_POLICY_HASH, type DecisionRecord } from "../index";
 
 let dir = "";
 let seq = 0;
@@ -133,7 +133,10 @@ describe("decision audit log", () => {
 			verdict: "SAFE",
 			cached: 0,
 			policyVersion: "frontier-v1",
+			policyHash: CLASSIFIER_POLICY_HASH,
+			sessionId: "audit-safe",
 		});
+		expect(lines[0].decisionId).toMatch(/^[0-9a-f-]{36}$/u);
 		expect(lines[0].cmd).toBe(command);
 
 		// Same session + command: the cached judgement answers, provenance flips.
