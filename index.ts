@@ -2554,24 +2554,70 @@ const HEREDOC_DATA_WRITE =
 /**
  * True when `at` sits inside the body of an earlier heredoc in `command`: an
  * owner line found there is data to the outer cat or tee, never a command of
- * its own. The outer opener is the first `<<` whose delimiter line lies
- * before `at` and whose closer line lies after it. Delimiters here are read
- * the same loose way `heredocBody` reads them: this only ever over-flags,
- * because the caller keeps the region under scan either way.
+ * its own. Every opener counts, not just the strip-shape owners, because an
+ * unquoted outer delimiter expands its body before the outer command reads
+ * it, so text the strip would delete can be live shell. The walk follows
+ * shell body order: openers on one line consume consecutive bodies, an
+ * opener inside a consumed body is data and opens nothing, and an
+ * unterminated body covers to EOF. This only ever over-flags, because the
+ * caller keeps the region under scan either way.
  */
 function heredocShadowedAt(command: string, at: number): boolean {
-	const openerRe = /(?:^|\n)[^\n]*<<(-?)[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_.-]*)\2[ \t]*$/gmu;
-	openerRe.lastIndex = 0;
-	let outer: RegExpExecArray | null;
-	while ((outer = openerRe.exec(command)) !== null) {
-		const ownerEnd = outer.index + outer[0].length;
-		if (ownerEnd >= at) break;
-		const closer = new RegExp(`^${outer[1] === "-" ? "\\t*" : ""}${outer[3].replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}[ \\t]*$`, "mu")
-			.exec(command.slice(ownerEnd + 1));
-		const bodyEnd = closer === null ? command.length : ownerEnd + 1 + closer.index;
-		if (bodyEnd >= at) return true;
+	const all = [...command.matchAll(/<<(-?)[ \t]*(['"]?)([A-Za-z0-9_][A-Za-z0-9_.-]*)\2/gu)].map((m) => ({
+		index: m.index,
+		bodyStart: command.indexOf("\n", m.index) + 1,
+		tabs: m[1] === "-",
+		delim: m[3].replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"),
+	}));
+	let cursor = 0;
+	for (let i = 0; i < all.length; i++) {
+		const op = all[i];
+		if (op.bodyStart === 0) break;
+		if (op.bodyStart > at) return false;
+		if (op.index < cursor) continue;
+		// A closer is the whole delimiter line, exact; `<<-` strips leading
+		// tabs. Trailing whitespace disqualifies it here exactly as it does
+		// for stripping, or `OUT ` would end a body the shell keeps reading.
+		// Openers sharing a line consume consecutive bodies; a body with no
+		// closer covers to EOF, which only ever over-flags.
+		let edge = op.bodyStart;
+		for (let j = i; j < all.length && all[j].bodyStart === op.bodyStart; j++) {
+			const peer = all[j];
+			const closer = new RegExp(`^${peer.tabs ? "\\t*" : ""}${peer.delim}$`, "mu").exec(command.slice(edge));
+			if (closer === null) return true;
+			const line = edge + closer.index;
+			const nl = command.indexOf("\n", line);
+			edge = nl === -1 ? command.length : nl + 1;
+		}
+		cursor = edge;
+		if (at < cursor) return true;
 	}
 	return false;
+}
+
+/**
+ * True when a quote opened before `at` and stays open there, so the shell
+ * reads everything in between as string text. Both quotes span newlines, a
+ * backslash outside single quotes escapes the next character, and nothing
+ * else matters. An apostrophe in unquoted prose opens a quote that never
+ * closes, which only ever blocks a strip that would have removed text — the
+ * over-flag direction.
+ */
+function openQuoteBefore(command: string, at: number): boolean {
+	let quote: "'" | '"' | undefined;
+	for (let i = 0; i < at; i++) {
+		const ch = command[i];
+		if (quote === "'") {
+			if (ch === "'") quote = undefined;
+			continue;
+		}
+		if (ch === "\\") {
+			i++;
+			continue;
+		}
+		if (ch === "'" || ch === '"') quote = ch;
+	}
+	return quote !== undefined;
 }
 
 /**
@@ -2618,9 +2664,11 @@ export function withoutWrittenHeredocBodies(command: string): string {
 			HEREDOC_DATA_WRITE.lastIndex = lineEnd === -1 ? command.length : lineEnd + 1;
 			continue;
 		}
-		if (commented) {
-			// A comment opens nothing: scanning resumes right after the
-			// owner line, and the lines after it are live commands.
+		if (commented || openQuoteBefore(command, opener.index)) {
+			// A comment opens nothing, so the lines after it are live
+			// commands; an owner inside a multi-line string is string text.
+			// Neither shape strips, and scanning resumes after the owner
+			// line for both.
 			continue;
 		}
 		// An owner-shaped line inside another heredoc's body is data to the
@@ -2656,8 +2704,10 @@ function heredocBody(text: string): string | null {
 	const tail = text.slice(start + 1);
 	// The closer is the whole line, and only `<<-` strips leading tabs. Accepting
 	// an indented delimiter ended the payload early, so an interpreter body could
-	// hide its `os.system` behind a `  EOF` line and read as plain code.
-	const closer = new RegExp(`^${opener[1] === "-" ? "\\t*" : ""}${opener[3]}[ \t]*$`, "mu").exec(tail);
+	// hide its `os.system` behind a `  EOF` line and read as plain code. Trailing
+	// whitespace disqualifies a closer too: the shell keeps reading, so a body
+	// may hide its second act behind an `EOF ` line.
+	const closer = new RegExp(`^${opener[1] === "-" ? "\\t*" : ""}${opener[3]}$`, "mu").exec(tail);
 	return closer ? tail.slice(0, closer.index) : tail;
 }
 

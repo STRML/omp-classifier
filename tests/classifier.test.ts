@@ -560,6 +560,37 @@ describe("heredoc bodies are data, not commands", () => {
 		).toEqual(["sudo"]);
 	});
 
+	// Codex review round 6, four findings. Each one hides live text behind a
+	// parse the strip rule thought it could trust.
+	test("an owner inside a multi-line string is string text", async () => {
+		// The quote opens on the echo line and swallows the owner; the shell
+		// never opens a heredoc there, so nothing may strip.
+		expect(
+			await flags("echo \"prefix\ncat > /tmp/f <<'EOF'\n\"\nEOF\nsudo chown root /etc/hosts")
+		).toEqual(["sudo"]);
+	});
+
+	test("a shadowing outer heredoc counts whatever opens it", async () => {
+		// Digit delimiters are legal words, and the outer body expands, so
+		// the substitution inside stays under scan.
+		expect(
+			await flags("cat <<123\ncat > /tmp/f <<'EOF'\n$(sudo chown root /etc/hosts)\nEOF\n123")
+		).toEqual(["sudo"]);
+		// A closer with trailing whitespace does not close for the shell
+		// either, so the outer body runs on past it.
+		expect(
+			await flags("cat <<OUT\nOUT \ncat > /tmp/f <<'EOF'\n$(sudo chown root /etc/hosts)\nEOF\nOUT")
+		).toEqual(["sudo"]);
+	});
+
+	test("an interpreter body runs past a closer with trailing space", async () => {
+		// The shell keeps reading at `EOF `, so the os.system line executes;
+		// the body extractor must truncate nowhere before it.
+		expect(
+			await flags("echo x | python3 - <<'EOF'\nEOF=0\nEOF \n__import__(\"os\").system(\"id\")\nEOF")
+		).toEqual(["| python3"]);
+	});
+
 	test("a glued heredoc still ends where its closer says", async () => {
 		// The glued owner's body is kept, but a real owner after its closer
 		// strips exactly as before: the resume point is the closer line.
