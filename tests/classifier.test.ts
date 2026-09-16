@@ -526,6 +526,31 @@ describe("heredoc bodies are data, not commands", () => {
 		expect(await flags("cat > /tmp/f <<'EOF'\nsudo rm -rf /etc\n")).toEqual(["sudo"]);
 	});
 
+	test("an unterminated heredoc keeps every later owner line as body", async () => {
+		expect(await flags("cat > /tmp/a <<'A'\ncat > /tmp/b <<'B'\nsudo chown root /etc/hosts\nB")).toEqual(["sudo"]);
+	});
+
+	// Codex review round 4, two findings. Each one deletes text the shell
+	// really runs, which the narrow rule read as inert body.
+	test("a glued or commented owner line is not a command boundary", async () => {
+		// `bash -s \` glues the owner onto the previous line; the body runs
+		// as bash script text, so it stays under scan.
+		expect(await flags("bash -s \\\ncat > /tmp/f <<'EOF'\nsudo chown root /etc/hosts\nEOF")).toEqual(["sudo"]);
+		// A `#` earlier on the line makes the owner a comment; the lines
+		// after it are live commands.
+		expect(await flags("echo hi #; cat > /tmp/f <<'EOF'\nsudo rm -rf /tmp/build/*\nEOF")).toEqual(["sudo"]);
+	});
+
+	test("a glued heredoc still ends where its closer says", async () => {
+		// The glued owner's body is kept, but a real owner after its closer
+		// strips exactly as before: the resume point is the closer line.
+		const { withoutWrittenHeredocBodies } = await import("../index.ts");
+		const both = "bash -s \\\ncat > /tmp/f <<'EOF'\nif (dd < 30) {\nEOF\ncat > /tmp/g.ts <<'G'\nrm -rf /tmp/build/*\nG";
+		expect(withoutWrittenHeredocBodies(both)).toBe(
+			"bash -s \\\ncat > /tmp/f <<'EOF'\nif (dd < 30) {\nEOF\ncat > /tmp/g.ts <<'G'\n"
+		);
+	});
+
 	// Codex review round 1, five findings. Each one is a command whose body the
 	// shell really does execute or expand, which the first cut read as inert.
 	test("an expansion in the owner is not a command boundary", async () => {

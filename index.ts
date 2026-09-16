@@ -2556,8 +2556,9 @@ const HEREDOC_DATA_WRITE =
  *
  * Runs on the RAW command: normalizing backslash-newline first let a `safe\`
  * line inside a body join the closing delimiter and delete the rest of the
- * command. A body whose closer is missing is left alone, because then the
- * parse cannot say where it ends.
+ * command. A body whose closer is missing ends the stripping, because then
+ * the parse cannot say where it ends and every later owner line sits inside
+ * that body.
  */
 export function withoutWrittenHeredocBodies(command: string): string {
 	if (!command.includes("<<")) return command;
@@ -2566,6 +2567,31 @@ export function withoutWrittenHeredocBodies(command: string): string {
 	let copied = 0;
 	let opener: RegExpExecArray | null;
 	while ((opener = HEREDOC_DATA_WRITE.exec(command)) !== null) {
+		// A physical newline ends a command only when the shell does not glue
+		// the lines: `bash -s \` + an owner line feeds the body to bash's
+		// stdin, where it runs as script text. And a `#` earlier on the line
+		// makes the whole owner a comment, so the lines after it are live
+		// commands, not body. Neither shape strips; both keep everything the
+		// regex would have deleted under scan. An escaped backslash before
+		// the newline also counts as glued, which only ever over-flags.
+		const lineStart = command.lastIndexOf("\n", opener.index - 1) + 1;
+		const glued = command[opener.index - 1] === "\n" && command[opener.index - 2] === "\\";
+		if (glued || command.slice(lineStart, opener.index).includes("#")) {
+			const bodyStart = command.indexOf("\n", opener.index + opener[0].length);
+			if (bodyStart === -1) break;
+			const delimiter = opener[3].replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+			const closer = new RegExp(`^${opener[1] === "-" ? "\\t*" : ""}${delimiter}$`, "mu")
+				.exec(command.slice(bodyStart + 1));
+			// A glued owner still opens a real heredoc: everything up to its
+			// closer is body, so scanning resumes after the closer to keep
+			// data lines from stripping as if they were owners. A comment
+			// opens nothing, so scanning resumes right after the owner line.
+			if (glued && closer) {
+				const lineEnd = command.indexOf("\n", bodyStart + 1 + closer.index);
+				HEREDOC_DATA_WRITE.lastIndex = lineEnd === -1 ? command.length : lineEnd + 1;
+			}
+			continue;
+		}
 		const bodyStart = command.indexOf("\n", opener.index + opener[0].length);
 		if (bodyStart === -1) break;
 		const delimiter = opener[3].replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
@@ -2573,7 +2599,9 @@ export function withoutWrittenHeredocBodies(command: string): string {
 		// `  EOF` is body text for a plain `<<` exactly as the shell reads it.
 		const closer = new RegExp(`^${opener[1] === "-" ? "\\t*" : ""}${delimiter}$`, "mu")
 			.exec(command.slice(bodyStart + 1));
-		if (!closer) continue;
+		// No closer means the parse cannot say where the body ends, so every
+		// later owner line sits inside this body and nothing after it strips.
+		if (!closer) break;
 		const bodyEnd = bodyStart + 1 + closer.index;
 		const lineEnd = command.indexOf("\n", bodyEnd);
 		const next = lineEnd === -1 ? command.length : lineEnd + 1;
