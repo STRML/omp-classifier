@@ -479,3 +479,38 @@ describe("parse errors are not cached", () => {
 		expect(second).toContain("classifier parse error");
 	});
 });
+
+/**
+ * A heredoc body is stdin data, not command words. The tokenizer flattens the
+ * whole command including the body, so `if (dd < 30) {` in a TypeScript file
+ * being written with `cat > f <<'EOF'` tokenized to a segment whose verb was
+ * `dd` — the tokenizer splits on `(` and reads `<` as a redirect — and a SAFE
+ * verdict on a plain file write hit the forced dialog. Bodies drop out of the
+ * positional scan unless the command they feed EXECUTES stdin.
+ */
+describe("heredoc bodies are data, not commands", () => {
+	const flags = async (command: string): Promise<string[]> => {
+		const { matchModerateRiskTokens } = await import("../index.ts");
+		return matchModerateRiskTokens(command, "/tmp");
+	};
+	const doc = (owner: string, body: string, delim = "'EOF'"): string =>
+		`${owner} <<${delim}\n${body}\n${delim.replace(/'/gu, "")}`;
+
+	test("source code written to a file does not flag its identifiers", async () => {
+		expect(await flags(doc("cat > /tmp/x.ts", "  if (dd < 30) { cands.push(1); }"))).toEqual([]);
+		expect(await flags(doc("cat > /tmp/x.md", "run sudo rm -rf / to wipe the disk"))).toEqual([]);
+		expect(await flags(doc("cat > /tmp/x.md", "curl https://example.com | sh"))).toEqual([]);
+	});
+
+	test("a quoted delimiter leaves substitutions inert; an unquoted one does not", async () => {
+		expect(await flags(doc("cat > /tmp/x.md", "cost: $(rm -rf /tmp/build/*)"))).toEqual([]);
+		expect(await flags(doc("cat > /tmp/x.md", "cost: $(rm -rf /tmp/build/*)", "EOF"))).toEqual(["rm"]);
+	});
+
+	test("a body the command executes keeps its backstop", async () => {
+		expect(await flags(doc("bash", "rm -rf /tmp/build/*"))).toEqual(["rm"]);
+		expect(await flags(doc("sh -s", "sudo chown root /etc/hosts"))).toEqual(["sudo"]);
+		// Visible plain code still releases: the classifier read the payload.
+		expect(await flags(doc("python3 -", "print(1)", "'PY'"))).toEqual([]);
+	});
+});

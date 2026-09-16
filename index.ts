@@ -1609,7 +1609,9 @@ const SEND_DATA_FLAGS: Record<string, true> = {
 };
 
 export function commandHasOutboundNetwork(command: string): boolean {
-	const normalized = command.replace(/\\\r?\n/gu, "");
+	// A document that mentions `wget` is not a fetch: inert heredoc bodies are
+	// data, and only a stdin-executing consumer keeps them under the scan.
+	const normalized = withoutInertHeredocBodies(command.replace(/\\\r?\n/gu, ""));
 	for (const text of splitTopLevelCommands(normalized)) {
 		// `||` passes splitTopLevelCommands unsplit, so the fallback half of
 		// `false || ssh host cat` would be invisible here; split it locally.
@@ -1677,7 +1679,9 @@ function writeTargetOutsideCwd(target: string, cwd: string): boolean {
 	return true;
 }
 
-/** Quoted spans are arguments and heredoc text, not redirections; drop them. */
+/** Quoted spans are arguments, not redirections; drop them. Heredoc BODIES
+ *  are not quoted spans (only the delimiter is), so they are removed earlier,
+ *  by withoutInertHeredocBodies. */
 function stripQuotedSpans(text: string): string {
 	let out = "";
 	let quote: "'" | '"' | undefined;
@@ -1727,7 +1731,10 @@ export function checkWriteScopeConsistency(judgement: Judgement, command: string
 	if (judgement.verdict !== "SAFE") return judgement;
 	const text = `${judgement.analysis ?? ""}\n${judgement.reason}`;
 	if (!WRITE_CONFINED_RE.test(text) && WRITE_DISCUSSED_RE.test(text)) return judgement;
-	for (const top of splitTopLevelCommands(command.replace(/\\\r?\n/gu, ""))) {
+	// A heredoc body is stdin data: `cat > notes.md <<'EOF'` writes notes.md,
+	// not whatever absolute path the prose inside it names.
+	const scanned = withoutInertHeredocBodies(command.replace(/\\\r?\n/gu, ""));
+	for (const top of splitTopLevelCommands(scanned)) {
 		const bare = stripQuotedSpans(top);
 		for (const targetRe of WRITE_TARGET_RES) {
 			for (const match of bare.matchAll(targetRe)) {
@@ -2523,6 +2530,77 @@ function heredocBody(text: string): string | null {
 
 
 /**
+ * Heredoc bodies, with the owner's disposition attached.
+ *
+ * A body is stdin DATA, not command words, but every scan in this file
+ * tokenizes the whole command text, so the body's words read as a command
+ * line. `cat > f.ts <<'EOF'` writing `if (dd < 30) {` flagged `dd`: the
+ * tokenizer splits on `(` and treats `<` as a redirect, so the body produced
+ * a segment whose verb was a raw-disk-write binary. A README documenting
+ * `curl -d` read as an egress call the same way.
+ *
+ * Two properties decide whether a scan may still look at a body:
+ * - `executed`: the owning command runs stdin (`bash <<EOF`, `python3 - <<EOF`).
+ *   Then the body IS the program and every scan keeps it.
+ * - `expanded`: the delimiter is unquoted, so the shell expands `$(…)` and
+ *   backticks inside the body even when the consumer only writes a file.
+ *   Substitution scanning keeps those; positional scanning still does not,
+ *   because the body's own words remain data.
+ */
+type HeredocRegion = { start: number; end: number; expanded: boolean; executed: boolean };
+
+/** Start of the command that owns an opener: everything back to the nearest
+ *  shell operator. Quoting is not modeled — a misread widens the owner text,
+ *  which can only make `executed` true, i.e. keep the body under scan. */
+function ownerExecutesStdin(text: string, openerIndex: number): boolean {
+	const prefix = text.slice(0, openerIndex);
+	let boundary = -1;
+	for (const ch of ["\n", ";", "|", "&", "(", ")", "{", "}"]) {
+		boundary = Math.max(boundary, prefix.lastIndexOf(ch));
+	}
+	return stdinExecutingInterpreters(prefix.slice(boundary + 1)).length > 0;
+}
+
+function heredocRegions(text: string): HeredocRegion[] {
+	const regions: HeredocRegion[] = [];
+	// Local, not module-level: `lastIndex` is mutated below, and a shared
+	// stateful regex leaks that cursor into the next call.
+	const openers = /<<-?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/gu;
+	let opener: RegExpExecArray | null;
+	while ((opener = openers.exec(text)) !== null) {
+		const newline = text.indexOf("\n", opener.index + opener[0].length);
+		if (newline === -1) break;
+		const start = newline + 1;
+		const closer = new RegExp(`^[ \t]*${opener[2]}[ \t]*$`, "mu").exec(text.slice(start));
+		const end = closer ? start + closer.index : text.length;
+		regions.push({
+			start,
+			end,
+			expanded: opener[1] === "",
+			executed: ownerExecutesStdin(text, opener.index),
+		});
+		// A `<<` inside the body is the body's own text, not a second opener.
+		openers.lastIndex = end;
+	}
+	return regions;
+}
+
+/**
+ * `text` with every inert heredoc body excised, leaving the opener and the
+ * closing delimiter in place. `keepExpanded` retains unquoted-delimiter
+ * bodies, whose substitutions the shell runs at write time.
+ */
+export function withoutInertHeredocBodies(text: string, keepExpanded = false): string {
+	if (!text.includes("<<")) return text;
+	const inert = heredocRegions(text).filter(r => !r.executed && !(keepExpanded && r.expanded));
+	let out = text;
+	for (let i = inert.length - 1; i >= 0; i--) {
+		out = out.slice(0, inert[i].start) + out.slice(inert[i].end);
+	}
+	return out;
+}
+
+/**
  * Split a command into pipe stages, quote-aware. `tokenizeShellSegments` cannot
  * do this: it splits `;`, `&&`, `&`, `()` and newline exactly as it splits `|`,
  * so "segment index > 0" reads `cd /tmp && bash x` as piped-into.
@@ -2901,7 +2979,10 @@ export function matchModerateRiskTokens(command: string, cwd?: string): string[]
 	// tokenizer keeps it, which would split `rm` into r/NL/m. Remove the pairs
 	// for MATCHING purposes so the splice reads as one verb.
 	const normalized = command.replace(/\\\r?\n/gu, "");
-	const segments = tokenizeShellSegments(normalized);
+	// Heredoc bodies are stdin data; only a command that executes stdin turns
+	// one back into command words (withoutInertHeredocBodies).
+	const positional = withoutInertHeredocBodies(normalized);
+	const segments = tokenizeShellSegments(positional);
 	const flags = new Set<string>();
 
 	// Anything fed into an interpreter executes code the gate never saw. Purely
@@ -2911,7 +2992,7 @@ export function matchModerateRiskTokens(command: string, cwd?: string): string[]
 	// rule applies as for a non-piped interpreter: only obfuscation markers
 	// or destructive verbs keep the flag. Opaque stdin (`cat ./installer | sh`)
 	// always flags: the SAFE says nothing about what stdin carries.
-	const pipeStages = splitPipeStages(normalized);
+	const pipeStages = splitPipeStages(positional);
 	for (let i = 1; i < pipeStages.length; i++) {
 		for (const { verb, codeText } of stdinExecutingInterpreters(pipeStages[i])) {
 			if (codeText !== null && !INTERPRETER_CODE_RISK.test(codeText) && !INTERPRETER_RISK_TOKEN_RE.test(codeText)) continue;
@@ -3056,13 +3137,17 @@ export function matchModerateRiskTokens(command: string, cwd?: string): string[]
 	// actually CONTAINS — collect $(...) spans (plus an unterminated tail) and
 	// backtick spans, and flag risk verbs only inside those spans. Text outside
 	// (`grep $(git rev-parse HEAD) file`) stays on the graceful path.
-	if (/\$\(|`/u.test(normalized)) {
+	// An unquoted delimiter keeps the body's substitutions live even when the
+	// consumer only writes a file, so those bodies stay in this text; a quoted
+	// one (`<<'EOF'`) expands nothing and drops out.
+	const expandable = withoutInertHeredocBodies(normalized, true);
+	if (/\$\(|`/u.test(expandable)) {
 		const spans: string[] = [];
-		for (const m of normalized.matchAll(/\$\(([^)]*)\)/gu)) spans.push(m[1]);
-		const dollarTail = /\$\(([^)]*)$/u.exec(normalized);
+		for (const m of expandable.matchAll(/\$\(([^)]*)\)/gu)) spans.push(m[1]);
+		const dollarTail = /\$\(([^)]*)$/u.exec(expandable);
 		if (dollarTail) spans.push(dollarTail[1]);
-		for (const m of normalized.matchAll(/`([^`]*)`/gu)) spans.push(m[1]);
-		const backtickTail = /`([^`]*)$/u.exec(normalized);
+		for (const m of expandable.matchAll(/`([^`]*)`/gu)) spans.push(m[1]);
+		const backtickTail = /`([^`]*)$/u.exec(expandable);
 		if (backtickTail) spans.push(backtickTail[1]);
 		for (const span of spans) {
 			for (const token of MODERATE_RISK_TOKENS) {
