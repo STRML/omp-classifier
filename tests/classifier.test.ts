@@ -507,6 +507,22 @@ describe("heredoc bodies are data, not commands", () => {
 		expect(await flags(doc("cat > /tmp/x.md", "cost: $(rm -rf /tmp/build/*)", "EOF"))).toEqual(["rm"]);
 	});
 
+	test("a body piped into an interpreter stays opaque", async () => {
+		// The owner is `cat`, so the body drops out of the positional scan, and
+		// the pipe stage is then a shell with no visible payload: fail closed.
+		expect(await flags("cat <<'EOF' | bash\nrm -rf /tmp/build/*\nEOF")).toEqual(["| bash"]);
+	});
+
+	test("one command, two heredocs, judged separately", async () => {
+		const both = "cat > /tmp/a.ts <<'A'\nif (dd < 30) {\nA\nbash <<'B'\nrm -rf /tmp/build/*\nB";
+		expect(await flags(both)).toEqual(["rm"]);
+	});
+
+	test("an indented delimiter and an unterminated body are still data", async () => {
+		expect(await flags("cat > /tmp/f <<-'EOF'\n\tif (dd < 30) {\n\tEOF")).toEqual([]);
+		expect(await flags("cat > /tmp/f <<'EOF'\nsudo rm -rf /etc\n")).toEqual([]);
+	});
+
 	test("a body the command executes keeps its backstop", async () => {
 		expect(await flags(doc("bash", "rm -rf /tmp/build/*"))).toEqual(["rm"]);
 		expect(await flags(doc("sh -s", "sudo chown root /etc/hosts"))).toEqual(["sudo"]);
