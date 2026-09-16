@@ -591,6 +591,24 @@ describe("heredoc bodies are data, not commands", () => {
 		).toEqual(["| python3"]);
 	});
 
+	// Codex review round 7, two findings. The parses behind the strip and the
+	// shadow check each missed a way bash really reads the text.
+	test("an owner inside an ansi-c string is string text", async () => {
+		// bash closes this string only at the lone quote on line three, then
+		// runs what follows: `\'` does not close a $'...' string.
+		const cmd = "printf $'prefix \\'\ncat > /tmp/f <<'EOF'\n'\necho PWNED\nEOF";
+		const { withoutWrittenHeredocBodies } = await import("../index.ts");
+		expect(withoutWrittenHeredocBodies(cmd)).toBe(cmd);
+	});
+
+	test("a shadowing outer heredoc counts any bash delimiter word", async () => {
+		// A dot-start delimiter is a legal word, and the outer body expands,
+		// so the substitution inside stays under scan.
+		expect(
+			await flags("cat <<.OUT\ncat > /tmp/f <<'EOF'\n$(sudo chown root /etc/hosts)\nEOF\n.OUT")
+		).toEqual(["sudo"]);
+	});
+
 	test("a glued heredoc still ends where its closer says", async () => {
 		// The glued owner's body is kept, but a real owner after its closer
 		// strips exactly as before: the resume point is the closer line.

@@ -2552,6 +2552,52 @@ const HEREDOC_DATA_WRITE =
 	/(?:^|(?<=[\n;|&(){}]))[ \t]*(?:cat|tee)(?:[ \t]+-{1,2}[A-Za-z][A-Za-z-]*)*(?:[ \t]*(?:\d?>>?[ \t]*)?[^\s;|&<>'"`$#-][^\s;|&<>'"`$#]*)*[ \t]*<<(-?)[ \t]*(['"])([A-Za-z_][A-Za-z0-9_.-]*)\2[ \t]*$/gmu;
 
 /**
+ * Every `<<` in `command` the shell would read as a heredoc operator, with
+ * the delimiter word after it. Delimiters are words: quote runs contribute
+ * their contents, a backslash contributes the escaped character, and a shell
+ * metacharacter or whitespace ends the word. Digit and punctuation starts
+ * are legal (`cat <<123`, `cat <<.OUT`), and missing quotes only loosen the
+ * walk toward covering more text, which over-flags.
+ */
+function shadowOpeners(command: string): Array<{ index: number; bodyStart: number; tabs: boolean; delim: string }> {
+	const openers: Array<{ index: number; bodyStart: number; tabs: boolean; delim: string }> = [];
+	const re = /<<(-?)[ \t]*/gu;
+	re.lastIndex = 0;
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(command)) !== null) {
+		let delim = "";
+		let i = m.index + m[0].length;
+		for (; i < command.length; i++) {
+			const ch = command[i];
+			if (ch === "\\" && i + 1 < command.length) {
+				delim += command[i + 1];
+				i++;
+				continue;
+			}
+			if (ch === "'" || ch === '"') {
+				const close = command.indexOf(ch, i + 1);
+				if (close === -1) break;
+				delim += command.slice(i + 1, close);
+				i = close;
+				continue;
+			}
+			if (/[\s;|&<>()]/u.test(ch)) break;
+			delim += ch;
+		}
+		if (delim === "") continue;
+		const bodyStart = command.indexOf("\n", i) + 1;
+		if (bodyStart === 0) break;
+		openers.push({
+			index: m.index,
+			bodyStart,
+			tabs: m[1] === "-",
+			delim: delim.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"),
+		});
+	}
+	return openers;
+}
+
+/**
  * True when `at` sits inside the body of an earlier heredoc in `command`: an
  * owner line found there is data to the outer cat or tee, never a command of
  * its own. Every opener counts, not just the strip-shape owners, because an
@@ -2563,12 +2609,7 @@ const HEREDOC_DATA_WRITE =
  * caller keeps the region under scan either way.
  */
 function heredocShadowedAt(command: string, at: number): boolean {
-	const all = [...command.matchAll(/<<(-?)[ \t]*(['"]?)([A-Za-z0-9_][A-Za-z0-9_.-]*)\2/gu)].map((m) => ({
-		index: m.index,
-		bodyStart: command.indexOf("\n", m.index) + 1,
-		tabs: m[1] === "-",
-		delim: m[3].replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"),
-	}));
+	const all = shadowOpeners(command);
 	let cursor = 0;
 	for (let i = 0; i < all.length; i++) {
 		const op = all[i];
@@ -2598,24 +2639,44 @@ function heredocShadowedAt(command: string, at: number): boolean {
 /**
  * True when a quote opened before `at` and stays open there, so the shell
  * reads everything in between as string text. Both quotes span newlines, a
- * backslash outside single quotes escapes the next character, and nothing
- * else matters. An apostrophe in unquoted prose opens a quote that never
- * closes, which only ever blocks a strip that would have removed text — the
- * over-flag direction.
+ * backslash outside quotes escapes the next character, and ANSI-C `$'...'`
+ * strings treat `\'` as an escaped quote where plain `'...'` would close.
+ * Nothing else matters. An apostrophe in unquoted prose opens a quote that
+ * never closes, which only ever blocks a strip that would have removed
+ * text — the over-flag direction.
  */
 function openQuoteBefore(command: string, at: number): boolean {
 	let quote: "'" | '"' | undefined;
+	let ansi = false;
 	for (let i = 0; i < at; i++) {
 		const ch = command[i];
 		if (quote === "'") {
-			if (ch === "'") quote = undefined;
+			if (ch === "\\" && ansi) {
+				i++;
+				continue;
+			}
+			if (ch === "'") {
+				quote = undefined;
+				ansi = false;
+			}
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === "\\") {
+				i++;
+				continue;
+			}
+			if (ch === '"') quote = undefined;
 			continue;
 		}
 		if (ch === "\\") {
 			i++;
 			continue;
 		}
-		if (ch === "'" || ch === '"') quote = ch;
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			ansi = ch === "'" && command[i - 1] === "$";
+		}
 	}
 	return quote !== undefined;
 }
