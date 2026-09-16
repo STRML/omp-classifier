@@ -523,6 +523,32 @@ describe("heredoc bodies are data, not commands", () => {
 		expect(await flags("cat > /tmp/f <<'EOF'\nsudo rm -rf /etc\n")).toEqual([]);
 	});
 
+	// Codex review round 1, five findings. Each one is a command whose body the
+	// shell really does execute or expand, which the first cut read as inert.
+	test("a quoted shell operator does not truncate the owner", async () => {
+		expect(await flags("bash -s 'arg;value' <<'EOF'\nrm -rf /tmp/build/*\nEOF")).toEqual(["rm"]);
+	});
+
+	test("an unlisted wrapper does not hide the interpreter", async () => {
+		expect(await flags("time bash <<'EOF'\nrm -rf /tmp/build/*\nEOF")).toEqual(["rm"]);
+		expect(await flags("doas bash <<'EOF'\nrm -rf /tmp/build/*\nEOF")).toEqual(["rm"]);
+	});
+
+	test("an opener inside quotes is text, and a delimiter keeps its whole word", async () => {
+		// `printf 'literal <<EOF'` opens nothing; reading it as an unterminated
+		// heredoc deleted the rest of the command.
+		expect(await flags("printf 'literal <<EOF'\nsudo rm -rf /tmp/build/*")).toEqual(["sudo"]);
+		// `EOF-1` is the delimiter, not `EOF`: matching the prefix found no
+		// closer and swallowed everything after it.
+		expect(await flags("cat <<EOF-1\nbody\nEOF-1\nsudo rm -rf /tmp/build/*")).toEqual(["sudo"]);
+	});
+
+	test("a closing delimiter is the whole line, spaces included", async () => {
+		// `  EOF` is body text for a plain `<<`, so the real body runs past it.
+		const doc = "cat > /tmp/f <<'EOF'\n  EOF\nsudo chown root /etc/x\nEOF";
+		expect(await flags(doc)).toEqual([]);
+	});
+
 	test("a body the command executes keeps its backstop", async () => {
 		expect(await flags(doc("bash", "rm -rf /tmp/build/*"))).toEqual(["rm"]);
 		expect(await flags(doc("sh -s", "sudo chown root /etc/hosts"))).toEqual(["sudo"]);

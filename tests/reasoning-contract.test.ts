@@ -256,6 +256,11 @@ describe("checkEgressConsistency", () => {
 		expect(checkWriteScopeConsistency(silent, script, cwd).verdict).toBe("UNSURE");
 	});
 
+	test("an unquoted heredoc keeps the writes its substitutions perform", () => {
+		const live = "cat > ./out <<EOF\n$(echo x > ~/.zshrc)\nEOF";
+		expect(checkWriteScopeConsistency(silent, live, cwd).verdict).toBe("UNSURE");
+	});
+
 	test("tilde redirect outside cwd downgrades", () => {
 		expect(checkWriteScopeConsistency(silent, "echo x >> ~/.zshrc", cwd).verdict).toBe("UNSURE");
 	});
