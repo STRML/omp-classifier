@@ -541,6 +541,25 @@ describe("heredoc bodies are data, not commands", () => {
 		expect(await flags("echo hi #; cat > /tmp/f <<'EOF'\nsudo rm -rf /tmp/build/*\nEOF")).toEqual(["sudo"]);
 	});
 
+	test("an owner inside another heredoc body is not a command", async () => {
+		// The outer delimiter is unquoted, so the shell expands the body
+		// before cat reads it: stripping the substitution would hide it.
+		expect(
+			await flags("cat <<OUT\ncat > /tmp/f <<'EOF'\n$(sudo chown root /etc/hosts)\nEOF\nOUT")
+		).toEqual(["sudo"]);
+		// With a quoted outer delimiter the body is inert, and its writer
+		// shape strips the body exactly as any other: nothing flags.
+		expect(
+			await flags("cat <<'OUT'\ncat > /tmp/f <<'EOF'\nsudo chown root /etc/hosts\nEOF\nOUT")
+		).toEqual([]);
+	});
+
+	test("a glued heredoc without a closer ends the stripping", async () => {
+		expect(
+			await flags("bash -s \\\ncat > /tmp/a <<'A'\ncat > /tmp/b <<'B'\nsudo chown root /etc/hosts\nB")
+		).toEqual(["sudo"]);
+	});
+
 	test("a glued heredoc still ends where its closer says", async () => {
 		// The glued owner's body is kept, but a real owner after its closer
 		// strips exactly as before: the resume point is the closer line.

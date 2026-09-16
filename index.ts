@@ -2552,6 +2552,29 @@ const HEREDOC_DATA_WRITE =
 	/(?:^|(?<=[\n;|&(){}]))[ \t]*(?:cat|tee)(?:[ \t]+-{1,2}[A-Za-z][A-Za-z-]*)*(?:[ \t]*(?:\d?>>?[ \t]*)?[^\s;|&<>'"`$#-][^\s;|&<>'"`$#]*)*[ \t]*<<(-?)[ \t]*(['"])([A-Za-z_][A-Za-z0-9_.-]*)\2[ \t]*$/gmu;
 
 /**
+ * True when `at` sits inside the body of an earlier heredoc in `command`: an
+ * owner line found there is data to the outer cat or tee, never a command of
+ * its own. The outer opener is the first `<<` whose delimiter line lies
+ * before `at` and whose closer line lies after it. Delimiters here are read
+ * the same loose way `heredocBody` reads them: this only ever over-flags,
+ * because the caller keeps the region under scan either way.
+ */
+function heredocShadowedAt(command: string, at: number): boolean {
+	const openerRe = /(?:^|\n)[^\n]*<<(-?)[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_.-]*)\2[ \t]*$/gmu;
+	openerRe.lastIndex = 0;
+	let outer: RegExpExecArray | null;
+	while ((outer = openerRe.exec(command)) !== null) {
+		const ownerEnd = outer.index + outer[0].length;
+		if (ownerEnd >= at) break;
+		const closer = new RegExp(`^${outer[1] === "-" ? "\\t*" : ""}${outer[3].replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}[ \\t]*$`, "mu")
+			.exec(command.slice(ownerEnd + 1));
+		const bodyEnd = closer === null ? command.length : ownerEnd + 1 + closer.index;
+		if (bodyEnd >= at) return true;
+	}
+	return false;
+}
+
+/**
  * `command` with the body and closing line of every matching heredoc removed.
  *
  * Runs on the RAW command: normalizing backslash-newline first let a `safe\`
@@ -2576,22 +2599,7 @@ export function withoutWrittenHeredocBodies(command: string): string {
 		// the newline also counts as glued, which only ever over-flags.
 		const lineStart = command.lastIndexOf("\n", opener.index - 1) + 1;
 		const glued = command[opener.index - 1] === "\n" && command[opener.index - 2] === "\\";
-		if (glued || command.slice(lineStart, opener.index).includes("#")) {
-			const bodyStart = command.indexOf("\n", opener.index + opener[0].length);
-			if (bodyStart === -1) break;
-			const delimiter = opener[3].replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-			const closer = new RegExp(`^${opener[1] === "-" ? "\\t*" : ""}${delimiter}$`, "mu")
-				.exec(command.slice(bodyStart + 1));
-			// A glued owner still opens a real heredoc: everything up to its
-			// closer is body, so scanning resumes after the closer to keep
-			// data lines from stripping as if they were owners. A comment
-			// opens nothing, so scanning resumes right after the owner line.
-			if (glued && closer) {
-				const lineEnd = command.indexOf("\n", bodyStart + 1 + closer.index);
-				HEREDOC_DATA_WRITE.lastIndex = lineEnd === -1 ? command.length : lineEnd + 1;
-			}
-			continue;
-		}
+		const commented = command.slice(lineStart, opener.index).includes("#");
 		const bodyStart = command.indexOf("\n", opener.index + opener[0].length);
 		if (bodyStart === -1) break;
 		const delimiter = opener[3].replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
@@ -2599,6 +2607,28 @@ export function withoutWrittenHeredocBodies(command: string): string {
 		// `  EOF` is body text for a plain `<<` exactly as the shell reads it.
 		const closer = new RegExp(`^${opener[1] === "-" ? "\\t*" : ""}${delimiter}$`, "mu")
 			.exec(command.slice(bodyStart + 1));
+		if (glued) {
+			// A glued owner opens a real heredoc only if its closer exists;
+			// with no closer the body runs to EOF, so every later owner line
+			// sits inside it and stripping ends, exactly like the normal
+			// path below. With a closer, scanning resumes after it so data
+			// lines inside the glued body never strip as if they were owners.
+			if (!closer) break;
+			const lineEnd = command.indexOf("\n", bodyStart + 1 + closer.index);
+			HEREDOC_DATA_WRITE.lastIndex = lineEnd === -1 ? command.length : lineEnd + 1;
+			continue;
+		}
+		if (commented) {
+			// A comment opens nothing: scanning resumes right after the
+			// owner line, and the lines after it are live commands.
+			continue;
+		}
+		// An owner-shaped line inside another heredoc's body is data to the
+		// outer cat or tee. With a QUOTED outer delimiter nothing in the body
+		// runs, but an unquoted one expands before the outer command reads
+		// it, so no strip inside another body can call its payload inert.
+		// Over-flag: the whole region stays under scan.
+		if (heredocShadowedAt(command, opener.index)) continue;
 		// No closer means the parse cannot say where the body ends, so every
 		// later owner line sits inside this body and nothing after it strips.
 		if (!closer) break;
