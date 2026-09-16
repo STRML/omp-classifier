@@ -2549,23 +2549,26 @@ function interpretersInSegment(segment: string[], rawStage: string): Array<{ ver
  * is allowed to be wrong in.
  */
 const HEREDOC_DATA_WRITE =
-	/(?:^|(?<=[\n;|&(){}]))[ \t]*(?:cat|tee)(?:[ \t]+-{1,2}[A-Za-z][A-Za-z-]*)*(?:[ \t]*(?:\d?>>?[ \t]*)?[^\s;|&<>'"`$#-][^\s;|&<>'"`$#]*)*[ \t]*<<(-?)[ \t]*(['"])([A-Za-z_][A-Za-z0-9_.-]*)\2[ \t]*$/gmu;
+	/(?:^|(?<=[\n;|&(){}]))[ \t]*(?:cat|tee)(?![^\s;|&(){}<>])(?:[ \t]+-{1,2}[A-Za-z][A-Za-z-]*)*(?:[ \t]*(?:\d?>>?[ \t]*)?[^\s;|&<>'"`$#-][^\s;|&<>'"`$#]*)*[ \t]*<<(-?)[ \t]*(['"])([A-Za-z_][A-Za-z0-9_.-]*)\2[ \t]*$/gmu;
 
 /**
  * Every `<<` in `command` the shell would read as a heredoc operator, with
  * the delimiter word after it. Delimiters are words: quote runs contribute
  * their contents, a backslash contributes the escaped character, and a shell
  * metacharacter or whitespace ends the word. Digit and punctuation starts
- * are legal (`cat <<123`, `cat <<.OUT`), and missing quotes only loosen the
- * walk toward covering more text, which over-flags.
+ * are legal (`cat <<123`, `cat <<.OUT`). A word the walk cannot finish —
+ * one containing a command or parameter substitution like `$(printf OUT)`,
+ * which bash takes literally — comes back with `delim: null`, and the walk
+ * treats an unknown delimiter as covering to EOF, which only over-flags.
  */
-function shadowOpeners(command: string): Array<{ index: number; bodyStart: number; tabs: boolean; delim: string }> {
-	const openers: Array<{ index: number; bodyStart: number; tabs: boolean; delim: string }> = [];
+function shadowOpeners(command: string): Array<{ index: number; bodyStart: number; tabs: boolean; delim: string | null }> {
+	const openers: Array<{ index: number; bodyStart: number; tabs: boolean; delim: string | null }> = [];
 	const re = /<<(-?)[ \t]*/gu;
 	re.lastIndex = 0;
 	let m: RegExpExecArray | null;
 	while ((m = re.exec(command)) !== null) {
 		let delim = "";
+		let unknown = false;
 		let i = m.index + m[0].length;
 		for (; i < command.length; i++) {
 			const ch = command[i];
@@ -2581,17 +2584,23 @@ function shadowOpeners(command: string): Array<{ index: number; bodyStart: numbe
 				i = close;
 				continue;
 			}
-			if (/[\s;|&<>()]/u.test(ch)) break;
+			if (/[\s;|&<>]/u.test(ch)) break;
+			if (ch === "(" || ch === ")" || ch === "$" || ch === "`") {
+				// Substitution syntax in the word: bash reads it literally,
+				// but this walk cannot know where the word ends, so no
+				// closer line can be trusted.
+				unknown = true;
+				break;
+			}
 			delim += ch;
 		}
-		if (delim === "") continue;
 		const bodyStart = command.indexOf("\n", i) + 1;
 		if (bodyStart === 0) break;
 		openers.push({
 			index: m.index,
 			bodyStart,
 			tabs: m[1] === "-",
-			delim: delim.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"),
+			delim: unknown || delim === "" ? null : delim.replace(/[.*+^${}()|[\]\\]/gu, "\\$&"),
 		});
 	}
 	return openers;
@@ -2624,6 +2633,8 @@ function heredocShadowedAt(command: string, at: number): boolean {
 		let edge = op.bodyStart;
 		for (let j = i; j < all.length && all[j].bodyStart === op.bodyStart; j++) {
 			const peer = all[j];
+			// An unknown delimiter covers everything to EOF.
+			if (peer.delim === null) return true;
 			const closer = new RegExp(`^${peer.tabs ? "\\t*" : ""}${peer.delim}$`, "mu").exec(command.slice(edge));
 			if (closer === null) return true;
 			const line = edge + closer.index;

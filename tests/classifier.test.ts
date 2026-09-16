@@ -609,6 +609,22 @@ describe("heredoc bodies are data, not commands", () => {
 		).toEqual(["sudo"]);
 	});
 
+	// Codex review round 8, two findings. One let a longer command name wear
+	// the owner shape; one let a substitution delimiter truncate the shadow.
+	test("the owner word is exactly cat or tee", async () => {
+		// `catapult <<"EOF"` is a different command; a function by that name
+		// executes its stdin as a script, so the body stays under scan.
+		expect(await flags('catapult <<"EOF"\nrm -rf /tmp/build/*\nEOF')).toEqual(["rm"]);
+	});
+
+	test("an expansion-shaped delimiter covers to end of input", async () => {
+		// bash reads the delimiter word literally, and this walk cannot know
+		// where such a word ends, so no closer line may be trusted.
+		expect(
+			await flags("cat <<$(printf OUT)\ncat > /tmp/f <<'EOF'\n$(sudo chown root /etc/hosts)\nEOF\n$")
+		).toEqual(["sudo"]);
+	});
+
 	test("a glued heredoc still ends where its closer says", async () => {
 		// The glued owner's body is kept, but a real owner after its closer
 		// strips exactly as before: the resume point is the closer line.
