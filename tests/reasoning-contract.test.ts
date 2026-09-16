@@ -246,6 +246,21 @@ describe("checkEgressConsistency", () => {
 		expect(j.reason).toBe("declared scope contradicts command (write target)");
 	});
 
+	test("a redirect inside an inert heredoc body is documentation, not a write", () => {
+		// The body is stdin data: `cat > notes.md <<'EOF'` writes notes.md, not
+		// whatever path the prose it contains happens to name.
+		const doc = "cat > ./notes.md <<'EOF'\nto install: echo export PATH=x >> ~/.zshrc\nEOF";
+		expect(checkWriteScopeConsistency(silent, doc, cwd).verdict).toBe("SAFE");
+		// A body the command executes still carries its redirect.
+		const script = "bash <<'EOF'\necho export PATH=x >> ~/.zshrc\nEOF";
+		expect(checkWriteScopeConsistency(silent, script, cwd).verdict).toBe("UNSURE");
+	});
+
+	test("an unquoted heredoc keeps the writes its substitutions perform", () => {
+		const live = "cat > ./out <<EOF\n$(echo x > ~/.zshrc)\nEOF";
+		expect(checkWriteScopeConsistency(silent, live, cwd).verdict).toBe("UNSURE");
+	});
+
 	test("tilde redirect outside cwd downgrades", () => {
 		expect(checkWriteScopeConsistency(silent, "echo x >> ~/.zshrc", cwd).verdict).toBe("UNSURE");
 	});
