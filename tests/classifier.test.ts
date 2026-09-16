@@ -525,6 +525,17 @@ describe("heredoc bodies are data, not commands", () => {
 
 	// Codex review round 1, five findings. Each one is a command whose body the
 	// shell really does execute or expand, which the first cut read as inert.
+	test("an expansion in the owner is not a command boundary", async () => {
+		// `(`, `)`, `{` and `}` are operators in one context and expansion
+		// syntax in another. Reading them as boundaries dropped the body of a
+		// live `bash`.
+		expect(await flags("bash $(echo -s) <<'EOF'\nrm -rf /tmp/build/*\nEOF")).toEqual(["rm"]);
+		expect(await flags("bash ${OPTS} <<'EOF'\nrm -rf /tmp/build/*\nEOF")).toEqual(["rm"]);
+		expect(await flags("bash `echo -s` <<'EOF'\nrm -rf /tmp/build/*\nEOF")).toEqual(["rm"]);
+		// A real boundary still ends the owner.
+		expect(await flags("bash; cat > /tmp/x.ts <<'EOF'\nif (dd < 30) {\nEOF")).toEqual([]);
+	});
+
 	test("a quoted shell operator does not truncate the owner", async () => {
 		expect(await flags("bash -s 'arg;value' <<'EOF'\nrm -rf /tmp/build/*\nEOF")).toEqual(["rm"]);
 	});

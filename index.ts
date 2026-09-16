@@ -2592,6 +2592,22 @@ function heredocBodyEnd(text: string, start: number, delimiter: string, stripsTa
 	return found ? start + found.index : text.length;
 }
 
+/** Index just past a `(`/`{` expansion that starts at `open`, counting nesting
+ *  so `$( … $( … ) … )` closes once. An unclosed one runs to the end, which is
+ *  what the shell would read. */
+function expansionEnd(text: string, open: number): number {
+	const closer = text[open] === "(" ? ")" : "}";
+	let depth = 0;
+	for (let i = open; i < text.length; i++) {
+		if (text[i] === text[open]) depth++;
+		else if (text[i] === closer) {
+			depth--;
+			if (depth === 0) return i + 1;
+		}
+	}
+	return text.length;
+}
+
 /**
  * One left-to-right pass, quote-aware: a `<<` inside quotes opens nothing
  * (`printf 'literal <<EOF'` is a string), and an operator inside quotes does
@@ -2618,6 +2634,18 @@ function heredocRegions(text: string): HeredocRegion[] {
 		}
 		if (ch === "\\") {
 			i += 2;
+			continue;
+		}
+		// `$(…)`, `${…}` and `` `…` `` are expansions, not command boundaries:
+		// `bash $(echo -s) <<'EOF'` is still bash. Skip them whole, so their
+		// brackets never move ownerStart past the interpreter.
+		if (ch === "`") {
+			const close = text.indexOf("`", i + 1);
+			i = close === -1 ? text.length : close + 1;
+			continue;
+		}
+		if (ch === "$" && (text[i + 1] === "(" || text[i + 1] === "{")) {
+			i = expansionEnd(text, i + 1);
 			continue;
 		}
 		if (SHELL_OPERATOR_CHARS.has(ch)) {
