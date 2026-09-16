@@ -2600,7 +2600,7 @@ function shadowOpeners(command: string): Array<{ index: number; bodyStart: numbe
 			index: m.index,
 			bodyStart,
 			tabs: m[1] === "-",
-			delim: unknown || delim === "" ? null : delim.replace(/[.*+^${}()|[\]\\]/gu, "\\$&"),
+			delim: unknown || delim === "" ? null : delim.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"),
 		});
 	}
 	return openers;

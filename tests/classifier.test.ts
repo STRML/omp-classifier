@@ -625,6 +625,16 @@ describe("heredoc bodies are data, not commands", () => {
 		).toEqual(["sudo"]);
 	});
 
+	// Codex review round 9, one finding. The escape set for delimiter words
+	// had lost its question mark, so a quantifier leaked into the closer.
+	test("a question-mark delimiter closes on its own line only", async () => {
+		// ^A?$ with an unescaped ? would accept a bare A line as the closer
+		// and strip a nested substitution the outer body really expands.
+		expect(
+			await flags("cat <<A?\nA\ncat > /tmp/f <<'EOF'\n$(sudo chown root /etc/hosts)\nEOF\nA?")
+		).toEqual(["sudo"]);
+	});
+
 	test("a glued heredoc still ends where its closer says", async () => {
 		// The glued owner's body is kept, but a real owner after its closer
 		// strips exactly as before: the resume point is the closer line.
