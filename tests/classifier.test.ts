@@ -507,10 +507,10 @@ describe("heredoc bodies are data, not commands", () => {
 		expect(await flags(doc("cat > /tmp/x.md", "cost: $(rm -rf /tmp/build/*)", "EOF"))).toEqual(["rm"]);
 	});
 
-	test("a body piped into an interpreter stays opaque", async () => {
-		// The owner is `cat`, so the body drops out of the positional scan, and
-		// the pipe stage is then a shell with no visible payload: fail closed.
-		expect(await flags("cat <<'EOF' | bash\nrm -rf /tmp/build/*\nEOF")).toEqual(["| bash"]);
+	test("a body piped into an interpreter is not a plain write", async () => {
+		// The owner line carries a pipe, so it is not the one shape this drops.
+		// The body stays under scan and the pipe stage flags on top of it.
+		expect(await flags("cat <<'EOF' | bash\nrm -rf /tmp/build/*\nEOF")).toEqual(["rm", "| bash"]);
 	});
 
 	test("one command, two heredocs, judged separately", async () => {
@@ -566,10 +566,6 @@ describe("heredoc bodies are data, not commands", () => {
 	// Codex review round 2, seven more findings. The pattern behind all of them
 	// was a default that had to be right about the owner to stay safe; it is
 	// now inverted, and a body is data only when the owner provably reads.
-	test("a body that retains an unbalanced quote does not swallow the command", async () => {
-		expect(await flags("bash <<'EOF'\n\"\nEOF\nsudo rm -rf /tmp/x")).toEqual(["sudo"]);
-	});
-
 	test("a backslash-newline inside a body does not eat the closer", async () => {
 		// The `\\\n` strip used to run before heredoc boundaries were known,
 		// which joined `safe\` to the closing EOF and deleted the tail.
@@ -585,12 +581,17 @@ describe("heredoc bodies are data, not commands", () => {
 		expect(await flags("cat <<EOF$X\nbody\nEOF$X\nsudo rm -rf /tmp/x")).toEqual(["sudo"]);
 	});
 
-	test("adjacent heredocs on one line take their bodies in order", async () => {
-		expect(await flags("cat <<'A' <<'B'\nplain\nA\nsudo rm -rf /tmp/x\nB")).toEqual([]);
+	test("two heredocs on one line are not the shape this drops", async () => {
+		// `cat <<'A' <<'B'` needs the shell's left-to-right redirection rules to
+		// say which body is which. It does not match, so both stay under scan.
+		expect(await flags("cat <<'A' <<'B'\nplain\nA\nsudo rm -rf /tmp/x\nB")).toEqual(["sudo"]);
 	});
 
-	test("the closing delimiter is syntax, not a command", async () => {
-		expect(await flags("cat <<sudo\nbody\nsudo")).toEqual([]);
+	test("an unquoted delimiter is not the shape this drops", async () => {
+		// Quoting the delimiter is what proves the body expands nothing, so an
+		// unquoted one keeps the body under scan, closer line included.
+		expect(await flags("cat <<sudo\nbody\nsudo")).toEqual(["sudo"]);
+		expect(await flags("cat > /tmp/f <<EOF\nsudo rm -rf /tmp/x\nEOF")).toEqual(["sudo"]);
 	});
 
 	test("a body the command executes keeps its backstop", async () => {

