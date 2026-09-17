@@ -7,7 +7,7 @@
  * static rules. Dry-run: /classifier dry-run <command> fires the real gate
  * once with all side effects off and reports the first decision it reaches.
  *
- * Each test points OMP_CLASSIFIER_CONFIG at a fresh temp dir, so
+ * Each test points OMP_JEV_CONFIG at a fresh temp dir, so
  * decisions.jsonl and the config file are per-test (same convention as
  * audit-log.test.ts). Fresh sessions per test — the plugin's stores are
  * module-level.
@@ -23,6 +23,8 @@ import {
 	DENY,
 	fire,
 	fireCommand,
+	jevSafeAnswer,
+	jevUnsafeAnswer,
 	loadPlugin,
 	makeCtx,
 	makeEvent,
@@ -32,7 +34,7 @@ import {
 	refusalOf,
 	resultText,
 	selectCalls,
-	setClassifierReply,
+	setJevAnswer,
 	writeConfigFile,
 } from "./fixtures";
 
@@ -50,9 +52,9 @@ const readDecisions = (): DecisionRecord[] =>
 
 beforeEach(async () => {
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-grants-"));
-	process.env.OMP_CLASSIFIER_CONFIG = path.join(dir, "omp-classifier.json");
+	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-jevens-classifier.json");
 	await loadPlugin(makeSettings([]));
-	setClassifierReply("UNSAFE | no");
+	setJevAnswer(jevUnsafeAnswer());
 });
 
 afterEach(() => {
@@ -102,11 +104,11 @@ describe("session grants", () => {
 		const initialBranch = [
 			{ type: "message", id: "u1", message: { role: "user", attribution: "user", content: "Publish the package for this task." } },
 		] as const;
-		setClassifierReply("UNSAFE");
+		setJevAnswer(jevUnsafeAnswer());
 		const first = makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_SESSION, branch: initialBranch });
 		await fire("tool_call", makeEvent("npm publish"), first);
 		expect(selectCalls(first)).toHaveLength(1);
-		setClassifierReply("UNSAFE");
+		setJevAnswer(jevUnsafeAnswer());
 		const narrowedBranch = [
 			...initialBranch,
 			{ type: "message", id: "u2", message: { role: "user", attribution: "user", content: "Do not publish anything now." } },
@@ -122,7 +124,7 @@ describe("session grants", () => {
 		const sid = `grant-progress-${++seq}`;
 		const initialBranch = [{ type: "message", id: "u1", message: { role: "user", attribution: "user", content: "Publish the package for this task." } }] as const;
 		const first = makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_SESSION, branch: initialBranch });
-		setClassifierReply("UNSAFE");
+		setJevAnswer(jevUnsafeAnswer());
 		await fire("tool_call", makeEvent("npm publish"), first);
 		const progressBranch = [
 			...initialBranch,
@@ -193,14 +195,14 @@ describe("session grants", () => {
 		await prompted("rm -rf x", DENY, sid);
 		// ...then approve a REWORDED ask for the session: SAFE-despite-prior
 		// raises the dialog, and the answer grants AND lifts.
-		setClassifierReply("SAFE | routine");
+		setJevAnswer(jevSafeAnswer());
 		const approved = await prompted("rm -rf ./x", ALLOW_SESSION, sid);
 		expect(resultText(approved.result)).toBe("ALLOWED");
 		// A third spelling with the SAME flags hits the grant BEFORE the
 		// classifier: allowed with no model call and no dialog, though a fresh
 		// UNSAFE verdict is pending. ("rm -r x" without -f is a different key
 		// now and gates again — see the regression test below.)
-		setClassifierReply("UNSAFE | would block if asked");
+		setJevAnswer(jevUnsafeAnswer());
 		const thirdCtx = makeCtx({ sessionId: sid, hasUI: true });
 		const third = await fire("tool_call", makeEvent("rm -r -f ./x"), thirdCtx);
 		expect(third).toBeUndefined();
@@ -212,7 +214,7 @@ describe("session grants", () => {
 		const sid = nextSession();
 		await prompted(`git branch -D feature-${sid}`, ALLOW_SESSION, sid);
 
-		writeConfigFile({ model: "changed-model" });
+		writeConfigFile({ typesafeModel: "changed-model" });
 		const ctx = makeCtx({ sessionId: sid, hasUI: true });
 		const result = await fire("tool_call", makeEvent(`git branch -D feature-${sid}`), ctx);
 		expect(refusalOf(result).layer).toBe("dialog");
@@ -280,7 +282,7 @@ describe("/classifier dry-run", () => {
 	});
 
 	test("an undecided command reports would classify and skips the model call", async () => {
-		setClassifierReply("SAFE");
+		setJevAnswer(jevSafeAnswer());
 		const sid = nextSession();
 		const report = await dryRunReport(`git branch -D feature-${sid}`, sid);
 		expect(report).toMatchObject({ would: "classify", layer: "classifier" });
@@ -303,7 +305,7 @@ describe("/classifier dry-run", () => {
 		// the key itself must tell "evidence off" from "on, but no user wrote anything".
 		// Otherwise the probe reports a cited SAFE the citation check would now downgrade.
 		writeConfigFile({ evidenceUserMessages: 0 });
-		setClassifierReply('The user said "yes". VERDICT: SAFE');
+		setJevAnswer(jevSafeAnswer());
 		const sid = nextSession();
 		const command = `echo evidence-flip-${sid}`;
 		await fire("tool_call", makeEvent(command), makeCtx({ sessionId: sid }));
@@ -315,7 +317,7 @@ describe("/classifier dry-run", () => {
 	});
 
 	test("a cached verdict is followed without a model call, mutating nothing", async () => {
-		setClassifierReply("SAFE");
+		setJevAnswer(jevSafeAnswer());
 		const sid = nextSession();
 		const command = `echo cached-dry-${sid}`;
 		await fire("tool_call", makeEvent(command), makeCtx({ sessionId: sid }));

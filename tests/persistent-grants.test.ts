@@ -1,6 +1,6 @@
 /**
  * Persistent "Always allow" grants: the dialog's fourth option writes
- * {cmd, cwd, ts} to omp-classifier-grants.json (beside omp-classifier.json),
+ * {cmd, cwd, ts} to omp-jevens-classifier-grants.json (beside omp-jevens-classifier.json),
  * and a live entry lets that EXACT command text run in that directory across
  * every session for 30 days — no model call, no cache write, one audit line.
  *
@@ -22,6 +22,7 @@ import {
 	DENY,
 	fire,
 	fireCommand,
+	jevUnsafeAnswer,
 	loadPlugin,
 	makeCtx,
 	makeEvent,
@@ -31,13 +32,13 @@ import {
 	refusalOf,
 	resultText,
 	selectCalls,
-	setClassifierReply,
+	setJevAnswer,
 } from "./fixtures";
 
 let dir = "";
 let seq = 0;
 
-const grantsPath = (): string => path.join(dir, "omp-classifier-grants.json");
+const grantsPath = (): string => path.join(dir, "omp-jevens-classifier-grants.json");
 const decisionsPath = (): string => path.join(dir, "decisions.jsonl");
 
 interface GrantEntry {
@@ -76,11 +77,11 @@ const DAY = 24 * 60 * 60 * 1000;
 let lastConfigMtimeMs = 0;
 
 /** Write the config file in THIS test's dir. Never fixtures.writeConfigFile:
- *  it repoints OMP_CLASSIFIER_CONFIG at a shared per-process temp dir, which
+ *  it repoints OMP_JEV_CONFIG at a shared per-process temp dir, which
  *  would break the per-test decisions/grants paths below. Same
  *  strictly-increasing mtime trick to defeat coarse-granularity mtimes. */
 function writeTestConfig(raw: Record<string, unknown>): void {
-	const target = path.join(dir, "omp-classifier.json");
+	const target = path.join(dir, "omp-jevens-classifier.json");
 	fs.writeFileSync(target, JSON.stringify(raw));
 	const mtimeMs = Math.max(Date.now(), lastConfigMtimeMs + 1);
 	fs.utimesSync(target, mtimeMs / 1000, mtimeMs / 1000);
@@ -89,9 +90,9 @@ function writeTestConfig(raw: Record<string, unknown>): void {
 
 beforeEach(async () => {
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-persistent-grants-"));
-	process.env.OMP_CLASSIFIER_CONFIG = path.join(dir, "omp-classifier.json");
+	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-jevens-classifier.json");
 	await loadPlugin(makeSettings([]));
-	setClassifierReply("UNSAFE | no");
+	setJevAnswer(jevUnsafeAnswer());
 });
 
 afterEach(() => {
@@ -300,9 +301,9 @@ describe("persistent grants", () => {
 	test("/classifier persistentGrants toggles the key and the bare config shows it", async () => {
 		const ctx = makeCtx({ sessionId: nextSession() });
 		await fireCommand("classifier", "persistentGrants false", ctx);
-		expect(JSON.parse(fs.readFileSync(path.join(dir, "omp-classifier.json"), "utf8"))).toMatchObject({ persistentGrants: false });
+		expect(JSON.parse(fs.readFileSync(path.join(dir, "omp-jevens-classifier.json"), "utf8"))).toMatchObject({ persistentGrants: false });
 		await fireCommand("classifier", "persistentGrants true", ctx);
-		expect(JSON.parse(fs.readFileSync(path.join(dir, "omp-classifier.json"), "utf8"))).toMatchObject({ persistentGrants: true });
+		expect(JSON.parse(fs.readFileSync(path.join(dir, "omp-jevens-classifier.json"), "utf8"))).toMatchObject({ persistentGrants: true });
 
 		const showCtx = makeCtx({ sessionId: nextSession() });
 		await fireCommand("classifier", "", showCtx);

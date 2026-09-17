@@ -8,21 +8,24 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
 	fire,
+	jevSafeAnswer,
 	loadPlugin,
 	makeCtx,
 	makeEvent,
 	makeSettings,
 	modelCalls,
+	removeConfigFile,
 	resultText,
 	refusalOf,
 	selectCalls,
 	ALLOW_ONCE,
-	setClassifierReply,
+	setJevAnswer,
+	writeConfigFile,
 } from "./fixtures";
 
 beforeEach(async () => {
 	await loadPlugin(makeSettings([]));
-	setClassifierReply("SAFE");
+	setJevAnswer(jevSafeAnswer());
 });
 
 let seq = 0;
@@ -267,10 +270,12 @@ describe("allow rules", () => {
 
 	test("a segment carrying a redirect is never allow-matched", async () => {
 		await loadPlugin(makeSettings([{ match: "gh pr *", approval: "allow" }]));
-		// The reply must carry the egress sentence the two-stage contract
-		// demands of a hosted-API command: a silent-egress SAFE downgrades to
-		// UNSURE before the gate ever reaches the auto-run branch.
-		setClassifierReply("Egress: queries the GitHub API for pr 1; writes stdout to /tmp/out.\nVERDICT: SAFE");
+		// The redirect bars the segment from the allow rule, so the line is
+		// classified instead of riding it. The verdict then decides: with the
+		// egress consistency check gone, a safe answer runs a `gh pr view`
+		// whose output lands in /tmp — the write is reported as a descriptive
+		// hazard, and descriptive hazards never gate.
+		setJevAnswer(jevSafeAnswer());
 		expect(await gate("gh pr view 1 > /tmp/out")).toBe("ALLOWED");
 		expect(modelCalls.length).toBe(1);
 	});
@@ -336,6 +341,42 @@ describe("command bounds", () => {
 	test("internal-URL cwd is blocked, not misclassified", async () => {
 		const result = await gate("ls", { cwd: "local:/tmp/project" });
 		expect(result).toContain("cannot resolve an internal-URL cwd");
+		expect(modelCalls.length).toBe(0);
+	});
+});
+
+/**
+ * Structured refusal payload (#28): every block reason is machine-readable
+ * JSON with classifier/tool/layer/why/next/notThis, so a harness can read the
+ * decision instead of matching prose. These pin the contract on the block
+ * sites a harness sees directly that do not depend on a verdict: the bash
+ * length cap and the critical-pattern gate, which fires even when
+ * classification is disabled.
+ */
+describe("the refusal payload is structured at every deterministic layer", () => {
+	test("bash cap: layer cap, why names the limit, next names a remedy", async () => {
+		removeConfigFile();
+		const payload = refusalOf(await gate(`echo ${"x".repeat(9_000)}`));
+		expect(payload.classifier).toBe("blocked");
+		expect(payload.tool).toBe("bash");
+		expect(payload.layer).toBe("cap");
+		expect(payload.why).toContain("exceeds the 8000-character review limit");
+		expect(payload.next.length).toBeGreaterThan(0);
+		// The remedy has to be actionable: shortening the command to dodge the
+		// limit would launder text past the reviewer that the user never saw.
+		expect(payload.next).toContain("commit -F");
+		expect(payload.notThis.length).toBeGreaterThan(0);
+		expect(modelCalls.length).toBe(0); // blocked unseen, no model call
+	});
+
+	test("a critical pattern fires with enabled=false and still parses as a payload", async () => {
+		writeConfigFile({ enabled: false });
+		const payload = refusalOf(await gate("rm -rf /"));
+		expect(payload.classifier).toBe("blocked");
+		expect(payload.tool).toBe("bash");
+		expect(payload.layer).toBe("headless");
+		expect(payload.why).toContain("critical pattern");
+		expect(payload.next.length).toBeGreaterThan(0);
 		expect(modelCalls.length).toBe(0);
 	});
 });

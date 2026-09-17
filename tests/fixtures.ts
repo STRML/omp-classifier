@@ -2,10 +2,17 @@
  * Test fixtures for the tool_call interceptor plugin surface.
  *
  * The plugin takes its settings from the pi argument (`pi.pi.settings`) and
- * completes classifications through `completeSimple` — both are injectable
- * here without touching the real modules, so the ONLY stub is the pi-ai model
- * boundary; every static-gate helper (criticals, tokenizer, cwd resolution,
- * leading-cd extraction) runs the real published implementation.
+ * every judgement from TypeSafe's Jev (System One) over HTTP. Both are
+ * injectable here without touching the real modules, so the ONLY stub is the
+ * network boundary: `globalThis.fetch` is replaced by a scripted fake that
+ * answers with wire-shaped Jev responses. The production path runs for real —
+ * jev.ts's askJev (request body, response validation, error mapping) and
+ * deriveJevDecision (the policy arithmetic) are never stubbed, because a suite
+ * that stubs the thing under test asserts against itself.
+ *
+ * One entry in `modelCalls` is one judgement request: the boundary is an HTTP
+ * request now, not a provider completion. Entries are captured on ARRIVAL, so
+ * a request that later times out is still visible (`jevAttemptCount()`).
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -13,56 +20,380 @@ import * as path from "node:path";
 import { mock } from "bun:test";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
-export type Verdict = "SAFE" | "UNSAFE" | "UNSURE";
+export type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "UNAVAILABLE";
 
-export interface CapturedModelCall {
-	model: unknown;
-	request: {
-		systemPrompt: string[];
-		messages: { content: string }[];
+// ---------------------------------------------------------------------------
+// Jev answer fixtures.
+//
+// Wire shapes copied from measured live responses (the frozen contract): a
+// choice answer carries `choice` + `probabilities` + `confidence`, a noul
+// answer a single 0..1 `noul`, a score answer `score` + `legend` +
+// `probabilities` + `confidence`. The fixtures build `answers` maps; the fake
+// fetch wraps them in the response envelope ({model, answers, usage}).
+// ---------------------------------------------------------------------------
+
+export interface JevChoiceAnswerFixture {
+	type: "choice";
+	choice: string;
+	probabilities: Record<string, number>;
+	confidence: number;
+}
+
+export interface JevNoulAnswerFixture {
+	type: "noul";
+	noul: number;
+}
+
+export interface JevScoreAnswerFixture {
+	type: "score";
+	score: number;
+	legend: Record<string, string>;
+	probabilities: Record<string, number>;
+	confidence: number;
+}
+
+/**
+ * The battery's question ids: the contract's "verdict" choice, one noul per
+ * hazard, and the "blast_radius" score. Spelled here instead of imported so
+ * the fixtures never reach into jev.ts's module graph; a drift against
+ * jevQuestions() is loud rather than silent — askJev rejects a response whose
+ * answers do not cover the questions it sent, every judgement becomes
+ * UNAVAILABLE, and policy-gates.test.ts pins the ids the gate actually asked.
+ *
+ * The split mirrors the battery's: GATING hazards can force UNSAFE/UNSURE,
+ * DESCRIPTIVE ones are carried into the reason, the audit line and the dialog
+ * but never decide anything. A stub answer must carry all nine either way —
+ * the validator requires every id with a finite 0..1 value.
+ */
+export const JEV_FIXTURE_GATING_HAZARDS = [
+	"destructive_or_irreversible",
+	"exposes_secrets",
+	"sends_local_data_outbound",
+	"escalates_privilege",
+	"state_contains_injection",
+	"unauthorized_consequential_action",
+] as const;
+
+export const JEV_FIXTURE_DESCRIPTIVE_HAZARDS = [
+	"contacts_remote_endpoint",
+	"writes_outside_working_directory",
+	"affects_shared_or_remote_state",
+] as const;
+
+export const JEV_FIXTURE_HAZARDS = [
+	...JEV_FIXTURE_GATING_HAZARDS,
+	...JEV_FIXTURE_DESCRIPTIVE_HAZARDS,
+] as const;
+
+export type JevFixtureHazard = (typeof JEV_FIXTURE_HAZARDS)[number];
+export type JevFixtureGatingHazard = (typeof JEV_FIXTURE_GATING_HAZARDS)[number];
+export type JevFixtureDescriptiveHazard = (typeof JEV_FIXTURE_DESCRIPTIVE_HAZARDS)[number];
+
+export type JevFixtureAnswers = {
+	verdict: JevChoiceAnswerFixture;
+	blast_radius: JevScoreAnswerFixture;
+} & Record<JevFixtureHazard, JevNoulAnswerFixture>;
+
+/** The model id the fake reports; the real endpoint resolves jev-latest to it. */
+export const JEV_FIXTURE_MODEL = "jev-1.13.0";
+
+/** Blast-radius legend served with every score answer (0..2, ordered). */
+export const JEV_FIXTURE_BLAST_LEVELS = ["local, reversible", "repository-wide", "shared or remote state"] as const;
+
+export function jevChoice(choice: string, probabilities: Record<string, number>, confidence: number): JevChoiceAnswerFixture {
+	return { type: "choice", choice, probabilities, confidence };
+}
+
+export function jevNoul(noul: number): JevNoulAnswerFixture {
+	return { type: "noul", noul };
+}
+
+export function jevScore(score: number, confidence: number): JevScoreAnswerFixture {
+	// The measured shape carries one probability per legend level. Putting the
+	// mass on the level nearest the score keeps a fixture consistent with
+	// itself, so a test that fails on the score cannot be explained away by the
+	// distribution.
+	const levels = JEV_FIXTURE_BLAST_LEVELS;
+	const nearest = Math.max(0, Math.min(levels.length - 1, Math.round(score)));
+	const probabilities: Record<string, number> = {};
+	const siblings = levels.length - 1;
+	levels.forEach((_, index) => {
+		probabilities[String(index)] = index === nearest ? 0.7 : 0.3 / siblings;
+	});
+	const legend: Record<string, string> = {};
+	levels.forEach((level, index) => {
+		legend[String(index)] = level;
+	});
+	return { type: "score", score, legend, probabilities, confidence };
+}
+
+/** Every hazard quiet, blast radius local: the baseline the fixtures vary. */
+function quietHazards(): Record<JevFixtureHazard, JevNoulAnswerFixture> {
+	const hazards = {} as Record<JevFixtureHazard, JevNoulAnswerFixture>;
+	for (const hazard of JEV_FIXTURE_HAZARDS) hazards[hazard] = jevNoul(0.03);
+	return hazards;
+}
+
+/** p(safe) .95 at confidence .9 — clears DEFAULT_JEV_POLICY with room to spare. */
+export function jevSafeAnswer(overrides: Partial<JevFixtureAnswers> = {}): JevFixtureAnswers {
+	return {
+		...quietHazards(),
+		verdict: jevChoice("safe", { safe: 0.95, unsafe: 0.04, unsure: 0.01 }, 0.9),
+		blast_radius: jevScore(0.4, 0.85),
+		...overrides,
 	};
-	options: { apiKey: unknown; disableReasoning: boolean; signal: unknown };
 }
 
-export const modelCalls: CapturedModelCall[] = [];
-export let classifierReply = "SAFE";
-export function setClassifierReply(value: string): void {
-	classifierReply = value;
-}
-export function setClassifierThrows(value: boolean): void {
-	classifierThrows = value;
-}
-/** Make the stubbed completion slower than the configurable timeout (abort tests). */
-export function setClassifierDelay(ms: number): void {
-	classifierDelayMs = ms;
-}
-/** Script per-call replies: consumed in order, then `classifierReply` takes
- *  over. An empty string models the empty-reply outage path. */
-let classifierReplyQueue: string[] | undefined;
-export function setClassifierReplies(values: string[]): void {
-	classifierReplyQueue = [...values];
-}
-/** Make the next `count` completions throw (provider-exception path); later
- *  calls behave normally again. */
-let classifierFailuresLeft = 0;
-export function setClassifierFailures(count: number): void {
-	classifierFailuresLeft = count;
-}
-let classifierAttempts = 0;
-/** completeSimple invocations, including ones aborted before completing —
- *  the only way to see that a timeout did NOT trigger a fallback attempt. */
-export function classifierAttemptCount(): number {
-	return classifierAttempts;
+/** p(unsafe) .96: the argmax and the probability agree, unlike the live
+ *  sample that returned choice "safe" with unsafe at .43. */
+export function jevUnsafeAnswer(overrides: Partial<JevFixtureAnswers> = {}): JevFixtureAnswers {
+	return {
+		...quietHazards(),
+		verdict: jevChoice("unsafe", { safe: 0.02, unsafe: 0.96, unsure: 0.02 }, 0.92),
+		blast_radius: jevScore(1.2, 0.8),
+		...overrides,
+	};
 }
 
-let classifierThrows = false;
-let classifierDelayMs = 5;
+/** The genuinely-ambiguous answer: no option reaches a floor, so the gate may
+ *  not read the argmax as a decision. */
+export function jevUnsureAnswer(overrides: Partial<JevFixtureAnswers> = {}): JevFixtureAnswers {
+	return {
+		...quietHazards(),
+		verdict: jevChoice("unsure", { safe: 0.3, unsafe: 0.28, unsure: 0.42 }, 0.31),
+		blast_radius: jevScore(0.8, 0.4),
+		...overrides,
+	};
+}
+
+/** A safe verdict the policy must NOT accept: p(safe) under the .80 floor and
+ *  confidence under the .50 floor. This is the live measured shape — Jev said
+ *  "safe" while unsafe held .43 — and the reason the floors exist. */
+export function jevWeakSafeAnswer(overrides: Partial<JevFixtureAnswers> = {}): JevFixtureAnswers {
+	return jevSafeAnswer({
+		verdict: jevChoice("safe", { safe: 0.55, unsafe: 0.42, unsure: 0.03 }, 0.29),
+		...overrides,
+	});
+}
+
+/** A safe verdict with one hazard raised: the hazard-block/review shapes. */
+export function jevHazardousAnswer(hazard: JevFixtureHazard, noul: number, overrides: Partial<JevFixtureAnswers> = {}): JevFixtureAnswers {
+	return jevSafeAnswer({ ...overrides, [hazard]: jevNoul(noul) });
+}
+
+// ---------------------------------------------------------------------------
+// The fake network boundary.
+// ---------------------------------------------------------------------------
+
+export interface CapturedJevRequest {
+	/** The state (report) the gate sent. Never a prompt: Jev reads structure. */
+	state: unknown;
+	/** The question battery, by id. */
+	questions: Record<string, unknown>;
+	/** The model id from the request body. */
+	model: unknown;
+	/** Request headers, lower-cased (the bearer token rides here). */
+	headers: Record<string, string>;
+}
+
+export const modelCalls: CapturedJevRequest[] = [];
+
+let jevDefaultAnswers: JevFixtureAnswers = jevSafeAnswer();
+let jevQueue: JevFixtureAnswers[] | undefined;
+let jevFailuresLeft = 0;
+let jevUnavailable = false;
+let jevDelayMs = 5;
+const jevRawQueue: Array<{ status: number; body: string }> = [];
+
+/** Requests SENT, including ones aborted before a response (a timeout is
+ *  evidence the gate tried — the only way to see it, since nothing lands). */
+export function jevAttemptCount(): number {
+	return modelCalls.length;
+}
+
+/** Serve this answer for every request from now on; drops a queued script. */
+export function setJevAnswer(answers: JevFixtureAnswers = jevSafeAnswer()): void {
+	jevDefaultAnswers = answers;
+	jevQueue = undefined;
+}
+
+/** Script per-request answers, consumed in order; once drained,
+ *  `jevDefaultAnswers` (set by setJevAnswer, safe by default) takes over. */
+export function setJevAnswers(answers: JevFixtureAnswers[]): void {
+	jevQueue = [...answers];
+}
+
+/** Make the next `count` requests fail with HTTP 503 (provider outage). */
+export function setJevFailures(count: number): void {
+	jevFailuresLeft = count;
+}
+
+/** Model an unreachable endpoint: the request rejects like a failed
+ *  connection rather than answering with a status. sticky until cleared. */
+export function setJevUnavailable(unavailable = true): void {
+	jevUnavailable = unavailable;
+}
+
+/** Serve exact bodies (status 200 unless given), bypassing answer scripting:
+ *  the malformed-body and wrong-shape paths. */
+export function setJevRawResponses(responses: Array<{ status?: number; body: string }>): void {
+	jevRawQueue.length = 0;
+	for (const response of responses) jevRawQueue.push({ status: response.status ?? 200, body: response.body });
+}
+
+/** Delay every response; combined with a small `timeoutMs`, this is the abort
+ *  path (the gate's AbortSignal fires before the fake answers). */
+export function setJevDelay(ms: number): void {
+	jevDelayMs = ms;
+}
+
+const JEV_TEST_KEY = "jev-test-key";
+const REAL_PATH = process.env.PATH;
+
+/**
+ * The API key must never be resolved from the developer's keychain during a
+ * test run: `resolveJevApiKey` falls back to
+ * `security find-generic-password -s jev -w`, so the happy path would depend on
+ * this machine having the entry and CI not having it — pass/fail by host. Pin
+ * a test key instead. Cleared by clearJevApiKey for the missing-key path.
+ */
+export function restoreJevApiKey(): void {
+	process.env.TYPESAFE_API_KEY = JEV_TEST_KEY;
+	if (REAL_PATH !== undefined) process.env.PATH = REAL_PATH;
+}
+
+/**
+ * The no-key path must be deterministic too, and here the machine actively
+ * betrays it: this developer's keychain HAS the `jev` entry, so leaving the
+ * fallback reachable would make "missing key" pass or fail by machine state.
+ * An unreachable PATH makes the keychain read fail the way it does on a host
+ * with no entry — the same shape a fresh CI runner sees.
+ */
+export function clearJevApiKey(): void {
+	delete process.env.TYPESAFE_API_KEY;
+	process.env.PATH = "/nonexistent-omp-jevens-test-bin";
+}
+
+async function sleepWithAbort(ms: number, signal: AbortSignal | undefined): Promise<void> {
+	if (!signal) {
+		await new Promise<void>(resolve => setTimeout(resolve, ms));
+		return;
+	}
+	// A DOMException-shaped rejection, like fetch's own abort: askJev maps any
+	// rejection to JevUnavailableError, and the name keeps the stack readable
+	// when a timeout test fails.
+	const aborted = (): Error => Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+	if (signal.aborted) throw aborted();
+	await new Promise<void>((resolve, reject) => {
+		const timer = setTimeout(() => {
+			cleanup();
+			resolve();
+		}, ms);
+		// A leaked listener on a long-lived signal would fire long after this
+		// request ended; every exit path detaches it.
+		const onAbort = (): void => {
+			cleanup();
+			reject(aborted());
+		};
+		const cleanup = (): void => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", onAbort);
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+function headerRecord(headers: unknown): Record<string, string> {
+	const out: Record<string, string> = {};
+	if (headers && typeof headers === "object") {
+		const entries = headers instanceof Map ? [...headers.entries()] : Object.entries(headers as Record<string, unknown>);
+		for (const [key, value] of entries) out[String(key).toLowerCase()] = String(value);
+	} else if (typeof headers === "string") {
+		for (const line of headers.split("\n")) {
+			const index = line.indexOf(":");
+			if (index > 0) out[line.slice(0, index).trim().toLowerCase()] = line.slice(index + 1).trim();
+		}
+	}
+	return out;
+}
+
+async function fakeJevFetch(
+	_url: unknown,
+	init?: { method?: string; body?: string; headers?: unknown; signal?: AbortSignal },
+): Promise<Response> {
+	const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : undefined;
+	// Captured BEFORE the delay: a request that times out was still sent, and
+	// that is the only evidence a timeout triggered no silent allow.
+	modelCalls.push({
+		state: body?.state,
+		questions: (body?.questions ?? {}) as Record<string, unknown>,
+		model: body?.model,
+		headers: headerRecord(init?.headers),
+	});
+	await sleepWithAbort(jevDelayMs, init?.signal);
+	if (jevUnavailable) throw new TypeError("fetch failed");
+	if (jevFailuresLeft > 0) {
+		jevFailuresLeft -= 1;
+		return new Response('{"error":"service unavailable"}', { status: 503, headers: { "content-type": "application/json" } });
+	}
+	const raw = jevRawQueue.shift();
+	if (raw) return new Response(raw.body, { status: raw.status });
+	const answers = jevQueue?.shift() ?? jevDefaultAnswers;
+	return new Response(JSON.stringify({ model: JEV_FIXTURE_MODEL, answers, usage: { input_tokens: 528, output_tokens: 126 } }), {
+		status: 200,
+		headers: { "content-type": "application/json" },
+	});
+}
+
+// Installed at module load, before any test imports index.ts (loadPlugin's
+// dynamic import), so the plugin binds the fake and never opens a socket. A
+// test that forgets to script an answer still gets a well-formed safe answer,
+// never a hung request against the real endpoint.
+globalThis.fetch = fakeJevFetch as unknown as typeof fetch;
+
+/** The state sent with one captured request. */
+export function stateOf(index = 0): Record<string, unknown> {
+	const call = modelCalls[index];
+	if (!call) throw new Error(`no captured Jev request at index ${index}`);
+	return (call.state ?? {}) as Record<string, unknown>;
+}
+
+/** The question battery sent with one captured request. */
+export function questionsOf(index = 0): Record<string, unknown> {
+	const call = modelCalls[index];
+	if (!call) throw new Error(`no captured Jev request at index ${index}`);
+	return call.questions;
+}
+
+export interface EvidenceTierView {
+	userMessages?: string[];
+	userMessageIds?: string[];
+	operatorContext?: string;
+}
+
+/**
+ * The provenance tiers of one request's state. The state's envelope is jev.ts's
+ * business (top-level fields or an `evidence` sub-object), but the tier NAMES
+ * are the contract — userMessages is the user's own voice, operatorContext is
+ * agent-authored — so read them wherever the builder put them and assert on
+ * their meaning, not their address.
+ */
+export function evidenceOf(index = 0): EvidenceTierView {
+	const state = stateOf(index);
+	const nested = state.evidence;
+	const source = (typeof nested === "object" && nested !== null ? nested : state) as Record<string, unknown>;
+	return {
+		userMessages: source.userMessages as string[] | undefined,
+		userMessageIds: source.userMessageIds as string[] | undefined,
+		operatorContext: source.operatorContext as string | undefined,
+	};
+}
 
 // The published 17.3.8 pi-ai/coding-agent pair is not mutually coherent: 30
 // names coding-agent imports are absent from the pi-ai barrel. The live OMP
 // binary bundles a coherent pair; the npm pair explodes on these names. The
-// mock fakes the whole surface; the test boundary is completeSimple,
-// everything else is inert.
+// mock fakes the whole surface; the test boundary is the HTTP request in
+// fakeJevFetch above, everything else is inert.
 const missingExportStub = () => undefined;
 const typeMarkerStub = "type-only-inert";
 mock.module("@oh-my-pi/pi-ai", () => ({
@@ -155,6 +486,12 @@ mock.module("@oh-my-pi/pi-ai", () => ({
 	calculateRateLimitBackoffMs: missingExportStub,
 	clearAnthropicFastModeFallback: missingExportStub,
 	coerceServiceTierByFamily: missingExportStub,
+	// The host modules this suite loads (tools/bash, tools/shell-tokenize,
+	// tools/path-utils) import `completeSimple` from the pi-ai barrel, so the
+	// mock must carry the name or module resolution fails before any test runs.
+	// Nothing here calls it: the judgement boundary is the HTTP request in the
+	// fake Jev fetch, and the classification path no longer completes a chat.
+	completeSimple: missingExportStub,
 	deriveClaudeDeviceId: missingExportStub,
 	getEnvApiKey: missingExportStub,
 	getOAuthProviders: missingExportStub,
@@ -187,30 +524,6 @@ mock.module("@oh-my-pi/pi-ai", () => ({
 	withAuth: missingExportStub,
 	withOAuthAccess: missingExportStub,
 	wrapFetchForCch: missingExportStub,
-	completeSimple: async (model: unknown, request: unknown, options: unknown) => {
-		classifierAttempts += 1;
-		if (classifierThrows) throw new Error("model call failed");
-		if (classifierFailuresLeft > 0) {
-			classifierFailuresLeft -= 1;
-			throw new Error("model call failed");
-		}
-		const reply = classifierReplyQueue?.shift() ?? classifierReply;
-		const signal = (options as { signal?: AbortSignal } | undefined)?.signal;
-		await new Promise<void>((resolve, reject) => {
-			if (signal?.aborted) {
-				reject(new Error("aborted before completion"));
-				return;
-			}
-			signal?.addEventListener("abort", () => reject(new Error("aborted before completion")));
-			setTimeout(resolve, classifierDelayMs);
-		});
-		modelCalls.push({
-			model,
-			request: request as CapturedModelCall["request"],
-			options: options as CapturedModelCall["options"],
-		});
-		return { content: [{ type: "text", text: reply }] };
-	},
 }));
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
@@ -235,11 +548,14 @@ export async function loadPlugin(settings: Record<string, unknown>): Promise<voi
 	// Every stub knob resets here: each test file's beforeEach loadPlugin()
 	// then starts from the pristine default, so no file can inherit another's
 	// scripted state no matter what order bun runs them in. Files wanting a
-	// non-default reply set it AFTER loadPlugin.
-	classifierReply = "SAFE";
-	classifierReplyQueue = undefined;
-	classifierFailuresLeft = 0;
-	classifierAttempts = 0;
+	// non-default answer set it AFTER loadPlugin.
+	jevDefaultAnswers = jevSafeAnswer();
+	jevQueue = undefined;
+	jevFailuresLeft = 0;
+	jevUnavailable = false;
+	jevDelayMs = 5;
+	jevRawQueue.length = 0;
+	restoreJevApiKey();
 	const mod = await import("../index.ts");
 	mod.default({
 		pi: { settings },
@@ -268,7 +584,7 @@ export const loggerWarnings: string[] = [];
 export function resetLoggerWarnings(): void {
 	loggerWarnings.length = 0;
 }
-/** Captured `pi.logger.info` messages (the classifier decision log). */
+/** Captured `pi.logger.info` messages (the gate decision log). */
 export const loggerInfos: string[] = [];
 
 export function resetLoggerInfos(): void {
@@ -326,10 +642,9 @@ export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 				notifyCalls.push([message, type]);
 			},
 		},
-		// Mirrors the host resolver contract: an empty selector is the caller's
-		// fallback model; `@tiny` is the tiny role (also the fallback model in
-		// tests); any other selector resolves by name; `undefined` when the
-		// selector names no available model (like model-resolver.ts).
+		// Mirrors the host resolver contract. The Jev gate judges with one
+		// model id and has no role resolution of its own, so these exist only
+		// so a host-shaped ctx stays honest about the surface it exposes.
 		models: {
 			resolve: (selector: string | undefined) => {
 				const s = selector?.trim();
@@ -383,7 +698,7 @@ let testConfigDir: string | undefined;
 // The plugin's config path must NEVER resolve to the real homedir file during
 // tests: machine state (a live /classifier edit) would silently flip defaults
 // and fail the suite. Force the env override before the plugin first reads it.
-process.env.OMP_CLASSIFIER_CONFIG = useTempConfigFile();
+process.env.OMP_JEV_CONFIG = useTempConfigFile();
 
 let testLockPath: string | undefined;
 
@@ -397,7 +712,7 @@ let testLockPath: string | undefined;
 // redirect inert and the suite read the developer's real lockfile. Pin it here
 // beside the redirect rather than relying on bun's default.
 process.env.NODE_ENV = "test";
-process.env.OMP_CLASSIFIER_TEST_LOCKFILE = lockfilePathForTests();
+process.env.OMP_JEV_TEST_LOCKFILE = lockfilePathForTests();
 
 function lockfilePathForTests(): string {
 	if (!testLockPath) {
@@ -405,7 +720,7 @@ function lockfilePathForTests(): string {
 		// the next run inheriting it would believe the plugin is disabled — the
 		// machine-state dependence this indirection exists to remove.
 		const suffix = Math.random().toString(36).slice(2, 10);
-		testLockPath = path.join(os.tmpdir(), `omp-classifier-test-lock-${process.pid}-${suffix}.json`);
+		testLockPath = path.join(os.tmpdir(), `omp-jevens-test-lock-${process.pid}-${suffix}.json`);
 	}
 	return testLockPath;
 }
@@ -442,14 +757,14 @@ export function removeLockfile(): void {
 export function useTempConfigFile(): string {
 	if (!testConfigPath) {
 		// A per-pid DIRECTORY, not a bare file: the decision audit log (#33)
-		// resolves to dirname(OMP_CLASSIFIER_CONFIG)/decisions.jsonl, so one
+		// resolves to dirname(OMP_JEV_CONFIG)/decisions.jsonl, so one
 		// dir keeps config + audit artifacts together and cleanable at exit.
 		if (!testConfigDir) {
-			testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), `omp-classifier-test-${process.pid}-`));
+			testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), `omp-jevens-test-${process.pid}-`));
 		}
-		testConfigPath = path.join(testConfigDir, "omp-classifier.json");
+		testConfigPath = path.join(testConfigDir, "omp-jevens-classifier.json");
 	}
-	process.env.OMP_CLASSIFIER_CONFIG = testConfigPath;
+	process.env.OMP_JEV_CONFIG = testConfigPath;
 	return testConfigPath;
 }
 
@@ -479,7 +794,7 @@ export function removeConfigFile(): void {
 		}
 	}
 	testConfigPath = undefined;
-	process.env.OMP_CLASSIFIER_CONFIG = useTempConfigFile();
+	process.env.OMP_JEV_CONFIG = useTempConfigFile();
 }
 
 /** Render an interceptor result: undefined means "let the host decide/run". */

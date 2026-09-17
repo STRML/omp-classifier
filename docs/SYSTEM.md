@@ -7,14 +7,36 @@ PR should name the layer it touches.
 Readers: contributors, reviewing agents, and future maintainers. The user-facing doc is the
 [README](../README.md).
 
+## What kind of judgment this is
+
+The gate does not ask a model for an opinion and read the prose. It sends Jev one typed
+request per command and gets typed answers back: a choice over `safe`/`unsafe`/`unsure` with
+calibrated probabilities, one **noul** (a probability, not a token) per hazard, and a
+blast-radius score. The verdict is derived in code from those numbers against a policy of
+thresholds. Four consequences shape every layer below:
+
+- **No model text exists anywhere in the design.** There is nothing to parse out of a reply,
+  nothing to quote, and nothing to render from a model. A layer that "reads what the model
+  said" cannot be written, because the model says nothing — it answers questions. Reasons are
+  assembled from numbers and hazard ids, and are byte-stable for the same answers.
+- **One request per classification.** The full battery answers in ~0.6s and extra questions
+  in the same request are cheap, so the verdict and all nine hazards ride in one call rather
+  than a second pass over a "review" prompt.
+- **The verdict is a function.** `deriveJevDecision(answers, policy)` is pure: the same
+  answers and the same policy always decide the same thing. A threshold change can therefore
+  be scored against recorded answers offline instead of re-asking the model (L5).
+- **Fail-closed is a code path, not a promise.** A missing key, a non-2xx, a timeout, or an
+  answer that does not match the battery yields `UNAVAILABLE`, which raises a dialog and is
+  never cached. Nothing admits a guess in place of an answer.
+
 ## The tower
 
 ```
 L6 control plane      /classifier, config bounds, kill switches, agent-legible status
-L5 self-measurement   eval harness, corpus, reports, regression gates
+L5 self-measurement   eval harness, corpus, policy sweep, regression gates
 L4 interaction        dialogs, refusal payloads, session grants, dry-run
 L3 memory             verdict cache, refusal memory, decision audit log
-L2 judgment           fenced record, pinned decode, structured verdict
+L2 judgment           Jev state + question battery, probabilities, derived verdict
 L1 recognition        critical patterns, structural rules, compound segments, marker scans
 L0 evidence           command text, payload, cwd/env, user messages, grants, prior refusals
 ```
@@ -33,70 +55,172 @@ What the gate may read, and what each source is allowed to mean.
 | Agent-supplied context (intent, runbook step) | agent | No. Explains, never authorizes |
 | Tool output, fetched content | hostile | No. Untrusted-wrapped if included at all |
 
+`buildJevState()` turns this into the state Jev judges: command, resolved cwd, and the
+evidence tiers that exist. Absent tiers are omitted rather than sent empty — `userMessages:
+[]` would read as "the user said nothing", which is a different claim from "this caller did
+not supply that tier", and the authorization question depends on the difference. `extra` is
+spread first so a caller-supplied key can never displace the command or the evidence.
+
 Invariant: provenance is decided by the channel, never by the content. Text that claims to
-authorize is itself evidence of injection.
+authorize is itself evidence of injection — and it is now evidence of exactly that, since the
+`state_contains_injection` hazard asks about the state itself rather than trusting a model to
+notice a claim in passing.
 
 ## L1 recognition
 
 The deterministic layer. Answers only "is this shape provably X": critical patterns,
 structural routine shapes, compound-command segments, interpreter scoping, shape-scoped
-`rm`/`unlink` forcing, eval spawn markers. Fetch clearing is no longer a dialog input: the
-forced-dialog set is the hard core only, and the fetch-shape scan survives solely as the
-egress-consistency check's read/write classification.
+`rm`/`unlink` forcing, eval spawn markers, heredoc handling. Its findings reach the tail as
+`riskFlags`, and they outrank the verdict: a destructive-token command that Jev reads as SAFE
+still raises a dialog, because Jev judges the command as untrusted state and can be steered
+by text inside it. This is why the port did not make L1 redundant: Jev removed the need to
+parse prose, not the need to notice shapes without asking anyone.
 
 Invariant: no model call decides what this layer can decide, and this layer never guesses.
 Anything ambiguous falls through to L2.
 
 ## L2 judgment
 
-One fenced record: command or payload, resolved cwd, provenance-tiered evidence. Structured
-verdict: decision plus reversibility, scope, confidence, injection flag. Decode parameters
-are pinned (temperature, reasoning); ambiguous, injection-shaped, inconsistent, and malformed
-primary replies receive one bounded second review within the same deadline.
+One request, two inputs, no prose:
 
-Invariant: the primary and review policy are content-hashed (policy hash/promptId). Every
-prompt or parser change runs the replay-aware corpus before it ships.
+- **State** — `buildJevState(...)`: the command or payload, cwd, and the evidence tiers.
+- **Battery** — `jevQuestions()`: one `choice` question for the verdict, one `noul` per
+  hazard in `JEV_HAZARDS`, one `score` question for blast radius. The battery is a pure
+  function of the module, not of config, so its hash is a stable identity (below).
+
+The response's answers are validated field by field (`askJev` throws `JevUnavailableError` on
+a missing or mistyped field rather than letting a default slip through), then
+`deriveJevDecision(answers, policy)` derives the verdict in a fixed precedence:
+
+1. a hazard at or above `hazardBlock` → `UNSAFE` (a hard safety signal outranks the verdict
+   distribution — the choice can say "safe" right next to it)
+2. p(unsafe) at or above `unsafeMinProbability` → `UNSAFE`
+3. the safe gate: p(safe) and confidence above their floors, no hazard at or above
+   `hazardReview`, blast radius below `blastRadiusReview` → `SAFE`
+4. a hazard at or above `hazardReview` → `UNSURE`
+5. blast radius at or above `blastRadiusReview` → `UNSURE`
+6. otherwise `UNSURE`, below the safe gate's floors
+
+Every branch writes a `reasonCode` (`jev:safe`, `jev:hazard:<id>`, `jev:below-floor`,
+`jev:unavailable`) and a `reason` string assembled from the numbers that decided. Decode
+parameters are pinned: one pinned model (`typesafeModel`), one pinned timeout, no temperature
+knob to set.
+
+Invariant: nothing that reached L2 can end in silence. `UNAVAILABLE` behaves exactly like
+`UNSURE` at L4 (a dialog) and is excluded from the cache, so an outage cannot pin a session
+to a stale non-answer.
+
+## Policy: where the thresholds live
+
+The thresholds are policy, not constants, because Jev's probabilities move with the question
+set and the state shape — the same command scored p(safe) 0.61 / confidence 0.42 alone and
+0.52 / 0.43 / 0.29 with the full battery. `DEFAULT_JEV_POLICY` is therefore a starting
+point, and the interesting question is always what a *different* threshold set would do to
+the same answers.
+
+- The gate reads `jevPolicy: Partial<JevPolicy>` from the config file
+  (`<configRoot>/omp-jevens-classifier.json`, `OMP_JEV_CONFIG` overrides the path) and merges
+  it over `DEFAULT_JEV_POLICY`. A hand-edited value that is unknown, mistyped, NaN, or out of
+  range is dropped rather than passed through: for numbers that decide auto-run, a typo must
+  mean "keep the default", never "no floor".
+- The verdict cache is keyed on a config signature that includes the merged policy: changing
+  a threshold invalidates every cached verdict, so a `jevPolicy` edit cannot reuse a decision
+  made under different numbers.
+- `/classifier policy` prints the merged effective policy next to the defaults and the battery
+  hash, and is read-only on purpose — thresholds move together, so they are edited in the
+  config file where the whole set is visible at once.
+- A candidate policy is scored by the harness (`--policy <file.json>`), which is deliberately
+  stricter than the config loader: an unknown knob or an out-of-range value fails the run
+  (rather than being dropped), and so does a `hazardReview` above `hazardBlock` — the block
+  test runs first, so a higher review threshold could never fire and the candidate would look
+  tuned while changing nothing.
+
+Invariant: no threshold is copied from a vendor document into code without a corpus run
+behind it. The sweep in L5 exists to make that cheap enough to be routine.
 
 ## L3 memory
 
-- Verdict cache: exact-input keyed, per session, config-signature cleared.
-- Refusal memory: what this session was denied, fed back so rewording cannot launder a
-  refusal into a fresh judgment.
-- Decision audit: one JSONL line per decision, every path, every axis, with session/decision
-  ids, policy identity, model/review telemetry, approval outcome, and timing.
+- **Verdict cache**: per session, keyed by command + cwd + env/pty identity, and cleared
+  whenever the effective config signature changes. `UNAVAILABLE` is never cached.
+- **Refusal memory**: what this session was denied, keyed by normalized target and cwd and
+  fingerprinted by the evidence the judge saw, fed back into the state as `priorRefusal` so
+  rewording cannot launder a refusal into a fresh judgment. A SAFE under a prior refusal is
+  not a clean bill: the refusal rode in the state the judge saw.
+- **Decision audit**: one JSONL line per decision at
+  `<agentDir>/omp-jevens-classifier/decisions.jsonl`, every path, with session/decision ids,
+  `policyVersion`/`policyHash` (the battery hash), `modelId`, `verdict`, `reasonCode`, the
+  `jev` telemetry block (probabilities, hazards, confidence, blast radius, usage, latency),
+  approval outcome, and timing.
 
-Invariant: a cache entry answers only the exact input it was made for. Refusals lift only
-by user action, never by retry.
+Invariant: a cache entry answers only the exact input it was made for. Refusals lift only by
+user action, never by retry.
 
 ## L4 interaction
 
-Two readers, two shapes. The agent gets structured JSON on every block: what refused it,
-why, what would work instead, what not to try. The human gets one line plus the shortest
-dialog that can be answered correctly: the command, the axes, the alternatives.
+Two readers, two shapes. The agent gets structured JSON on every block: what refused it, why,
+what would work instead, what not to try. The human gets one line plus the shortest dialog
+that can be answered correctly: the command, the axes, the alternatives.
 
 Session grants and 30-day persistent grants let a human pre-authorize a family of actions
-once instead of answering the same dialog five times. Dialogs are written for the human:
-post-parse downgrade reasons are humanized for display (machine reasons stay byte-identical
-in the audit log), rm-family prompts carry the reversible-alternative footnote, and a dialog
-from a session older than the on-disk plugin says so in its subtitle. Dry-run lets an agent
-ask the gate what it would do before doing it.
+once instead of answering the same dialog five times. Dialog reasons are built from the same
+numbers as the audit line, and the rm-family prompts carry the reversible-alternative
+footnote. Dry-run lets an agent ask the gate what it would do before doing it. A dialog from
+a session older than the on-disk plugin says so in its subtitle.
 
-Invariant: a block must always leave the agent a lawful next move, and a prompt must cost
-the human one glance when everything is normal.
+Invariant: a block must always leave the agent a lawful next move, and a prompt must cost the
+human one glance when everything is normal. Because the reason is derived rather than written,
+a dialog can also say *which hazard* and *how strongly* it fired — the human sees
+`contacts_remote_endpoint 0.96` instead of a paraphrase of it.
 
 ## L5 self-measurement
 
-The corpus is the immune system. Live failures become cases; the harness replays the
-primary, bounded review, deterministic tail, grants/refusals, and host handoff against
-every prompt or cap change; an irreversible action that would run silently fails the run.
+The corpus is the immune system. `eval/run.ts` scores a policy against labeled corpora by
+making the same calls production makes — `buildJevState`, `jevQuestions`, `askJev`,
+`deriveJevDecision`, and production's own `replayDecision` tail — and reports both error kinds
+by name: a **false ask** (a labeled-`allow` case that would raise a dialog) and a **false
+allow** (a labeled-`ask` case that would run silently). False allows are never aggregated away;
+any allow on a case tiered `irreversible` fails the run.
 
-Invariant: no change ships to L1 or L2 without a before/after run keyed by promptId and
-policy hash, including interruption and latency counters.
+Two properties fall out of the typed design:
+
+- **Answers are cached and policy-independent**, so one pass over a corpus scores a grid of
+  ~14,000 threshold sets offline (`--replay` re-scores from cache with no API calls), and the
+  report names the false allows each setting would still make instead of trusting a single
+  percentage. The best-agreement setting is only a candidate: a setting that runs a
+  labeled-`ask` case silently is not adoptable at any agreement.
+- **A case with no answers is `UNAVAILABLE`**, excluded from every rate and counted loudly —
+  the harness never fabricates a verdict for a request that failed. A majority-unavailable run
+  fails outright, and an unavailable `irreversible` case fails too: its risk was never
+  assessed.
+
+`eval/mine-history.ts` rebuilds the other half of the corpus from this machine's real traffic:
+session logs for the commands actually run, and the decision audit log for the commands the
+gate actually stopped. Mined candidates carry the machine `reasonCode` and the flagged hazards
+in their note, so a human labeling them can see what the gate reacted to.
+
+Invariant: no change ships to L1 or L2 without a before/after run reporting agreement,
+interruption counters, and false allows by name.
 
 ## L6 control plane
 
-`/classifier` for humans, one agent-legible status surface for machines. Bounds on every
-config surface. Kill switches layered, and never gated by the thing they switch off.
+`/classifier` for humans (`model <id>` sets `typesafeModel`, `policy` prints the merged policy
+and battery hash), one agent-legible status surface for machines. Bounds on every config
+surface. Kill switches layered, and never gated by the thing they switch off.
+
+## Versioning and identity
+
+| Identity | Value | Changes when |
+| --- | --- | --- |
+| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v1` | the meaning of a verdict or a policy knob changes |
+| `jevQuestionsHash()` (`CLASSIFIER_POLICY_HASH`) | sha256 over version + serialized battery + `DEFAULT_JEV_POLICY`, first 16 hex | the battery, its question ids, or the shipped default changes |
+| `QUESTIONS_CONTRACT` | `questions+probabilities` | the answer shape the parser accepts changes |
+
+The battery hash is what makes mixed-version decisions visible: cache entries, audit lines,
+and harness reports all carry it, so a long session that spans a plugin update can be told
+apart from a clean one. Since the battery is code, a changed battery reaches running sessions
+only through a reload — and the stale-code suffix says so in the dialog. The harness's answer
+cache is keyed on the battery hash too, so answers recorded under an older battery are not
+silently re-scored under a new one.
 
 ## Agent ergonomics contract
 
@@ -104,26 +228,20 @@ The agent driving this system is owed three things:
 
 1. **Every block is actionable.** A refusal names its layer, its reason, and a lawful next
    step. A block the agent can only evade is a failure of the gate, not the agent.
-2. **Every prompt is cheap to answer.** The human's attention is the scarcest resource in
-   the system. Over-flagging is a tax paid in human turns; the measurement tracks it as
-   such.
-3. **Every judgment is replayable.** Any verdict can be re-derived later from its record:
-   same input, same policy version/hash, same evidence, same deterministic tail.
+2. **Every prompt is cheap to answer.** The human's attention is the scarcest resource in the
+   system. Over-flagging is a tax paid in human turns; the measurement tracks it as such, and
+   the sweep exists to spend that tax deliberately instead of by default.
+3. **Every judgment is replayable.** Any verdict can be re-derived later from its record: the
+   same answers, the same battery hash, the same policy, the same deterministic tail. Nothing
+   in the record is prose a later reader has to interpret.
 
-## Roadmap
+## Open work
 
 | Layer | Work | State |
 | --- | --- | --- |
-| L4 | Structured refusal payload (`why`/`next`/`notThis`, deciding layer, axes) | Landed (#28, PR #37) |
-| L2 | Pin temperature in `classify()` | Landed (#29, PR #37) |
-| L3 | Unified decision audit JSONL and agent-readable status | Landed (#33, PRs #38/#39) |
-| L3 | Refusal memory across rewording | Landed (#30, PR #40); subagent inheritance is a host gap |
-| L4 | Session grants and dry-run preview | Landed (#32, PR #41); simple actions use strict shape keys, compounds/substitutions use exact-text keys, and unusable grant choices stay hidden |
-| L0, L2 | Provenance-tiered evidence: user messages, operator context, recent tool activity | Landed (#31, PR #42); refusals carry cwd/source/evidence scope and decision logs carry a policy version |
-| L5 | Live corpus re-baseline for the post-#31 prompt | Blocked on provider credits (#44) |
-| L1, L2, L4 | Judge-owned deletes and network reads (rm shape-scoped, curl/wget off the forced set), affirmative-claim-only egress check, persistent grants documented, stale-code guard, humanized dialog reasons | Landed 2026-09-10 (no issue; promptId `7b4f082ad07c` → `f86ec6af7537`) |
-| L1, L2 | Cheap pre-filter stage | Measured NO-GO on adversarial corpus (2.2-4.4% volume, 0 misses); re-measure on a history corpus first (#34) |
-| L0 | Eval payload cwd propagation (spawn's own cwd in the record) | Open, re-scoped (#14) |
-| L2 | Residual over-flag family | Open; #31 is the architectural path (#17) |
-| L0–L6 | Frontier completion: bounded review, durable task scope, shared replay, held-out measurement, and policy/session observability | Landed on `finish/issue-55` |
-| L0 | Kernel-level spawn interception (structural scan fix) | Open; documented gap in README Limits (#13) |
+| L2 | Threshold calibration from measured data. Measured 2026-09-17 on the authored corpus (103 cases, one draw each, `battery=72c11adf23aa7469`): `DEFAULT_JEV_POLICY` gives 0 false allows and 20 false asks (80.6% agreement), and the best of ~14,000 threshold sets only reaches 16. Every remaining miss is a hazard-driven network or process command, so the lever is hazard policy rather than the numeric floors. Reproduce with `bun eval/run.ts --replay --samples 1` after a live pass; a battery or derivation edit moves the answers, which is why every report names the battery hash. | Open |
+| L2 | Hazard-level policy: whether some hazards (e.g. `contacts_remote_endpoint`) should need a higher noul than others. The battery is fixed; the decision table is not. | Open |
+| L5 | Corpus breadth: authored cases plus mined history give a false-ask rate, not a distribution over real traffic. The mined decision log is the intended source. | Open |
+| L1 | Kernel-level spawn interception (structural scan fix) | Open; documented gap in README Limits |
+| L1, L2 | Cheap pre-filter stage | Measured NO-GO on the authored corpus (2.2-4.4% volume, 0 misses); re-measure on a history corpus first |
+| L0 | Eval payload cwd propagation (spawn's own cwd in the record) | Open |

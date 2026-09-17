@@ -6,6 +6,8 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
 	fire,
+	jevSafeAnswer,
+	jevUnsafeAnswer,
 	loadPlugin,
 	makeCtx,
 	makeEvent,
@@ -13,12 +15,12 @@ import {
 	modelCalls,
 	resultText,
 	selectCalls,
-	setClassifierReply,
+	setJevAnswer,
 } from "./fixtures";
 
 beforeEach(async () => {
 	await loadPlugin(makeSettings([]));
-	setClassifierReply("UNSAFE"); // default: every classification blocks, so cache hits are visible as blocked-without-model
+	setJevAnswer(jevUnsafeAnswer()); // default: every classification blocks, so cache hits are visible as blocked-without-model
 });
 
 let seq = 0;
@@ -41,7 +43,7 @@ describe("identical execution identity is judged once", () => {
 		expect(second.modelCalls).toBe(1); // no second model call
 	});
 	test("cached SAFE runs without a second model call or prompt", async () => {
-		setClassifierReply("SAFE");
+		setJevAnswer(jevSafeAnswer());
 		const ctx = makeCtx({ sessionId: "cache-session", hasUI: true });
 		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), ctx);
 		expect(modelCalls.length).toBe(1);
@@ -52,16 +54,18 @@ describe("identical execution identity is judged once", () => {
 	});
 });
 
-describe("resolved model is part of the identity", () => {
-	test("a session whose classifier model changes reclassifies", async () => {
-		// Same session + command + cwd; the @tiny role resolves differently.
-		const a = makeCtx({ sessionId: "model-shift", cwd: "/repo", tinyModel: { id: "tiny-a" } });
-		const b = makeCtx({ sessionId: "model-shift", cwd: "/repo", tinyModel: { id: "tiny-b" } });
+describe("session is part of the identity", () => {
+	test("the same command in a different session reclassifies", async () => {
+		// Identical command, identical cwd, identical evidence: the only
+		// difference is which session owns the bucket. One fixed Jev model id
+		// serves every session, so nothing per-session can vary the identity
+		// except the session itself.
+		const a = makeCtx({ sessionId: "session-a", cwd: "/repo" });
+		const b = makeCtx({ sessionId: "session-b", cwd: "/repo" });
 		await fire("tool_call", makeEvent("npm publish"), a);
 		expect(modelCalls.length).toBe(1);
 		await fire("tool_call", makeEvent("npm publish"), b);
 		expect(modelCalls.length).toBe(2);
-		expect((modelCalls[1].model as { id: string }).id).toBe("tiny-b");
 	});
 });
 
@@ -148,7 +152,7 @@ describe("cache keys include the evidence fingerprint", () => {
 	const userEntry = (content: string) => ({ type: "message", message: { role: "user", attribution: "user", content } });
 
 	test("moved evidence is a different key: the model re-judges", async () => {
-		setClassifierReply('The user said "please ship it". VERDICT: SAFE');
+		setJevAnswer(jevSafeAnswer());
 		const ctx = makeCtx({
 			sessionId: "evidence-drift",
 			cwd: "/repo",
@@ -166,20 +170,22 @@ describe("cache keys include the evidence fingerprint", () => {
 			branch: [userEntry("actually stop everything")],
 		});
 		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), drifted);
-		// Different evidence, different key: the cached SAFE cannot answer,
-		// the model re-judges under the new evidence, and its SAFE loses the
-		// authorization it cites, so the dialog appears. The bounded reviewer adds
-		// a second model pass for that consistency downgrade.
-		expect(modelCalls.length).toBe(3);
-		expect(selectCalls(drifted).length).toBe(1);
+		// Different evidence, different key: the cached verdict cannot answer,
+		// so the judgement is made again — against the state, and the evidence,
+		// the gate actually saw this time.
+		expect(modelCalls.length).toBe(2);
+		expect(selectCalls(drifted).length).toBe(0);
 
-		// The downgraded verdict is not cached (noCache): it re-judges again.
+		// The re-judged verdict is cached under the new evidence: repeating the
+		// drifted identity costs no third request and does not re-enter the
+		// dialog path — the cached judgement answers it.
 		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), drifted);
-		expect(modelCalls.length).toBe(5);
+		expect(modelCalls.length).toBe(2);
+		expect(selectCalls(drifted).length).toBe(0);
 	});
 
 	test("identical evidence stays one cached decision", async () => {
-		setClassifierReply('The user said "please ship it". VERDICT: SAFE');
+		setJevAnswer(jevSafeAnswer());
 		const branch = [userEntry("please ship it")];
 		const ctx = makeCtx({ sessionId: "evidence-stable", cwd: "/repo", hasUI: true, branch });
 		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), ctx);

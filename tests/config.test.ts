@@ -2,11 +2,12 @@
  * The plugin's own config (OMP's /settings has no extension hook, so this is a
  * small JSON file + the /classifier command). Tests cover defaults, garbage
  * tolerance, the enabled=false semantics (classification off, critical/env/static
- * checks still on), model override, timeout, and the command-length bound.
+ * checks still on), the typesafeModel override, timeout, and the command-length bound.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
 	fire,
+	jevSafeAnswer,
 	loadPlugin,
 	makeCtx,
 	makeEvent,
@@ -15,20 +16,20 @@ import {
 	removeConfigFile,
 	refusalOf,
 	resultText,
-	setClassifierDelay,
-	setClassifierReply,
+	setJevAnswer,
+	setJevDelay,
 	writeConfigFile,
 } from "./fixtures";
 
 beforeEach(async () => {
 	removeConfigFile();
-	setClassifierDelay(5);
+	setJevDelay(5);
 	await loadPlugin(makeSettings([]));
 });
 
 const gate = async (
 	command: string,
-	opts: { model?: unknown; hasUI?: boolean; sessionId?: string } = {},
+	opts: { hasUI?: boolean; sessionId?: string } = {},
 	input: Record<string, unknown> = {},
 ) =>
 	resultText(
@@ -36,7 +37,7 @@ const gate = async (
 	);
 
 describe("defaults with no config file", () => {
-	test("classifier runs, 8000-char bound, 15s timeout, auto model", async () => {
+	test("classifier runs, 8000-char bound, 15s timeout, default model", async () => {
 		const ctx = makeCtx({});
 		await fire("tool_call", makeEvent("git status"), ctx);
 		expect(modelCalls.length).toBe(1);
@@ -78,36 +79,33 @@ describe("enabled=false", () => {
 	});
 });
 
-describe("model override", () => {
-	test("config.model is resolved first, before @tiny and the session model", async () => {
-		writeConfigFile({ model: "my-classifier" });
-		const tiny = { id: "tiny" };
-		const picked = { id: "picked" };
-		const ctx = makeCtx({ tinyModel: tiny, model: picked });
-		await fire("tool_call", makeEvent("make build"), ctx);
-		// The stub resolves a non-empty selector by name, mirroring the host
-		// resolver: the explicit model wins with no fallback involved.
-		expect((modelCalls[0].model as { id: string }).id).toBe("my-classifier");
+describe("typesafeModel", () => {
+	test("config.typesafeModel is the model the request asks Jev for", async () => {
+		writeConfigFile({ typesafeModel: "jev-pinned" });
+		await gate("make build");
+		expect(modelCalls.length).toBe(1);
+		// One model id, straight from config: the gate has no role resolution
+		// (@tiny, session model) of its own to fall back through.
+		expect(modelCalls[0].model).toBe("jev-pinned");
 	});
 
-	test("@tiny is the fallback; the session model is last", async () => {
-		const tiny = { id: "tiny" };
-		const picked = { id: "picked" };
-		const ctx = makeCtx({ tinyModel: tiny, model: picked });
-		await fire("tool_call", makeEvent("make build"), ctx);
-		expect(modelCalls[0].model).toBe(tiny);
+	test("with no config file the request asks for the default jev-latest", async () => {
+		await gate("make build");
+		expect(modelCalls.length).toBe(1);
+		// The vendor alias, resolved server-side — never a pinned version.
+		expect(modelCalls[0].model).toBe("jev-latest");
 	});
 
 	test("changing classifier config invalidates cached verdicts", async () => {
-		setClassifierReply("SAFE");
+		setJevAnswer(jevSafeAnswer());
 		await gate("git status", { sessionId: "sig-session" });
 		expect(modelCalls.length).toBe(1);
 		// Same session + command + cwd: without a config change this is cached.
 		await gate("git status", { sessionId: "sig-session" });
 		expect(modelCalls.length).toBe(1);
 
-		// Toggling enabled (or model/timeout) is a trust-state change: the old
-		// SAFE verdict must not survive it.
+		// Toggling enabled (or typesafeModel/timeout) is a trust-state change:
+		// the old SAFE verdict must not survive it.
 		writeConfigFile({ enabled: false });
 		await gate("git status", { sessionId: "sig-session" });
 		expect(modelCalls.length).toBe(1); // no classify at all now
@@ -131,20 +129,24 @@ describe("bounds and garbage", () => {
 		expect(modelCalls.length).toBe(0);
 	});
 
-	test("timeoutMs from config aborts a slow completion", async () => {
+	test("timeoutMs from config aborts a slow judgement", async () => {
 		// bun's AbortSignal.timeout exposes no duration, so the configurable
-		// timeout is proven behaviorally: a 20ms limit aborts the (stub) model
-		// call before it completes, and the gate fails closed instead of running.
-		setClassifierDelay(10_000); // stub completes slowly; the 20ms timeout aborts it
+		// timeout is proven behaviorally: a 20ms limit aborts the request
+		// before the fake Jev answers, and the gate fails closed instead of
+		// running the command on a judgement that never arrived.
+		setJevDelay(10_000); // the fake answer is 10s away; the 20ms timeout aborts first
 		writeConfigFile({ timeoutMs: 20 });
 		const result = await gate("git status");
-		expect(result).toContain("unclassified");
-		expect(refusalOf(result).layer).toBe("unclassified");
-		expect(modelCalls.length).toBe(0); // aborted before the call completed
+		expect(result).toContain("classifier unavailable");
+		expect(refusalOf(result).layer).toBe("headless");
+		// The request WAS sent: the fake captures it on arrival, before the
+		// delay. The old expectation of 0 here was an artifact of recording
+		// only completions that finished.
+		expect(modelCalls.length).toBe(1);
 	});
 
 	test("garbage config falls back to defaults", async () => {
-		writeConfigFile({ enabled: "banana", model: 7, timeoutMs: -1, maxCommandLength: 0 });
+		writeConfigFile({ enabled: "banana", typesafeModel: 7, timeoutMs: -1, maxCommandLength: 0 });
 		const result = await gate("git status");
 		expect(result).toBe("ALLOWED"); // default enabled, SAFE -> through
 		expect(modelCalls.length).toBe(1);

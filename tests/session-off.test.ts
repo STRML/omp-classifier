@@ -19,6 +19,8 @@ import { buildStatusReport } from "../index";
 import {
 	fire,
 	fireCommand,
+	jevSafeAnswer,
+	jevUnsafeAnswer,
 	loadPlugin,
 	makeCtx,
 	makeEvent,
@@ -27,7 +29,7 @@ import {
 	notifyCalls,
 	refusalOf,
 	resultText,
-	setClassifierReply,
+	setJevAnswer,
 	writeConfigFile,
 } from "./fixtures";
 
@@ -36,9 +38,9 @@ let seq = 0;
 
 beforeEach(async () => {
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-session-off-"));
-	process.env.OMP_CLASSIFIER_CONFIG = path.join(dir, "omp-classifier.json");
+	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-jevens-classifier.json");
 	await loadPlugin(makeSettings([]));
-	setClassifierReply("UNSAFE | no");
+	setJevAnswer(jevUnsafeAnswer());
 });
 
 afterEach(() => {
@@ -128,7 +130,7 @@ describe("/classifier off (per-session pause)", () => {
 describe("pause scope and cache", () => {
 	test("cached verdicts survive off/on: resume serves the cache, no second model call", async () => {
 		const sid = nextSession();
-		setClassifierReply("SAFE");
+		setJevAnswer(jevSafeAnswer());
 		const first = await fire("tool_call", makeEvent("git status"), makeCtx({ sessionId: sid }));
 		expect(resultText(first)).toBe("ALLOWED");
 		expect(modelCalls.length).toBe(1);

@@ -1,11 +1,17 @@
 /**
  * Refusal memory across rewording (issue #30): a command this session refused
- * (UNSAFE / human denial / critical / cap / a refusal-shaped PARSE_ERROR) is
- * remembered by
- * normalized target, injected into the next classify record as priorRefusal,
- * and a SAFE that lands anyway on a refused target still prompts. A user
- * approval lifts the memory; the store holds 20 targets per session, oldest
- * dropped.
+ * — an UNSAFE verdict, a human denial, a critical pattern, a cap — is
+ * remembered by normalized target, injected into the next state as
+ * priorRefusal, and a SAFE that lands anyway on a refused target still prompts.
+ * A user approval lifts the memory; the store holds 20 targets per session,
+ * oldest dropped.
+ *
+ * The trigger moved with the port: a text judge's refusal-shaped prose no
+ * longer exists, so memory keys off the VERDICT. UNSAFE is the only verdict
+ * that both judged the content and said no — UNSURE is undecided, and
+ * UNAVAILABLE judged nothing at all, so neither is evidence about the command.
+ * A human denial of an undecided command is still a refusal, and the dialog
+ * path records that itself.
  *
  * Unique sessions per test — the module-level refusal store outlives a test.
  */
@@ -13,20 +19,24 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { normalizeRefusalTarget, parseJudgement, refusalWorthRemembering } from "../index";
+import { normalizeRefusalTarget } from "../index";
 import type { DecisionRecord } from "../index";
 import {
 	selectCalls,
 	ALLOW_ONCE,
 	DENY,
 	fire,
+	jevSafeAnswer,
+	jevUnsureAnswer,
+	jevUnsafeAnswer,
 	loadPlugin,
 	makeCtx,
 	makeEvent,
 	makeSettings,
 	modelCalls,
 	refusalOf,
-	setClassifierReply,
+	setJevAnswer,
+	stateOf,
 } from "./fixtures";
 
 let dir = "";
@@ -43,9 +53,9 @@ const readDecisions = (): DecisionRecord[] =>
 
 beforeEach(async () => {
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-refusal-"));
-	process.env.OMP_CLASSIFIER_CONFIG = path.join(dir, "omp-classifier.json");
+	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-jevens-classifier.json");
 	await loadPlugin(makeSettings([]));
-	setClassifierReply("SAFE");
+	setJevAnswer(jevSafeAnswer());
 });
 
 afterEach(() => {
@@ -55,12 +65,9 @@ afterEach(() => {
 /** Fresh session id per test; the plugin's stores are module-level. */
 const nextSession = (): string => `refusal-memory-${(seq += 1)}`;
 
-/** The JSON record line inside the classifier prompt message. */
-const recordOf = (callIndex: number): Record<string, unknown> => {
-	const content = modelCalls[callIndex].request.messages[0].content;
-	const line = content.split("\n").find(candidate => candidate.startsWith("{"));
-	return JSON.parse(line ?? "{}") as Record<string, unknown>;
-};
+/** The prior-refusal field of one captured request's state, if it carried one. */
+const priorRefusalOf = (callIndex: number): { target: string; why: string; when: string } | undefined =>
+	stateOf(callIndex).priorRefusal as { target: string; why: string; when: string } | undefined;
 
 describe("normalizeRefusalTarget", () => {
 	test("case, whitespace, flags, cd-prefix, git verbs", () => {
@@ -82,183 +89,68 @@ describe("normalizeRefusalTarget", () => {
 	});
 });
 
-describe("refusalWorthRemembering", () => {
-	test("UNSAFE always; PARSE_ERROR only when refusal-shaped and verdict-free", () => {
-		expect(refusalWorthRemembering({ verdict: "UNSAFE", reason: "x" })).toBe(true);
-		expect(refusalWorthRemembering({ verdict: "SAFE", reason: "" })).toBe(false);
-		expect(refusalWorthRemembering({ verdict: "UNSURE", reason: "x" })).toBe(false);
-		expect(refusalWorthRemembering({ verdict: "PARSE_ERROR", reason: "no content", rawReply: "(empty reply)" })).toBe(false);
-		expect(refusalWorthRemembering({ verdict: "PARSE_ERROR", reason: "not a verdict", rawReply: "" })).toBe(false);
-		expect(refusalWorthRemembering({ verdict: "PARSE_ERROR", reason: "not a verdict" })).toBe(false);
-		expect(refusalWorthRemembering({ verdict: "PARSE_ERROR", reason: "not a verdict", rawReply: "I cannot assist with that." })).toBe(true);
-	});
-
-	test("PARSE_ERROR carrying a VERDICT label is never remembered", () => {
-		// Measured 2026-09-11: inline-verdict analyses that read SAFE were
-		// recorded as refusals, poisoning targets ("const {") and forcing
-		// "despite prior refusal" dialogs on routine re-runs.
-		expect(refusalWorthRemembering({
-			verdict: "PARSE_ERROR",
-			reason: "classifier reply had no VERDICT line",
-			rawReply: "Writes nothing, deletes nothing. VERDICT: SAFE REASON: read-only.",
-		})).toBe(false);
-	});
-	test("a late VERDICT label beyond the 200-char rawReply window still blocks memory", () => {
-		// The field is decided on the full reply; the truncated window cannot
-		// re-admit a refusal-shaped reply whose label it never sees.
-		expect(refusalWorthRemembering({
-			verdict: "PARSE_ERROR",
-			reason: "classifier reply had no VERDICT line",
-			rawReply: "I cannot assist with that.",
-			hasVerdictToken: true,
-		})).toBe(false);
-	});
-
-	test("a refusal that merely mentions the VERDICT format is remembered", () => {
-		// Suppression requires a verdict assertion (label + SAFE/UNSAFE/
-		// UNSURE), not the bare word: a refusal talking about the format is
-		// refusal-shaped and keeps prior-refusal protection.
-		expect(refusalWorthRemembering({
-			verdict: "PARSE_ERROR",
-			reason: "classifier reply had no VERDICT line",
-			rawReply: "I cannot assist. The VERDICT format is required, but I will not provide one.",
-			hasVerdictToken: false,
-		})).toBe(true);
-	});
-	test("a quoted format spec is not a verdict assertion", () => {
-		// The assertion rule rejects the spec echo (a second alternative
-		// follows the first), so this refusal keeps prior-refusal protection.
-		expect(refusalWorthRemembering({
-			verdict: "PARSE_ERROR",
-			reason: "classifier reply had no VERDICT line",
-			rawReply: "I cannot assist. Required format: VERDICT: SAFE|UNSAFE|UNSURE",
-		})).toBe(true);
-	});
-	test("refusal language beyond the 200-char window is remembered", () => {
-		const j = parseJudgement(`${"The command reads repository files and prints statistics. ".repeat(8)}I cannot assist with that.`);
-		expect(j.refusalShaped).toBe(true);
-		expect(refusalWorthRemembering(j)).toBe(true);
-	});
-	test("word-joined format alternatives are not a verdict assertion", () => {
-		// Codex round 4: "SAFE or UNSAFE or UNSURE" is the spec in prose.
-		expect(refusalWorthRemembering({
-			verdict: "PARSE_ERROR",
-			reason: "classifier reply had no VERDICT line",
-			rawReply: "I cannot decide. Required format: VERDICT: SAFE or UNSAFE or UNSURE.",
-		})).toBe(true);
-	});
-	test("analysis prose with unable-to is not a refusal", () => {
-		// Refusal language needs a first-person subject: "the command is
-		// unable to connect" is an analysis statement, not a refusal.
-		expect(refusalWorthRemembering({
-			verdict: "PARSE_ERROR",
-			reason: "classifier reply had no VERDICT line",
-			rawReply: "The command is unable to connect.",
-		})).toBe(false);
-	});
-	test("a terminal spec echo through the production path is remembered", () => {
-		// Codex round 6: the production parseJudgement sets hasVerdictToken
-		// from the terminal boundary — but a spec echo is the format, not a
-		// decision, so suppression must not fire and the refusal is kept.
-		const j = parseJudgement("I cannot assist. VERDICT: SAFE|UNSAFE|UNSURE");
-		expect(j.verdict).toBe("PARSE_ERROR");
-		expect(j.hasVerdictToken).toBe(false);
-		expect(refusalWorthRemembering(j)).toBe(true);
-	});
-	test("gerund refusal forms are refusal-shaped", () => {
-		expect(refusalWorthRemembering({
-			verdict: "PARSE_ERROR",
-			reason: "classifier reply had no VERDICT line",
-			rawReply: "I am refusing to assist.",
-		})).toBe(true);
-		expect(refusalWorthRemembering({
-			verdict: "PARSE_ERROR",
-			reason: "classifier reply had no VERDICT line",
-			rawReply: "I am declining to assist.",
-		})).toBe(true);
-	});
-	test("subjectless cannot is analysis prose, not a refusal", () => {
-		expect(refusalWorthRemembering({
-			verdict: "PARSE_ERROR",
-			reason: "classifier reply had no VERDICT line",
-			rawReply: "This command cannot modify files.",
-		})).toBe(false);
-	});
-	test("decline language is refusal-shaped", () => {
-		expect(refusalWorthRemembering({
-			verdict: "PARSE_ERROR",
-			reason: "classifier reply had no VERDICT line",
-			rawReply: "I must decline to assist.",
-		})).toBe(true);
-	});
-	test("a verdict followed by trailing reply text is not remembered", () => {
-		// The reply did assert a verdict (even though trailing text voids it
-		// as a decision), so it is not refusal-shaped and must not enter the
-		// refusal store.
-		const j = parseJudgement("VERDICT: SAFE\nI cannot assist.");
-		expect(j.verdict).toBe("PARSE_ERROR");
-		expect(refusalWorthRemembering(j)).toBe(false);
-	});
-	test("first-person refusal forms are refusal-shaped", () => {
-		expect(refusalWorthRemembering({
-			verdict: "PARSE_ERROR",
-			reason: "classifier reply had no VERDICT line",
-			rawReply: "I decline this request.",
-		})).toBe(true);
-		expect(refusalWorthRemembering({
-			verdict: "PARSE_ERROR",
-			reason: "classifier reply had no VERDICT line",
-			rawReply: "I must refuse.",
-		})).toBe(true);
-		expect(refusalWorthRemembering({
-			verdict: "PARSE_ERROR",
-			reason: "classifier reply had no VERDICT line",
-			rawReply: "We will refuse.",
-		})).toBe(true);
-	});
-});
-
 describe("refusal memory", () => {
-	test("reworded command carries priorRefusal into the classify record", async () => {
+	test("reworded command carries priorRefusal into the state", async () => {
 		const sid = nextSession();
-		setClassifierReply("UNSAFE | deletes files");
+		setJevAnswer(jevUnsafeAnswer());
 		await fire("tool_call", makeEvent("rm -rf x"), makeCtx({ sessionId: sid }));
 		expect(modelCalls.length).toBe(1);
-		setClassifierReply("UNSAFE | still");
+		setJevAnswer(jevUnsafeAnswer());
 		await fire("tool_call", makeEvent("rm -rf ./x"), makeCtx({ sessionId: sid }));
 		expect(modelCalls.length).toBe(2);
-		const record = recordOf(1);
-		const prior = record.priorRefusal as { target: string; why: string; when: string };
-		expect(prior.target).toBe("rm x");
-		expect(prior.why).toBe("deletes files");
-		expect(new Date(prior.when).getTime()).toBeGreaterThan(0);
+		const prior = priorRefusalOf(1);
+		expect(prior?.target).toBe("rm x");
+		// The stored why is the refusal's machine reason, not model prose: with
+		// no text reply there is nothing else it could be.
+		expect(prior?.why).toContain("unsafe 0.96");
+		expect(new Date(prior?.when ?? "").getTime()).toBeGreaterThan(0);
 		// The first, unrefused classification carries no such field.
-		expect(recordOf(0).priorRefusal).toBeUndefined();
+		expect(priorRefusalOf(0)).toBeUndefined();
+	});
+
+	test("an UNSURE verdict is undecided, so it is not remembered as a refusal", async () => {
+		// An undecided judgement is not evidence about the command. If it were
+		// remembered, a single ambiguous verdict would pin every rewording of
+		// that target to a dialog for the rest of the session.
+		const sid = nextSession();
+		setJevAnswer(jevUnsureAnswer());
+		await fire("tool_call", makeEvent("git diff --stat"), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		await fire("tool_call", makeEvent("git diff --name-only"), makeCtx({ sessionId: sid }));
+		expect(priorRefusalOf(1)).toBeUndefined();
+	});
+
+	test("an UNAVAILABLE verdict judged nothing, so it is not remembered either", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsureAnswer());
+		await fire("tool_call", makeEvent("git diff --stat"), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		const ctx = makeCtx({ sessionId: sid });
+		expect(await fire("tool_call", makeEvent("git diff --name-only"), ctx)).toBeUndefined();
+		expect(priorRefusalOf(1)).toBeUndefined();
 	});
 
 	test("a SAFE that lands despite a prior refusal still prompts", async () => {
 		const sid = nextSession();
 		const ctx = makeCtx({ sessionId: sid, hasUI: true, selectResult: DENY });
-		setClassifierReply("UNSAFE | not this session");
+		setJevAnswer(jevUnsafeAnswer());
 		await fire("tool_call", makeEvent("echo bye"), ctx);
 		// echo is not a moderate-risk token, so without the refusal memory a
 		// SAFE here would auto-run; the dialog proves the refusal decided.
-		setClassifierReply("SAFE | harmless rewording");
+		setJevAnswer(jevSafeAnswer());
 		const result = await fire("tool_call", makeEvent("echo bye again"), ctx);
 		expect(selectCalls(ctx).length).toBe(2);
-		const payload = JSON.parse(
-			(result as { block: true; reason: string }).reason,
-		) as { layer: string };
+		const payload = JSON.parse((result as { block: true; reason: string }).reason) as { layer: string };
 		expect(payload.layer).toBe("dialog");
 		expect(readDecisions().some(line => line.why.startsWith("despite prior refusal"))).toBe(true);
 	});
 
 	test("machine refusals are scoped to the reviewed directory", async () => {
 		const sid = nextSession();
-		setClassifierReply("UNSAFE | not approved here");
+		setJevAnswer(jevUnsafeAnswer());
 		await fire("tool_call", makeEvent("git diff --stat"), makeCtx({ sessionId: sid, cwd: "/workspace" }));
 
-		setClassifierReply("SAFE | read-only diff");
+		setJevAnswer(jevSafeAnswer());
 		const elsewhere = makeCtx({ sessionId: sid, cwd: "/elsewhere" });
 		const result = await fire("tool_call", makeEvent("git diff --name-only"), elsewhere);
 		expect(result).toBeUndefined();
@@ -268,12 +160,12 @@ describe("refusal memory", () => {
 
 	test("approval in one directory does not erase a refusal in another", async () => {
 		const sid = nextSession();
-		setClassifierReply("UNSAFE | not approved here");
+		setJevAnswer(jevUnsafeAnswer());
 		await fire("tool_call", makeEvent("git diff --stat"), makeCtx({ sessionId: sid, cwd: "/workspace" }));
 
 		const elsewhereDenied = makeCtx({ sessionId: sid, cwd: "/elsewhere", hasUI: true, selectResult: DENY });
 		await fire("tool_call", makeEvent("git diff --stat"), elsewhereDenied);
-		setClassifierReply("SAFE | read-only diff");
+		setJevAnswer(jevSafeAnswer());
 		const elsewhere = makeCtx({ sessionId: sid, cwd: "/elsewhere", hasUI: true, selectResult: ALLOW_ONCE });
 		expect(await fire("tool_call", makeEvent("git diff --name-only"), elsewhere)).toBeUndefined();
 
@@ -284,9 +176,9 @@ describe("refusal memory", () => {
 
 	test("user approval lifts the refusal for the target", async () => {
 		const sid = nextSession();
-		setClassifierReply("UNSAFE | deletes files");
+		setJevAnswer(jevUnsafeAnswer());
 		await fire("tool_call", makeEvent("rm -rf x"), makeCtx({ sessionId: sid, hasUI: true }));
-		setClassifierReply("SAFE | routine");
+		setJevAnswer(jevSafeAnswer());
 		const approved = await fire(
 			"tool_call",
 			makeEvent("rm -rf ./x"),
@@ -295,12 +187,12 @@ describe("refusal memory", () => {
 		expect(approved).toBeUndefined();
 		await fire("tool_call", makeEvent("rm -r x"), makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_ONCE }));
 		expect(modelCalls.length).toBe(3);
-		expect(recordOf(2).priorRefusal).toBeUndefined();
+		expect(priorRefusalOf(2)).toBeUndefined();
 	});
 
 	test("store caps at 20 per session and drops the oldest", async () => {
 		const sid = nextSession();
-		setClassifierReply("UNSAFE | no");
+		setJevAnswer(jevUnsafeAnswer());
 		for (let i = 1; i <= 21; i++) {
 			await fire(
 				"tool_call",
@@ -308,14 +200,13 @@ describe("refusal memory", () => {
 				makeCtx({ sessionId: sid }),
 			);
 		}
-		setClassifierReply("UNSAFE | no");
+		setJevAnswer(jevUnsafeAnswer());
 		// Oldest target (rm f01) was evicted: its rewording classifies bare.
 		await fire("tool_call", makeEvent("rm -f f01"), makeCtx({ sessionId: sid }));
-		expect(recordOf(21).priorRefusal).toBeUndefined();
+		expect(priorRefusalOf(21)).toBeUndefined();
 		// Newest target (rm f21) is still remembered.
 		await fire("tool_call", makeEvent("rm -f f21"), makeCtx({ sessionId: sid }));
-		const prior = recordOf(22).priorRefusal as { target: string };
-		expect(prior.target).toBe("rm f21");
+		const prior = priorRefusalOf(22);
+		expect(prior?.target).toBe("rm f21");
 	});
-
 });

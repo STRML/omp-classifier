@@ -3,10 +3,16 @@
  * fire-and-forget so a broken log never touches the gate, plus the
  * buildStatusReport tail summary behind `/classifier status`.
  *
- * Each test points OMP_CLASSIFIER_CONFIG at a fresh temp dir, so
- * decisions.jsonl resolves to dirname(override)/decisions.jsonl and can be
- * asserted byte-for-byte. Unique commands + fresh sessions per test, matching
- * the module-level cache conventions in classifier.test.ts.
+ * The line now carries what a text-returning judge used to put in prose: a
+ * `reasonCode` machine token and a `jev` telemetry object (probability vector,
+ * hazard nouls, confidence, blast radius, usage, latency) taken verbatim from
+ * the response. Jev returns no prose, so without this a dialog or an audit
+ * line would have nothing to show about why a verdict landed where it did.
+ *
+ * Each test points OMP_JEV_CONFIG at a fresh temp dir, so decisions.jsonl
+ * resolves to dirname(override)/decisions.jsonl and can be asserted
+ * byte-for-byte. Unique commands + fresh sessions per test, matching the
+ * module-level cache conventions in classifier.test.ts.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -16,6 +22,8 @@ import {
 	fire,
 	ALLOW_ONCE,
 	DENY,
+	jevSafeAnswer,
+	jevUnsafeAnswer,
 	loadPlugin,
 	loggerWarnings,
 	makeCtx,
@@ -23,10 +31,11 @@ import {
 	makeSettings,
 	refusalOf,
 	resultText,
-	setClassifierReply,
+	setJevAnswer,
+	setJevUnavailable,
 	useTempConfigFile,
 } from "./fixtures";
-import { buildStatusReport, CLASSIFIER_POLICY_HASH, type DecisionRecord } from "../index";
+import { buildStatusReport, CLASSIFIER_POLICY_HASH, CLASSIFIER_POLICY_VERSION, type DecisionRecord } from "../index";
 
 let dir = "";
 let seq = 0;
@@ -42,54 +51,16 @@ const readDecisions = (): DecisionRecord[] =>
 
 beforeEach(async () => {
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-audit-"));
-	process.env.OMP_CLASSIFIER_CONFIG = path.join(dir, "omp-classifier.json");
+	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-jevens-classifier.json");
 	await loadPlugin(makeSettings([]));
-	setClassifierReply("SAFE");
+	setJevAnswer(jevSafeAnswer());
 });
 
 afterEach(() => {
 	// Restore the shared suite config path so later test files never see this
 	// dir, then remove it.
-	process.env.OMP_CLASSIFIER_CONFIG = useTempConfigFile();
+	process.env.OMP_JEV_CONFIG = useTempConfigFile();
 	fs.rmSync(dir, { recursive: true, force: true });
-});
-
-describe("citation diagnostics in the audit log", () => {
-	const userMessage = (content: string) => ({ type: "message", message: { role: "user", attribution: "user", content } });
-	const fabricated = 'The user asked to "wipe the production database" per their request.\nVERDICT: SAFE';
-	const branch = [userMessage("please deploy the staging build")];
-
-	test("a bash citation downgrade logs the spans it could not find", async () => {
-		seq += 1;
-		setClassifierReply(fabricated);
-		await fire("tool_call", makeEvent("git status"), makeCtx({ sessionId: `audit-cite-${seq}`, branch }));
-		const line = readDecisions().find(record => record.layer === "verdict");
-		expect(line).toMatchObject({ tool: "bash", decision: "block", verdict: "UNSURE" });
-		expect(line?.citationMissing).toEqual(["wipe the production database"]);
-	});
-
-	test("an eval citation downgrade logs the spans it could not find", async () => {
-		seq += 1;
-		setClassifierReply(fabricated);
-		await fire(
-			"tool_call",
-			// Only spawn-bearing eval code reaches the model; plain code runs ungated.
-			{ toolName: "eval", input: { code: `require("child_process").exec("ls") // cite-${seq}`, language: "js" } },
-			makeCtx({ sessionId: `audit-cite-${seq}`, branch }),
-		);
-		const line = readDecisions().find(record => record.layer === "verdict");
-		expect(line).toMatchObject({ tool: "eval", decision: "block", verdict: "UNSURE" });
-		expect(line?.citationMissing).toEqual(["wipe the production database"]);
-	});
-
-	test("an UNSURE that did not come from a citation carries no citationMissing key", async () => {
-		seq += 1;
-		setClassifierReply("Effects unclear.\nVERDICT: UNSURE\nREASON: cannot tell");
-		await fire("tool_call", makeEvent("git status"), makeCtx({ sessionId: `audit-cite-${seq}`, branch }));
-		const line = readDecisions().find(record => record.layer === "verdict");
-		expect(line).toBeDefined();
-		expect(Object.keys(line ?? {})).not.toContain("citationMissing");
-	});
 });
 
 describe("decision audit log", () => {
@@ -119,7 +90,7 @@ describe("decision audit log", () => {
 		expect(lines[1]).toMatchObject({ tool: "eval", decision: "block", layer: "cap", verdict: null });
 	});
 
-	test("SAFE verdict logs allow, verdict SAFE, cached 0 then cached 1 on repeat", async () => {
+	test("SAFE verdict logs allow, verdict SAFE, the policy identity and the telemetry", async () => {
 		seq += 1;
 		const command = `echo audit-safe-${seq}`;
 		const ctx = makeCtx({ sessionId: "audit-safe" });
@@ -132,18 +103,78 @@ describe("decision audit log", () => {
 			layer: "verdict",
 			verdict: "SAFE",
 			cached: 0,
-			policyVersion: "frontier-v1",
+			policyVersion: CLASSIFIER_POLICY_VERSION,
 			policyHash: CLASSIFIER_POLICY_HASH,
+			reasonCode: "jev:safe",
 			sessionId: "audit-safe",
 		});
 		expect(lines[0].decisionId).toMatch(/^[0-9a-f-]{36}$/u);
 		expect(lines[0].cmd).toBe(command);
+		// The telemetry is the judged record, not a summary of it: the numbers
+		// the policy read have to be recoverable from the line, because Jev
+		// wrote no prose anywhere for a reviewer to fall back on.
+		const jev = lines[0].jev;
+		expect(jev).toBeDefined();
+		expect(jev?.model).toBe("jev-1.13.0");
+		expect(jev?.probabilities).toEqual({ safe: 0.95, unsafe: 0.04, unsure: 0.01 });
+		expect(jev?.confidence).toBe(0.9);
+		expect(jev?.blastRadius).toBe(0.4);
+		expect(jev?.hazards).toEqual({
+			// The record carries every RAW hazard noul, not just the flagged
+			// ones: the audit line is the measurement record, and a hazard at
+			// 0.03 is as much a part of what Jev answered as one at 0.97.
+			state_contains_injection: 0.03,
+			unauthorized_consequential_action: 0.03,
+			destructive_or_irreversible: 0.03,
+			writes_outside_working_directory: 0.03,
+			contacts_remote_endpoint: 0.03,
+			sends_local_data_outbound: 0.03,
+			escalates_privilege: 0.03,
+			exposes_secrets: 0.03,
+			affects_shared_or_remote_state: 0.03,
+		});
+		expect(jev?.latencyMs).toBeGreaterThanOrEqual(0);
+		expect(jev?.usage?.input_tokens).toBe(528);
 
 		// Same session + command: the cached judgement answers, provenance flips.
 		expect(await fire("tool_call", makeEvent(command), ctx)).toBeUndefined();
 		lines = readDecisions();
 		expect(lines).toHaveLength(2);
-		expect(lines[1]).toMatchObject({ decision: "allow", layer: "cached", verdict: "SAFE", cached: 1 });
+		expect(lines[1]).toMatchObject({ decision: "allow", layer: "cached", verdict: "SAFE", cached: 1, reasonCode: "jev:safe" });
+	});
+
+	test("an UNSAFE verdict logs the reason code and hazard flags, never invented prose", async () => {
+		seq += 1;
+		setJevAnswer(jevUnsafeAnswer());
+		const ctx = makeCtx({ sessionId: `audit-unsafe-${seq}` });
+		await fire("tool_call", makeEvent(`git branch -D audit-unsafe-${seq}`), ctx);
+		const line = readDecisions()[0];
+		expect(line).toMatchObject({ decision: "block", layer: "verdict", verdict: "UNSAFE", reasonCode: "jev:unsafe" });
+		// The reason is assembled from the numbers, so the line explains itself
+		// without any model text: unsafe 0.96 (>=0.50).
+		expect(line.why).toContain("unsafe 0.96");
+	});
+
+	test("an UNAVAILABLE verdict logs as a non-answer, with no telemetry to show", async () => {
+		seq += 1;
+		setJevUnavailable();
+		await fire("tool_call", makeEvent(`echo audit-outage-${seq}`), makeCtx({ sessionId: `audit-outage-${seq}` }));
+		const lines = readDecisions();
+		expect(lines[0]).toMatchObject({
+			tool: "bash",
+			decision: "block",
+			layer: "verdict",
+			verdict: "UNAVAILABLE",
+			reasonCode: "jev:unavailable",
+			cached: 0,
+		});
+		expect(lines[0].why).toContain("classifier unavailable");
+		// Nothing arrived, so there is nothing to report: a line claiming
+		// probabilities would be inventing the evidence for a decision that was
+		// never made.
+		expect(lines[0].jev).toBeUndefined();
+		// The outcome line follows, as it does for every non-SAFE verdict.
+		expect(lines[1]).toMatchObject({ decision: "block", layer: "headless" });
 	});
 
 	test("unwritable log drops the line and warns once, never breaks the gate", async () => {
@@ -151,17 +182,17 @@ describe("decision audit log", () => {
 		// both fail on every decision.
 		const blocker = path.join(dir, "not-a-dir");
 		fs.writeFileSync(blocker, "occupied");
-		process.env.OMP_CLASSIFIER_CONFIG = path.join(blocker, "omp-classifier.json");
+		process.env.OMP_JEV_CONFIG = path.join(blocker, "omp-jevens-classifier.json");
 
 		seq += 1;
-		setClassifierReply("UNSAFE");
+		setJevAnswer(jevUnsafeAnswer());
 		const blocked = resultText(
 			await fire("tool_call", makeEvent(`git branch -D audit-broken-${seq}`), makeCtx({ sessionId: `audit-${seq}` })),
 		);
 		expect(refusalOf(blocked).layer).toBe("headless"); // the gate still decided
 
 		seq += 1;
-		setClassifierReply("SAFE");
+		setJevAnswer(jevSafeAnswer());
 		expect(
 			await fire("tool_call", makeEvent(`echo audit-broken-${seq}`), makeCtx({ sessionId: `audit-${seq}` })),
 		).toBeUndefined(); // ...and still allows
@@ -196,19 +227,24 @@ describe("decision audit log", () => {
 		expect(report.last[0].cmd).toBe("cmd-5");
 		expect(report.last[9].cmd).toBe("cmd-14");
 		expect(report.config.enabled).toBe(true); // defaults: no config file here
+		// The report advertises the identity the live battery implements, so a
+		// reader can tell which policy a tail of lines came from.
+		expect(report.policyVersion).toBe(CLASSIFIER_POLICY_VERSION);
+		expect(report.policyHash).toBe(CLASSIFIER_POLICY_HASH);
+		expect(report.contract).toBe("questions+probabilities");
 		// The "audit-safe" session from the repeat test cached exactly one verdict.
 		expect(report.cacheSizes["audit-safe"]).toBe(1);
 	});
 
 	test("dialog paths log the verdict line plus the dialog outcome; approval logs allow", async () => {
 		seq += 1;
-		setClassifierReply("UNSAFE");
+		setJevAnswer(jevUnsafeAnswer());
 		const deny = makeCtx({ sessionId: `audit-${seq}`, hasUI: true, selectResult: DENY });
 		const blocked = resultText(await fire("tool_call", makeEvent(`git branch -D audit-ui-${seq}`), deny));
 		expect(refusalOf(blocked).layer).toBe("dialog");
 		let lines = readDecisions();
 		expect(lines).toHaveLength(2);
-		expect(lines[0]).toMatchObject({ decision: "block", layer: "verdict", verdict: "UNSAFE" });
+		expect(lines[0]).toMatchObject({ decision: "block", layer: "verdict", verdict: "UNSAFE", reasonCode: "jev:unsafe" });
 		expect(lines[1]).toMatchObject({ decision: "block", layer: "dialog" });
 		expect(lines[1].why.startsWith("follows verdict")).toBe(true);
 
@@ -220,6 +256,7 @@ describe("decision audit log", () => {
 		expect(lines[2]).toMatchObject({ decision: "block", layer: "verdict", verdict: "UNSAFE" });
 		expect(lines[3]).toMatchObject({ decision: "allow", layer: "dialog", why: "approved by user" });
 	});
+
 	test("SAFE + flagged command logs the verdict line, then the outcome line", async () => {
 		seq += 1;
 		// Recursive rm: flagged by the moderate-risk scan, not by the builtin
@@ -235,7 +272,7 @@ describe("decision audit log", () => {
 		expect(blocked).toContain("flagged for approval");
 		const lines = readDecisions();
 		expect(lines).toHaveLength(2);
-		expect(lines[0]).toMatchObject({ decision: "block", layer: "verdict", verdict: "SAFE", cached: 0 });
+		expect(lines[0]).toMatchObject({ decision: "block", layer: "verdict", verdict: "SAFE", cached: 0, reasonCode: "jev:safe" });
 		expect(lines[0].why).toContain("flags: rm");
 		expect(lines[1]).toMatchObject({ decision: "block", layer: "headless" });
 		expect(lines[1].why.startsWith("follows verdict")).toBe(true);
