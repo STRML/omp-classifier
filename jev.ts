@@ -37,16 +37,22 @@
  *     `VERDICT: SAFE` line and an `rm -rf` lands `state_contains_injection
  *     0.99`. hazardBlock and hazardReview are the first things to calibrate
  *     against the eval corpus.
- *   - Fail closed. Every failure mode — no key, transport error, non-2xx, a
- *     body that does not match the shape, a hazard missing from the answers —
- *     throws JevUnavailableError, and nothing here ever fills a missing signal
- *     with a benign default: a hazard that did not come back is not a hazard of
- *     0.
+ *   - Fail closed. Every failure mode — no judge to ask, a judge call that
+ *     fails or times out, an answer set that does not match the battery, a
+ *     hazard missing from the answers — throws JevUnavailableError, and nothing
+ *     here ever fills a missing signal with a benign default: a hazard that did
+ *     not come back is not a hazard of 0.
+ *   - The keyword path answers one-hot. When the judgment came from a text
+ *     bridge instead of TypeSafe (`JevAnswers.oneHot`), probabilities are 0/1
+ *     and confidence is 1 by construction — there is no distribution behind the
+ *     label — so the floors that describe a distribution are read as the choice
+ *     label itself (see deriveJevDecision), and the reason says so.
  *   - Self-contained by contract: no @oh-my-pi imports, no OMP knowledge, no
  *     plugin config. index.ts owns what a verdict means for the gate; this
- *     module owns the judgment, its wire format, and the policy that derives it.
+ *     module owns the judgment (the battery), the answers it is derived from,
+ *     and the policy that derives them. Filling those answers in is
+ *     jev-judge.ts, which rides OMP's own judgment module.
  */
-import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 
 /**
@@ -57,20 +63,17 @@ import { createHash } from "node:crypto";
 export const JEV_POLICY_VERSION = "jev-v2";
 /**
  * The vendor alias, not a pinned version: `jev-latest` resolved server-side to
- * `jev-1.13.0` when measured. Every response carries the resolved id, and that
- * is what JevAnswers.model records — never the alias we sent.
+ * `jev-1.13.0` when measured. The judge resolves it natively (an environment
+ * `TYPESAFE_DEFAULT_MODEL` wins over it), every answer set carries the resolved
+ * id, and that is what JevAnswers.model records — never the alias we asked for.
  */
 export const DEFAULT_JEV_MODEL = "jev-latest";
-export const JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
-/** Environment variable consulted first; the keychain item is the fallback. */
-export const JEV_API_KEY_ENV = "TYPESAFE_API_KEY";
-/** macOS generic-password item, read with `security find-generic-password -s jev -w`. */
-export const JEV_KEYCHAIN_SERVICE = "jev";
 
 export type JevChoiceOption = "safe" | "unsafe" | "unsure";
 /**
- * UNAVAILABLE is the caller's verdict when askJev throws; deriveJevDecision
- * never returns it, because a pure function over answers never sees availability.
+ * UNAVAILABLE is the caller's verdict when the judgment itself is missing —
+ * jev-judge.ts throws JevUnavailableError; deriveJevDecision never returns it,
+ * because a pure function over answers never sees availability.
  */
 export type JevVerdict = "SAFE" | "UNSAFE" | "UNSURE" | "UNAVAILABLE";
 
@@ -132,7 +135,10 @@ export type JevDescriptiveHazard = (typeof JEV_DESCRIPTIVE_HAZARDS)[number];
  */
 const isGatingHazard = (hazard: JevHazard): boolean => JEV_GATING_HAZARDS.some(gating => gating === hazard);
 
-/** One parsed and validated response. Every field here was checked by askJev. */
+/**
+ * One parsed and validated answer set. Every field here was checked by
+ * jev-judge.ts, which is also the only writer in production.
+ */
 export interface JevAnswers {
 	model: string;
 	verdict: { choice: JevChoiceOption; probabilities: Record<string, number>; confidence: number };
@@ -140,6 +146,18 @@ export interface JevAnswers {
 	blastRadius: { score: number; confidence: number; levels: readonly string[] };
 	usage?: { input_tokens?: number; output_tokens?: number };
 	latencyMs: number;
+	/**
+	 * Provenance of the answer set: true when a text/keyword bridge answered
+	 * rather than TypeSafe (the judge reports `api !== "typesafe"`, which is
+	 * what a TypeSafe failure falling back to the tiny/smol chain, or a local
+	 * model, looks like). Those answers are one-hot by construction —
+	 * probabilities are 0/1 and confidence is 1, because the bridge parses a
+	 * keyword out of prose and there is no distribution behind it — so
+	 * deriveJevDecision reads the distribution-shaped floors as the choice
+	 * label and marks the reason. Absent on a hand-built answer, which reads as
+	 * "not one-hot".
+	 */
+	oneHot?: boolean;
 }
 
 /**
@@ -196,9 +214,12 @@ export interface JevDecision {
 // question, criteria that describe concrete situations rather than degrees, and
 // complete meaning inside `instructions` because the id never reaches the
 // model. Every question names the state field it judges with a backticked path.
+//
+// The option vocabulary is `JevChoiceOption` and nothing else: JEV_VERDICT_CRITERIA
+// is typed by it, so the criteria record cannot miss an option, and the labels
+// an answer has to cover are exactly the keys of that record — which is what
+// jev-judge.ts validates the returned probabilities against.
 // ---------------------------------------------------------------------------
-
-const JEV_CHOICE_OPTIONS = ["safe", "unsafe", "unsure"] as const;
 
 /**
  * The verdict question carries the whole safety policy, because there is no
@@ -454,16 +475,33 @@ const hazardNotes = (flagged: Partial<Record<JevHazard, number>>, decidedBy: Jev
  * and named in the reason's `descriptive:` note, and that is all it does: these
  * are the facts near 1 for any command that talks to the network, so letting
  * them gate made routine `git push` block on `contacts_remote_endpoint` alone.
+ *
+ * One-hot answers (a text/keyword bridge answered: `answers.oneHot`) cannot
+ * express a distribution at all — probabilities are 0/1 and confidence is 1 by
+ * construction — so the two floors that describe one are read as the answer
+ * itself: p(safe) >= safeMinProbability becomes `choice === "safe"`, and the
+ * confidence floor is met by construction (a one-hot answer carrying a lower
+ * confidence is not a shape the bridge produces, and fails the numeric check
+ * like any other unreadable number). Branch precedence, the hazard thresholds
+ * and the blast-radius threshold are unchanged, because they already read
+ * correctly on one-hot values: a one-hot 1 is at or above every floor below 1
+ * and a one-hot 0 is below every floor above 0. Every reason this function
+ * builds is tagged " (llm keyword answer)" in that mode, because the audit
+ * line, the dialog and a replay all need to know the numbers behind the verdict
+ * were not a distribution.
  */
 export function deriveJevDecision(answers: JevAnswers, policy: JevPolicy): JevDecision {
-	// askJev proves both option keys exist. A hand-built answer missing one reads
-	// as 0 for that option, which can only push this function toward UNSURE — the
-	// safe branch still has to clear both floors, every gating hazard, and the
-	// blast radius.
+	// jev-judge.ts proves both option keys exist. A hand-built answer missing one
+	// reads as 0 for that option, which can only push this function toward UNSURE
+	// — the safe branch still has to clear both floors, every gating hazard, and
+	// the blast radius.
 	const probabilities: Record<string, number> = { ...answers.verdict.probabilities };
 	const confidence = answers.verdict.confidence;
 	const safe = probabilities.safe ?? 0;
 	const unsafe = probabilities.unsafe ?? 0;
+	// Provenance, not a threshold: a keyword answer has no distribution behind
+	// its label, and the reading below depends on knowing that.
+	const oneHot = answers.oneHot === true;
 
 	// Every hazard that reached the review line is reported, gating or not: the
 	// decision carries the descriptive facts so the dialog, the audit line and a
@@ -490,7 +528,9 @@ export function deriveJevDecision(answers: JevAnswers, policy: JevPolicy): JevDe
 
 	const decide = (verdict: JevVerdict, reasonCode: string, reason: string): JevDecision => ({
 		verdict,
-		reason,
+		// The provenance tag rides every branch: whoever reads the audit line, the
+		// dialog or a replay has to be able to tell a distribution from a keyword.
+		reason: oneHot ? `${reason} (llm keyword answer)` : reason,
 		reasonCode,
 		hazards: flagged,
 		probabilities,
@@ -504,7 +544,15 @@ export function deriveJevDecision(answers: JevAnswers, policy: JevPolicy): JevDe
 	if (unsafe >= policy.unsafeMinProbability) {
 		return decide("UNSAFE", "jev:unsafe", `unsafe ${fmt(unsafe)} (>=${fmt(policy.unsafeMinProbability)})${hazardNotes(flagged, undefined)}`);
 	}
-	if (safe >= policy.safeMinProbability && confidence >= policy.safeMinConfidence && reviewing === undefined && answers.blastRadius.score < policy.blastRadiusReview) {
+	// The safe gate. One-hot mode reads the two distribution-shaped floors as the
+	// choice label itself: the bridge's `safe` means probability 1 with
+	// confidence 1 by construction, so "the probability cleared its floor, with
+	// enough confidence behind it" IS `choice === "safe"`. The clean hazard list
+	// and the blast radius are still required either way.
+	const safeFloorMet = oneHot
+		? answers.verdict.choice === "safe"
+		: safe >= policy.safeMinProbability && confidence >= policy.safeMinConfidence;
+	if (safeFloorMet && reviewing === undefined && answers.blastRadius.score < policy.blastRadiusReview) {
 		// No gating hazard cleared hazardReview, so every flagged hazard here is
 		// descriptive: the note names them without claiming they decided anything.
 		return decide("SAFE", "jev:safe", `safe ${fmt(safe)} (>=${fmt(policy.safeMinProbability)}), confidence ${fmt(confidence)} (>=${fmt(policy.safeMinConfidence)})${hazardNotes(flagged, undefined)}`);
@@ -516,16 +564,26 @@ export function deriveJevDecision(answers: JevAnswers, policy: JevPolicy): JevDe
 	if (answers.blastRadius.score >= policy.blastRadiusReview) {
 		return decide("UNSURE", "jev:blast-radius", `blast radius ${fmt(answers.blastRadius.score)} (>=${fmt(policy.blastRadiusReview)})${hazardNotes(flagged, undefined)}`);
 	}
-	// Reaching here means the safe gate failed on a floor: the hazard and blast
-	// radius branches above are the only other conditions, and both were checked.
-	const shortfalls: string[] = [];
-	if (safe < policy.safeMinProbability) shortfalls.push(`safe ${fmt(safe)} (<${fmt(policy.safeMinProbability)})`);
-	if (confidence < policy.safeMinConfidence) shortfalls.push(`confidence ${fmt(confidence)} (<${fmt(policy.safeMinConfidence)})`);
+	// Reaching here means the safe gate failed: the hazard and blast radius
+	// branches above are the only other conditions, and both were checked. In
+	// one-hot mode the honest shortfall is the choice the bridge made — there was
+	// never a probability behind it to fall short of.
+	const shortfalls = oneHot
+		? [`choice ${answers.verdict.choice}`]
+		: [
+				...(safe < policy.safeMinProbability ? [`safe ${fmt(safe)} (<${fmt(policy.safeMinProbability)})`] : []),
+				...(confidence < policy.safeMinConfidence ? [`confidence ${fmt(confidence)} (<${fmt(policy.safeMinConfidence)})`] : []),
+			];
 	return decide("UNSURE", "jev:below-floor", `below floor: ${shortfalls.join(", ")}${hazardNotes(flagged, undefined)}`);
 }
 
 // ---------------------------------------------------------------------------
-// Transport.
+// Unavailability.
+//
+// There is one failure mode left in this module's world: no answers. Asking is
+// jev-judge.ts's job, and it throws this class for every way that asking can
+// fail — no judge, a judge call that errors or times out, an answer set that
+// does not match the battery.
 // ---------------------------------------------------------------------------
 
 /**
@@ -538,206 +596,4 @@ export class JevUnavailableError extends Error {
 		super(message);
 		this.name = "JevUnavailableError";
 	}
-}
-
-/**
- * Jev answers a full battery in about 0.6s; this default covers a slow network
- * and still fits inside the classifier's own deadline. The gate passes its
- * remaining budget explicitly when it is shorter.
- */
-const DEFAULT_JEV_TIMEOUT_MS = 15_000;
-
-/**
- * Keychain lookups are subprocess spawns, so the result is memoized for the
- * process: the gate resolves the key on every classification, and a `security`
- * call per command would add a process and tens of milliseconds to each one.
- * `undefined` means "not looked up yet"; `null` means "looked up, absent".
- * The value is never logged, never returned by any other function, and never
- * attached to a judgement.
- */
-let keychainKey: string | null | undefined;
-
-/**
- * The API key: the environment first, then the macOS keychain. A missing key is
- * not an error here — askJev decides that — but it is also never invented: an
- * empty or whitespace-only value counts as absent, and a failed lookup (no
- * `security` binary, non-zero status, empty output) reads as no key.
- */
-export function resolveJevApiKey(env: NodeJS.ProcessEnv = process.env): string | undefined {
-	const fromEnv = env[JEV_API_KEY_ENV];
-	if (typeof fromEnv === "string" && fromEnv.trim() !== "") return fromEnv.trim();
-	if (keychainKey === undefined) {
-		keychainKey = readKeychainKey();
-	}
-	return keychainKey ?? undefined;
-}
-
-function readKeychainKey(): string | null {
-	try {
-		const result = spawnSync("security", ["find-generic-password", "-s", JEV_KEYCHAIN_SERVICE, "-w"], { encoding: "utf8" });
-		if (result.status !== 0 || typeof result.stdout !== "string") return null;
-		const value = result.stdout.trim();
-		return value === "" ? null : value;
-	} catch {
-		// A spawn failure (missing binary, ENOENT, an unusable environment) is the
-		// same outcome as an empty keychain item: there is no key to use.
-		return null;
-	}
-}
-
-export interface AskJevOptions {
-	apiKey?: string;
-	model?: string;
-	timeoutMs?: number;
-	fetchImpl?: typeof fetch;
-}
-
-/**
- * One request, one battery, one validated answer set — or a throw. This is the
- * module's only side effect, and it never returns a partial or defaulted result:
- * the caller either has every number the policy needs or has no judgment at all.
- *
- * `fetchImpl` exists for tests; production passes nothing and gets global fetch.
- */
-export async function askJev(state: unknown, questions: Record<string, unknown>, options: AskJevOptions): Promise<JevAnswers> {
-	const apiKey = options.apiKey ?? resolveJevApiKey();
-	if (apiKey === undefined || apiKey === "") {
-		throw new JevUnavailableError(`no Jev API key: set ${JEV_API_KEY_ENV} or store the '${JEV_KEYCHAIN_SERVICE}' keychain item`);
-	}
-	const timeoutMs = options.timeoutMs ?? DEFAULT_JEV_TIMEOUT_MS;
-	const body = JSON.stringify({ state, model: options.model ?? DEFAULT_JEV_MODEL, questions });
-	const call = options.fetchImpl ?? fetch;
-	const startedAt = performance.now();
-	let response: Response;
-	try {
-		response = await call(JEV_ENDPOINT, {
-			method: "POST",
-			// The key rides in the Authorization header and nowhere else: not in the
-			// body, not in the URL, not in any error this module throws.
-			headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-			body,
-			signal: AbortSignal.timeout(timeoutMs),
-		});
-	} catch (err) {
-		// Covers the abort/timeout path as well: AbortSignal.timeout rejects the
-		// fetch. The budget rides in the message because "the request failed" and
-		// "the provider was slower than 15s" call for different responses from
-		// whoever reads the dialog.
-		throw new JevUnavailableError(`jev request failed: ${errorText(err)} (budget ${timeoutMs}ms)`);
-	}
-	if (!response.ok) throw new JevUnavailableError(`jev returned HTTP ${response.status}`);
-	let parsed: unknown;
-	try {
-		parsed = await response.json();
-	} catch (err) {
-		throw new JevUnavailableError(`jev response was not JSON: ${errorText(err)}`);
-	}
-	// Measured after the body is read, so latencyMs covers the whole round trip
-	// rather than just the time to first byte.
-	return parseJevResponse(parsed, Math.round(performance.now() - startedAt));
-}
-
-const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err));
-
-const asRecord = (value: unknown): Record<string, unknown> | undefined =>
-	typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
-
-const finiteNumber = (value: unknown): number | undefined =>
-	typeof value === "number" && Number.isFinite(value) ? value : undefined;
-
-/** Probability-shaped numbers: finite and inside 0..1. A noul of 1.4 or a
- *  confidence of -0.2 means the answer is not the shape this module consumes. */
-const unitNumber = (value: unknown): number | undefined => {
-	const unit = finiteNumber(value);
-	return unit !== undefined && unit >= 0 && unit <= 1 ? unit : undefined;
-};
-
-/**
- * Validate a response body into JevAnswers, or throw naming the field that
- * failed. Every field this module consumes is checked, a missing hazard is a
- * throw rather than a 0, and unknown keys are dropped instead of passed
- * through: the decision reads exactly the option keys and level indices defined
- * above, so a server-side addition can never appear in a dialog or an audit
- * line as if it were one of ours.
- *
- * The blast-radius score is checked for finite and non-negative only. Its
- * upper end is a probability-weighted position that can sit above the top level
- * index, and clamping to the levels is the server's documented behavior; a
- * score above the top level can only push the value toward the UNSURE floor,
- * never past it.
- */
-function parseJevResponse(body: unknown, latencyMs: number): JevAnswers {
-	const fieldError = (field: string, problem: string): JevUnavailableError =>
-		new JevUnavailableError(`jev response field ${field} ${problem}`);
-	const root = asRecord(body);
-	if (root === undefined) throw new JevUnavailableError("jev response body is not a JSON object");
-	const model = root.model;
-	if (typeof model !== "string" || model === "") throw fieldError("model", "is missing or not a non-empty string");
-	const answers = asRecord(root.answers);
-	if (answers === undefined) throw fieldError("answers", "is missing or not an object");
-
-	const verdictAnswer = asRecord(answers.verdict);
-	if (verdictAnswer === undefined) throw fieldError("answers.verdict", "is missing or not an object");
-	if (verdictAnswer.type !== "choice") throw fieldError("answers.verdict.type", 'is missing or not "choice"');
-	const rawChoice = verdictAnswer.choice;
-	const choice = typeof rawChoice === "string" ? JEV_CHOICE_OPTIONS.find(option => option === rawChoice) : undefined;
-	if (choice === undefined) throw fieldError("answers.verdict.choice", "is missing or not one of safe/unsafe/unsure");
-	const rawProbabilities = asRecord(verdictAnswer.probabilities);
-	if (rawProbabilities === undefined) throw fieldError("answers.verdict.probabilities", "is missing or not an object");
-	const probabilities: Record<string, number> = {};
-	for (const option of JEV_CHOICE_OPTIONS) {
-		const value = unitNumber(rawProbabilities[option]);
-		if (value === undefined) throw fieldError(`answers.verdict.probabilities.${option}`, "is missing or not a number in 0..1");
-		probabilities[option] = value;
-	}
-	const confidence = unitNumber(verdictAnswer.confidence);
-	if (confidence === undefined) throw fieldError("answers.verdict.confidence", "is missing or not a number in 0..1");
-
-	const hazards = {} as Record<JevHazard, number>;
-	for (const hazard of JEV_HAZARDS) {
-		const answer = asRecord(answers[hazard]);
-		if (answer === undefined) throw fieldError(`answers.${hazard}`, "is missing or not an object");
-		if (answer.type !== "noul") throw fieldError(`answers.${hazard}.type`, 'is missing or not "noul"');
-		const value = unitNumber(answer.noul);
-		if (value === undefined) throw fieldError(`answers.${hazard}.noul`, "is missing or not a number in 0..1");
-		hazards[hazard] = value;
-	}
-
-	const blastAnswer = asRecord(answers.blast_radius);
-	if (blastAnswer === undefined) throw fieldError("answers.blast_radius", "is missing or not an object");
-	if (blastAnswer.type !== "score") throw fieldError("answers.blast_radius.type", 'is missing or not "score"');
-	const score = finiteNumber(blastAnswer.score);
-	if (score === undefined || score < 0) throw fieldError("answers.blast_radius.score", "is missing or not a non-negative number");
-	const blastConfidence = unitNumber(blastAnswer.confidence);
-	if (blastConfidence === undefined) throw fieldError("answers.blast_radius.confidence", "is missing or not a number in 0..1");
-	const legend = asRecord(blastAnswer.legend);
-	if (legend === undefined) throw fieldError("answers.blast_radius.legend", "is missing or not an object");
-	const levels: string[] = [];
-	for (let level = 0; level < JEV_BLAST_RADIUS_LEVELS.length; level++) {
-		const description = legend[String(level)];
-		if (typeof description !== "string") throw fieldError(`answers.blast_radius.legend.${level}`, "is missing or not a string");
-		levels.push(description);
-	}
-
-	let usage: { input_tokens?: number; output_tokens?: number } | undefined;
-	if (root.usage !== undefined) {
-		const rawUsage = asRecord(root.usage);
-		if (rawUsage === undefined) throw fieldError("usage", "is present but not an object");
-		usage = {};
-		for (const key of ["input_tokens", "output_tokens"] as const) {
-			if (rawUsage[key] === undefined) continue;
-			const value = finiteNumber(rawUsage[key]);
-			if (value === undefined || value < 0) throw fieldError(`usage.${key}`, "is present but not a non-negative number");
-			usage[key] = value;
-		}
-	}
-
-	return {
-		model,
-		verdict: { choice, probabilities, confidence },
-		hazards,
-		blastRadius: { score, confidence: blastConfidence, levels },
-		...(usage === undefined ? {} : { usage }),
-		latencyMs,
-	};
 }

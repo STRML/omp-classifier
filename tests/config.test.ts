@@ -2,9 +2,9 @@
  * The plugin's own config (OMP's /settings has no extension hook, so this is a
  * small JSON file + the /classifier command). Tests cover defaults, garbage
  * tolerance, the enabled=false semantics (classification off, critical/env/static
- * checks still on), the typesafeModel override, timeout, and the command-length bound.
+ * checks still on), the host-resolved model id, timeout, and the command-length bound.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	fire,
 	jevSafeAnswer,
@@ -25,6 +25,14 @@ beforeEach(async () => {
 	removeConfigFile();
 	setJevDelay(5);
 	await loadPlugin(makeSettings([]));
+});
+
+// The judge's model id is a derived identity now (`TYPESAFE_DEFAULT_MODEL`, else
+// the vendor alias), read from the host rather than from the config file — so a
+// test that pins it sets the env var, and this keeps that pin from leaking into
+// a sibling file that expects the default.
+afterEach(() => {
+	delete process.env.TYPESAFE_DEFAULT_MODEL;
 });
 
 const gate = async (
@@ -80,16 +88,21 @@ describe("enabled=false", () => {
 });
 
 describe("typesafeModel", () => {
-	test("config.typesafeModel is the model the request asks Jev for", async () => {
-		writeConfigFile({ typesafeModel: "jev-pinned" });
+	test("TYPESAFE_DEFAULT_MODEL is the model the judgement asks for", async () => {
+		// The judge resolves its own model from the host (`TYPESAFE_DEFAULT_MODEL`
+		// wins, the vendor alias otherwise); a config file's `typesafeModel` key is
+		// deliberately not a knob any more, and the garbage-config test below
+		// covers that it is tolerated rather than honored.
+		process.env.TYPESAFE_DEFAULT_MODEL = "jev-pinned";
 		await gate("make build");
 		expect(modelCalls.length).toBe(1);
-		// One model id, straight from config: the gate has no role resolution
-		// (@tiny, session model) of its own to fall back through.
+		// One model id, resolved by the client itself: the gate has no role
+		// resolution (@tiny, session model) of its own to fall back through.
 		expect(modelCalls[0].model).toBe("jev-pinned");
 	});
 
-	test("with no config file the request asks for the default jev-latest", async () => {
+	test("with no model pinned the judgement asks for the default jev-latest", async () => {
+		delete process.env.TYPESAFE_DEFAULT_MODEL;
 		await gate("make build");
 		expect(modelCalls.length).toBe(1);
 		// The vendor alias, resolved server-side — never a pinned version.
@@ -146,9 +159,13 @@ describe("bounds and garbage", () => {
 	});
 
 	test("garbage config falls back to defaults", async () => {
+		// `typesafeModel: 7` is doubly inert now: the key is no longer read at all
+		// (the model comes from the host), and a non-string would have been ignored
+		// even when it was — so the file must not be able to choose a model.
 		writeConfigFile({ enabled: "banana", typesafeModel: 7, timeoutMs: -1, maxCommandLength: 0 });
 		const result = await gate("git status");
 		expect(result).toBe("ALLOWED"); // default enabled, SAFE -> through
 		expect(modelCalls.length).toBe(1);
+		expect(modelCalls[0].model).toBe("jev-latest");
 	});
 });

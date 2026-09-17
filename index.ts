@@ -50,24 +50,26 @@
  *     throws. An SDK/isolated session may have no global settings at all, so an
  *     unreadable read degrades to "no static rules, classify everything" rather
  *     than blocking every bash call.
- *   - Classification asks TypeSafe's Jev (System One) exactly one request per
- *     command: a fixed battery of typed questions (one Choice for the verdict,
- *     one Noul per hazard, one Score for blast radius) whose returned
- *     probabilities code derives a verdict from (see jev.ts). Jev never emits
- *     text — no analysis, no explanation, no reason string — so the previous
- *     prompt-and-parse contract has no analogue here: the judge's contribution
- *     is a probability vector, and every deterministic check that surrounded
- *     the old model (static rules, moderate-risk tokens, the eval spawn scan,
- *     forced dialogs, grants, refusal memory) is unchanged.
+ *   - Classification asks the judgment module's judge (TypeSafe's Jev /
+ *     System One, with the harness's tiny/smol chain behind it as fallback)
+ *     exactly one request per command: a fixed battery of typed questions (one
+ *     Choice for the verdict, one Noul per hazard, one Score for blast radius)
+ *     whose returned probabilities code derives a verdict from (see jev.ts).
+ *     Transport, credentials (AuthStorage), retries, and model choice
+ *     (`TYPESAFE_DEFAULT_MODEL` else `jev-latest`) hence belong to the host —
+ *     the plugin passes a deadline and receives a probability vector, and
+ *     every deterministic check that surrounded the old judge (static rules,
+ *     moderate-risk tokens, the eval spawn scan, forced dialogs, grants,
+ *     refusal memory) is unchanged.
  *
  * Fail-closed points: a command too long to display is blocked outright; an
- * `env` override and a Jev request that fails, times out, or answers with a
+ * `env` override and a judgment that fails, times out, or answers with a
  * shape we cannot read raise a permission request when a UI exists and block
  * when headless; any unexpected plugin throw always blocks. A command the gate
  * could not judge is never silently auto-run. A SAFE verdict alone is never
  * enough to auto-run a command carrying a destructive/irreversible token
- * (matchModerateRiskTokens): those raise a permission request even when Jev
- * said SAFE.
+ * (matchModerateRiskTokens): those raise a permission request even when the
+ * judge said SAFE.
  */
 import * as fs from "node:fs";
 import { createHash } from "node:crypto";
@@ -79,16 +81,13 @@ import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 import { getConfigRootDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
+import { judgeBattery } from "./jev-judge";
 import {
-	askJev,
 	buildJevState,
-	DEFAULT_JEV_MODEL,
 	DEFAULT_JEV_POLICY,
 	deriveJevDecision,
 	JEV_POLICY_VERSION,
-	jevQuestions,
 	jevQuestionsHash,
-	resolveJevApiKey,
 	type JevHazard,
 	type JevPolicy,
 } from "./jev";
@@ -136,11 +135,11 @@ interface Judgement {
 /** Per-session cache: sessionId -> `${cwd}\0${env}\0${pty}\0${command}` -> judgement. */
 const cache = new Map<string, Map<string, Judgement>>();
 // Effective-config signature of the last gate run. The classifier config
-// (enabled, typesafeModel, timeoutMs, maxCommandLength, evidenceUserMessages,
-// and the merged Jev policy) is the trust state a cached verdict was made
-// under: changing any of it invalidates every session's cached judgements, so
-// `/classifier model x` or a `jevPolicy` edit cannot reuse a SAFE verdict made
-// by (or under the policy of) a different configuration.
+// (enabled, the derived judge-model identity, timeoutMs, maxCommandLength,
+// evidenceUserMessages, and the merged Jev policy) is the trust state a cached
+// verdict was made under: changing any of it invalidates every session's
+// cached judgements, so a model swap or a `jevPolicy` edit cannot reuse a SAFE
+// verdict made by (or under the policy of) a different configuration.
 let classifierConfigSignature = "";
 
 // Stale-code guard: OMP binds plugin code at session start, so a fix landing
@@ -510,8 +509,17 @@ function canonicalEnv(value: unknown): CanonicalEnv {
 
 interface ClassifierConfig {
 	enabled: boolean;
-	/** Jev model selector, sent as `model` on every request. Default
-	 *  `jev-latest`, which the server resolves to the current release. */
+	/**
+	 * Model the judge will answer with — a derived read-only identity, never a
+	 * knob. The native judge resolves its own TypeSafe client from
+	 * `TYPESAFE_DEFAULT_MODEL` (host default `jev-latest`, resolved server-side
+	 * to the current release), and can additionally fall back to the chat
+	 * judge, so the id that actually answers is read back off the response as
+	 * `Judgement.modelId`. This field mirrors the host's pre-call resolution
+	 * for two consumers only: `/classifier` display and the cache trust state —
+	 * a model swap must still invalidate cached verdicts. A `typesafeModel`
+	 * key in a pre-existing config file is tolerated and ignored.
+	 */
 	typesafeModel: string;
 	/** Threshold overrides over DEFAULT_JEV_POLICY; absent keys keep the
 	 *  shipped default. These are policy, not facts from vendor docs: measured
@@ -561,9 +569,11 @@ const JEV_POLICY_RANGES: Record<keyof JevPolicy, { min: number; max: number }> =
 	blastRadiusReview: { min: 0, max: 10 },
 };
 
-const CLASSIFIER_CONFIG_DEFAULTS: ClassifierConfig = {
+/** Defaults without `typesafeModel`: the model identity is derived per read in
+ *  normalizeClassifierConfig — the single derivation site — so no module-load
+ *  snapshot can go stale when `TYPESAFE_DEFAULT_MODEL` changes. */
+const CLASSIFIER_CONFIG_DEFAULTS: Omit<ClassifierConfig, "typesafeModel"> = {
 	enabled: true,
-	typesafeModel: DEFAULT_JEV_MODEL,
 	jevPolicy: {},
 	timeoutMs: DEFAULT_TIMEOUT_MS,
 	maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH,
@@ -589,12 +599,19 @@ interface ClassifierConfigCache {
 let classifierConfigCache: ClassifierConfigCache | undefined;
 
 function normalizeClassifierConfig(raw: Record<string, unknown>): ClassifierConfig {
-	const config: ClassifierConfig = { ...CLASSIFIER_CONFIG_DEFAULTS };
+	// The one place `typesafeModel` is derived: the display value and the cache
+	// trust state both read it from here, and no module-load snapshot exists to
+	// go stale. It is never read from the file — the native judge owns model
+	// resolution (`TYPESAFE_DEFAULT_MODEL` when the operator pinned one, else
+	// the `jev-latest` alias the server maps to its current release) — so a
+	// legacy key in a pre-existing config file is tolerated: it simply stops
+	// being a knob, like an unknown key.
+	const config: ClassifierConfig = {
+		...CLASSIFIER_CONFIG_DEFAULTS,
+		typesafeModel: process.env.TYPESAFE_DEFAULT_MODEL?.trim() || "jev-latest",
+	};
 	if (typeof raw.enabled === "boolean") config.enabled = raw.enabled;
 	if (typeof raw.persistentGrants === "boolean") config.persistentGrants = raw.persistentGrants;
-	if (typeof raw.typesafeModel === "string" && raw.typesafeModel.trim().length > 0) {
-		config.typesafeModel = raw.typesafeModel.trim();
-	}
 	if (typeof raw.timeoutMs === "number" && Number.isFinite(raw.timeoutMs) && raw.timeoutMs > 0) {
 		config.timeoutMs = raw.timeoutMs;
 	}
@@ -642,14 +659,16 @@ export function readClassifierConfig(): ClassifierConfig {
 		classifierConfigCache = { mtimeMs: stat.mtimeMs, config };
 		return config;
 	} catch {
-		return CLASSIFIER_CONFIG_DEFAULTS;
+		// Folded through normalizeClassifierConfig so `typesafeModel` is derived
+		// at read time here too, never a stale module-load snapshot.
+		return normalizeClassifierConfig({});
 	}
 }
 
 function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig {
 	const before = readClassifierConfig();
 	const raw: Record<string, unknown> = {};
-	for (const key of ["enabled", "typesafeModel", "jevPolicy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "persistentGrants"] as const) {
+	for (const key of ["enabled", "jevPolicy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "persistentGrants"] as const) {
 		if (key in patch) raw[key] = patch[key];
 	}
 	const next = normalizeClassifierConfig({ ...before, ...raw });
@@ -3112,9 +3131,9 @@ export default function (pi: ExtensionAPI) {
 	// prints the effective config and the file path.
 	pi.registerCommand("classifier", {
 		description:
-			"View or set omp-jevens-classifier options: enabled, typesafeModel, policy, timeoutMs, maxCommandLength, evidenceUserMessages, persistentGrants, reset, status, dry-run, off, on",
+			"View or set omp-jevens-classifier options: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, persistentGrants, reset, status, dry-run, off, on",
 		getArgumentCompletions: (prefix: string) => {
-			const keywords = ["enabled", "model", "policy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "persistentGrants", "reset", "status", "dry-run", "off", "on", "file"] as const;
+			const keywords = ["enabled", "policy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "persistentGrants", "reset", "status", "dry-run", "off", "on", "file"] as const;
 			return keywords
 				.filter(keyword => keyword.startsWith(prefix.toLowerCase()))
 				.map(keyword => ({ label: keyword, value: keyword }));
@@ -3178,7 +3197,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (key === "reset") {
-				writeClassifierConfig({ enabled: true, typesafeModel: DEFAULT_JEV_MODEL, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, persistentGrants: true });
+				writeClassifierConfig({ enabled: true, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, persistentGrants: true });
 				notify(`omp-jevens-classifier reset to defaults (${classifierConfigPath()})`);
 				return;
 			}
@@ -3207,14 +3226,6 @@ export default function (pi: ExtensionAPI) {
 				} catch (err) {
 					notify(`could not update the session pause: ${err instanceof Error ? err.message : String(err)}`, "error");
 				}
-				return;
-			}
-			if (key === "model") {
-				// The server resolves the selector, so anything non-empty is
-				// accepted; a typo fails closed as UNAVAILABLE on the next call
-				// rather than being second-guessed here.
-				const next = writeClassifierConfig({ typesafeModel: value ?? "" });
-				notify(`classifier typesafeModel=${next.typesafeModel}`);
 				return;
 			}
 			if (key === "policy") {
@@ -3277,7 +3288,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			notify(
-				`unknown key "${key}". Keys: enabled, model, policy, timeoutMs, maxCommandLength, evidenceUserMessages, persistentGrants, reset, status, dry-run, off, on, file`,
+				`unknown key "${key}". Keys: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, persistentGrants, reset, status, dry-run, off, on, file`,
 				"error",
 			);
 		},
@@ -3315,16 +3326,19 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * Ask Jev to judge one command. One request per classification, no retries,
-	 * no second pass: the battery returns typed answers and the verdict is
-	 * derived from their probabilities (jev.ts), so there is no reply to parse
-	 * and no fallback-model ladder to walk. A request that cannot be made,
-	 * answered, or read becomes an UNAVAILABLE verdict, which the caller turns
-	 * into a permission request — never a silent allow.
+	 * Ask the native judgment module to judge one command. One judge call per
+	 * classification, no retries of our own and no second pass: judgeBattery
+	 * (jev-judge.ts) carries the whole battery, the native judge already
+	 * retries its own transients and falls back to the chat chain, and the
+	 * verdict is derived from the answer probabilities (jev.ts). A request
+	 * that cannot be made, answered, or read surfaces as JevUnavailableError
+	 * and becomes an UNAVAILABLE verdict, which the caller turns into a
+	 * permission request — never a silent allow.
 	 *
-	 * `timeoutMs` bounds the single request: the old path needed deadline
-	 * arithmetic of its own because it could make two sequential provider calls
-	 * inside one handler budget, while one AbortSignal covers this one.
+	 * `timeoutMs` is the caller's deadline, passed as an AbortSignal so a slow
+	 * judge cannot exceed the plugin's own budget: the old path needed deadline
+	 * arithmetic of its own because it could make two sequential provider
+	 * calls inside one handler budget, while one signal covers this one.
 	 */
 	const classify = async (
 		ctx: ExtensionContext,
@@ -3346,8 +3360,8 @@ export default function (pi: ExtensionAPI) {
 		const userMessages = taskEvidence?.messages;
 		const hadUserEvidence = (userMessages?.length ?? 0) > 0;
 		try {
-			const answers = await askJev(
-				buildJevState({
+			const answers = await judgeBattery(AbortSignal.timeout(timeoutMs), {
+				state: buildJevState({
 					command,
 					workingDirectory: cwd,
 					...(userMessages ? { userMessages } : {}),
@@ -3355,9 +3369,12 @@ export default function (pi: ExtensionAPI) {
 					...(operatorContext ? { operatorContext } : {}),
 					...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
 				}),
-				jevQuestions(),
-				{ apiKey: resolveJevApiKey(), model: config.typesafeModel, timeoutMs },
-			);
+				// The host settings instance, not a plugin-local singleton copy:
+				// the native resolver reads providers.judgmentProvider and the
+				// credential store through it (see the header note on settings).
+				context: ctx,
+				settings,
+			});
 			const decision = deriveJevDecision(answers, policy);
 			// `decision.hazards` carries only the hazards that reached
 			// hazardReview, so "fired" is presence, not a threshold re-check.

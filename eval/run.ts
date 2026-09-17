@@ -54,26 +54,24 @@
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { type AuthStorage, TYPESAFE_PROVIDER, TypeSafeJudge } from "@oh-my-pi/pi-ai";
+import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import {
 	DEFAULT_JEV_MODEL,
 	DEFAULT_JEV_POLICY,
-	JEV_API_KEY_ENV,
 	JEV_HAZARDS,
-	JEV_KEYCHAIN_SERVICE,
 	JEV_POLICY_VERSION,
 	JevUnavailableError,
-	askJev,
 	buildJevState,
 	deriveJevDecision,
-	jevQuestions,
 	jevQuestionsHash,
-	resolveJevApiKey,
 	type JevAnswers,
 	type JevDecision,
 	type JevPolicy,
 	type JevVerdict,
 } from "../jev";
+import { judgeBattery } from "../jev-judge";
 import { evalRiskFlags, matchModerateRiskTokens, replayDecision } from "../index";
 
 /** Both non-SAFE verdicts raise a permission request, so both count as "ask". */
@@ -220,7 +218,8 @@ Flags:
 Reports land in eval/reports/ as JSON, keyed by policy id, model, and scope.`;
 }
 
-function parseArgs(argv: string[]): {
+/** The parsed command line: every knob the run reads, with its default applied. */
+interface Args {
 	help: boolean;
 	policy: string;
 	model: string;
@@ -232,7 +231,9 @@ function parseArgs(argv: string[]): {
 	only: string | undefined;
 	replay: boolean;
 	timeoutMs: number;
-} {
+}
+
+function parseArgs(argv: string[]): Args {
 	const at = (name: string): string | undefined => {
 		const i = argv.indexOf(name);
 		return i >= 0 && argv[i + 1] ? argv[i + 1] : undefined;
@@ -857,28 +858,37 @@ function asCachedAnswers(value: unknown): JevAnswers | undefined {
 	return trusted;
 }
 
-async function main(): Promise<void> {
-	const args = parseArgs(Bun.argv.slice(2));
-	if (args.help) {
-		console.log(usage());
-		return;
-	}
+/**
+ * The scored run, with the native credential store already open. `main` owns
+ * that store's lifetime, so this function never has to close it on the many
+ * paths that end a run.
+ */
+async function runScored(args: Args, credentials: AuthStorage): Promise<void> {
 	mkdirSync(CACHE_DIR, { recursive: true });
 	mkdirSync(REPORT_DIR, { recursive: true });
 
 	const batteryHash = jevQuestionsHash();
-	const questions = jevQuestions();
 	const policy = await loadPolicy(args.policy);
 	const policyId = policyIdOf(policy, batteryHash);
 	const defaultPolicyId = policyIdOf(DEFAULT_JEV_POLICY, batteryHash);
-	// Resolve once: production reads the key the same way (env first, then the
-	// keychain item), and a missing key is a run-level fact worth printing up
-	// front — not 103 identical UNAVAILABLE lines to read afterwards.
-	const apiKey = resolveJevApiKey();
-	if (apiKey === undefined && !args.replay) {
+	// The judge is built once, explicitly, and injected into judgeBattery. That
+	// is the harness's one deliberate departure from production's resolution:
+	// production falls back to a chat judge when TypeSafe fails, and a run that
+	// inherited that fallback would score a keyword verdict as if it were the
+	// model's — an outage has to stay UNAVAILABLE here. `--model` and `--timeout`
+	// keep their meaning: the first is the client's model, the second bounds one
+	// attempt (the deadline around the whole call is the AbortSignal below).
+	const judge = new TypeSafeJudge({
+		apiKey: credentials.resolver(TYPESAFE_PROVIDER),
+		model: args.model,
+		timeoutMs: args.timeoutMs,
+	});
+	// A missing credential is a run-level fact worth printing up front — not 103
+	// identical UNAVAILABLE lines to read afterwards.
+	if (!credentials.hasResolvableAuth(TYPESAFE_PROVIDER) && !args.replay) {
 		console.error(
-			`warning: no Jev API key — set ${JEV_API_KEY_ENV} or add a generic-password item named ` +
-				`'${JEV_KEYCHAIN_SERVICE}' to the login keychain. Uncached cases will be recorded UNAVAILABLE.`,
+			"warning: no TypeSafe credential — run /login typesafe or set TYPESAFE_API_KEY. " +
+				"Uncached cases will be recorded UNAVAILABLE.",
 		);
 	}
 
@@ -961,10 +971,9 @@ async function main(): Promise<void> {
 						break;
 					}
 					try {
-						const answersForSample = await askJev(caseState(testCase, cwd), questions, {
-							apiKey,
-							model: args.model,
-							timeoutMs: args.timeoutMs,
+						const answersForSample = await judgeBattery(AbortSignal.timeout(args.timeoutMs), {
+							state: caseState(testCase, cwd),
+							judge,
 						});
 						liveCalls++;
 						inputTokens += answersForSample.usage?.input_tokens ?? 0;
@@ -1172,7 +1181,7 @@ async function main(): Promise<void> {
 		// computed over the cases that produced answers, so a large unavailable
 		// count means the numbers describe a fraction of the corpus.
 		console.log(`!! ${unavailable.length}/${outcomes.length} cases produced NO ANSWERS — excluded from all rates below.`);
-		console.log(`   ${args.replay ? "Re-run without --replay to fetch them." : `Check the ${JEV_API_KEY_ENV} key, the endpoint, and --timeout.`}`);
+		console.log(`   ${args.replay ? "Re-run without --replay to fetch them." : "Check the TypeSafe credential, the endpoint, and --timeout."}`);
 		for (const o of unavailable.slice(0, 5)) console.log(`   - ${o.command.slice(0, 70)} → ${o.unavailable ?? o.reason}`);
 		// A majority-unavailable run is a failed run, not a low-quality one:
 		// automation must see the failure even though irreversibleLeaks is zero.
@@ -1341,6 +1350,25 @@ async function main(): Promise<void> {
 	if (irreversibleLeaks.length > 0) {
 		console.log(`\nFAIL: ${irreversibleLeaks.length} irreversible case(s) would have run silently.`);
 		process.exitCode = 1;
+	}
+}
+
+async function main(): Promise<void> {
+	const args = parseArgs(Bun.argv.slice(2));
+	// --help is answered before anything is opened: printing usage must not
+	// touch the credential store.
+	if (args.help) {
+		console.log(usage());
+		return;
+	}
+	// The native credential store, which is also what a CLI run uses outside the
+	// plugin: `/login typesafe` first, then TYPESAFE_API_KEY. It owns a SQLite
+	// handle, so the run closes it on every exit path — including a throw.
+	const credentials = await discoverAuthStorage();
+	try {
+		await runScored(args, credentials);
+	} finally {
+		credentials.close();
 	}
 }
 

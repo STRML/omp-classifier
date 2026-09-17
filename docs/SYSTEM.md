@@ -88,9 +88,9 @@ One request, two inputs, no prose:
   hazard in `JEV_HAZARDS`, one `score` question for blast radius. The battery is a pure
   function of the module, not of config, so its hash is a stable identity (below).
 
-The response's answers are validated field by field (`askJev` throws `JevUnavailableError` on
-a missing or mistyped field rather than letting a default slip through), then
-`deriveJevDecision(answers, policy)` derives the verdict in a fixed precedence:
+The response's answers are validated field by field (`judgeBattery` in `jev-judge.ts` throws
+`JevUnavailableError` on a missing or mistyped field rather than letting a default slip
+through), then `deriveJevDecision(answers, policy)` derives the verdict in a fixed precedence:
 
 1. a hazard at or above `hazardBlock` → `UNSAFE` (a hard safety signal outranks the verdict
    distribution — the choice can say "safe" right next to it)
@@ -102,9 +102,12 @@ a missing or mistyped field rather than letting a default slip through), then
 6. otherwise `UNSURE`, below the safe gate's floors
 
 Every branch writes a `reasonCode` (`jev:safe`, `jev:hazard:<id>`, `jev:below-floor`,
-`jev:unavailable`) and a `reason` string assembled from the numbers that decided. Decode
-parameters are pinned: one pinned model (`typesafeModel`), one pinned timeout, no temperature
-knob to set.
+`jev:unavailable`) and a `reason` string assembled from the numbers that decided. The decode
+parameters belong to the harness now: the judge is OMP's native one (TypeSafe when a
+credential exists, otherwise the tiny/smol/default chain, whose one-hot answers tag every
+reason with `(llm keyword answer)`), the model is whatever that judge resolves
+(`TYPESAFE_DEFAULT_MODEL`, else `jev-latest`), and the only knob this gate passes is its own
+deadline as an `AbortSignal` — no temperature to set.
 
 Invariant: nothing that reached L2 can end in silence. `UNAVAILABLE` behaves exactly like
 `UNSURE` at L4 (a dialog) and is excluded from the cache, so an outage cannot pin a session

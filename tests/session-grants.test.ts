@@ -214,11 +214,19 @@ describe("session grants", () => {
 		const sid = nextSession();
 		await prompted(`git branch -D feature-${sid}`, ALLOW_SESSION, sid);
 
-		writeConfigFile({ typesafeModel: "changed-model" });
-		const ctx = makeCtx({ sessionId: sid, hasUI: true });
-		const result = await fire("tool_call", makeEvent(`git branch -D feature-${sid}`), ctx);
-		expect(refusalOf(result).layer).toBe("dialog");
-		expect(selectCalls(ctx)).toHaveLength(1);
+		// The model id is part of the trust state a grant was made under, and it
+		// is a derived identity now: the host resolves it (`TYPESAFE_DEFAULT_MODEL`),
+		// so the env var is what changes it. The signature is recomputed from a
+		// fresh config read on every tool call, so the swap lands on the next one.
+		process.env.TYPESAFE_DEFAULT_MODEL = "changed-model";
+		try {
+			const ctx = makeCtx({ sessionId: sid, hasUI: true });
+			const result = await fire("tool_call", makeEvent(`git branch -D feature-${sid}`), ctx);
+			expect(refusalOf(result).layer).toBe("dialog");
+			expect(selectCalls(ctx)).toHaveLength(1);
+		} finally {
+			delete process.env.TYPESAFE_DEFAULT_MODEL;
+		}
 	});
 
 	test("a session boundary drops the session's grants", async () => {

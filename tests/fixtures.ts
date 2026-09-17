@@ -2,23 +2,29 @@
  * Test fixtures for the tool_call interceptor plugin surface.
  *
  * The plugin takes its settings from the pi argument (`pi.pi.settings`) and
- * every judgement from TypeSafe's Jev (System One) over HTTP. Both are
- * injectable here without touching the real modules, so the ONLY stub is the
- * network boundary: `globalThis.fetch` is replaced by a scripted fake that
- * answers with wire-shaped Jev responses. The production path runs for real —
- * jev.ts's askJev (request body, response validation, error mapping) and
- * deriveJevDecision (the policy arithmetic) are never stubbed, because a suite
- * that stubs the thing under test asserts against itself.
+ * every judgement from the judge jev-judge.ts resolves out of the extension
+ * context. Both are injectable here without touching the real modules, so the
+ * ONLY stub on our side of the seam is the judgement boundary: the mocked
+ * `@oh-my-pi/pi-coding-agent/judgment` hands back a scripted judge. The
+ * production path then runs for real — the battery jev.ts builds, jev-judge.ts's
+ * validation and mapping, and deriveJevDecision's policy arithmetic are never
+ * stubbed, because a suite that stubs the thing under test asserts against
+ * itself. `globalThis.fetch` is stubbed as well, as a firewall: no test may
+ * open a socket even if some future code path resolves its judge elsewhere.
  *
- * One entry in `modelCalls` is one judgement request: the boundary is an HTTP
- * request now, not a provider completion. Entries are captured on ARRIVAL, so
- * a request that later times out is still visible (`jevAttemptCount()`).
+ * One entry in `modelCalls` is one judgement: the boundary is one `judge()`
+ * call per classification, not a completion and not the host client's own
+ * HTTP retries. Entries are captured on ARRIVAL, so a judgement that later
+ * times out is still visible (`jevAttemptCount()`).
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { mock } from "bun:test";
+import { TYPESAFE_PROVIDER, tokenUsage, typesafeModel } from "@oh-my-pi/pi-ai";
+import type { Judge, JudgeOptions, JudgmentRequest, JudgmentResult, Questions } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { JudgeDeps } from "@oh-my-pi/pi-coding-agent/judgment";
 
 export type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "UNAVAILABLE";
 
@@ -28,8 +34,9 @@ export type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "UNAVAILABLE";
 // Wire shapes copied from measured live responses (the frozen contract): a
 // choice answer carries `choice` + `probabilities` + `confidence`, a noul
 // answer a single 0..1 `noul`, a score answer `score` + `legend` +
-// `probabilities` + `confidence`. The fixtures build `answers` maps; the fake
-// fetch wraps them in the response envelope ({model, answers, usage}).
+// `probabilities` + `confidence`. The fixtures build `answers` maps; the
+// scripted judge returns them as a judge result, and the firewall wraps the
+// same answers in the wire envelope ({model, answers, usage}).
 // ---------------------------------------------------------------------------
 
 export interface JevChoiceAnswerFixture {
@@ -56,9 +63,10 @@ export interface JevScoreAnswerFixture {
  * The battery's question ids: the contract's "verdict" choice, one noul per
  * hazard, and the "blast_radius" score. Spelled here instead of imported so
  * the fixtures never reach into jev.ts's module graph; a drift against
- * jevQuestions() is loud rather than silent — askJev rejects a response whose
- * answers do not cover the questions it sent, every judgement becomes
- * UNAVAILABLE, and policy-gates.test.ts pins the ids the gate actually asked.
+ * jevQuestions() is loud rather than silent — jev-judge.ts rejects a judge
+ * result whose answers do not cover the questions it asked, every judgement
+ * becomes UNAVAILABLE, and policy-gates.test.ts pins the ids the gate actually
+ * asked.
  *
  * The split mirrors the battery's: GATING hazards can force UNSAFE/UNSURE,
  * DESCRIPTIVE ones are carried into the reason, the audit line and the dialog
@@ -182,7 +190,15 @@ export function jevHazardousAnswer(hazard: JevFixtureHazard, noul: number, overr
 }
 
 // ---------------------------------------------------------------------------
-// The fake network boundary.
+// The judgement boundary.
+//
+// jev-judge.ts resolves one judge per classification and asks it one battery,
+// so the judge resolution is where the fixture injects: the mocked judgment
+// module below answers `resolveJudge` with `scriptedJudge`, which records the
+// state and the questions verbatim, then answers from the script. The native
+// client's own retries and its LLM fallback sit behind this seam, so they can
+// neither turn one scripted judgement into three attempts nor answer with
+// something this suite never scripted.
 // ---------------------------------------------------------------------------
 
 export interface CapturedJevRequest {
@@ -190,13 +206,23 @@ export interface CapturedJevRequest {
 	state: unknown;
 	/** The question battery, by id. */
 	questions: Record<string, unknown>;
-	/** The model id from the request body. */
+	/** The model the judge was asked with — the resolver's own pick
+	 *  (`TYPESAFE_DEFAULT_MODEL` or the vendor alias). The id that ANSWERED is
+	 *  `JEV_FIXTURE_MODEL`, and the gate reads that off the result. */
 	model: unknown;
-	/** Request headers, lower-cased (the bearer token rides here). */
-	headers: Record<string, string>;
+	/** HTTP headers, lower-cased. Present only when the firewall below carried
+	 *  the judgement; the judge seam has no headers to show. */
+	headers?: Record<string, string>;
 }
 
 export const modelCalls: CapturedJevRequest[] = [];
+
+/**
+ * The `JudgeDeps` every context-resolved judge was built from, in call order.
+ * The scripted judge ignores them (it answers from the script), so this is the
+ * only way a test can see the wiring jev-judge.ts assembled out of the ctx.
+ */
+export const resolvedJudgeDeps: JudgeDeps[] = [];
 
 let jevDefaultAnswers: JevFixtureAnswers = jevSafeAnswer();
 let jevQueue: JevFixtureAnswers[] | undefined;
@@ -205,30 +231,31 @@ let jevUnavailable = false;
 let jevDelayMs = 5;
 const jevRawQueue: Array<{ status: number; body: string }> = [];
 
-/** Requests SENT, including ones aborted before a response (a timeout is
+/** Judgements STARTED, including ones aborted before an answer (a timeout is
  *  evidence the gate tried — the only way to see it, since nothing lands). */
 export function jevAttemptCount(): number {
 	return modelCalls.length;
 }
 
-/** Serve this answer for every request from now on; drops a queued script. */
+/** Serve this answer for every judgement from now on; drops a queued script. */
 export function setJevAnswer(answers: JevFixtureAnswers = jevSafeAnswer()): void {
 	jevDefaultAnswers = answers;
 	jevQueue = undefined;
 }
 
-/** Script per-request answers, consumed in order; once drained,
+/** Script per-judgement answers, consumed in order; once drained,
  *  `jevDefaultAnswers` (set by setJevAnswer, safe by default) takes over. */
 export function setJevAnswers(answers: JevFixtureAnswers[]): void {
 	jevQueue = [...answers];
 }
 
-/** Make the next `count` requests fail with HTTP 503 (provider outage). */
+/** Make the next `count` judgements fail the way the endpoint's 503 does
+ *  (provider outage). */
 export function setJevFailures(count: number): void {
 	jevFailuresLeft = count;
 }
 
-/** Model an unreachable endpoint: the request rejects like a failed
+/** Model an unreachable endpoint: the judgement rejects like a failed
  *  connection rather than answering with a status. sticky until cleared. */
 export function setJevUnavailable(unavailable = true): void {
 	jevUnavailable = unavailable;
@@ -241,7 +268,7 @@ export function setJevRawResponses(responses: Array<{ status?: number; body: str
 	for (const response of responses) jevRawQueue.push({ status: response.status ?? 200, body: response.body });
 }
 
-/** Delay every response; combined with a small `timeoutMs`, this is the abort
+/** Delay every answer; combined with a small `timeoutMs`, this is the abort
  *  path (the gate's AbortSignal fires before the fake answers). */
 export function setJevDelay(ms: number): void {
 	jevDelayMs = ms;
@@ -251,25 +278,34 @@ const JEV_TEST_KEY = "jev-test-key";
 const REAL_PATH = process.env.PATH;
 
 /**
- * The API key must never be resolved from the developer's keychain during a
- * test run: `resolveJevApiKey` falls back to
- * `security find-generic-password -s jev -w`, so the happy path would depend on
- * this machine having the entry and CI not having it — pass/fail by host. Pin
- * a test key instead. Cleared by clearJevApiKey for the missing-key path.
+ * Whether a credential exists, for both layers that ask: the scripted judge
+ * refuses to judge without one, and the fake registry's `authStorage` reports
+ * the same thing, so the two can never disagree about it.
+ */
+let jevApiKeyPresent = true;
+
+/**
+ * The no-key path must be deterministic, and the machine actively betrays it:
+ * this developer's keychain HAS a TypeSafe entry, and a real resolver would
+ * find it, so "missing key" would pass or fail by host. Pinning a test key both
+ * here and on the key flag keeps the happy path host-independent, and
+ * `clearJevApiKey` (below) models the missing case. Cleared by `loadPlugin` on
+ * every load, so no file inherits another's scripted key state.
  */
 export function restoreJevApiKey(): void {
+	jevApiKeyPresent = true;
 	process.env.TYPESAFE_API_KEY = JEV_TEST_KEY;
 	if (REAL_PATH !== undefined) process.env.PATH = REAL_PATH;
 }
 
 /**
- * The no-key path must be deterministic too, and here the machine actively
- * betrays it: this developer's keychain HAS the `jev` entry, so leaving the
- * fallback reachable would make "missing key" pass or fail by machine state.
- * An unreachable PATH makes the keychain read fail the way it does on a host
- * with no entry — the same shape a fresh CI runner sees.
+ * The missing-credential case. The scrub of PATH is belt-and-braces rather than
+ * mechanism — the fixture's registry never reads a keychain — so that anything
+ * in the real resolver reached by accident fails the way a fresh CI runner
+ * fails instead of finding this developer's entry.
  */
 export function clearJevApiKey(): void {
+	jevApiKeyPresent = false;
 	delete process.env.TYPESAFE_API_KEY;
 	process.env.PATH = "/nonexistent-omp-jevens-test-bin";
 }
@@ -279,8 +315,8 @@ async function sleepWithAbort(ms: number, signal: AbortSignal | undefined): Prom
 		await new Promise<void>(resolve => setTimeout(resolve, ms));
 		return;
 	}
-	// A DOMException-shaped rejection, like fetch's own abort: askJev maps any
-	// rejection to JevUnavailableError, and the name keeps the stack readable
+	// A DOMException-shaped rejection, like fetch's own abort: jev-judge.ts maps
+	// any rejection to JevUnavailableError, and the name keeps the stack readable
 	// when a timeout test fails.
 	const aborted = (): Error => Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
 	if (signal.aborted) throw aborted();
@@ -317,51 +353,158 @@ function headerRecord(headers: unknown): Record<string, string> {
 	return out;
 }
 
+/** What one scripted judgement produced: an answer set, or a status the
+ *  transport layer must raise as its own kind of failure. */
+type ScriptedJudgement =
+	| { kind: "answers"; model: string; answers: Record<string, unknown> }
+	| { kind: "status"; status: number; body: string };
+
+const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+	typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+
+/**
+ * A scripted wire body, checked the way the native client checks one: JSON, an
+ * `answers` object, and an answer of the asked type for every question that was
+ * asked. Nothing more — the answer FIELDS are jev-judge.ts's business now, and
+ * production is what turns a mistyped answer into an outage, so a looser check
+ * here is what keeps that code under test instead of re-testing it.
+ */
+function answersFromRaw(raw: { status: number; body: string }, questions: Record<string, unknown>): ScriptedJudgement {
+	if (raw.status < 200 || raw.status >= 300) return { kind: "status", status: raw.status, body: raw.body };
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw.body);
+	} catch {
+		throw new Error("judgment failed: response body is not JSON");
+	}
+	const envelope = asRecord(parsed);
+	const answers = asRecord(envelope?.answers);
+	if (!answers) throw new Error('judgment failed: response body has no "answers" object');
+	for (const id of Object.keys(questions)) {
+		const question = asRecord(questions[id]);
+		const answer = asRecord(answers[id]);
+		if (!answer || answer.type !== question?.type) {
+			throw new Error(`judgment failed: response has no "${String(question?.type)}" answer for question "${id}"`);
+		}
+	}
+	const model = typeof envelope?.model === "string" && envelope.model.length > 0 ? envelope.model : JEV_FIXTURE_MODEL;
+	return { kind: "answers", model, answers };
+}
+
+/**
+ * The one decision every scripted judgement reaches: delay, then unanswered,
+ * then scripted failure, then a raw body, then the queued or default answer.
+ * Both boundaries below call it, so they cannot answer differently.
+ *
+ * The caller captures the attempt BEFORE calling this: the delay is here, so a
+ * judgement that a deadline aborts still leaves the record that it was tried.
+ */
+async function scriptedJudgement(questions: Record<string, unknown>, signal: AbortSignal | undefined): Promise<ScriptedJudgement> {
+	await sleepWithAbort(jevDelayMs, signal);
+	// The exact rejection a dead endpoint produces, so both boundaries fail the
+	// way the connection would.
+	if (jevUnavailable) throw new TypeError("fetch failed");
+	if (jevFailuresLeft > 0) {
+		jevFailuresLeft -= 1;
+		return { kind: "status", status: 503, body: '{"error":"service unavailable"}' };
+	}
+	const raw = jevRawQueue.shift();
+	if (raw) return answersFromRaw(raw, questions);
+	return { kind: "answers", model: JEV_FIXTURE_MODEL, answers: (jevQueue?.shift() ?? jevDefaultAnswers) as unknown as Record<string, unknown> };
+}
+
+/** The raise the native client performs for a non-2xx response. */
+const statusError = (status: number, body: string): Error => new Error(`TypeSafe API error (${status}): ${body}`);
+
+/**
+ * The scripted judge — the seam every classification now goes through.
+ *
+ * One `judge()` call per classification, which is exactly what the old fixture
+ * counted HTTP requests as: the fixture models the boundary the plugin talks
+ * to, not the host client's retries, so a scripted outage stays one attempt.
+ */
+const scriptedJudge: Judge & { readonly kind: "typesafe" } = {
+	kind: "typesafe",
+	// Lazy, like the client's own label: it names the model the client was built
+	// with, and a test may move TYPESAFE_DEFAULT_MODEL mid-run.
+	get label(): string {
+		return `typesafe/${typesafeModel()}`;
+	},
+	async judge<Q extends Questions>(request: JudgmentRequest<Q>, options?: JudgeOptions): Promise<JudgmentResult<Q>> {
+		// The credential is checked first, exactly as the client does it: without
+		// one nothing was ever sent, and a capture here would claim otherwise.
+		if (!jevApiKeyPresent) throw new Error("no TypeSafe credential for provider typesafe");
+		const questions = request.questions as Record<string, unknown>;
+		modelCalls.push({ state: request.state, questions, model: typesafeModel() });
+		const scripted = await scriptedJudgement(questions, options?.signal);
+		if (scripted.kind === "status") throw statusError(scripted.status, scripted.body);
+		return {
+			api: TYPESAFE_PROVIDER,
+			provider: TYPESAFE_PROVIDER,
+			model: scripted.model,
+			answers: scripted.answers as JudgmentResult<Q>["answers"],
+			usage: tokenUsage(528, 126),
+		};
+	},
+};
+
+// The judgement seam. Registered at module load, and a module mock reaches an
+// importer that was evaluated earlier too, so jev-judge.ts's `resolveJudge` is
+// the scripted one whichever order a test file's imports land in. Mocking THIS
+// module rather than the host's HTTP client is deliberate: the native client
+// retries transients and degrades to the chat judge, and a fixture that had to
+// script that behavior would be asserting the host's logic instead of the
+// gate's. `resolvedJudgeDeps` is the one thing the scripted resolver keeps: the
+// deps jev-judge.ts assembled from the extension context, which is what makes
+// the ctx -> JudgeDeps wiring assertable without a provider.
+mock.module("@oh-my-pi/pi-coding-agent/judgment", () => ({
+	resolveJudge: (deps: JudgeDeps) => {
+		resolvedJudgeDeps.push(deps);
+		return scriptedJudge;
+	},
+	usesTypeSafeJudge: () => true,
+}));
+
+/** The firewall's transport: the wire fake the suite has always had, kept so
+ *  that nothing in a test run can open a socket. It answers the same scripted
+ *  judgement as the judge seam, so a path that resolved its judge some other
+ *  way behaves identically here rather than reaching the network. */
 async function fakeJevFetch(
 	_url: unknown,
 	init?: { method?: string; body?: string; headers?: unknown; signal?: AbortSignal },
 ): Promise<Response> {
 	const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : undefined;
-	// Captured BEFORE the delay: a request that times out was still sent, and
-	// that is the only evidence a timeout triggered no silent allow.
+	// Captured BEFORE the delay: a judgement that times out was still attempted,
+	// and that is the only evidence a timeout triggered no silent allow.
 	modelCalls.push({
 		state: body?.state,
 		questions: (body?.questions ?? {}) as Record<string, unknown>,
 		model: body?.model,
 		headers: headerRecord(init?.headers),
 	});
-	await sleepWithAbort(jevDelayMs, init?.signal);
-	if (jevUnavailable) throw new TypeError("fetch failed");
-	if (jevFailuresLeft > 0) {
-		jevFailuresLeft -= 1;
-		return new Response('{"error":"service unavailable"}', { status: 503, headers: { "content-type": "application/json" } });
-	}
-	const raw = jevRawQueue.shift();
-	if (raw) return new Response(raw.body, { status: raw.status });
-	const answers = jevQueue?.shift() ?? jevDefaultAnswers;
-	return new Response(JSON.stringify({ model: JEV_FIXTURE_MODEL, answers, usage: { input_tokens: 528, output_tokens: 126 } }), {
+	const scripted = await scriptedJudgement((body?.questions ?? {}) as Record<string, unknown>, init?.signal);
+	if (scripted.kind === "status") return new Response(scripted.body, { status: scripted.status });
+	return new Response(JSON.stringify({ model: scripted.model, answers: scripted.answers, usage: { input_tokens: 528, output_tokens: 126 } }), {
 		status: 200,
 		headers: { "content-type": "application/json" },
 	});
 }
 
-// Installed at module load, before any test imports index.ts (loadPlugin's
-// dynamic import), so the plugin binds the fake and never opens a socket. A
-// test that forgets to script an answer still gets a well-formed safe answer,
-// never a hung request against the real endpoint.
+// Installed at module load. A test that forgets to script an answer still gets
+// a well-formed safe answer, never a hung request against the real endpoint.
 globalThis.fetch = fakeJevFetch as unknown as typeof fetch;
 
-/** The state sent with one captured request. */
+/** The state sent with one captured judgement. */
 export function stateOf(index = 0): Record<string, unknown> {
 	const call = modelCalls[index];
-	if (!call) throw new Error(`no captured Jev request at index ${index}`);
+	if (!call) throw new Error(`no captured Jev judgement at index ${index}`);
 	return (call.state ?? {}) as Record<string, unknown>;
 }
 
-/** The question battery sent with one captured request. */
+/** The question battery sent with one captured judgement. */
 export function questionsOf(index = 0): Record<string, unknown> {
 	const call = modelCalls[index];
-	if (!call) throw new Error(`no captured Jev request at index ${index}`);
+	if (!call) throw new Error(`no captured Jev judgement at index ${index}`);
 	return call.questions;
 }
 
@@ -389,143 +532,6 @@ export function evidenceOf(index = 0): EvidenceTierView {
 	};
 }
 
-// The published 17.3.8 pi-ai/coding-agent pair is not mutually coherent: 30
-// names coding-agent imports are absent from the pi-ai barrel. The live OMP
-// binary bundles a coherent pair; the npm pair explodes on these names. The
-// mock fakes the whole surface; the test boundary is the HTTP request in
-// fakeJevFetch above, everything else is inert.
-const missingExportStub = () => undefined;
-const typeMarkerStub = "type-only-inert";
-mock.module("@oh-my-pi/pi-ai", () => ({
-	ANTHROPIC_OAUTH_GRANT_TTL_MS: 1000 * 60 * 60 * 24 * 30,
-	AnthropicAuthConfig: typeMarkerStub,
-	AnthropicSystemBlock: typeMarkerStub,
-	Api: typeMarkerStub,
-	ApiKey: typeMarkerStub,
-	ApiKeyResolver: typeMarkerStub,
-	AssistantMessage: typeMarkerStub,
-	AssistantMessageEvent: typeMarkerStub,
-	AssistantMessageEventStream: typeMarkerStub,
-	AssistantRetryRecovery: typeMarkerStub,
-	AssistantRetryRecoveryKind: typeMarkerStub,
-	AuthCredential: typeMarkerStub,
-	AuthCredentialSnapshotEntry: typeMarkerStub,
-	AuthCredentialStore: typeMarkerStub,
-	AuthStorage: typeMarkerStub,
-	CodexCompactionContext: typeMarkerStub,
-	CompletionProbe: typeMarkerStub,
-	CompletionProbeInput: typeMarkerStub,
-	ComputerSafetyCheck: typeMarkerStub,
-	Context: typeMarkerStub,
-	CredentialCompletionResult: typeMarkerStub,
-	CredentialDisabledEvent: typeMarkerStub,
-	CursorExecHandlers: typeMarkerStub,
-	CursorMcpCall: typeMarkerStub,
-	CursorMcpResource: typeMarkerStub,
-	CursorMcpResourceContent: typeMarkerStub,
-	CursorShellStreamCallbacks: typeMarkerStub,
-	CursorTodoSnapshot: typeMarkerStub,
-	DeveloperMessage: typeMarkerStub,
-	DisabledCredentialSummary: typeMarkerStub,
-	Effort: typeMarkerStub,
-	EventStream: class {},
-	FetchImpl: typeMarkerStub,
-	ImageContent: typeMarkerStub,
-	KnownProvider: typeMarkerStub,
-	Message: typeMarkerStub,
-	MessageAttribution: typeMarkerStub,
-	Model: typeMarkerStub,
-	ModelSpec: typeMarkerStub,
-	ModelUsageHealth: typeMarkerStub,
-	OAuthAccess: typeMarkerStub,
-	OAuthAccessResolution: typeMarkerStub,
-	OAuthAccountIdentity: typeMarkerStub,
-	OAuthAccountSummary: typeMarkerStub,
-	OAuthCredential: typeMarkerStub,
-	OAuthProvider: typeMarkerStub,
-	OAuthProviderInfo: typeMarkerStub,
-	OpenAIResponsesHistoryPayload: typeMarkerStub,
-	PASTE_CODE_LOGIN_PROVIDERS: [],
-	PROVIDER_REGISTRY: typeMarkerStub,
-	REMOTE_REFRESH_SENTINEL: "inert-sentinel",
-	ProviderDetails: typeMarkerStub,
-	ProviderPayload: typeMarkerStub,
-	ProviderResponseMetadata: typeMarkerStub,
-	ProviderSessionState: typeMarkerStub,
-	RawSseEvent: typeMarkerStub,
-	ResetCreditAccountStatus: typeMarkerStub,
-	ResetCreditRedeemOutcome: typeMarkerStub,
-	ResetCreditTarget: typeMarkerStub,
-	ServiceTier: typeMarkerStub,
-	ServiceTierByFamily: typeMarkerStub,
-	SqliteAuthCredentialStore: class {},
-	ServiceTierFamily: typeMarkerStub,
-	SimpleStreamOptions: typeMarkerStub,
-	Static: typeMarkerStub,
-	StoredAuthCredential: typeMarkerStub,
-	THINKING_EFFORTS: [],
-	TSchema: typeMarkerStub,
-	TextContent: typeMarkerStub,
-	ThinkingContent: typeMarkerStub,
-	Tool: typeMarkerStub,
-	ToolCall: typeMarkerStub,
-	ToolChoice: typeMarkerStub,
-	ToolExample: typeMarkerStub,
-	ToolResultMessage: typeMarkerStub,
-	Usage: typeMarkerStub,
-	UsageHistoryEntry: typeMarkerStub,
-	UsageLimit: typeMarkerStub,
-	UsageReport: typeMarkerStub,
-	UsageResetCreditDetail: typeMarkerStub,
-	UsageUnit: typeMarkerStub,
-	UserMessage: typeMarkerStub,
-	buildAnthropicAuthConfig: missingExportStub,
-	buildAnthropicSearchHeaders: missingExportStub,
-	buildAnthropicSystemBlocks: missingExportStub,
-	buildAnthropicUrl: missingExportStub,
-	calculateRateLimitBackoffMs: missingExportStub,
-	clearAnthropicFastModeFallback: missingExportStub,
-	coerceServiceTierByFamily: missingExportStub,
-	// The host modules this suite loads (tools/bash, tools/shell-tokenize,
-	// tools/path-utils) import `completeSimple` from the pi-ai barrel, so the
-	// mock must carry the name or module resolution fails before any test runs.
-	// Nothing here calls it: the judgement boundary is the HTTP request in the
-	// fake Jev fetch, and the classification path no longer completes a chat.
-	completeSimple: missingExportStub,
-	deriveClaudeDeviceId: missingExportStub,
-	getEnvApiKey: missingExportStub,
-	getOAuthProviders: missingExportStub,
-	getOpenRouterHeaders: missingExportStub,
-	getProviderDetails: missingExportStub,
-	isAnthropicFastModeFallbackDisabled: missingExportStub,
-	isApiKeyResolver: missingExportStub,
-	isAuthRetryableError: missingExportStub,
-	isDefinitiveOAuthFailure: missingExportStub,
-	isSqliteBusyError: missingExportStub,
-	isUsageLimitOutcome: missingExportStub,
-	jsonSchemaToTypeScript: missingExportStub,
-	listProvidersWithEnvKey: missingExportStub,
-	parseRateLimitReason: missingExportStub,
-	realizesPriorityServiceTier: missingExportStub,
-	resolveAnthropicMetadataUserId: missingExportStub,
-	resolveApiKeyOnce: missingExportStub,
-	resolveModelServiceTier: missingExportStub,
-	resolveUsedFraction: missingExportStub,
-	retryTransientCompletion: missingExportStub,
-	seedApiKeyResolver: missingExportStub,
-	shouldSendServiceTier: missingExportStub,
-	serviceTierFamily: typeMarkerStub,
-	streamSimple: missingExportStub,
-	stripSchemaDescriptions: missingExportStub,
-	stripClaudeToolPrefix: missingExportStub,
-	toolWireSchema: typeMarkerStub,
-	validateToolArguments: missingExportStub,
-	validateToolCall: missingExportStub,
-	withAuth: missingExportStub,
-	withOAuthAccess: missingExportStub,
-	wrapFetchForCch: missingExportStub,
-}));
-
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 const handlers = new Map<string, Handler>();
 export type CommandHandler = (args: string, ctx: ExtensionContext) => Promise<unknown>;
@@ -545,6 +551,7 @@ export async function loadPlugin(settings: Record<string, unknown>): Promise<voi
 	handlers.clear();
 	registeredCommands.clear();
 	modelCalls.length = 0;
+	resolvedJudgeDeps.length = 0;
 	// Every stub knob resets here: each test file's beforeEach loadPlugin()
 	// then starts from the pristine default, so no file can inherit another's
 	// scripted state no matter what order bun runs them in. Files wanting a
@@ -629,6 +636,9 @@ export const DENY = "Deny";
 export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 	const selectCalls: Array<[string, Array<{ label: string; description?: string }>]> = [];
 	const notifyCalls: string[][] = [];
+	// "model" in options distinguishes an explicit undefined (no model) from an
+	// absent option (default test model).
+	const currentModel = "model" in options ? options.model : { id: "test-model" };
 	const ctx = {
 		cwd: options.cwd ?? "/workspace",
 		sessionManager: { getSessionId: () => options.sessionId ?? "session-1", getBranch: () => options.branch ?? [] },
@@ -642,20 +652,34 @@ export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 				notifyCalls.push([message, type]);
 			},
 		},
-		// Mirrors the host resolver contract. The Jev gate judges with one
-		// model id and has no role resolution of its own, so these exist only
-		// so a host-shaped ctx stays honest about the surface it exposes.
+		// Mirrors the host's `ctx.models` facade (extension model-api.ts): the
+		// judge reads the session model off `current()`, and role aliases resolve
+		// for the audit line. There is no registry behind this fake, so `list` is
+		// empty — a judge resolved from it has no fallback candidates, which is
+		// what keeps an unscriped runtime from reaching a provider.
 		models: {
+			list: () => [],
+			current: () => currentModel,
 			resolve: (selector: string | undefined) => {
 				const s = selector?.trim();
 				if (!s || s === "@tiny") return options.tinyModel;
 				return { id: s };
 			},
+			family: (model: { provider?: string }) => model.provider ?? "unknown",
 		},
-		// "model" in options distinguishes an explicit undefined (no model)
-		// from an absent option (default test model).
-		model: "model" in options ? options.model : { id: "test-model" },
-		modelRegistry: { resolver: () => undefined },
+		model: currentModel,
+		// The registry surface jev-judge.ts resolves a judge through. Its
+		// `authStorage` reports the same key flag clearJevApiKey flips, so a ctx
+		// and the judge seam can never disagree about whether a credential exists.
+		modelRegistry: {
+			authStorage: {
+				hasAuth: (provider: string): boolean => provider === TYPESAFE_PROVIDER && jevApiKeyPresent,
+				resolver: () => async (): Promise<string | undefined> => (jevApiKeyPresent ? JEV_TEST_KEY : undefined),
+			},
+			getAvailable: () => [],
+			getApiKey: async (): Promise<string | undefined> => undefined,
+			resolver: () => async (): Promise<string | undefined> => undefined,
+		},
 	} as unknown as ExtensionContext;
 	Object.defineProperty(ctx, "selectCalls", { value: selectCalls });
 	Object.defineProperty(ctx, "notifyCalls", { value: notifyCalls });

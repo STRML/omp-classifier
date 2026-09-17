@@ -1,34 +1,38 @@
 /**
- * jev.ts — the TypeSafe (System One) judgment layer.
+ * jev.ts — the TypeSafe (System One) judgment layer — and jev-judge.ts, the
+ * adapter onto the host's judge.
  *
  * What is pinned here: the verdict truth table over every threshold (including
- * the boundaries, which are inclusive), the fail-closed validation of a live
- * response, the state shape that carries provenance tiers, and the policy
- * fingerprint. The HTTP boundary is the only seam that gets stubbed; nothing in
- * this file talks to the network, and nothing needs an API key.
+ * the boundaries, which are inclusive), the question battery and its policy
+ * fingerprint, the state shape that carries the provenance tiers, and the
+ * adapter's mapping plus its fail-closed validation — the one-hot reading the
+ * keyword path needs included. The adapter tests inject their judge, or take
+ * the scripted one the fixture suite installs in place of the host resolver;
+ * nothing in this file opens a socket or needs an API key.
  */
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import type { Answer, Judge, JudgeOptions, JudgmentRequest, JudgmentResult, Questions, Usage } from "@oh-my-pi/pi-ai";
+import { ONLINE_MEMORY_MODEL_KEY } from "@oh-my-pi/pi-coding-agent/tiny/models";
 import {
-	askJev,
 	buildJevState,
-	DEFAULT_JEV_MODEL,
 	DEFAULT_JEV_POLICY,
 	deriveJevDecision,
-	JEV_API_KEY_ENV,
 	JEV_DESCRIPTIVE_HAZARDS,
-	JEV_ENDPOINT,
 	JEV_GATING_HAZARDS,
 	JEV_HAZARDS,
 	JEV_POLICY_VERSION,
 	JevUnavailableError,
 	jevQuestions,
 	jevQuestionsHash,
-	resolveJevApiKey,
 	type JevAnswers,
+	type JevChoiceOption,
+	type JevDecision,
 	type JevHazard,
 	type JevPolicy,
 } from "../jev.ts";
+import { judgeBattery, type JudgeContext } from "../jev-judge.ts";
+import { jevSafeAnswer, resolvedJudgeDeps, setJevAnswer, setJevDelay, setJevFailures, setJevUnavailable } from "./fixtures";
 
 /** Answers with everything at its most benign, then overridden per case. */
 const answers = (
@@ -384,176 +388,341 @@ describe("buildJevState", () => {
 		expect((state.evidence as { userMessages: string[] }).userMessages).toEqual(["first"]);
 	});
 });
-
 // ---------------------------------------------------------------------------
-// askJev: the HTTP boundary is stubbed in every test. Responses are real
-// Response objects, so status/ok/json semantics are the ones Bun gives the
-// module in production.
+// judgeBattery: the adapter onto the host's judge (jev-judge.ts).
+//
+// The judge is injected in every test here, so nothing resolves a provider,
+// retries a transient, or opens a socket: what these tests pin is the mapping
+// into JevAnswers, the fail-closed validation that refuses a partial answer
+// set, and the one-hot reading the policy needs when a keyword bridge answered
+// instead of TypeSafe.
 // ---------------------------------------------------------------------------
 
-interface StubCall {
-	url: string;
-	init: RequestInit | undefined;
-}
+type BatteryAnswers = Record<string, Answer>;
 
-const stubFetch = (reply: (call: StubCall) => Response | Promise<Response>): { calls: StubCall[]; fetch: typeof fetch } => {
-	const calls: StubCall[] = [];
-	const impl = (async (url: string, init?: RequestInit) => {
-		const call = { url, init };
-		calls.push(call);
-		return await reply(call);
-	}) as unknown as typeof fetch;
-	return { calls, fetch: impl };
-};
+/** One noul per hazard, quiet unless named. */
+const nouls = (values: Partial<Record<JevHazard, number>> = {}): BatteryAnswers =>
+	Object.fromEntries(
+		JEV_HAZARDS.map(hazard => [hazard, { type: "noul", noul: values[hazard] ?? 0 } satisfies Answer]),
+	) as BatteryAnswers;
 
-const jsonResponse = (body: unknown, status = 200): Response =>
-	new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
-
-/** A response shaped like the live ones: model id, per-question typed answers,
- *  and token usage. */
-const liveShapedResponse = (): Record<string, unknown> => ({
-	model: "jev-1.13.0",
-	answers: {
-		verdict: { type: "choice", choice: "safe", probabilities: { safe: 0.91, unsafe: 0.06, unsure: 0.03 }, confidence: 0.83 },
-		state_contains_injection: { type: "noul", noul: 0.01 },
-		unauthorized_consequential_action: { type: "noul", noul: 0.02 },
-		destructive_or_irreversible: { type: "noul", noul: 0.03 },
-		writes_outside_working_directory: { type: "noul", noul: 0.04 },
-		contacts_remote_endpoint: { type: "noul", noul: 0.05 },
-		sends_local_data_outbound: { type: "noul", noul: 0.06 },
-		escalates_privilege: { type: "noul", noul: 0.07 },
-		exposes_secrets: { type: "noul", noul: 0.08 },
-		affects_shared_or_remote_state: { type: "noul", noul: 0.09 },
-		blast_radius: {
-			type: "score",
-			score: 0.4,
-			legend: { 0: "reads only", 1: "local change", 2: "damaging" },
-			probabilities: { 0: 0.7, 1: 0.3 },
-			confidence: 0.61,
-		},
+/** The distribution-shaped answer set TypeSafe returns. */
+const distributed = (
+	over: { safe?: number; unsafe?: number; confidence?: number; hazards?: Partial<Record<JevHazard, number>>; score?: number } = {},
+): BatteryAnswers => ({
+	verdict: {
+		type: "choice",
+		choice: "safe",
+		probabilities: { safe: over.safe ?? 0.95, unsafe: over.unsafe ?? 0.03, unsure: 0.02 },
+		confidence: over.confidence ?? 0.92,
 	},
-	usage: { input_tokens: 528, output_tokens: 126 },
+	...nouls(over.hazards),
+	blast_radius: { type: "score", score: over.score ?? 0.4, probabilities: { "0": 0.6, "1": 0.4 }, confidence: 0.8 },
 });
 
-const expectUnavailable = async (run: Promise<unknown>, match: RegExp): Promise<JevUnavailableError> => {
+/**
+ * The one-hot answer set the keyword bridge returns: probability 1 on the
+ * chosen label and confidence 1, by construction. There is no distribution
+ * behind the label, which is exactly what the adapter records as `oneHot` and
+ * what deriveJevDecision's reasons have to disclose.
+ */
+const oneHot = (choice: JevChoiceOption, hazards: Partial<Record<JevHazard, number>> = {}, score = 0): BatteryAnswers => ({
+	verdict: {
+		type: "choice",
+		choice,
+		probabilities: { safe: choice === "safe" ? 1 : 0, unsafe: choice === "unsafe" ? 1 : 0, unsure: choice === "unsure" ? 1 : 0 },
+		confidence: 1,
+	},
+	...nouls(hazards),
+	blast_radius: {
+		type: "score",
+		score,
+		probabilities: { "0": score < 0.5 ? 1 : 0, "1": score >= 0.5 && score < 1.5 ? 1 : 0, "2": score >= 1.5 ? 1 : 0 },
+		confidence: 1,
+	},
+});
+
+const JUDGE_USAGE: Usage = {
+	input: 528,
+	output: 126,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 654,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+/** What one fake judge saw: the evidence that the adapter passed its inputs on. */
+interface Judged {
+	state?: unknown;
+	questions?: Questions;
+	signalAborted?: boolean;
+}
+
+/**
+ * A judge answering from a scripted map. `api` is the transport the host
+ * reports — anything that is not TypeSafe is the keyword bridge, which is what
+ * makes the answer set one-hot downstream — and `usage: null` models a judge
+ * that reports no token counts at all.
+ */
+const fakeJudge = (
+	answers: BatteryAnswers,
+	meta: { api?: string; model?: string; usage?: Usage | null } = {},
+): { judge: Judge; judged: Judged } => {
+	const judged: Judged = {};
+	return {
+		judged,
+		judge: {
+			label: "fake",
+			async judge<Q extends Questions>(request: JudgmentRequest<Q>, options?: JudgeOptions): Promise<JudgmentResult<Q>> {
+				judged.state = request.state;
+				judged.questions = request.questions;
+				judged.signalAborted = options?.signal?.aborted === true;
+				// A judge handed an already-aborted deadline does not answer; the
+				// client's fetch would reject the same way.
+				if (judged.signalAborted) throw new Error("This operation was aborted");
+				return {
+					api: meta.api ?? "typesafe",
+					provider: meta.api ?? "typesafe",
+					model: meta.model ?? "jev-1.13.0",
+					answers,
+					usage: meta.usage === null ? undefined : (meta.usage ?? JUDGE_USAGE),
+				} as unknown as JudgmentResult<Q>;
+			},
+		},
+	};
+};
+
+const expectUnavailable = async (run: Promise<unknown>, match: RegExp): Promise<void> => {
+	let thrown: unknown;
 	try {
 		await run;
 	} catch (err) {
-		expect(err).toBeInstanceOf(JevUnavailableError);
-		const failure = err as JevUnavailableError;
-		expect(failure.message).toMatch(match);
-		return failure;
+		thrown = err;
 	}
-	throw new Error("askJev resolved instead of failing closed");
+	if (!(thrown instanceof JevUnavailableError)) throw new Error(`expected JevUnavailableError, got ${String(thrown)}`);
+	expect((thrown as Error).message).toMatch(match);
 };
 
-describe("askJev", () => {
-	test("a full answer set parses into JevAnswers and decides SAFE", async () => {
+describe("judgeBattery", () => {
+	// The two context-path tests below resolve through the fixture suite's
+	// scripted resolver, so the scripted state is reset here rather than inherited
+	// from whichever test file ran last in this process.
+	beforeEach(() => {
+		setJevAnswer(jevSafeAnswer());
+		setJevUnavailable(false);
+		setJevFailures(0);
+		setJevDelay(5);
+	});
+
+	/** One scripted judgement, derived: the adapter and the policy end to end. */
+	const decide = async (batteryAnswers: BatteryAnswers, meta: { api?: string; model?: string } = {}): Promise<JevDecision> =>
+		deriveJevDecision(await judgeBattery(undefined, { state: "state", judge: fakeJudge(batteryAnswers, meta).judge }), DEFAULT_JEV_POLICY);
+
+	test("a TypeSafe answer set maps into JevAnswers, one call carrying the whole battery", async () => {
 		const state = buildJevState({ command: "git status", workingDirectory: "/repo" });
-		const questions = jevQuestions();
-		const stub = stubFetch(() => jsonResponse(liveShapedResponse()));
-		const parsed = await askJev(state, questions, { apiKey: "test-key", fetchImpl: stub.fetch });
+		const { judge, judged } = fakeJudge(distributed());
+		const judgedAnswers = await judgeBattery(undefined, { state, judge });
 
-		expect(stub.calls).toHaveLength(1);
-		expect(stub.calls[0].url).toBe(JEV_ENDPOINT);
-		expect(stub.calls[0].init?.method).toBe("POST");
-		expect((stub.calls[0].init?.headers as Record<string, string>).authorization).toBe("Bearer test-key");
-		expect(JSON.parse(String(stub.calls[0].init?.body))).toEqual({ state, model: DEFAULT_JEV_MODEL, questions });
+		expect(judgedAnswers.model).toBe("jev-1.13.0");
+		expect(judgedAnswers.oneHot).toBe(false);
+		expect(judgedAnswers.hazards.exposes_secrets).toBe(0);
+		expect(judgedAnswers.usage).toEqual({ input_tokens: 528, output_tokens: 126 });
+		expect(judgedAnswers.latencyMs).toBeGreaterThanOrEqual(0);
+		// One call, the whole battery, and the state passed through untouched.
+		expect(JSON.stringify(judged.questions)).toBe(JSON.stringify(jevQuestions()));
+		expect(Object.keys(judged.questions ?? {})).toHaveLength(11);
+		expect(judged.state).toEqual(state);
+		// The levels come from the question, because the native answer carries the
+		// score and its distribution but not the legend the old response echoed —
+		// and the audit line prints them.
+		const levels = (jevQuestions().blast_radius as { criteria: readonly string[] }).criteria;
+		expect([...judgedAnswers.blastRadius.levels]).toEqual([...levels]);
 
-		expect(parsed.model).toBe("jev-1.13.0");
-		expect(parsed.verdict).toEqual({ choice: "safe", probabilities: { safe: 0.91, unsafe: 0.06, unsure: 0.03 }, confidence: 0.83 });
-		expect(Object.keys(parsed.hazards)).toEqual([...JEV_HAZARDS]);
-		expect(parsed.hazards.exposes_secrets).toBe(0.08);
-		expect(parsed.blastRadius).toEqual({ score: 0.4, confidence: 0.61, levels: ["reads only", "local change", "damaging"] });
-		expect(parsed.usage).toEqual({ input_tokens: 528, output_tokens: 126 });
-		expect(parsed.latencyMs).toBeGreaterThanOrEqual(0);
-		// The two halves compose: what came off the wire decides under the policy.
-		expect(deriveJevDecision(parsed, DEFAULT_JEV_POLICY).verdict).toBe("SAFE");
+		// The two halves compose: what the judge returned decides under the policy.
+		const decision = deriveJevDecision(judgedAnswers, DEFAULT_JEV_POLICY);
+		expect(decision.verdict).toBe("SAFE");
+		expect(decision.reasonCode).toBe("jev:safe");
+		expect(decision.reason).not.toContain("llm keyword answer");
 	});
 
-	test("the model override rides the request and absent usage is omitted", async () => {
-		const body = liveShapedResponse();
-		delete body.usage;
-		const stub = stubFetch(() => jsonResponse(body));
-		const parsed = await askJev("state", jevQuestions(), { apiKey: "k", model: "jev-pinned", fetchImpl: stub.fetch });
-		expect(JSON.parse(String(stub.calls[0].init?.body)).model).toBe("jev-pinned");
-		expect("usage" in parsed).toBe(false);
+	test("distribution-shaped answers escalate exactly as the policy says", async () => {
+		// A descriptive hazard never gates: the routine push stays SAFE, and the
+		// reason labels the flag as a description rather than as a decider.
+		const push = await decide(distributed({ hazards: { contacts_remote_endpoint: 0.97, affects_shared_or_remote_state: 0.94 } }));
+		expect(push.verdict).toBe("SAFE");
+		expect(push.reason).toContain("descriptive: contacts_remote_endpoint 0.97");
+
+		const reviewed = await decide(distributed({ hazards: { destructive_or_irreversible: 0.84 } }));
+		expect(reviewed.verdict).toBe("UNSURE");
+		expect(reviewed.reasonCode).toBe("jev:hazard:destructive_or_irreversible");
+
+		expect((await decide(distributed({ hazards: { destructive_or_irreversible: 0.95 } }))).verdict).toBe("UNSAFE");
+
+		const wide = await decide(distributed({ score: 2 }));
+		expect(wide.verdict).toBe("UNSURE");
+		expect(wide.reasonCode).toBe("jev:blast-radius");
 	});
 
-	test("the request carries an abort signal wired to the timeout", async () => {
-		const stub = stubFetch(() => jsonResponse(liveShapedResponse()));
-		await askJev("state", jevQuestions(), { apiKey: "k", timeoutMs: 5_000, fetchImpl: stub.fetch });
-		// AbortSignal.timeout is where the budget lands; a regression that drops the
-		// timeout drops the signal with it. Waiting for the clock to fire here would
-		// buy nothing the abort-path test below does not already cover.
-		const signal = stub.calls[0].init?.signal;
-		expect(signal).toBeInstanceOf(AbortSignal);
-		expect((signal as AbortSignal).aborted).toBe(false);
-	});
+	test("the keyword path is flagged one-hot and its reasons say so", async () => {
+		const safe = await judgeBattery(undefined, {
+			state: "state",
+			judge: fakeJudge(oneHot("safe"), { api: "openai-completions", model: "gpt-5.4-mini" }).judge,
+		});
+		expect(safe.oneHot).toBe(true);
+		// The id that answered is read off the result, never the one we asked for.
+		expect(safe.model).toBe("gpt-5.4-mini");
+		const safeDecision = deriveJevDecision(safe, DEFAULT_JEV_POLICY);
+		expect(safeDecision.verdict).toBe("SAFE");
+		expect(safeDecision.reasonCode).toBe("jev:safe");
+		expect(safeDecision.reason).toContain("(llm keyword answer)");
 
-	test("a missing key fails closed before any request", async () => {
-		const stub = stubFetch(() => jsonResponse(liveShapedResponse()));
-		await expectUnavailable(askJev("state", jevQuestions(), { apiKey: "", fetchImpl: stub.fetch }), /TYPESAFE_API_KEY/u);
-		expect(stub.calls).toHaveLength(0);
-	});
+		const unsafeDecision = await decide(oneHot("unsafe"), { api: "chat" });
+		expect(unsafeDecision.verdict).toBe("UNSAFE");
+		expect(unsafeDecision.reasonCode).toBe("jev:unsafe");
+		expect(unsafeDecision.reason).toContain("(llm keyword answer)");
 
-	test("a non-2xx response fails closed with the status", async () => {
-		const stub = stubFetch(() => new Response("upstream is having a day", { status: 503 }));
-		await expectUnavailable(askJev("state", jevQuestions(), { apiKey: "k", fetchImpl: stub.fetch }), /HTTP 503/u);
-	});
+		// The distribution-shaped floors are read as the choice label itself in
+		// this mode: a keyword that could not say "safe" is below the floor, and
+		// the reason names the choice rather than inventing a probability.
+		const unsureDecision = await decide(oneHot("unsure"), { api: "tiny-local" });
+		expect(unsureDecision.verdict).toBe("UNSURE");
+		expect(unsureDecision.reasonCode).toBe("jev:below-floor");
+		expect(unsureDecision.reason).toBe("below floor: choice unsure (llm keyword answer)");
 
-	test("a body that is not JSON fails closed", async () => {
-		const stub = stubFetch(() => new Response("<html>gateway</html>", { status: 200 }));
-		await expectUnavailable(askJev("state", jevQuestions(), { apiKey: "k", fetchImpl: stub.fetch }), /not JSON/u);
+		// A keyword "safe" cannot wave off a hazard or a wide blast radius: those
+		// thresholds read correctly on one-hot values already.
+		const dirty = await decide(oneHot("safe", { exposes_secrets: 1 }), { api: "chat" });
+		expect(dirty.verdict).toBe("UNSAFE");
+		expect(dirty.reasonCode).toBe("jev:hazard:exposes_secrets");
+
+		const wide = await decide(oneHot("safe", {}, 2), { api: "chat" });
+		expect(wide.verdict).toBe("UNSURE");
+		expect(wide.reasonCode).toBe("jev:blast-radius");
+		expect(wide.reason).toContain("(llm keyword answer)");
 	});
 
 	test("a missing hazard answer fails closed instead of reading as zero", async () => {
-		const body = liveShapedResponse();
-		delete (body.answers as Record<string, unknown>).exposes_secrets;
-		const stub = stubFetch(() => jsonResponse(body));
-		await expectUnavailable(askJev("state", jevQuestions(), { apiKey: "k", fetchImpl: stub.fetch }), /exposes_secrets/u);
-	});
-
-	test("an out-of-range hazard value fails closed", async () => {
-		const body = liveShapedResponse();
-		(body.answers as Record<string, { noul: number }>).exposes_secrets.noul = 1.4;
-		const stub = stubFetch(() => jsonResponse(body));
-		await expectUnavailable(askJev("state", jevQuestions(), { apiKey: "k", fetchImpl: stub.fetch }), /exposes_secrets\.noul/u);
-	});
-
-	test("a mistyped verdict fails closed", async () => {
-		const body = liveShapedResponse();
-		(body.answers as Record<string, unknown>).verdict = { type: "choice", choice: "likely-safe", probabilities: { safe: 0.6 }, confidence: 0.6 };
-		const stub = stubFetch(() => jsonResponse(body));
-		await expectUnavailable(askJev("state", jevQuestions(), { apiKey: "k", fetchImpl: stub.fetch }), /answers\.verdict\.choice/u);
-	});
-
-	test("an aborted request fails closed and reports the budget it was given", async () => {
-		const timedOut = new Error("The operation was aborted due to timeout");
-		timedOut.name = "TimeoutError";
-		const stub = stubFetch(() => {
-			throw timedOut;
-		});
+		const missing = distributed();
+		delete missing.exposes_secrets;
 		await expectUnavailable(
-			askJev("state", jevQuestions(), { apiKey: "k", timeoutMs: 250, fetchImpl: stub.fetch }),
-			/jev request failed: The operation was aborted due to timeout \(budget 250ms\)/u,
+			judgeBattery(undefined, { state: "state", judge: fakeJudge(missing).judge }),
+			/judgment answer field answers\.exposes_secrets is missing/u,
 		);
 	});
-});
 
-describe("resolveJevApiKey", () => {
-	test("an explicit env object wins over the keychain, trimmed", () => {
-		expect(resolveJevApiKey({ [JEV_API_KEY_ENV]: "env-key" })).toBe("env-key");
-		expect(resolveJevApiKey({ [JEV_API_KEY_ENV]: "  padded  " })).toBe("padded");
+	test("an out-of-range or mistyped answer fails closed, naming the field it read", async () => {
+		const outOfRange = distributed();
+		outOfRange.exposes_secrets = { type: "noul", noul: 1.4 };
+		await expectUnavailable(
+			judgeBattery(undefined, { state: "state", judge: fakeJudge(outOfRange).judge }),
+			/answers\.exposes_secrets\.noul is missing or not a number in 0\.\.1/u,
+		);
+
+		const badChoice = distributed();
+		badChoice.verdict = { type: "choice", choice: "probably-fine", probabilities: { safe: 1, unsafe: 0, unsure: 0 }, confidence: 1 } as unknown as Answer;
+		await expectUnavailable(
+			judgeBattery(undefined, { state: "state", judge: fakeJudge(badChoice).judge }),
+			/answers\.verdict\.choice is missing or not one of the question's options/u,
+		);
+
+		const badProbability = distributed();
+		badProbability.verdict = { type: "choice", choice: "safe", probabilities: { safe: "high", unsafe: 0, unsure: 0 }, confidence: 1 } as unknown as Answer;
+		await expectUnavailable(
+			judgeBattery(undefined, { state: "state", judge: fakeJudge(badProbability).judge }),
+			/answers\.verdict\.probabilities\.safe/u,
+		);
+
+		const notChoice = distributed();
+		notChoice.verdict = { type: "noul", noul: 1 } as Answer;
+		await expectUnavailable(
+			judgeBattery(undefined, { state: "state", judge: fakeJudge(notChoice).judge }),
+			/answers\.verdict\.type is missing or not "choice"/u,
+		);
+
+		// The model id is what the audit line records, so an empty one is not an
+		// answer set either.
+		await expectUnavailable(
+			judgeBattery(undefined, { state: "state", judge: fakeJudge(distributed(), { model: "" }).judge }),
+			/judgment answer field model is missing/u,
+		);
 	});
 
-	test("a blank env value is not a key", () => {
-		// The keychain branch is environment-dependent by design: it reads the
-		// macOS item `security find-generic-password -s jev -w`, so this asserts the
-		// shape of the outcome — a trimmed key or none — rather than comparing
-		// against a live keychain item from a unit test.
-		const blank = resolveJevApiKey({ [JEV_API_KEY_ENV]: "   " });
-		expect(blank).not.toBe("   ");
-		if (blank !== undefined) expect(blank.trim()).toBe(blank);
+	test("a judge that reports no usage leaves the field off rather than zeroed", async () => {
+		const silent = await judgeBattery(undefined, { state: "state", judge: fakeJudge(distributed(), { usage: null }).judge });
+		expect("usage" in silent).toBe(false);
+	});
+
+	test("a throwing judge and an aborted deadline both become JevUnavailableError", async () => {
+		const exploding: Judge = {
+			label: "fake",
+			async judge() {
+				throw new Error("TypeSafe API error (503): upstream is having a day");
+			},
+		};
+		await expectUnavailable(judgeBattery(undefined, { state: "state", judge: exploding }), /judgment failed: TypeSafe API error \(503\)/u);
+
+		const controller = new AbortController();
+		controller.abort();
+		// The caller's deadline reaches the judge as its signal, and a judgement
+		// that aborts is an outage rather than a verdict.
+		const { judge, judged } = fakeJudge(distributed());
+		await expectUnavailable(judgeBattery(controller.signal, { state: "state", judge }), /judgment failed: This operation was aborted/u);
+		expect(judged.signalAborted).toBe(true);
+	});
+
+	test("no judge to ask is a missing judgment, not a crash", async () => {
+		await expectUnavailable(judgeBattery(undefined, { state: "state" }), /no judge to ask/u);
+		await expectUnavailable(judgeBattery(undefined, { state: "state", context: undefined, settings: undefined }), /no judge to ask/u);
+		await expectUnavailable(judgeBattery(undefined, { state: "state", context: { modelRegistry: {} } as unknown as JudgeContext }), /no judge to ask/u);
+	});
+
+	test("the ctx supplies the resolver's deps: registry, backend, session model and id", async () => {
+		resolvedJudgeDeps.length = 0;
+		const context = {
+			modelRegistry: { authStorage: { hasAuth: () => false }, getAvailable: () => [] },
+			models: { current: () => ({ provider: "test", id: "session-model" }) },
+			sessionManager: { getSessionId: () => "session-1" },
+		} as unknown as JudgeContext;
+		const settings = { get: () => "llm" } as unknown as Parameters<typeof judgeBattery>[1]["settings"];
+		const judgeAnswers = await judgeBattery(undefined, { state: "state", context, settings });
+
+		// No judge was injected, so the adapter had to build its deps from the ctx
+		// and hand them to the host resolver — and the answer that came back is the
+		// one it mapped.
+		expect(resolvedJudgeDeps).toHaveLength(1);
+		const deps = resolvedJudgeDeps[0] as unknown as Record<string, unknown>;
+		expect(deps.settings).toBe(settings);
+		expect(deps.registry).toBe((context as unknown as Record<string, unknown>).modelRegistry);
+		// The chat chain is the backend when a feature does not name a local model.
+		expect(deps.backend).toBe(ONLINE_MEMORY_MODEL_KEY);
+		expect(deps.sessionModel).toEqual({ provider: "test", id: "session-model" });
+		expect(deps.sessionId).toBe("session-1");
+		expect(judgeAnswers.model).toBe("jev-1.13.0");
+	});
+
+	test("a ctx that cannot report its session identity is still asked", async () => {
+		resolvedJudgeDeps.length = 0;
+		// Session identity is advisory to the judge, so the reads are contained:
+		// a models facade or a session manager that throws leaves those deps
+		// absent rather than costing the gate its judgement.
+		const brittle = {
+			modelRegistry: { authStorage: { hasAuth: () => false }, getAvailable: () => [] },
+			get models(): { current: () => unknown } {
+				throw new Error("no models facade");
+			},
+			sessionManager: {
+				getSessionId: () => {
+					throw new Error("isolated context");
+				},
+			},
+		} as unknown as JudgeContext;
+		const settings = { get: () => "llm" } as unknown as Parameters<typeof judgeBattery>[1]["settings"];
+		const judgeAnswers = await judgeBattery(undefined, { state: "state", context: brittle, settings });
+
+		expect(resolvedJudgeDeps).toHaveLength(1);
+		const deps = resolvedJudgeDeps[0] as unknown as Record<string, unknown>;
+		expect(deps.sessionModel).toBeUndefined();
+		expect(deps.sessionId).toBeUndefined();
+		expect(judgeAnswers.oneHot).toBe(false);
 	});
 });
