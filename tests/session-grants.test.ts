@@ -52,7 +52,7 @@ const readDecisions = (): DecisionRecord[] =>
 
 beforeEach(async () => {
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-grants-"));
-	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-jevens-classifier.json");
+	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));
 	setJevAnswer(jevUnsafeAnswer());
 });

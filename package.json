@@ -1,5 +1,5 @@
 {
-	"name": "omp-jevens-classifier",
+	"name": "omp-classifier",
 	"version": "0.3.0",
 	"description": "Jev-powered permission gate for OMP: intercepts bash calls and spawn-bearing eval payloads the host would auto-approve, asks TypeSafe System One (jev-latest) typed questions about them — one verdict choice, one noul per hazard, one blast-radius score — and decides from the returned probabilities instead of parsing model text.",
 	"type": "module",

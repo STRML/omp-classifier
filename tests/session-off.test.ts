@@ -38,7 +38,7 @@ let seq = 0;
 
 beforeEach(async () => {
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-session-off-"));
-	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-jevens-classifier.json");
+	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));
 	setJevAnswer(jevUnsafeAnswer());
 });

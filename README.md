@@ -1,4 +1,4 @@
-# omp-jevens-classifier
+# omp-classifier
 
 Jev-judged permission checks for OMP's bash tool, and for `eval` payloads that spawn
 processes.
@@ -28,7 +28,7 @@ Calls walk this order:
 
 A normal gate prompt is a four-choice selector — **Allow once**, **Allow for session**, **Always allow**, **Deny** — showing the full command, the gate's reason, and only the details that differ from their defaults: working directory (when it differs from the session cwd), timeout, env, pty, async. The reason is assembled from Jev's numbers — the probability floor it missed, or the hazard ids that tripped it — because Jev returns typed answers and no prose to quote. Critical-pattern and env-override prompts show only choices the gate can honor (**Allow once**/**Deny**), so an authorization cannot appear to succeed and then re-prompt on the next call. Canceling or timing out counts as Deny.
 **Allow for session** records a grant: this action, in this exact directory, runs ungated for the rest of the session — no Jev call, no dialog. Rewordings of a simple action match the grant through a strict key that keeps flags (split, sorted short bundles) and the first argument; compounds and command substitutions use an exact-text key, so an edited segment or payload never rides the grant. Answering with it also lifts any refusal recorded for that action in that directory. Grants stay below critical patterns, caller-supplied `env`, and your static rules, and they die with the session or a classifier config change (up to 50 per session).
-**Always allow** (bash only) writes a persistent grant: this exact command text, in this exact directory, runs ungated everywhere for 30 days — no Jev call, no dialog, one audit line. The key is the whole command text, compounds included, so multi-segment commands host rules can never match are covered; grants are stored in `omp-jevens-classifier-grants.json` beside `omp-jevens-classifier.json` (`OMP_JEV_CONFIG` relocates both), capped at 500 entries, pruned on a 30-day TTL, and toggled off wholesale with `persistentGrants: false` (the existing file stays on disk). A live persistent grant also keeps refusal memory from re-prompting for its exact text.
+**Always allow** (bash only) writes a persistent grant: this exact command text, in this exact directory, runs ungated everywhere for 30 days — no Jev call, no dialog, one audit line. The key is the whole command text, compounds included, so multi-segment commands host rules can never match are covered; grants are stored in `omp-classifier-grants.json` beside `omp-classifier.json` (`OMP_JEV_CONFIG` relocates both), capped at 500 entries, pruned on a 30-day TTL, and toggled off wholesale with `persistentGrants: false` (the existing file stays on disk). A live persistent grant also keeps refusal memory from re-prompting for its exact text.
 
 ## Eval code that spawns
 
@@ -60,19 +60,19 @@ Even a SAFE verdict is gated. It auto-runs only when the command avoids the forc
 ## Install
 
 ```bash
-git clone https://github.com/STRML/omp-jevens-classifier.git
-cd omp-jevens-classifier && omp plugin install .
+git clone https://github.com/STRML/omp-classifier.git
+cd omp-classifier && omp plugin install .
 ```
 
-An existing checkout works the same way: `omp plugin install /path/to/omp-jevens-classifier` symlinks that directory to `~/.omp/plugins/node_modules/omp-jevens-classifier`, and the plugin lockfile keys the entry by package name (`omp-jevens-classifier`). No build step, no runtime dependencies. Plugins load at session start, so start a new OMP session.
+An existing checkout works the same way: `omp plugin install /path/to/omp-classifier` symlinks that directory to `~/.omp/plugins/node_modules/omp-classifier`, and the plugin lockfile keys the entry by package name (`omp-classifier`). No build step, no runtime dependencies. Plugins load at session start, so start a new OMP session.
 
-Uninstall: `omp plugin uninstall omp-jevens-classifier`. Coming from the parent? Uninstall it in the same breath — `omp plugin uninstall omp-classifier` — because two bash gates installed at once both intercept `tool_call`.
+Uninstall: `omp plugin uninstall omp-classifier`. Coming from the parent? Uninstall it in the same breath — `omp plugin uninstall omp-classifier` — because two bash gates installed at once both intercept `tool_call`.
 
 ## Configuration
 
 Your existing `bash.patterns` and `tools.approval` keep working. A narrow `allow` rule doubles as the opt-out from classification for a trusted shape; blanket patterns never qualify.
 
-Plugin settings live in `~/.omp/omp-jevens-classifier.json`. View or change them with `/classifier`:
+Plugin settings live in `~/.omp/omp-classifier.json`. View or change them with `/classifier`:
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -82,7 +82,7 @@ Plugin settings live in `~/.omp/omp-jevens-classifier.json`. View or change them
 | `timeoutMs` | `8000` | Whole classification budget for the single Jev request. A timeout fails closed to a permission request. (`/classifier` dialogs pause the host's handler budget, so a human is never on this clock.) |
 | `maxCommandLength` | `8000` | Commands longer than this are blocked (bounds 64-100000; values outside fall back to the default). |
 | `evidenceUserMessages` | `3` | How many recent user messages (0-6) ride into the state as user evidence. `0` sends no evidence. Values outside the bounds fall back to the default. |
-| `persistentGrants` | `true` | Offers **Always allow** on bash dialogs (30-day exact-command grants in `omp-jevens-classifier-grants.json`). Kill-switch: `false` stops offering them and stops honoring live ones; the stored file stays on disk. |
+| `persistentGrants` | `true` | Offers **Always allow** on bash dialogs (30-day exact-command grants in `omp-classifier-grants.json`). Kill-switch: `false` stops offering them and stops honoring live ones; the stored file stays on disk. |
 
 Changing any key flushes the verdict cache and the session grants. To silence the judge quickly, `/classifier enabled false` takes effect on the very next command. `omp plugin disable` needs a session restart, since interceptors bind when a session begins.
 

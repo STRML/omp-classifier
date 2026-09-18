@@ -61,7 +61,7 @@ beforeEach(async () => {
 	// read an empty log.
 	removeConfigFile();
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-jevens-outage-"));
-	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-jevens-classifier.json");
+	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));
 	// The default fixture answer is safe; every test that wants a verdict
 	// scripts its own, so a passing test never depends on a leftover.

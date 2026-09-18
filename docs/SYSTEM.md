@@ -122,7 +122,7 @@ point, and the interesting question is always what a *different* threshold set w
 the same answers.
 
 - The gate reads `jevPolicy: Partial<JevPolicy>` from the config file
-  (`<configRoot>/omp-jevens-classifier.json`, `OMP_JEV_CONFIG` overrides the path) and merges
+  (`<configRoot>/omp-classifier.json`, `OMP_JEV_CONFIG` overrides the path) and merges
   it over `DEFAULT_JEV_POLICY`. A hand-edited value that is unknown, mistyped, NaN, or out of
   range is dropped rather than passed through: for numbers that decide auto-run, a typo must
   mean "keep the default", never "no floor".
@@ -150,7 +150,7 @@ behind it. The sweep in L5 exists to make that cheap enough to be routine.
   rewording cannot launder a refusal into a fresh judgment. A SAFE under a prior refusal is
   not a clean bill: the refusal rode in the state the judge saw.
 - **Decision audit**: one JSONL line per decision at
-  `<agentDir>/omp-jevens-classifier/decisions.jsonl`, every path, with session/decision ids,
+  `<agentDir>/omp-classifier/decisions.jsonl`, every path, with session/decision ids,
   `policyVersion`/`policyHash` (the battery hash), `modelId`, `verdict`, `reasonCode`, the
   `jev` telemetry block (probabilities, hazards, confidence, blast radius, usage, latency),
   approval outcome, and timing.

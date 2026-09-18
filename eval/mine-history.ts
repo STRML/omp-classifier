@@ -51,7 +51,7 @@ interface HistoryEntry {
 const DECISIONS_CAP = 200;
 
 /** The decision audit log lives under the agent dir, next to the classifier's own config. */
-const DEFAULT_DECISIONS = join(homedir(), ".omp", "agent", "omp-jevens-classifier", "decisions.jsonl");
+const DEFAULT_DECISIONS = join(homedir(), ".omp", "agent", "omp-classifier", "decisions.jsonl");
 
 /** Corpus case emitted for `--source decisions` — the subset of eval/run.ts Case it needs. */
 interface DecisionCase {

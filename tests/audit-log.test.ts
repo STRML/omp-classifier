@@ -51,7 +51,7 @@ const readDecisions = (): DecisionRecord[] =>
 
 beforeEach(async () => {
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-audit-"));
-	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-jevens-classifier.json");
+	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));
 	setJevAnswer(jevSafeAnswer());
 });
@@ -182,7 +182,7 @@ describe("decision audit log", () => {
 		// both fail on every decision.
 		const blocker = path.join(dir, "not-a-dir");
 		fs.writeFileSync(blocker, "occupied");
-		process.env.OMP_JEV_CONFIG = path.join(blocker, "omp-jevens-classifier.json");
+		process.env.OMP_JEV_CONFIG = path.join(blocker, "omp-classifier.json");
 
 		seq += 1;
 		setJevAnswer(jevUnsafeAnswer());

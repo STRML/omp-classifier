@@ -786,7 +786,7 @@ export function useTempConfigFile(): string {
 		if (!testConfigDir) {
 			testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), `omp-jevens-test-${process.pid}-`));
 		}
-		testConfigPath = path.join(testConfigDir, "omp-jevens-classifier.json");
+		testConfigPath = path.join(testConfigDir, "omp-classifier.json");
 	}
 	process.env.OMP_JEV_CONFIG = testConfigPath;
 	return testConfigPath;

@@ -37,8 +37,8 @@ beforeEach(async () => {
 	await loadPlugin(makeSettings([]));
 });
 
-const DISABLED = { plugins: { "omp-jevens-classifier": { version: "0.2.0", enabled: false } } };
-const ENABLED = { plugins: { "omp-jevens-classifier": { version: "0.2.0", enabled: true } } };
+const DISABLED = { plugins: { "omp-classifier": { version: "0.2.0", enabled: false } } };
+const ENABLED = { plugins: { "omp-classifier": { version: "0.2.0", enabled: true } } };
 
 describe("notice fires when the lockfile disabled us after we bound", () => {
 	test("warns once, naming both ways out", async () => {
@@ -50,7 +50,7 @@ describe("notice fires when the lockfile disabled us after we bound", () => {
 		expect(calls).toHaveLength(1);
 		const [message, level] = calls[0];
 		expect(level).toBe("warning");
-		expect(message).toContain("omp-jevens-classifier");
+		expect(message).toContain("omp-classifier");
 		expect(message).toContain("restart OMP");
 		expect(message).toContain("/classifier enabled false");
 		// It reads the user-scope lockfile only, so it states what it read and
@@ -122,7 +122,7 @@ describe("notice fires when the lockfile disabled us after we bound", () => {
 		// Assert the branch that actually runs. Without this the test passes
 		// even if the logger call is deleted outright.
 		expect(loggerWarnings).toHaveLength(1);
-		expect(loggerWarnings[0]).toContain("omp-jevens-classifier");
+		expect(loggerWarnings[0]).toContain("omp-classifier");
 		expect(loggerWarnings[0]).toContain("marked disabled");
 	});
 
@@ -165,7 +165,7 @@ describe("notice stays silent otherwise", () => {
 	});
 
 	test("malformed lockfile is not a disable signal", async () => {
-		for (const raw of ['{"plugins": "nope"}', "{}", "not json at all", '{"plugins":{"omp-jevens-classifier":7}}']) {
+		for (const raw of ['{"plugins": "nope"}', "{}", "not json at all", '{"plugins":{"omp-classifier":7}}']) {
 			removeLockfile();
 			const { writeFileSync } = await import("node:fs");
 			writeFileSync(process.env.OMP_JEV_TEST_LOCKFILE as string, raw);
@@ -185,7 +185,7 @@ describe("notice stays silent otherwise", () => {
 			["zero", { version: "0.2.0", enabled: 0 }],
 			["null", { version: "0.2.0", enabled: null }],
 		] as const) {
-			writeLockfile({ plugins: { "omp-jevens-classifier": entry } });
+			writeLockfile({ plugins: { "omp-classifier": entry } });
 			const ctx = makeCtx({ sessionId: `host-parity-${label}`, hasUI: true });
 			await fire("tool_call", makeEvent("git status"), ctx);
 			expect(notifyCalls(ctx)).toHaveLength(1);
