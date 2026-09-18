@@ -1,5 +1,5 @@
 /**
- * omp-jevens-classifier
+ * omp-classifier
  *
  * Adds a model-judged permission gate to the native `bash` tool. Commands not
  * already decided by a static deny/prompt/narrow-allow rule get classified;
@@ -41,7 +41,7 @@
  *     is never classified — its values can hold secrets — it goes straight to a
  *     permission request.
  *   - Every gate decision appends one JSON line to
- *     <agentDir>/omp-jevens-classifier/decisions.jsonl (issue #33): tool,
+ *     <agentDir>/omp-classifier/decisions.jsonl (issue #33): tool,
  *     decision, layer, why, command, verdict, cache provenance, timing. The
  *     write is fire-and-forget: a failure drops the log line, never the
  *     command.
@@ -88,8 +88,10 @@ import {
 	deriveJevDecision,
 	JEV_POLICY_VERSION,
 	jevQuestionsHash,
+	type GitPushProvenance,
 	type JevHazard,
 	type JevPolicy,
+	measureGitPushProvenance,
 } from "./jev";
 
 type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "UNAVAILABLE";
@@ -589,7 +591,7 @@ export function jevPolicyFor(config: ClassifierConfig): JevPolicy {
 }
 
 function classifierConfigPath(): string {
-	return process.env.OMP_JEV_CONFIG ?? path.join(getConfigRootDir(), "omp-jevens-classifier.json");
+	return process.env.OMP_JEV_CONFIG ?? path.join(getConfigRootDir(), "omp-classifier.json");
 }
 
 interface ClassifierConfigCache {
@@ -681,10 +683,10 @@ function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig
 // ---------------------------------------------------------------------------
 // Decision audit log (issue #33)
 //
-// One JSON line per gate decision at <agentDir>/omp-jevens-classifier/
+// One JSON line per gate decision at <agentDir>/omp-classifier/
 // decisions.jsonl. The directory mirrors classifierConfigPath()'s resolution —
 // dirname(OMP_JEV_CONFIG) when the test override is set,
-// <agentDir>/omp-jevens-classifier otherwise — so tests point one env var at a
+// <agentDir>/omp-classifier otherwise — so tests point one env var at a
 // temp dir and find every artifact there. Append-only; the writer is
 // fire-and-forget (see logDecision inside the plugin factory).
 // ---------------------------------------------------------------------------
@@ -811,7 +813,7 @@ export function buildStatusReport(): StatusReport {
 // losing the session.
 // ---------------------------------------------------------------------------
 
-const PLUGIN_NAME = "omp-jevens-classifier";
+const PLUGIN_NAME = "omp-classifier";
 
 /**
  * Resolve the lockfile the way the host does. `OMP_PROFILE`/`PI_PROFILE`,
@@ -3200,7 +3202,7 @@ function matchingGrant(ctx: ExtensionContext, key: string, cwd: string, evidence
 // a missing or corrupt store reads as zero grants (the gate never crashes on
 // it), and a failed write leaves the just-approved call allowed while simply
 // not remembering it.
-// The store is <dirname(omp-jevens-classifier.json)>/omp-jevens-classifier-grants.json
+// The store is <dirname(omp-classifier.json)>/omp-classifier-grants.json
 // — the config root, beside the config file, so the OMP_JEV_CONFIG test
 // override relocates it like every other artifact. Shape: {version: 1,
 // grants: [{cmd, cwd, ts}]}, pretty-printed for human inspection.
@@ -3252,7 +3254,7 @@ function sanitizePersistentGrantFile(raw: unknown): PersistentGrant[] {
 /** Read the store: mtime-cached like the config, pruned in memory (a read
  *  never writes — the file is rewritten only by a dialog approval). */
 function loadPersistentGrants(): PersistentGrant[] {
-	const filePath = path.join(path.dirname(classifierConfigPath()), "omp-jevens-classifier-grants.json");
+	const filePath = path.join(path.dirname(classifierConfigPath()), "omp-classifier-grants.json");
 	try {
 		const stat = fs.statSync(filePath);
 		if (
@@ -3296,7 +3298,7 @@ function addPersistentGrant(command: string, cwd: string): void {
 		if (existing !== -1) grants.splice(existing, 1);
 		grants.push({ cmd: command, cwd, ts: now });
 		while (grants.length > PERSISTENT_GRANT_CAP) grants.shift();
-		const filePath = path.join(path.dirname(classifierConfigPath()), "omp-jevens-classifier-grants.json");
+		const filePath = path.join(path.dirname(classifierConfigPath()), "omp-classifier-grants.json");
 		fs.mkdirSync(path.dirname(filePath), { recursive: true });
 		const tmp = `${filePath}.${process.pid}.tmp`;
 		try {
@@ -3350,7 +3352,7 @@ export default function (pi: ExtensionAPI) {
 	// prints the effective config and the file path.
 	pi.registerCommand("classifier", {
 		description:
-			"View or set omp-jevens-classifier options: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, persistentGrants, reset, status, dry-run, off, on",
+			"View or set omp-classifier options: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, persistentGrants, reset, status, dry-run, off, on",
 		getArgumentCompletions: (prefix: string) => {
 			const keywords = ["enabled", "policy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "persistentGrants", "reset", "status", "dry-run", "off", "on", "file"] as const;
 			return keywords
@@ -3361,7 +3363,7 @@ export default function (pi: ExtensionAPI) {
 			const [key, value] = args.trim().split(/\s+/u);
 			const notify = (message: string, level: "info" | "error" = "info") => ctx.ui.notify(message, level);
 			if (!key) {
-				notify(`omp-jevens-classifier (${classifierConfigPath()}):\n${formatClassifierConfig(readClassifierConfig())}`);
+				notify(`omp-classifier (${classifierConfigPath()}):\n${formatClassifierConfig(readClassifierConfig())}`);
 				return;
 			}
 			if (key === "file") {
@@ -3412,12 +3414,12 @@ export default function (pi: ExtensionAPI) {
 				}
 				// Full dump on disk; the toast gets a truncation so a long tail of
 				// decisions cannot flood the pane.
-				notify(`omp-jevens-classifier status — ${where}:\n${truncated(json, 1500)}`);
+				notify(`omp-classifier status — ${where}:\n${truncated(json, 1500)}`);
 				return;
 			}
 			if (key === "reset") {
 				writeClassifierConfig({ enabled: true, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, persistentGrants: true });
-				notify(`omp-jevens-classifier reset to defaults (${classifierConfigPath()})`);
+				notify(`omp-classifier reset to defaults (${classifierConfigPath()})`);
 				return;
 			}
 			if (key === "enabled") {
@@ -3578,6 +3580,16 @@ export default function (pi: ExtensionAPI) {
 		const taskEvidence = evidenceSnapshot === undefined ? evidenceUserSnapshot(ctx) : evidenceSnapshot;
 		const userMessages = taskEvidence?.messages;
 		const hadUserEvidence = (userMessages?.length ?? 0) > 0;
+		// Gate-measured git push provenance (issue #63). Runs the plumbing in
+		// the target cwd; a non-push command, a push the repo does not track,
+		// or a plumbing failure leaves it undefined and the state carries no
+		// provenance — the criteria then fall back to the syntax-level read.
+		let pushProvenance: GitPushProvenance | undefined;
+		try {
+			pushProvenance = measureGitPushProvenance(command, cwd);
+		} catch {
+			pushProvenance = undefined;
+		}
 		try {
 			const answers = await judgeBattery(AbortSignal.timeout(timeoutMs), {
 				state: buildJevState({
@@ -3586,6 +3598,7 @@ export default function (pi: ExtensionAPI) {
 					...(userMessages ? { userMessages } : {}),
 					...(taskEvidence?.ids.length ? { userMessageIds: taskEvidence.ids } : {}),
 					...(operatorContext ? { operatorContext } : {}),
+					...(pushProvenance !== undefined ? { gitPushProvenance: pushProvenance } : {}),
 					...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
 				}),
 				// The host settings instance, not a plugin-local singleton copy:
@@ -3928,7 +3941,7 @@ export default function (pi: ExtensionAPI) {
 					? [{ label: "Allow for session", description: "This action, in this directory, for the rest of the session" }]
 					: []),
 				...(persistentGrantAvailable
-					? [{ label: "Always allow", description: "This exact command, in this directory, for 30 days (stored alongside omp-jevens-classifier.json)" }]
+					? [{ label: "Always allow", description: "This exact command, in this directory, for 30 days (stored alongside omp-classifier.json)" }]
 					: []),
 				{ label: "Deny" },
 			],
@@ -4417,10 +4430,14 @@ export default function (pi: ExtensionAPI) {
 			// Judge identity is the model selector plus the question battery: a
 			// verdict earned under one policy must not be reused under another.
 			// (The config signature clears the whole cache when either changes;
-			// this keeps the key honest on its own.)
+			// this keeps the key honest on its own.) The measured push
+			// provenance (issue #63) is what the judge read about the refs, so
+			// a ref move between calls must invalidate the cached verdict.
+			const pushProvenanceForCache = measureGitPushProvenance(command, cwd);
 			const cacheKey = JSON.stringify([
 				config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, command,
 				reviewEvidenceFingerprint,
+				pushProvenanceForCache ?? null,
 			]);
 			// Refusal memory (issue #30): a reworded command meets its session's
 			// prior refusal. The record tells the model; the SAFE branch below
