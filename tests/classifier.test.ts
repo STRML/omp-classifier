@@ -623,4 +623,31 @@ describe("heredoc bodies are data, not commands", () => {
 		// Visible plain code still releases: the classifier read the payload.
 		expect(await flags(doc("python3 -", "print(1)", "'PY'"))).toEqual([]);
 	});
+
+	// Issues #60/#61: quote-state shapes the plain tokenizer mis-closes, which
+	// let every later command vanish from the risk scan. The mask blanks
+	// heredoc bodies and ANSI-C / unclosed-quote spans before tokenizing and
+	// scans each blanked region as its own unit.
+	test("an unbalanced quote in a heredoc body does not hide later commands (#60)", async () => {
+		// The `"` is body data; before the mask it opened a phantom quote that
+		// swallowed the closer and the real command after it.
+		expect(await flags("bash <<'EOF'\n\"\nEOF\nsudo rm -rf /tmp/x")).toEqual(["sudo"]);
+	});
+
+	test("a nested heredoc carrying an unbalanced quote stays under scan (#60)", async () => {
+		expect(await flags("bash <<'OUT'\ncat <<'IN'\n\"\nIN\nrm -rf /tmp/x\nOUT")).toContain("rm");
+	});
+
+	test("an ANSI-C quote spanning lines does not hide the destructive tail (#61)", async () => {
+		// bash parses $'prefix \' as an open ANSI-C string (\' is an escaped
+		// quote) across the next lines; the plain tokenizer closed at the
+		// apostrophe and never saw the sudo.
+		expect(await flags("printf $'prefix \\'\ncat > /tmp/f <<'EOF'\n'\nsudo chown root /etc/hosts\nEOF")).toEqual(["sudo"]);
+	});
+
+	test("an unclosed plain quote blanked by the mask still scans its content", async () => {
+		// The unclosed quote's span moves to the quoted-piece scan, so the
+		// risk verb inside it flags rather than vanishing.
+		expect(await flags("echo 'it never closes\nsudo rm -rf /tmp/x")).toEqual(["sudo"]);
+	});
 });

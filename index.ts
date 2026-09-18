@@ -2035,6 +2035,186 @@ function heredocShadowedAt(command: string, at: number): boolean {
 }
 
 /**
+ * Masked scan text for the risk-token matcher (issues #60, #61).
+ *
+ * `tokenizeShellSegments` models only `inSingle`/`inDouble`. Two shell
+ * realities put it into a quote it never leaves, and everything after the
+ * quote point disappears from every segment scan:
+ *
+ * 1. (#60) heredoc body text is DATA unless an unquoted delimiter expands
+ *    it, so an unbalanced `"` inside a body swallows the closer and every
+ *    later live command. Body boundaries are decidable from the delimiter
+ *    alone, which `shadowOpeners` already computes; whether the body runs
+ *    is NOT decidable and is not needed here.
+ * 2. (#61) ANSI-C `$'...'` strings span lines and treat `\'` as an escaped
+ *    quote. The plain `'` state machine closes at the first apostrophe, and
+ *    the string's closing apostrophe then opens a phantom quote that eats
+ *    the rest of the command.
+ */
+export interface MaskedScanText {
+	masked: string;
+	/** Heredoc body regions, scanned as their own units by the caller. */
+	bodies: string[];
+	/**
+	 * Quote-span regions (`'...'`, `"..."`, `$'...'`) the tokenizer
+	 * mis-reads, with the opening quote dropped so the recursion
+	 * tokenizes the content as fresh text; the seen-set stops a repeat.
+	 */
+	quoted: string[];
+}
+
+export function maskHeredocBodiesAndAnsiSpans(command: string): MaskedScanText {
+	const bodies: string[] = [];
+	// 1. Heredoc bodies, in shell body order. Openers are reported on the
+	// original text; one line's openers consume consecutive bodies, so an
+	// opener whose body-start sits inside an already-consumed span is data
+	// to an outer heredoc and opens nothing. An opener with no body start
+	// (`<<EOF` ending the text) has no body at all. An UNKNOWN delimiter
+	// covers to EOF: the whole tail moves to the isolated-body scan, which
+	// only ever over-flags.
+	const spans: Array<{ start: number; end: number }> = [];
+	let cursor = 0;
+	for (const op of shadowOpeners(command)) {
+		if (op.bodyStart === 0) break;
+		if (op.index < cursor) continue;
+		if (op.delim === null) {
+			spans.push({ start: op.bodyStart, end: command.length });
+			bodies.push(command.slice(op.bodyStart));
+			cursor = command.length;
+			continue;
+		}
+		const closer = new RegExp(`^${op.tabs ? "\\t*" : ""}${op.delim}$`, "mu").exec(command.slice(op.bodyStart));
+		const bodyEnd = closer === null ? command.length : op.bodyStart + closer.index;
+		spans.push({ start: op.bodyStart, end: bodyEnd });
+		bodies.push(command.slice(op.bodyStart, bodyEnd));
+		cursor = bodyEnd;
+	}
+	// 2. Quote spans the tokenizer mis-READS, walked OUTSIDE the body
+	// regions (quotes inside a body are body data; the isolated-body
+	// recursion handles them):
+	//   a. ANSI-C `$'...'` — `\'` escapes, so the plain loop closes early;
+	//   b. a quote run crossed by a heredoc body — body bytes are DATA to
+	//      the shell's quote state too;
+	//   c. a quote never closed — the #61 swallowing shape; the span covers
+	//      to EOF.
+	// A properly closed plain `'...'` or `"..."` span is NOT masked: the
+	// tokenizer reads those correctly, and the quoted-piece scan changed
+	// release behavior the suite pins (an inline `-c 'payload'` must stay
+	// releasable). Only mis-read spans are blanked out of the plain read,
+	// and the recursion scans their content separately.
+	const quoteSpans: Array<{ start: number; end: number }> = [];
+	const inBody = (at: number): boolean => spans.some(s => at >= s.start && at < s.end);
+	let i = 0;
+	while (i < command.length) {
+		if (inBody(i)) {
+			// Jump past the current body region; its quotes are body data.
+			const region = spans.find(s => i >= s.start && i < s.end);
+			if (!region) break;
+			i = region.end;
+			continue;
+		}
+		const ch = command[i];
+		if (ch === "\\" && i + 1 < command.length) {
+			i += 2;
+			continue;
+		}
+		if (ch === "$" && command[i + 1] === "'") {
+			// ANSI-C open at i: `\'` escapes, plain `'` closes.
+			let j = i + 2;
+			let closed = false;
+			while (j < command.length) {
+				if (inBody(j)) break;
+				if (command[j] === "'") {
+					quoteSpans.push({ start: i, end: j + 1 });
+					i = j + 1;
+					closed = true;
+					break;
+				}
+				j++;
+			}
+			if (!closed) {
+				quoteSpans.push({ start: i, end: command.length });
+				i = command.length;
+			}
+			continue;
+		}
+		if (ch === "'") {
+			let j = i + 1;
+			let crossedBody = false;
+			let closed = false;
+			while (j < command.length) {
+				if (inBody(j)) {
+					crossedBody = true;
+					const region = spans.find(s => j >= s.start && j < s.end);
+					if (!region) break;
+					j = region.end;
+					continue;
+				}
+				if (command[j] === "'") {
+					if (crossedBody) quoteSpans.push({ start: i, end: j + 1 });
+					i = j + 1;
+					closed = true;
+					break;
+				}
+				j++;
+			}
+			if (!closed) {
+				quoteSpans.push({ start: i, end: command.length });
+				i = command.length;
+			}
+			continue;
+		}
+		if (ch === '"') {
+			let j = i + 1;
+			let crossedBody = false;
+			let closed = false;
+			while (j < command.length) {
+				if (inBody(j)) {
+					crossedBody = true;
+					const region = spans.find(s => j >= s.start && j < s.end);
+					if (!region) break;
+					j = region.end;
+					continue;
+				}
+				if (command[j] === "\\") {
+					j += 2;
+					continue;
+				}
+				if (command[j] === '"') {
+					if (crossedBody) quoteSpans.push({ start: i, end: j + 1 });
+					i = j + 1;
+					closed = true;
+					break;
+				}
+				j++;
+			}
+			if (!closed) {
+				quoteSpans.push({ start: i, end: command.length });
+				i = command.length;
+			}
+			continue;
+		}
+		i++;
+	}
+	// Apply ALL masks (heredoc bodies + mis-read quote spans) to a single
+	// output buffer. Every newline is kept so segment structure survives.
+	const all = [...spans, ...quoteSpans].sort((a, b) => a.start - b.start);
+	const chars = command.split("");
+	for (const span of all) {
+		for (let k = span.start; k < Math.min(span.end, chars.length); k++) {
+			if (chars[k] !== "\n") chars[k] = " ";
+		}
+	}
+	const masked = chars.join("");
+	// The queue gets each span's INNER text (opening quote dropped). For an
+	// unclosed quote — the #61 swallowing shape — the inner text is the
+	// whole tail after the opener, tokenized as fresh text exactly once;
+	// the seen-set stops any repeat.
+	const quoted = quoteSpans.map(s => command.slice(s.start + 1, s.end));
+	return { masked, bodies: bodies, quoted };
+}
+
+/**
  * True when a quote opened before `at` and stays open there, so the shell
  * reads everything in between as string text. Both quotes span newlines, a
  * backslash outside quotes escapes the next character, and ANSI-C `$'...'`
@@ -2543,7 +2723,11 @@ function rmForcesDialog(args: readonly string[], cwd: string): boolean {
 	return false;
 }
 
-export function matchModerateRiskTokens(command: string, cwd?: string): string[] {
+export function matchModerateRiskTokens(
+	command: string,
+	cwd?: string,
+	options?: { skipWriteStrip?: boolean },
+): string[] {
 	const effectiveCwd = cwd ?? MATCHER_CWD_UNKNOWN;
 	// POSIX deletes a backslash-newline pair before word splitting; the
 	// tokenizer keeps it, which would split `rm` into r/NL/m. Remove the pairs
@@ -2554,7 +2738,15 @@ export function matchModerateRiskTokens(command: string, cwd?: string): string[]
 	// POSIX deletes a backslash-newline pair before word splitting; the
 	// tokenizer keeps it, which would split `rm` into r/NL/m. Remove the pairs
 	// for MATCHING purposes so the splice reads as one verb.
-	const normalized = withoutWrittenHeredocBodies(command).replace(/\\\r?\n/gu, "");
+	const stripped = options?.skipWriteStrip ? command : withoutWrittenHeredocBodies(command);
+	// Issues #60/#61: heredoc-bounded bodies and ANSI-C `$'...'` spans are
+	// blanked out of the text the tokenizer reads, because both put the
+	// plain quote state machine into a quote it never leaves (an unbalanced
+	// `"` in a body, `\'` inside `$'...'`). The blanked regions are scanned
+	// as separate units below, so their risk tokens still flag — the mask
+	// changes WHERE a chunk is tokenized, never WHETHER it is scanned.
+	const { masked, bodies, quoted } = maskHeredocBodiesAndAnsiSpans(stripped);
+	const normalized = masked.replace(/\\\r?\n/gu, "");
 	const segments = tokenizeShellSegments(normalized);
 	const flags = new Set<string>();
 
@@ -2565,7 +2757,13 @@ export function matchModerateRiskTokens(command: string, cwd?: string): string[]
 	// rule applies as for a non-piped interpreter: only obfuscation markers
 	// or destructive verbs keep the flag. Opaque stdin (`cat ./installer | sh`)
 	// always flags: the SAFE says nothing about what stdin carries.
-	const pipeStages = splitPipeStages(normalized);
+	// This scan is TEXT-level (heredocBody pulls the body from the stage's
+	// own text), so it runs on the unmasked text: masking would blank the
+	// body out of the stage and the risk-pattern check would read only
+	// blanks. The masked text stays behind for the TOKEN scans below, where
+	// the #60/#61 quote blindspots live.
+	const unmaskedNormalized = stripped.replace(/\\\r?\n/gu, "");
+	const pipeStages = splitPipeStages(unmaskedNormalized);
 	for (let i = 1; i < pipeStages.length; i++) {
 		for (const { verb, codeText } of stdinExecutingInterpreters(pipeStages[i])) {
 			if (codeText !== null && !INTERPRETER_CODE_RISK.test(codeText) && !INTERPRETER_RISK_TOKEN_RE.test(codeText)) continue;
@@ -2711,6 +2909,27 @@ export function matchModerateRiskTokens(command: string, cwd?: string): string[]
 	// backtick spans, and flag risk verbs only inside those spans. Text outside
 	// (`grep $(git rev-parse HEAD) file`) stays on the graceful path.
 	addSubstitutionFlags(normalized, flags);
+
+	// The masked regions (#60 heredoc bodies, #61 quote spans) carry their own
+	// live commands under scan, so each is tokenized as its own unit with the
+	// SAME rules (recursive: a body can hold a nested heredoc). The visited
+	// set stops the recursion when a piece re-extracts itself (an unclosed
+	// quote's span is its own mask output): no new text, nothing new to scan.
+	// A body piece skips the write-strip: the piece sits inside a body region
+	// the outer scan owns, where an unquoted outer delimiter means the shell
+	// EXPANDS the nested body before the owner command reads it, and an
+	// unterminated outer heredoc means nothing has decided the nested text is
+	// data. Both directions leave the nested words live, so the piece scans
+	// raw; the graceful-release rule (strip = inert) applies only to
+	// standalone write bodies, which the plain-scan path already handled.
+	const seenPieces = new Set<string>([stripped]);
+	const queue = [...bodies, ...quoted];
+	while (queue.length > 0) {
+		const rawPiece = queue.pop() as string;
+		if (seenPieces.has(rawPiece)) continue;
+		seenPieces.add(rawPiece);
+		for (const flag of matchModerateRiskTokens(rawPiece, effectiveCwd, { skipWriteStrip: true })) flags.add(flag);
+	}
 	return [...flags].sort();
 }
 
