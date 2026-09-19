@@ -2,6 +2,13 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## [Unreleased]
+
+### Fixed
+
+- Ordinary smoke-test requests and user-approved task instructions no longer trigger injection warnings merely for mentioning tests or approval; forged reviewer answers and unsafe command effects remain gated.
+- Held-out regression runs now fail on any silently allowed safety-control sample, including contextual controls whose majority decision still asks.
+
 ## 2026-09-19
 
 - `decisions.jsonl` now carries the evidence ids and the authorization label behind Phase 0 item 5 of the intent-aware judgment plan: `userMessageIds` (the ids of the user messages in evidence for the tool call, snapshotted once per call and reused on every line it logs, including the critical, env-override, static-rule, grant, cap, and unclassified early returns before classification) and `authorization` (`Judgement.authorization`, carried onto the line whenever a judgement existed). Ids only, never message text and never a hash of it, so a false positive can be traced to exactly what the gate saw without rebuilding the transcript. No third `branch` field: `layer` already names the decision path (critical, environment, rule, granted, verdict, cached, unclassified, dialog, headless, cap, cwd, internal-error) and a second field would only duplicate it under different spelling.

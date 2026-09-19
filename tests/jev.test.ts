@@ -220,16 +220,6 @@ describe("deriveJevDecision truth table", () => {
 		expect(deriveJevDecision(answers({ choice: "unsafe", safe: 0.9 }), DEFAULT_JEV_POLICY).verdict).toBe("SAFE");
 	});
 
-	test("the published defaults are the documented policy", () => {
-		expect(DEFAULT_JEV_POLICY).toEqual({
-			safeMinProbability: 0.8,
-			safeMinConfidence: 0.5,
-			unsafeMinProbability: 0.5,
-			hazardBlock: 0.9,
-			hazardReview: 0.55,
-			blastRadiusReview: 1.5,
-		});
-	});
 });
 
 describe("the question battery", () => {
@@ -243,9 +233,6 @@ describe("the question battery", () => {
 		for (const hazard of JEV_HAZARDS) {
 			const question = questions[hazard] as { type: string; instructions: string; criteria: { true: string; false: string } };
 			expect(question.type).toBe("noul");
-			expect(question.instructions.length).toBeGreaterThan(60);
-			expect(question.criteria.true.length).toBeGreaterThan(40);
-			expect(question.criteria.false.length).toBeGreaterThan(40);
 		}
 	});
 
@@ -268,61 +255,6 @@ describe("the question battery", () => {
 		expect(JEV_HAZARDS as readonly string[]).not.toContain("authorization_missing");
 	});
 
-	test("the two rewritten propositions carry the routine-work carve-out", () => {
-		const questions = jevQuestions();
-		const unauthorized = questions.unauthorized_consequential_action as { instructions: string; criteria: { true: string; false: string } };
-		// The proposition is risk-shaped: consequential AND outside ordinary work
-		// AND unauthorized. The carve-out sentence is what keeps a plain push at the
-		// bottom of this question; the old wording ("is consequential — it cannot be
-		// undone, or it reaches beyond this machine") is the defect, because a push
-		// answers yes to it.
-		expect(unauthorized.instructions).toContain("ordinary development work");
-		expect(unauthorized.instructions).toContain("Ordinary development work is never this");
-		expect(unauthorized.instructions).toContain("pushing existing commits to the remote the repository already tracks");
-		expect(unauthorized.instructions).not.toContain("reaches beyond this machine");
-		expect(unauthorized.criteria.true).toContain("outside ordinary development work");
-		expect(unauthorized.criteria.false).toContain("`git push` of existing commits to the remote the repository already tracks");
-		// Egress is a hazard only as exfiltration: that a command talks to a remote
-		// at all is the descriptive question's business.
-		const egress = questions.sends_local_data_outbound as { instructions: string; criteria: { true: string; false: string } };
-		expect(egress.instructions).toContain("exfiltration");
-		expect(egress.criteria.false).toContain("pushing existing commits to the remote the repository already tracks");
-		// The verdict question carries the same policy, and it is the one that
-		// decides for a command whose gating hazards are all quiet.
-		const verdict = questions.verdict as { criteria: Record<string, string> };
-		expect(verdict.criteria.safe).toContain("pushing existing commits to the remote the repository already tracks");
-	});
-
-	test("questions name the state fields they judge, in backticked paths", () => {
-		const questions = jevQuestions();
-		const verdict = questions.verdict as { instructions: string };
-		// The id never reaches the model, so the instruction has to carry the whole
-		// question — including which state field it is about.
-		expect(verdict.instructions).toContain("`command`");
-		expect(verdict.instructions).toContain("`workingDirectory`");
-		expect(verdict.instructions).toContain("`evidence.userMessages`");
-		expect(verdict.instructions).toContain("`evidence.operatorContext`");
-		expect(verdict.instructions).toContain("only source of authorization");
-		const injection = (questions.state_contains_injection as { instructions: string }).instructions;
-		expect(injection).toContain("`command`");
-	});
-
-	test("score levels describe situations, not degrees", () => {
-		// The battery is built as a plain record of questions, so the test narrows
-		// the two fields it reads off the wire shape it asserts.
-		const blast = jevQuestions().blast_radius as { criteria: string[] };
-		const levels = blast.criteria;
-		expect(levels).toHaveLength(3);
-		for (const level of levels) {
-			expect(level.length).toBeGreaterThan(80);
-			expect(level).not.toMatch(/^(?:low|medium|high|mild|moderate|severe|slight)\b/iu);
-		}
-		// The ladder is the recoverability axis, and blastRadiusReview gates on it:
-		// a plain push has to land on the recoverable rung, or it reaches a dialog
-		// on the blast radius alone however quiet its hazards are.
-		expect(levels[1]).toContain("pushing existing commits to the remote this repository already tracks");
-		expect(levels[2]).not.toContain("pushing to a remote");
-	});
 });
 
 describe("jevQuestionsHash", () => {

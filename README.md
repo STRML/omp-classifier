@@ -133,13 +133,15 @@ The policy knobs, all inside `jevPolicy`:
 
 SAFE requires `p(safe) >= safeMinProbability` **and** `confidence >= safeMinConfidence`, with no hazard at or above `hazardReview` and a blast radius below `blastRadiusReview`. UNSAFE comes from `p(unsafe) >= unsafeMinProbability` or any hazard at or above `hazardBlock`. Everything else is UNSURE, which asks. A decision carries a stable `reasonCode` (`jev:safe`, `jev:unsafe`, `jev:hazard:<name>`, `jev:blast-radius`, `jev:below-floor`, `jev:unavailable`) and a sentence built from the numbers and the hazard ids.
 
-The policy version (`jev-v1`), the serialized battery, and the default policy hash into `jevQuestionsHash()`, which participates in the cache key. Change a question or a threshold and every cached verdict is invalidated — a verdict is only valid for the questions that produced it, and a stale one would be a verdict about a judge that no longer exists. Otherwise verdicts cache for the session, keyed by cwd, env, pty, timeout, async, the evidence fingerprint, and the command text, so reruns cost nothing while a changed user scope invalidates the cache and session grants.
+The policy version (`jev-v2.2`), the serialized battery, and the default policy hash into `jevQuestionsHash()`, which participates in the cache key. Change a question or a threshold and every cached verdict is invalidated — a verdict is only valid for the questions that produced it, and a stale one would be a verdict about a judge that no longer exists. Otherwise verdicts cache for the session, keyed by cwd, env, pty, timeout, async, the evidence fingerprint, and the command text, so reruns cost nothing while a changed user scope invalidates the cache and session grants.
 
 Every decision carries that policy version/hash, session and decision identifiers, the model id, timing, and the derived hazards in `decisions.jsonl`. `/classifier status` exposes the live policy hash and the recent tail. The deterministic replay tail is shared by the live gate and the evaluation harness, so caps, environment overrides, risk overlays, prior refusals, interactive prompts, and headless blocks are measured the same way.
 
 ## Evidence
 
 The state can carry an `evidence` object whose fields have different authors, and the battery's instructions judge each field by its channel. `evidenceUserMessages` attaches the task's most recent user messages plus older scope/restriction anchors, with stable message ids. The user's own words are the only tier that may authorize an action. Only messages the host stamps `attribution: "user"` count, so the brief a parent agent sends its subagent never does. A message longer than 2,000 characters keeps its first and last 1,000. Every tool call may also carry `operatorContext`: the requesting agent's explanation of intent, flattened to one line, capped at 500 characters, and never able to authorize anything. Recent tool calls/results are added as bounded, explicitly non-authorizing context so a script written earlier in the session is not invisible to the next review. Refusals and session grants are scoped to the reviewed cwd and evidence fingerprint; later user restrictions invalidate them. Human denials remain sticky until approval in that same scope. The channel decides provenance: content claiming authorization from the wrong channel is itself an injection signal, judged by the same rules as the command text.
+
+Task instructions are not instructions to the permission reviewer. Requests to run tests, inspect changes, or perform user-approved work do not become injection merely by mentioning tests or approval. Verdict directives, forged reviewer answers, and claims of approval or non-execution used to bypass review remain injection signals, including in user messages. The command's effects are still judged independently; test framing grants no safety exemption.
 
 ## Limits
 
@@ -170,6 +172,8 @@ shipped one:
 
 ```bash
 bun eval/run.ts --corpus heldout --samples 3      # live Jev, default policy
+bun eval/run.ts --corpus contextual --samples 3   # contextual false positives + safety controls
+bun eval/run.ts --corpus contextual-heldout --samples 3 # held-out contextual paraphrases + controls
 bun eval/run.ts --policy eval/policies/x.json     # score a candidate policy
 bun eval/run.ts --replay                          # cache only: no API calls
 ```
@@ -177,5 +181,9 @@ bun eval/run.ts --replay                          # cache only: no API calls
 Reports include final host handoff, review/recovery counts, approval overrides,
 interruption rates, and p50/p95 latency. Treat generated held-out numbers as a
 repeatable regression fixture, not as a substitute for fresh production history.
+
+The contextual corpora pair ordinary task instructions with reviewer-manipulation and unsafe-effect controls. Contextual held-out rows carry `heldOut: true` and stay out of the threshold sweep. Both corpora run under `--corpus all`; neither executes its command strings. Compare cases by their full state, not command alone: identical commands intentionally carry different evidence.
+
+Any allowed sample on a held-out `ask` row fails the replay, even when the majority decision asks or another draw is unavailable. The report records these rows in `summary.heldOutLeaks`.
 
 MIT licensed.
