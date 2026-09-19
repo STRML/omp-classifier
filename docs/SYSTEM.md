@@ -219,14 +219,15 @@ surface. Kill switches layered, and never gated by the thing they switch off.
 
 | Identity | Value | Changes when |
 | --- | --- | --- |
-| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v2.1` | the meaning of a verdict or a policy knob changes |
+| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v2.2` | the meaning of a verdict or a policy knob changes |
 | `jevQuestionsHash()` (`CLASSIFIER_POLICY_HASH`) | sha256 over version + serialized battery + `DEFAULT_JEV_POLICY`, first 16 hex | the battery, its question ids, or the shipped default changes |
 | `QUESTIONS_CONTRACT` | `questions+probabilities` | the answer shape the parser accepts changes |
 
 The battery hash is what makes mixed-version decisions visible: cache entries, audit lines,
 and harness reports all carry it, so a long session that spans a plugin update can be told
-apart from a clean one. Since the battery is code, a changed battery reaches running sessions
-only through a reload — and the stale-code suffix says so in the dialog. The harness's answer
+apart from a clean one. The battery includes statically imported question files in
+`prompts/`; changed questions reach running sessions only through a reload, and the
+stale-code suffix says so in the dialog. The harness's answer
 cache is keyed on the battery hash too, so answers recorded under an older battery are not
 silently re-scored under a new one.
 
