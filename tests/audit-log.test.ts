@@ -345,5 +345,25 @@ describe("decision audit log", () => {
 				expect(JSON.stringify(line)).not.toContain(rawText);
 			}
 		});
+
+		test("an outage carries the evidence ids and no authorization label", async () => {
+			seq += 1;
+			const command = `echo audit-evidence-outage-${seq}`;
+			const ctx = makeCtx({ sessionId: `audit-evidence-outage-${seq}`, branch: [userEntry(rawText)] });
+			setJevUnavailable();
+			try {
+				expect(resultText(await fire("tool_call", makeEvent(command), ctx))).toContain("classifier unavailable");
+			} finally {
+				setJevUnavailable(false);
+			}
+			const lines = readDecisions();
+			expect(lines.length).toBeGreaterThan(0);
+			expect(lines[0].verdict).toBe("UNAVAILABLE");
+			// UNAVAILABLE judged nothing, so no line may claim an authorization.
+			for (const line of lines) {
+				expect(line.userMessageIds).toEqual(["user-0"]);
+				expect(line.authorization).toBeUndefined();
+			}
+		});
 	});
 });

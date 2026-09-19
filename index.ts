@@ -1230,7 +1230,9 @@ export function annotateJudgement(judgement: Judgement): Judgement {
 	// Authorization is only knowable from the battery answer that decided it.
 	// Without one (a hand-built judgement) the honest default is that the
 	// action never depended on it — never "grounded", which would claim the
-	// judge verified an authorization nobody asked it about.
+	// judge verified an authorization nobody asked it about. An outage judged
+	// nothing, so it carries no label at all.
+	if (judgement.verdict === "UNAVAILABLE") return { ...judgement, risk, reasonCode };
 	const authorization = judgement.authorization ?? "not-required";
 	return { ...judgement, risk, reasonCode, authorization };
 }
