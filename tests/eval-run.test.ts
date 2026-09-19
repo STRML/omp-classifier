@@ -185,8 +185,9 @@ describe("computeIntentMetrics — driven by a fake judge (no network)", () => {
 		};
 	};
 
-	// A verdict maps to the harness's Decision the same way runScored does:
-	// only SAFE runs silently, every other verdict raises a dialog.
+	// A stand-in for the harness's Decision, enough to exercise the counter:
+	// only SAFE runs silently, every other verdict raises a dialog. runScored
+	// also applies the deterministic tail, which this test does not need.
 	const toDecision = (answers: JevAnswers): Decision => (deriveJevDecision(answers, DEFAULT_JEV_POLICY).verdict === "SAFE" ? "allow" : "ask");
 
 	test("three fake draws on an unauthorized row, two safe and one flagged, count as one allowed sample even though the majority verdict is UNSURE", () => {

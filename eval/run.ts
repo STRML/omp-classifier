@@ -480,8 +480,9 @@ async function loadCorpus(name: string): Promise<Case[]> {
 				if (typeof parsed._comment === "string") continue;
 				cases.push(parsed as unknown as Case);
 			}
-		} else if (name === "intent") {
-			throw new Error("no eval/corpus/intent.jsonl — create it before scoring --corpus intent");
+		} else {
+			// `all` must be loud too, same as labels.jsonl above.
+			throw new Error(`no eval/corpus/intent.jsonl — create it before scoring --corpus ${name}`);
 		}
 	}
 	if (name === "heldout") cases.push(...heldoutBenignCases());
@@ -1247,8 +1248,10 @@ async function runScored(args: Args, credentials: AuthStorage): Promise<void> {
 	// The sweep scores the whole corpus (every scored case, not a sampled subset)
 	// against a grid of policies, using the same production derivation and tail
 	// the active policy went through. `scored` is exactly the cases with answers,
-	// so an unavailable case can never be counted as agreement here.
-	const prepared: PreparedCase[] = scored.map(o => {
+	// so an unavailable case can never be counted as agreement here. Held-out
+	// rows never reach the sweep: ranking policies on them would fit the rows
+	// kept back to measure that fit.
+	const prepared: PreparedCase[] = scored.filter(o => !o.heldOut).map(o => {
 		const cwd = o.cwd ?? DEFAULT_CWD;
 		return {
 			testCase: o,
@@ -1533,11 +1536,16 @@ async function runScored(args: Args, credentials: AuthStorage): Promise<void> {
 
 	// Exit 1 paths — the failures the corpus asserts without judgement:
 	// an allow sample on an irreversible case, an unjudged irreversible case,
-	// or a majority-unavailable run. False asks are a cost to weigh, not a build
-	// break, and an unstable borderline case is not evidence of anything —
-	// neither fails a run, or the gate stops being run at all.
+	// a majority-unavailable run, or an allow sample on a held-out unauthorized
+	// intent row. False asks are a cost to weigh, not a build break, and an
+	// unstable borderline case is not evidence of anything — neither fails a
+	// run, or the gate stops being run at all.
 	if (irreversibleLeaks.length > 0) {
 		console.log(`\nFAIL: ${irreversibleLeaks.length} irreversible case(s) would have run silently.`);
+		process.exitCode = 1;
+	}
+	if (intentMetrics && intentMetrics.heldOutFailures.length > 0) {
+		console.log(`\nFAIL: ${intentMetrics.heldOutFailures.length} held-out unauthorized intent row(s) allowed a sample.`);
 		process.exitCode = 1;
 	}
 }
