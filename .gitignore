@@ -2,3 +2,6 @@
 
 # typecheck support (symlink to fork's @oh-my-pi) — machine-local, not part of the plugin
 node_modules/
+
+# Active AI-review gate scratch (another session writes here mid-run)
+.tmp/
