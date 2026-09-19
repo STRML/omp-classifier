@@ -37,6 +37,15 @@ import {
 } from "./fixtures";
 import { buildStatusReport, CLASSIFIER_POLICY_HASH, CLASSIFIER_POLICY_VERSION, type DecisionRecord } from "../index";
 
+/** A user branch entry with no explicit id, so collectTaskEvidence falls back
+ *  to its synthetic `user-<index>` id — deterministic enough to assert on
+ *  without wiring up a host message id. */
+type BranchEntry = { type: string; message?: { role?: string; attribution?: string; content?: unknown } };
+const userEntry = (content: string): BranchEntry => ({
+	type: "message",
+	message: { role: "user", attribution: "user", content },
+});
+
 let dir = "";
 let seq = 0;
 
@@ -276,5 +285,85 @@ describe("decision audit log", () => {
 		expect(lines[0].why).toContain("flags: rm");
 		expect(lines[1]).toMatchObject({ decision: "block", layer: "headless" });
 		expect(lines[1].why.startsWith("follows verdict")).toBe(true);
+	});
+
+	describe("audit evidence fields (Phase 0 item 5)", () => {
+		const rawText = "please rm the scratch build, I asked for this";
+
+		test("a critical early return carries the evidence ids, never the message text", async () => {
+			seq += 1;
+			const ctx = makeCtx({ sessionId: `audit-evidence-critical-${seq}`, branch: [userEntry(rawText)] });
+			const blocked = resultText(await fire("tool_call", makeEvent("rm -rf /"), ctx));
+			expect(refusalOf(blocked).layer).toBe("headless");
+			// Critical pattern logs twice: the critical-layer line itself, then the
+			// headless outcome from requestPermission. Both carry the same ids.
+			const lines = readDecisions();
+			expect(lines).toHaveLength(2);
+			expect(lines[0].layer).toBe("critical");
+			expect(lines[0].userMessageIds).toEqual(["user-0"]);
+			// No judgement preceded a critical hit, so there is nothing to carry.
+			expect(lines[0].authorization).toBeUndefined();
+			expect(lines[1].layer).toBe("headless");
+			expect(lines[1].userMessageIds).toEqual(["user-0"]);
+			expect(lines[1].authorization).toBeUndefined();
+			for (const line of lines) {
+				expect(JSON.stringify(line)).not.toContain(rawText);
+			}
+		});
+
+		test("a static allow rule carries the evidence ids, never the message text", async () => {
+			seq += 1;
+			await loadPlugin(makeSettings([{ match: "echo audit-evidence-static*", approval: "allow" }]));
+			const ctx = makeCtx({ sessionId: `audit-evidence-static-${seq}`, branch: [userEntry(rawText)] });
+			const command = `echo audit-evidence-static-${seq}`;
+			expect(await fire("tool_call", makeEvent(command), ctx)).toBeUndefined();
+			const lines = readDecisions();
+			expect(lines).toHaveLength(1);
+			expect(lines[0].layer).toBe("rule");
+			expect(lines[0].userMessageIds).toEqual(["user-0"]);
+			// A static rule decides without a judgement, so no authorization label.
+			expect(lines[0].authorization).toBeUndefined();
+			for (const line of lines) {
+				expect(JSON.stringify(line)).not.toContain(rawText);
+			}
+		});
+
+		test("a verdict path carries the evidence ids and the judgement's authorization, never the message text", async () => {
+			seq += 1;
+			const command = `echo audit-evidence-verdict-${seq}`;
+			const ctx = makeCtx({ sessionId: `audit-evidence-verdict-${seq}`, branch: [userEntry(rawText)] });
+			expect(await fire("tool_call", makeEvent(command), ctx)).toBeUndefined();
+			const lines = readDecisions();
+			expect(lines).toHaveLength(1);
+			expect(lines[0]).toMatchObject({ decision: "allow", layer: "verdict", verdict: "SAFE" });
+			expect(lines[0].userMessageIds).toEqual(["user-0"]);
+			// The default SAFE answer clears unauthorized_consequential_action, and
+			// this call had user evidence in the branch, so authorization is
+			// "grounded" — the judgement actually depended on it.
+			expect(lines[0].authorization).toBe("grounded");
+			for (const line of lines) {
+				expect(JSON.stringify(line)).not.toContain(rawText);
+			}
+		});
+
+		test("an outage carries the evidence ids and no authorization label", async () => {
+			seq += 1;
+			const command = `echo audit-evidence-outage-${seq}`;
+			const ctx = makeCtx({ sessionId: `audit-evidence-outage-${seq}`, branch: [userEntry(rawText)] });
+			setJevUnavailable();
+			try {
+				expect(resultText(await fire("tool_call", makeEvent(command), ctx))).toContain("classifier unavailable");
+			} finally {
+				setJevUnavailable(false);
+			}
+			const lines = readDecisions();
+			expect(lines.length).toBeGreaterThan(0);
+			expect(lines[0].verdict).toBe("UNAVAILABLE");
+			// UNAVAILABLE judged nothing, so no line may claim an authorization.
+			for (const line of lines) {
+				expect(line.userMessageIds).toEqual(["user-0"]);
+				expect(line.authorization).toBeUndefined();
+			}
+		});
 	});
 });
