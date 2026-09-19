@@ -205,6 +205,13 @@ export interface JevDecision {
 	hazards: Partial<Record<JevHazard, number>>;
 	probabilities: Record<string, number>;
 	confidence: number;
+	/**
+	 * Whether an UNSAFE from this decision may be written to refusal memory.
+	 * False for one-hot answers (jev-v2.1): the verdict stays UNSAFE, because
+	 * the answer encoding never weakens a deny, but a keyword has no
+	 * distribution behind it to pin a target for the rest of the session.
+	 */
+	persistRefusal: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -595,9 +602,9 @@ const hazardNotes = (flagged: Partial<Record<JevHazard, number>>, decidedBy: Jev
  * like any other unreadable number). Branch precedence, the hazard thresholds
  * and the blast-radius threshold are unchanged, because they already read
  * correctly on one-hot values: a one-hot 1 is at or above every floor below 1
- * and a one-hot 0 is below every floor above 0. The two blocking branches
- * return UNSURE instead of UNSAFE in this mode (jev-v2.1): the command still
- * asks, but a keyword answer does not write refusal memory. Every reason this function
+ * and a one-hot 0 is below every floor above 0. In this mode the decision
+ * carries `persistRefusal: false` (jev-v2.1): an UNSAFE still asks, but a
+ * keyword answer does not write refusal memory. Every reason this function
  * builds is tagged " (llm keyword answer)" in that mode, because the audit
  * line, the dialog and a replay all need to know the numbers behind the verdict
  * were not a distribution.
@@ -647,19 +654,15 @@ export function deriveJevDecision(answers: JevAnswers, policy: JevPolicy): JevDe
 		hazards: flagged,
 		probabilities,
 		confidence,
+		persistRefusal: !oneHot,
 	});
 
-	// One-hot answers ask through UNSURE instead of UNSAFE on the two blocking
-	// branches. UNSAFE records a refusal (index.ts), which pins the target for
-	// the session and turns later SAFE verdicts on it into dialogs; a keyword
-	// has no distribution behind it to justify that. The dialog is the same.
-	const blockingVerdict: JevVerdict = oneHot ? "UNSURE" : "UNSAFE";
 	if (blocking !== undefined) {
 		const value = answers.hazards[blocking];
-		return decide(blockingVerdict, `jev:hazard:${blocking}`, `hazard ${blocking} ${fmt(value)} (>=${fmt(policy.hazardBlock)})${hazardNotes(flagged, blocking)}`);
+		return decide("UNSAFE", `jev:hazard:${blocking}`, `hazard ${blocking} ${fmt(value)} (>=${fmt(policy.hazardBlock)})${hazardNotes(flagged, blocking)}`);
 	}
 	if (unsafe >= policy.unsafeMinProbability) {
-		return decide(blockingVerdict, "jev:unsafe", `unsafe ${fmt(unsafe)} (>=${fmt(policy.unsafeMinProbability)})${hazardNotes(flagged, undefined)}`);
+		return decide("UNSAFE", "jev:unsafe", `unsafe ${fmt(unsafe)} (>=${fmt(policy.unsafeMinProbability)})${hazardNotes(flagged, undefined)}`);
 	}
 	// The safe gate. One-hot mode reads the two distribution-shaped floors as the
 	// choice label itself: the bridge's `safe` means probability 1 with

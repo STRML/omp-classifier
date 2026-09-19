@@ -36,6 +36,7 @@ import {
 	modelCalls,
 	refusalOf,
 	setJevAnswer,
+	setJevAnsweringApi,
 	stateOf,
 } from "./fixtures";
 
@@ -106,6 +107,20 @@ describe("refusal memory", () => {
 		expect(new Date(prior?.when ?? "").getTime()).toBeGreaterThan(0);
 		// The first, unrefused classification carries no such field.
 		expect(priorRefusalOf(0)).toBeUndefined();
+	});
+
+	test("a one-hot UNSAFE asks but is not remembered as a refusal (jev-v2.1)", async () => {
+		// The keyword bridge answers 0/1 with no distribution behind it. Its
+		// UNSAFE still asks; it must not pin the target for the session.
+		const sid = nextSession();
+		setJevAnsweringApi("chat");
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("rm -rf x"), makeCtx({ sessionId: sid }));
+		setJevAnsweringApi();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("rm -rf ./x"), makeCtx({ sessionId: sid }));
+		expect(modelCalls.length).toBe(2);
+		expect(priorRefusalOf(1)).toBeUndefined();
 	});
 
 	test("an UNSURE verdict is undecided, so it is not remembered as a refusal", async () => {

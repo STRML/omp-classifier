@@ -84,7 +84,7 @@ These always ask, at every authorization level. They are checked where `CRITICAL
 
 Two more rules are part of the floor. They depend on model answers, so they run after the Jev call:
 
-- `state_contains_injection` at or above `hazardReview` asks. It records a refusal, as UNSAFE does today, only when the risk request was not one-hot; a one-hot injection answer asks as UNSURE with no refusal, the same guard Phase 1 applies to the other blocking branches.
+- `state_contains_injection` at or above `hazardReview` asks. It records a refusal, as UNSAFE does today, only when the risk request was not one-hot; a one-hot injection answer is still UNSAFE but carries `persistRefusal: false`, the same guard Phase 1 applies to the other blocking branches.
 - A one-hot answer from the risk request never allows a hazard. A one-hot answer from the authorization request counts as `none`.
 
 ### Stage 1: Jev, two requests in parallel
@@ -121,8 +121,8 @@ Only standalone user text counts. Fenced code blocks, `>` quotes, and pasted blo
 
 `deriveJevDecision` stays pure and keeps its four verdicts. Its new inputs are the authorization answer, both one-hot flags, the literal-match result, the overlay flags, and `headless`. The floor has already run. First match wins:
 
-1. Injection at or above `hazardReview` → UNSAFE, or UNSURE with no refusal when the risk request was one-hot.
-2. The risk request was one-hot, and any gating hazard is at or above `hazardReview` or p(unsafe) is at or above `unsafeMinProbability` → UNSURE. No refusal is recorded.
+1. Injection at or above `hazardReview` → UNSAFE, with `persistRefusal: false` when the risk request was one-hot.
+2. The risk request was one-hot, and any gating hazard is at or above `hazardReview` or p(unsafe) is at or above `unsafeMinProbability` → UNSAFE with `persistRefusal: false`. It never reaches the reviewer, and no refusal is recorded.
 3. The safe gate passes as today, with no overlay flags → SAFE.
 4. Authorization `named` with p(`named`) at or above `namedMinProbability` (default 0.8, in `JevPolicy`), no overlay flags, at least one extracted action, and every segment matched or inert → SAFE. Exception: in a headless session, a hazard at or above `hazardBlock` or p(unsafe) at or above `unsafeMinProbability` goes to the reviewer instead.
 5. Authorization `named` or `goal` → reviewer. This includes every command with overlay flags.
@@ -220,7 +220,7 @@ Each phase ships as its own PR. Every failure-matrix row becomes a red test befo
 
 This bumps the policy version to `jev-v2.1`, because the policy hash covers the battery and thresholds but not the body of `deriveJevDecision` (`jev.ts:373-375`).
 
-A one-hot UNSAFE and a one-hot UNSURE show the same dialog today, and both block when headless (`index.ts:4724`, `index.ts:3926`). What differs is that UNSAFE writes refusal memory (`index.ts:4722`), which then turns later SAFE verdicts on the same target into dialogs. One-hot answers become UNSURE, so the fallback judge stops pinning targets for the session.
+A one-hot UNSAFE and a one-hot UNSURE show the same dialog today, and both block when headless (`index.ts:4724`, `index.ts:3926`). What differs is that UNSAFE writes refusal memory (`index.ts:4722`), which then turns later SAFE verdicts on the same target into dialogs. One-hot answers stay UNSAFE but carry `persistRefusal: false`, so the fallback judge stops pinning targets for the session. The verdict itself never weakens with the answer encoding, so no later branch that treats UNSURE more leniently can pick these up.
 
 ### Phase 2: the floor, the literal match, and the authorization request (about 2 days, in shadow)
 

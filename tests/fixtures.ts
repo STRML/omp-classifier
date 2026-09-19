@@ -237,6 +237,14 @@ export function jevAttemptCount(): number {
 	return modelCalls.length;
 }
 
+/** Which provider the scripted judge reports as having answered. TypeSafe by
+ *  default; anything else makes jev-judge.ts mark the answers one-hot, as the
+ *  keyword bridge's answers are. Reset by loadPlugin. */
+let jevAnsweringApi: string = TYPESAFE_PROVIDER;
+export function setJevAnsweringApi(api: string = TYPESAFE_PROVIDER): void {
+	jevAnsweringApi = api;
+}
+
 /** Serve this answer for every judgement from now on; drops a queued script. */
 export function setJevAnswer(answers: JevFixtureAnswers = jevSafeAnswer()): void {
 	jevDefaultAnswers = answers;
@@ -439,7 +447,7 @@ const scriptedJudge: Judge & { readonly kind: "typesafe" } = {
 		const scripted = await scriptedJudgement(questions, options?.signal);
 		if (scripted.kind === "status") throw statusError(scripted.status, scripted.body);
 		return {
-			api: TYPESAFE_PROVIDER,
+			api: jevAnsweringApi,
 			provider: TYPESAFE_PROVIDER,
 			model: scripted.model,
 			answers: scripted.answers as JudgmentResult<Q>["answers"],
@@ -562,6 +570,7 @@ export async function loadPlugin(settings: Record<string, unknown>): Promise<voi
 	jevUnavailable = false;
 	jevDelayMs = 5;
 	jevRawQueue.length = 0;
+	jevAnsweringApi = TYPESAFE_PROVIDER;
 	restoreJevApiKey();
 	const mod = await import("../index.ts");
 	mod.default({
