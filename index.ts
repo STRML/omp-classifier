@@ -711,7 +711,15 @@ function statusReportPath(): string {
 /** One decisions.jsonl line; the field order is the log contract (issue #33).
  *  `verdict` is null whenever no model verdict existed (static rules, caps,
  *  dialogs decided by a human); `ms` is wall-clock for the scope that logged
- *  the line (tool_call entry for gate lines, dialog entry for its outcome). */
+ *  the line (tool_call entry for gate lines, dialog entry for its outcome).
+ *  `userMessageIds` and `authorization` (Phase 0 item 5) make a false
+ *  positive auditable from the log alone: which user messages were in
+ *  evidence for this tool call, and how the decision read them, without
+ *  rebuilding the session transcript. There is no `branch`/decision-path
+ *  field: `layer` already names the path that decided (critical,
+ *  environment, rule, granted, verdict, cached, unclassified, dialog,
+ *  headless, cap, cwd, internal-error), so a second field would only
+ *  duplicate it under different spelling. */
 export interface DecisionRecord {
 	ts: string;
 	/** Unique line/action id for joining verdict and interaction entries. */
@@ -732,6 +740,19 @@ export interface DecisionRecord {
 	 *  was derived from. Absent on lines with no verdict (static rules, caps,
 	 *  dialogs decided by a human). */
 	jev?: Judgement["jev"];
+	/** Ids of the user messages that were in evidence for this tool call,
+	 *  taken verbatim from `UserEvidenceSnapshot.ids` (issue #31 plumbing).
+	 *  Ids only, never message text and never a hash of it — the log is an
+	 *  audit trail, not a second copy of the transcript. Present whenever the
+	 *  snapshot held at least one id, including every early return (critical
+	 *  pattern, env override, static rule, grant, cap, refusal dialog) so a
+	 *  false positive can be traced to exactly what the gate saw. */
+	userMessageIds?: string[];
+	/** `Judgement.authorization` carried onto the line when a judgement
+	 *  existed for this decision (a verdict, or a dialog/headless outcome
+	 *  that followed one). Absent on lines with no judgement (critical, env,
+	 *  static rule, grant, cap, unclassified). */
+	authorization?: Judgement["authorization"];
 	approval?: "allow-once" | "allow-session" | "always-allow" | "deny" | "headless" | "unavailable";
 	tool: "bash" | "eval";
 	decision: "allow" | "block";
@@ -3871,6 +3892,14 @@ export default function (pi: ExtensionAPI) {
 		tool: "bash" | "eval" = "bash",
 		logWhyPrefix = "",
 		userScopeFingerprint?: string,
+		/** The tool call's evidence snapshot ids (issue #33 audit fields),
+		 *  passed through from handleToolCall's single snapshot so the dialog
+		 *  or headless-block line carries the same ids as the verdict line it
+		 *  follows, or the ids alone when no judgement preceded it (critical,
+		 *  env override). */
+		userMessageIds?: string[],
+		/** `Judgement.authorization`, when a judgement preceded this dialog. */
+		authorization?: Judgement["authorization"],
 	): Promise<{ block: true; reason: string } | undefined> => {
 		const subject = tool === "eval" ? "eval code" : "bash command";
 		const detail = reason ? `${headline}: ${reason}` : headline;
@@ -3904,6 +3933,8 @@ export default function (pi: ExtensionAPI) {
 				ms: Date.now() - began,
 				...(approval ? { approval } : {}),
 				...(stale === "" ? {} : { staleCode: 1 as const }),
+				...(userMessageIds && userMessageIds.length > 0 ? { userMessageIds } : {}),
+				...(authorization ? { authorization } : {}),
 			});
 		const block = (whyOverride?: string, approval: DecisionRecord["approval"] = ctx.hasUI ? "deny" : "headless"): { block: true; reason: string } => {
 			// Verdict-driven callers pass "follows verdict" so the dialog/headless
@@ -4040,6 +4071,12 @@ export default function (pi: ExtensionAPI) {
 		const citableUserEvidence = citableEvidence(userEvidenceSnapshot?.messages);
 		const evidenceSnapshot = userEvidenceSnapshot;
 		const reviewEvidenceFingerprint = evidenceFingerprint(citableUserEvidence, reviewOperatorContext, userEvidenceSnapshot?.ids);
+		// Attach the same snapshot's ids to every audit line for this tool call,
+		// including the early returns before classification (issue #33 audit
+		// evidence fields). One snapshot, reused everywhere it is logged — never
+		// a second collectTaskEvidence call, and never the message text itself.
+		const auditUserMessageIds: string[] | undefined =
+			userEvidenceSnapshot && userEvidenceSnapshot.ids.length > 0 ? userEvidenceSnapshot.ids : undefined;
 		// Grants are scoped to durable authorization/restriction language, not
 		// every progress message or host-generated message id. A new "status?"
 		// must not revoke approval; a later "do not publish" must.
@@ -4150,7 +4187,7 @@ export default function (pi: ExtensionAPI) {
 					`eval code blocked: ${evalCode.length} chars exceeds the ` +
 					`${config.maxCommandLength}-character review limit`;
 				const replay = replayDecision({ tool: "eval", command: evalCode, cwd: ctx.cwd, maxCommandLength: config.maxCommandLength, headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: replay.layer, why, cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
+				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: replay.layer, why, cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
 				addRefusal(ctx, evalCode, why, { source: "cap", cwd });
 				return {
 					block: true,
@@ -4177,7 +4214,7 @@ export default function (pi: ExtensionAPI) {
 			if (matchingGrant(ctx, normalizeEvalGrantTarget(evalCode), cwd, userScopeFingerprint)) {
 				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, grant: "session" });
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: replay.layer, why: "session grant", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started });
+					logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: replay.layer, why: "session grant", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
 					return;
 				}
 			}
@@ -4208,7 +4245,7 @@ export default function (pi: ExtensionAPI) {
 					},
 				));
 				if (!judgement) {
-					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", userScopeFingerprint);
+					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", userScopeFingerprint, auditUserMessageIds);
 				}
 				if (!cached && judgement.verdict !== "UNAVAILABLE" && !judgement.noCache) remember(scoped, cacheKey, judgement);
 				const logCode = truncated(evalCode.replace(/\s+/gu, " ").trim(), 120);
@@ -4235,7 +4272,7 @@ export default function (pi: ExtensionAPI) {
 					if (replay.decision === "allow") {
 						// Fresh SAFE auto-run logs layer "verdict"; a replayed cached
 						// verdict logs "cached" — provenance, same allow.
-						logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}) });
+						logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
 						return;
 					}
 					// A SAFE on a target this session already refused is not a
@@ -4248,8 +4285,8 @@ export default function (pi: ExtensionAPI) {
 						flagList.length > 0
 							? `classifier-safe but flags: ${flagList.join(", ")}`
 							: replay.why;
-					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}) });
-					return await requestPermission(ctx, target, "flagged for approval", why, "eval", flagList.length > 0 ? "follows verdict" : "despite prior refusal", userScopeFingerprint);
+					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
+					return await requestPermission(ctx, target, "flagged for approval", why, "eval", flagList.length > 0 ? "follows verdict" : "despite prior refusal", userScopeFingerprint, auditUserMessageIds, judgement.authorization);
 				}
 				const detail =
 					judgement.verdict === "UNSAFE"
@@ -4272,6 +4309,8 @@ export default function (pi: ExtensionAPI) {
 					...(judgement.modelId ? { modelId: judgement.modelId } : {}),
 					...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}),
 					...(judgement.jev ? { jev: judgement.jev } : {}),
+					...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}),
+					...(judgement.authorization ? { authorization: judgement.authorization } : {}),
 				});
 				// A refusal record (issue #30) needs a verdict that judged the
 				// content, and with Jev that means UNSAFE outright: UNSURE is
@@ -4282,10 +4321,10 @@ export default function (pi: ExtensionAPI) {
 				if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
 					addRefusal(ctx, evalCode, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
 				}
-				return await requestPermission(ctx, target, detail, judgement.reason, "eval", "follows verdict", userScopeFingerprint);
+				return await requestPermission(ctx, target, detail, judgement.reason, "eval", "follows verdict", userScopeFingerprint, auditUserMessageIds, judgement.authorization);
 			} catch (err) {
 				pi.logger.error(`classifier: ${err instanceof Error ? err.message : String(err)}`);
-				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "internal-error", why: "classifier failed; eval code not run", cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
+				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "internal-error", why: "classifier failed; eval code not run", cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
 				return {
 					block: true,
 					reason: refusalPayload(
@@ -4306,7 +4345,7 @@ export default function (pi: ExtensionAPI) {
 				`bash command blocked: ${command.length} chars exceeds the ` +
 				`${config.maxCommandLength}-character review limit`;
 			const replay = replayDecision({ tool: "bash", command, cwd: ctx.cwd, maxCommandLength: config.maxCommandLength, headless: !ctx.hasUI });
-			logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why, cmd: command, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
+			logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why, cmd: command, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
 				addRefusal(ctx, command, why, { source: "cap", cwd: ctx.cwd });
 			return {
 				block: true,
@@ -4403,7 +4442,7 @@ export default function (pi: ExtensionAPI) {
 			// that ExtensionContext does not expose. Passing the raw URL to
 			// resolveToCwd would mislabel it; skipping the gate would fail open.
 			if (cwdInput?.includes("://") || cwdInput?.includes("local:/")) {
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "cwd", why: "classifier cannot resolve an internal-URL cwd; command not run", cmd: command, cwd: cwdInput ?? ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "cwd", why: "classifier cannot resolve an internal-URL cwd; command not run", cmd: command, cwd: cwdInput ?? ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
 				return {
 					block: true,
 					reason: refusalPayload(
@@ -4464,7 +4503,7 @@ export default function (pi: ExtensionAPI) {
 			// without appearing in settings at all.
 			if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command))) {
 				const replay = replayDecision({ tool: "bash", command, cwd, riskFlags: ["critical"], headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "critical pattern: matches a built-in dangerous-command pattern", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "critical pattern: matches a built-in dangerous-command pattern", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
 				// A critical hit is a refusal (issue #30) however the dialog below
 				// ends: the pattern itself is the memory. An approval lifts it via
 				// requestPermission.
@@ -4477,6 +4516,7 @@ export default function (pi: ExtensionAPI) {
 					"bash",
 					"",
 					userScopeFingerprint,
+					auditUserMessageIds,
 				);
 			}
 
@@ -4486,7 +4526,7 @@ export default function (pi: ExtensionAPI) {
 			// values are not shown to the classifier — they can hold secrets.
 			if (env.key !== "") {
 				const replay = replayDecision({ tool: "bash", command, cwd, envKeys: env.keys, headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "environment override: command runs with caller-supplied env; not classified", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "environment override: command runs with caller-supplied env; not classified", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
 				return await requestPermission(
 					ctx,
 					target,
@@ -4495,6 +4535,7 @@ export default function (pi: ExtensionAPI) {
 					"bash",
 					"",
 					userScopeFingerprint,
+					auditUserMessageIds,
 				);
 			}
 
@@ -4516,7 +4557,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (rule?.approval === "allow" && !isBlanketPattern(rule.match)) {
 				const replay = replayDecision({ tool: "bash", command, cwd, staticRule: "allow", headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: `rule: ${rule.match}`, cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
+				logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: `rule: ${rule.match}`, cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
 				return;
 			}
 			if (!rule && policy.bashPolicy === "prompt") {
@@ -4576,7 +4617,7 @@ export default function (pi: ExtensionAPI) {
 			if (matchingGrant(ctx, grantKeyForCommand(command), cwd, userScopeFingerprint)) {
 				const replay = replayDecision({ tool: "bash", command, cwd, grant: "session" });
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "session grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "session grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
 					return;
 				}
 			}
@@ -4595,7 +4636,7 @@ export default function (pi: ExtensionAPI) {
 			if (matchingPersistentGrant(command, cwd)) {
 				const replay = replayDecision({ tool: "bash", command, cwd, grant: "persistent" });
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "persistent grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started });
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "persistent grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
 					return;
 				}
 			}
@@ -4631,6 +4672,10 @@ export default function (pi: ExtensionAPI) {
 					target,
 					"unclassified",
 					classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable",
+					"bash",
+					"",
+					undefined,
+					auditUserMessageIds,
 				);
 			}
 			// A failed request is a transient failure, not a policy: do NOT
@@ -4669,7 +4714,7 @@ export default function (pi: ExtensionAPI) {
 					headless: !ctx.hasUI,
 				});
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: command, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}) });
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: command, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
 					return;
 				}
 				// A SAFE on a target this session already refused is not a clean
@@ -4684,7 +4729,7 @@ export default function (pi: ExtensionAPI) {
 						: `classifier-safe despite prior refusal of "${priorTarget}"`;
 				const foot = trashFootnote(flags);
 				const dialogWhy = foot === "" ? why : `${why}\n${foot}`;
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", why, cmd: command, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}) });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", why, cmd: command, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
 				return await requestPermission(
 					ctx,
 					target,
@@ -4693,6 +4738,8 @@ export default function (pi: ExtensionAPI) {
 					"bash",
 					flags.length > 0 ? "follows verdict" : "despite prior refusal",
 					userScopeFingerprint,
+					auditUserMessageIds,
+					judgement.authorization,
 				);
 			}
 			const verdict = judgement.verdict;
@@ -4715,6 +4762,8 @@ export default function (pi: ExtensionAPI) {
 				...(judgement.modelId ? { modelId: judgement.modelId } : {}),
 				...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}),
 				...(judgement.jev ? { jev: judgement.jev } : {}),
+				...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}),
+				...(judgement.authorization ? { authorization: judgement.authorization } : {}),
 			});
 			// A refusal record (issue #30) needs a verdict that judged the
 			// content, and with Jev that means UNSAFE outright: UNSURE is
@@ -4725,12 +4774,12 @@ export default function (pi: ExtensionAPI) {
 			if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
 				addRefusal(ctx, command, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
 			}
-			return await requestPermission(ctx, target, detail, judgement.reason, "bash", "follows verdict", userScopeFingerprint);
+			return await requestPermission(ctx, target, detail, judgement.reason, "bash", "follows verdict", userScopeFingerprint, auditUserMessageIds, judgement.authorization);
 		} catch (err) {
 			// Unexpected plugin error: fail closed rather than wave the command
 			// through on a path we cannot vouch for.
 			pi.logger.error(`classifier: ${err instanceof Error ? err.message : String(err)}`);
-			logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "internal-error", why: "classifier failed; command not run", cmd: command, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started });
+			logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "internal-error", why: "classifier failed; command not run", cmd: command, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
 			return {
 				block: true,
 				reason: refusalPayload(
