@@ -576,8 +576,11 @@ describe("judgeBattery", () => {
 		expect(safeDecision.reasonCode).toBe("jev:safe");
 		expect(safeDecision.reason).toContain("(llm keyword answer)");
 
+		// A keyword "unsafe" asks but is not UNSAFE: UNSAFE writes refusal memory
+		// (index.ts), and a keyword has no distribution behind it to pin a target
+		// for the rest of the session. The reason code still names what it said.
 		const unsafeDecision = await decide(oneHot("unsafe"), { api: "chat" });
-		expect(unsafeDecision.verdict).toBe("UNSAFE");
+		expect(unsafeDecision.verdict).toBe("UNSURE");
 		expect(unsafeDecision.reasonCode).toBe("jev:unsafe");
 		expect(unsafeDecision.reason).toContain("(llm keyword answer)");
 
@@ -589,11 +592,12 @@ describe("judgeBattery", () => {
 		expect(unsureDecision.reasonCode).toBe("jev:below-floor");
 		expect(unsureDecision.reason).toBe("below floor: choice unsure (llm keyword answer)");
 
-		// A keyword "safe" cannot wave off a hazard or a wide blast radius: those
-		// thresholds read correctly on one-hot values already.
+		// A keyword "safe" cannot wave off a hazard or a wide blast radius. A
+		// keyword hazard at 1 still asks, as UNSURE for the same reason as above.
 		const dirty = await decide(oneHot("safe", { exposes_secrets: 1 }), { api: "chat" });
-		expect(dirty.verdict).toBe("UNSAFE");
+		expect(dirty.verdict).toBe("UNSURE");
 		expect(dirty.reasonCode).toBe("jev:hazard:exposes_secrets");
+		expect(dirty.reason).toContain("(llm keyword answer)");
 
 		const wide = await decide(oneHot("safe", {}, 2), { api: "chat" });
 		expect(wide.verdict).toBe("UNSURE");
