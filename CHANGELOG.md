@@ -2,6 +2,10 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-09-19
+
+- One-hot answers stop writing refusal memory (policy `jev-v2.1`). When a keyword bridge answers instead of TypeSafe, a hazard at or above `hazardBlock` or `p(unsafe)` at or above `unsafeMinProbability` now derives `UNSURE` instead of `UNSAFE`. The user sees the same dialog, and a headless session is blocked the same way. The difference is refusal memory: `UNSAFE` recorded a model refusal that turned later SAFE verdicts on the same target into dialogs for the rest of the session, on the strength of a keyword with no distribution behind it. Reason codes are unchanged. Phase 1 of the intent-aware judgment plan (#70).
+
 ## 2026-09-17 — Jev port (v0.3.0)
 
 - Judgment moved from a prompted local model to Jev, TypeSafe's System One model: one HTTP request per classification (`POST https://api.typesafe.ai/v1/systemone`, `model: jev-latest`), plain `fetch`, no SDK dependency. The two-stage contract goes with the prompt that defined it — `CLASSIFIER_PROMPT`, the capped `ANALYSIS` plus terminal `VERDICT:` line, `parseJudgement`, the verdict regexes, the reviewer pass, and every post-parse check that read the model's prose (citation grounding, egress consistency, write scope). Jev never writes prose: it answers typed questions, and the verdict is derived in code from the returned probabilities, so a decision's reason is assembled from numbers and hazard ids and the machine-readable `reasonCode` carries the same information (`jev:safe`, `jev:unsafe`, `jev:hazard:<name>`, `jev:blast-radius`, `jev:below-floor`, `jev:unavailable`).

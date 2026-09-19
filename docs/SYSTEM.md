@@ -95,6 +95,10 @@ through), then `deriveJevDecision(answers, policy)` derives the verdict in a fix
 1. a hazard at or above `hazardBlock` → `UNSAFE` (a hard safety signal outranks the verdict
    distribution — the choice can say "safe" right next to it)
 2. p(unsafe) at or above `unsafeMinProbability` → `UNSAFE`
+
+   When the answers are one-hot (a keyword bridge answered), branches 1 and 2 return `UNSURE`
+   instead: the command still asks, but a keyword answer does not write refusal memory.
+
 3. the safe gate: p(safe) and confidence above their floors, no hazard at or above
    `hazardReview`, blast radius below `blastRadiusReview` → `SAFE`
 4. a hazard at or above `hazardReview` → `UNSURE`
@@ -214,7 +218,7 @@ surface. Kill switches layered, and never gated by the thing they switch off.
 
 | Identity | Value | Changes when |
 | --- | --- | --- |
-| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v1` | the meaning of a verdict or a policy knob changes |
+| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v2.1` | the meaning of a verdict or a policy knob changes |
 | `jevQuestionsHash()` (`CLASSIFIER_POLICY_HASH`) | sha256 over version + serialized battery + `DEFAULT_JEV_POLICY`, first 16 hex | the battery, its question ids, or the shipped default changes |
 | `QUESTIONS_CONTRACT` | `questions+probabilities` | the answer shape the parser accepts changes |
 
