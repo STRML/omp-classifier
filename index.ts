@@ -132,6 +132,9 @@ interface Judgement {
 	 * session to a stale non-answer.
 	 */
 	noCache?: boolean;
+	/** False when an UNSAFE must not be written to refusal memory (a one-hot
+	 *  keyword answer, jev-v2.1). Absent means true. */
+	persistRefusal?: boolean;
 }
 
 /** Per-session cache: sessionId -> `${cwd}\0${env}\0${pty}\0${command}` -> judgement. */
@@ -3641,6 +3644,7 @@ export default function (pi: ExtensionAPI) {
 				verdict: decision.verdict,
 				reason: decision.reason,
 				reasonCode: decision.reasonCode,
+				...(decision.persistRefusal ? {} : { persistRefusal: false }),
 				risk,
 				authorization,
 				modelId: answers.model,
@@ -4275,7 +4279,7 @@ export default function (pi: ExtensionAPI) {
 				// failure is not evidence about the command). Only a human denial
 				// makes an undecided command a refusal — requestPermission
 				// records that itself.
-				if (judgement.verdict === "UNSAFE") {
+				if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
 					addRefusal(ctx, evalCode, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
 				}
 				return await requestPermission(ctx, target, detail, judgement.reason, "eval", "follows verdict", userScopeFingerprint);
@@ -4718,7 +4722,7 @@ export default function (pi: ExtensionAPI) {
 			// failure is not evidence about the command). Only a human denial
 			// makes an undecided command a refusal — requestPermission records
 			// that itself.
-			if (judgement.verdict === "UNSAFE") {
+			if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
 				addRefusal(ctx, command, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
 			}
 			return await requestPermission(ctx, target, detail, judgement.reason, "bash", "follows verdict", userScopeFingerprint);

@@ -96,8 +96,9 @@ through), then `deriveJevDecision(answers, policy)` derives the verdict in a fix
    distribution — the choice can say "safe" right next to it)
 2. p(unsafe) at or above `unsafeMinProbability` → `UNSAFE`
 
-   When the answers are one-hot (a keyword bridge answered), branches 1 and 2 return `UNSURE`
-   instead: the command still asks, but a keyword answer does not write refusal memory.
+   When the answers are one-hot (a keyword bridge answered), the decision carries
+   `persistRefusal: false`: the verdict is still `UNSAFE` and still asks, but a keyword answer
+   does not write refusal memory.
 
 3. the safe gate: p(safe) and confidence above their floors, no hazard at or above
    `hazardReview`, blast radius below `blastRadiusReview` → `SAFE`

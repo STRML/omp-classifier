@@ -4,6 +4,7 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-19
 
+- One-hot UNSAFE verdicts stay UNSAFE (follow-up to #74). #74 relabelled them UNSURE to skip the refusal write. The verdict now stays UNSAFE and the decision carries `persistRefusal: false`, which both `addRefusal` sites check, so the deny never weakens with the answer encoding and a later branch that treats UNSURE more leniently cannot pick up a keyword "unsafe". The dialog label is "classified unsafe" again. Raised by an automated security review.
 - One-hot answers stop writing refusal memory (policy `jev-v2.1`). When a keyword bridge answers instead of TypeSafe, a hazard at or above `hazardBlock` or `p(unsafe)` at or above `unsafeMinProbability` now derives `UNSURE` instead of `UNSAFE`. The user sees the same dialog, and a headless session is blocked the same way. The difference is refusal memory: `UNSAFE` recorded a model refusal that turned later SAFE verdicts on the same target into dialogs for the rest of the session, on the strength of a keyword with no distribution behind it. Reason codes are unchanged. Phase 1 of the intent-aware judgment plan (#70).
 
 ## 2026-09-17 — Jev port (v0.3.0)
