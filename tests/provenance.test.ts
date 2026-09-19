@@ -5,6 +5,22 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+// Real git in a temp repo. The runner has no global identity and may default
+// to a branch other than main, so pin both, and ignore the host's git config
+// (signing, hooks, templates) so the fixture is the same everywhere.
+const GIT_ENV = {
+	...process.env,
+	GIT_CONFIG_GLOBAL: "/dev/null",
+	GIT_CONFIG_NOSYSTEM: "1",
+	GIT_AUTHOR_NAME: "test",
+	GIT_AUTHOR_EMAIL: "test@example.com",
+	GIT_COMMITTER_NAME: "test",
+	GIT_COMMITTER_EMAIL: "test@example.com",
+};
+const git = (script: string, cwd: string): void => {
+	execSync(script, { cwd, env: GIT_ENV });
+};
+
 describe("gate-measured git push provenance (#63)", () => {
 	test("a non-push command carries no provenance", () => {
 		expect(measureGitPushProvenance("echo hello", "/tmp")).toBeUndefined();
@@ -22,7 +38,7 @@ describe("gate-measured git push provenance (#63)", () => {
 	test("equal tips: forwardOnly true, ahead 0 behind 0", () => {
 		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
 		try {
-			execSync("git init -q && git commit -q --allow-empty -m base && git branch side && git update-ref refs/remotes/origin/side HEAD", { cwd: dir });
+			git("git init -q -b main && git commit -q --allow-empty -m base && git branch side && git update-ref refs/remotes/origin/side HEAD", dir);
 			const p = measureGitPushProvenance("git push origin +main:side --force-with-lease", dir);
 			expect(p?.forwardOnly).toBe(true);
 			expect(p?.ahead).toBe(0);
@@ -40,11 +56,11 @@ describe("gate-measured git push provenance (#63)", () => {
 	test("diverged tips: behind above zero, forwardOnly false", () => {
 		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
 		try {
-			execSync("git init -q && git commit -q --allow-empty -m base", { cwd: dir });
+			git("git init -q -b main && git commit -q --allow-empty -m base", dir);
 			// Remote gets its own commit; local gets a different one: a genuine
 			// divergence where the push would discard the remote's commit.
-			execSync("git checkout -q --detach HEAD && git commit -q --allow-empty -m remote-only && git update-ref refs/remotes/origin/side HEAD", { cwd: dir });
-			execSync("git checkout -q main && git commit -q --allow-empty -m local-only", { cwd: dir });
+			git("git checkout -q --detach HEAD && git commit -q --allow-empty -m remote-only && git update-ref refs/remotes/origin/side HEAD", dir);
+			git("git checkout -q main && git commit -q --allow-empty -m local-only", dir);
 			const p = measureGitPushProvenance("git push origin main:side", dir);
 			expect(p?.behind).toBe(1);
 			expect(p?.ahead).toBe(1);
@@ -57,7 +73,7 @@ describe("gate-measured git push provenance (#63)", () => {
 	test("an untracked remote yields null tips, not a guess", () => {
 		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
 		try {
-			execSync("git init -q && git commit -q --allow-empty -m base", { cwd: dir });
+			git("git init -q -b main && git commit -q --allow-empty -m base", dir);
 			const p = measureGitPushProvenance("git push https://example.com/x.git main:main", dir);
 			expect(p?.remoteTip).toBeNull();
 			expect(p?.localTip).not.toBeNull();
