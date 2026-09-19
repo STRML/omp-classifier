@@ -60,7 +60,7 @@ beforeEach(async () => {
 	// decisions.jsonl location — lands in the fixture dir and the audit tests
 	// read an empty log.
 	removeConfigFile();
-	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-jevens-outage-"));
+	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-classifier-outage-"));
 	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));
 	// The default fixture answer is safe; every test that wants a verdict

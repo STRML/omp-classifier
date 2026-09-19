@@ -307,7 +307,7 @@ export function restoreJevApiKey(): void {
 export function clearJevApiKey(): void {
 	jevApiKeyPresent = false;
 	delete process.env.TYPESAFE_API_KEY;
-	process.env.PATH = "/nonexistent-omp-jevens-test-bin";
+	process.env.PATH = "/nonexistent-omp-classifier-test-bin";
 }
 
 async function sleepWithAbort(ms: number, signal: AbortSignal | undefined): Promise<void> {
@@ -744,7 +744,7 @@ function lockfilePathForTests(): string {
 		// the next run inheriting it would believe the plugin is disabled — the
 		// machine-state dependence this indirection exists to remove.
 		const suffix = Math.random().toString(36).slice(2, 10);
-		testLockPath = path.join(os.tmpdir(), `omp-jevens-test-lock-${process.pid}-${suffix}.json`);
+		testLockPath = path.join(os.tmpdir(), `omp-classifier-test-lock-${process.pid}-${suffix}.json`);
 	}
 	return testLockPath;
 }
@@ -784,7 +784,7 @@ export function useTempConfigFile(): string {
 		// resolves to dirname(OMP_JEV_CONFIG)/decisions.jsonl, so one
 		// dir keeps config + audit artifacts together and cleanable at exit.
 		if (!testConfigDir) {
-			testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), `omp-jevens-test-${process.pid}-`));
+			testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), `omp-classifier-test-${process.pid}-`));
 		}
 		testConfigPath = path.join(testConfigDir, "omp-classifier.json");
 	}
