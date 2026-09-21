@@ -76,6 +76,11 @@ describe("floor entry 2 — a secret leaving its source for a sink that is not a
 		expect(asks(`${KEYCHAIN} >> /tmp/keep`)).toBe(true);
 		// A discarded first read does not cover a printed second one.
 		expect(asks(`${KEYCHAIN} &>/dev/null && ${KEYCHAIN} | pbcopy`)).toBe(true);
+		// Both-stream spellings that append to or duplicate onto /dev/null.
+		expect(asks(`${KEYCHAIN} &>>/dev/null`)).toBe(false);
+		expect(asks(`${KEYCHAIN} >&/dev/null`)).toBe(false);
+		// `>&2` redirects onto stderr, which still prints.
+		expect(asks(`${KEYCHAIN} >&2`)).toBe(true);
 	});
 
 	test("a quoted redirect is an argument that prints, not a redirect", () => {
@@ -101,6 +106,18 @@ describe("floor entry 2 — a secret leaving its source for a sink that is not a
 			"pass 'show' services/x",
 		]) {
 			expect(asks(command)).toBe(true);
+		}
+	});
+
+	test("a prefix that does not keep assignment position is not a capture", () => {
+		// Verified against bash: `nohup TOKEN=$(…) true` runs a COMMAND named
+		// `TOKEN=<the secret>`, and the shell's error prints it. The same for
+		// `command` and `builtin`. Reading them as captures allowed the sink
+		// and recorded a taint for a variable that never existed.
+		for (const prefix of ["nohup", "command", "builtin"]) {
+			const result = evaluateFloor({ command: `${prefix} TOKEN=$(op read op://v/i/c) true` });
+			expect(result.asks).toBe(true);
+			expect(result.tainted).toEqual([]);
 		}
 	});
 

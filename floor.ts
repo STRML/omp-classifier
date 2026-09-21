@@ -195,19 +195,36 @@ function captureTarget(word: string): string | undefined {
 	return match?.[1];
 }
 
-/** Words that can stand in front of an assignment without ending the
- *  assignment position: `env TOKEN=$(…) cmd`, `local KEY=$(…)` in a function,
- *  and the function header that encloses it. */
-const ASSIGNMENT_PREFIX = /^(env|local|declare|typeset|readonly|export|nohup|command|builtin|time|function|\{|[A-Za-z_][A-Za-z0-9_]*\(\))$/u;
+/**
+ * Words that can stand in front of an assignment without ending the
+ * assignment position: `env TOKEN=$(…) cmd`, `local KEY=$(…)` in a function,
+ * and the function header that encloses it.
+ *
+ * Checked against a real bash, not from memory, because the first version of
+ * this list was wrong in the dangerous direction. `nohup`, `command` and
+ * `builtin` do NOT keep assignment position: under them `TOKEN=$(…)` runs as
+ * a command NAME, the substitution expands, and the shell's "not found" error
+ * carries the secret to the transcript. Anything added here needs the same
+ * check.
+ */
+const ASSIGNMENT_PREFIX = /^(env|local|declare|typeset|readonly|export|time|function|\{|[A-Za-z_][A-Za-z0-9_]*\(\))$/u;
 
-/** True when every word before this one is an assignment or a prefix that can
- *  precede one, which is the only place a shell performs an assignment. An
- *  argument to a command is not: `curl -d token=$(op read …)` sends the secret
- *  rather than capturing it. */
+/**
+ * Whether the shell will treat this word as an assignment rather than as a
+ * command name or an argument.
+ *
+ * What decides is the nearest word back that is not itself an assignment: the
+ * segment's start, or a word that keeps assignment position. `nohup env
+ * TOKEN=$(…)` is a capture because `env` sits in front of it, while `nohup
+ * TOKEN=$(…)` is a command name, and `curl -d token=$(…)` is an argument.
+ */
 function inAssignmentPosition(segment: readonly Word[], index: number): boolean {
-	return segment
-		.slice(0, index)
-		.every(word => ASSIGNMENT_PREFIX.test(unquote(word.text)) || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(unquote(word.text)));
+	for (let before = index - 1; before >= 0; before -= 1) {
+		const word = unquote(segment[before].text);
+		if (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(word)) continue;
+		return ASSIGNMENT_PREFIX.test(word);
+	}
+	return true;
 }
 
 /** A redirect that discards the SECRET, which means stdout: `>/dev/null` or
@@ -218,11 +235,15 @@ function isDevNullRedirect(segment: readonly Word[], index: number): boolean {
 	// prints, and unquoting it first made it look like the allowed sink.
 	const text = segment[index].text;
 	if (/["']/u.test(text)) return false;
-	const match = /^(\d?|&)>{1,2}(.*)$/u.exec(text);
+	const match = /^(\d?|&)>{1,2}(&?)(.*)$/u.exec(text);
 	if (match === null) return false;
-	if (match[1] !== "" && match[1] !== "1" && match[1] !== "&") return false;
-	if (match[2] === "/dev/null") return true;
-	return match[2] === "" && unquote(segment[index + 1]?.text ?? "") === "/dev/null";
+	const [, fd, duplicated, target] = match;
+	// Only a redirect of stdout, or of both streams, discards the secret.
+	if (fd !== "" && fd !== "1" && fd !== "&") return false;
+	// `>&2` and `1>&2` point stdout at another open stream, which still prints.
+	if (duplicated === "&" && /^\d+$/u.test(target)) return false;
+	if (target === "/dev/null") return true;
+	return target === "" && unquote(segment[index + 1]?.text ?? "") === "/dev/null";
 }
 
 interface SecretOccurrence {
@@ -343,7 +364,7 @@ function splitWords(text: string): Word[][] {
 			}
 			const operator = char === "&" ? ">" : char;
 			while (text[index + 1] === operator) {
-				current += char;
+				current += operator;
 				index += 1;
 			}
 			// `2>&1` and `>/dev/null` attach their target; a space-separated
