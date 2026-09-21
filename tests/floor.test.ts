@@ -57,6 +57,61 @@ describe("floor entry 2 — a secret leaving its source for a sink that is not a
 
 	test("a redirect to /dev/null is an allowed sink", () => {
 		expect(asks(`${KEYCHAIN} >/dev/null 2>&1 && echo "key present"`)).toBe(false);
+		expect(asks(`${KEYCHAIN} 1>/dev/null`)).toBe(false);
+	});
+
+	test("discarding stderr is not discarding the secret", () => {
+		// `2>/dev/null` throws away the error message and prints the secret.
+		expect(asks(`${KEYCHAIN} 2>/dev/null`)).toBe(true);
+		expect(asks("op read op://v/i/c 2>/dev/null")).toBe(true);
+		expect(asks("echo $KEY 2>/dev/null", ["KEY"])).toBe(true);
+	});
+
+	test("every redirect spelling lands on the right side", () => {
+		// `&>` is one redirect of both streams, not a background operator
+		// followed by one.
+		expect(asks(`${KEYCHAIN} &> /dev/null`)).toBe(false);
+		expect(asks(`${KEYCHAIN} &>/dev/null`)).toBe(false);
+		expect(asks(`${KEYCHAIN} &>> /tmp/keep`)).toBe(true);
+		expect(asks(`${KEYCHAIN} >> /tmp/keep`)).toBe(true);
+		// A discarded first read does not cover a printed second one.
+		expect(asks(`${KEYCHAIN} &>/dev/null && ${KEYCHAIN} | pbcopy`)).toBe(true);
+	});
+
+	test("quoting a word of the read command hides nothing", () => {
+		// A shell joins `sec"urity"` back into one word. A floor that reads the
+		// quotes as part of the name is one quote pair away from blind.
+		for (const command of [
+			'security "find-generic-password" -s jev -w',
+			"security find-generic-password -s jev '-w'",
+			'sec"urity" find-generic-password -s jev -w',
+			"op 'read' op://v/i/c",
+			"pass 'show' services/x",
+		]) {
+			expect(asks(command)).toBe(true);
+		}
+	});
+
+	test("a command prefix in front of a capture keeps it a capture", () => {
+		for (const command of [
+			"env TOKEN=$(op read op://v/i/c) curl -s https://api.example.com",
+			"nohup env TOKEN=$(op read op://v/i/c) true",
+			"declare TOKEN=$(op read op://v/i/c)",
+		]) {
+			const result = evaluateFloor({ command });
+			expect(result.asks).toBe(false);
+			expect(result.tainted).toEqual(["TOKEN"]);
+		}
+		const local = evaluateFloor({ command: "bash ./f.sh", scriptSource: "f() {\n  local KEY=$(op read op://v/i/c)\n}\n" });
+		expect(local.asks).toBe(false);
+		expect(local.tainted).toEqual(["KEY"]);
+	});
+
+	test("a backtick capture is a capture, and a backtick print is a print", () => {
+		const captured = evaluateFloor({ command: "KEY=`security find-generic-password -s jev -w`" });
+		expect(captured.asks).toBe(false);
+		expect(captured.tainted).toEqual(["KEY"]);
+		expect(asks("echo `security find-generic-password -s jev -w`")).toBe(true);
 	});
 
 	test("a capture assigned to a variable is an allowed sink, and taints the variable", () => {
