@@ -88,7 +88,10 @@ const INTERPRETER = "sh|bash|zsh|dash|ksh|fish|python3?|node|bun|deno|ruby|perl|
 const FETCH = /\b(curl|wget|aria2c|httpie|http)\b/u;
 const PIPE_TO_INTERPRETER = new RegExp(String.raw`\|\s*(sudo\s+)?(${INTERPRETER})(\s|$)`, "u");
 const PROCESS_SUBSTITUTION_FETCH = new RegExp(String.raw`\b(${INTERPRETER})\s+<\(\s*(curl|wget)`, "u");
-const PIPE_TO_PASSWORD_STDIN = /\|[^|;&]*--password-stdin/u;
+/** Commands that read a credential from stdin for their own login. The
+ *  `--password-stdin` exemption is for handing a secret to one of these, not
+ *  for any command that happens to carry the flag. */
+const CREDENTIAL_CONSUMER = /^(docker|podman|nerdctl|buildah|helm|gh|glab|npm|pnpm|yarn|crane|skopeo)$/u;
 
 const BASE64_DECODE = /\bbase64\s+(-{1,2}[dD]\b|--decode\b)/u;
 const DECODE_INTO_EXEC = /\b(exec|eval|compile)\s*\(\s*[^)]*\b(b64decode|b64_decode|urlsafe_b64decode|atob|from_base64)\b/u;
@@ -132,13 +135,14 @@ function scanText(text: string, source: FloorFinding["source"], tainted: readonl
  */
 function scanSecrets(text: string, source: FloorFinding["source"], tainted: readonly string[], findings: FloorFinding[], capturedOut: string[]): void {
 	const shellTracing = SHELL_TRACING.test(text);
-	const passwordStdinPipe = PIPE_TO_PASSWORD_STDIN.test(text);
-	for (const segment of splitWords(text)) {
+	const allSegments = splitWords(text);
+	allSegments.forEach((entry, segmentIndex) => {
+		const segment = entry.words;
 		const words = segment.map(word => word.text);
 		const verb = unquote(words[0] ?? "");
 		const tracing = shellTracing || (TRACING_CLIENT_VERB.test(verb) && words.some(word => CLIENT_TRACING.test(unquote(word))));
 		const toDevNull = segment.some((_word, index) => isDevNullRedirect(segment, index));
-		const feedsPasswordStdin = passwordStdinPipe && /^(echo|printf|cat)$/u.test(verb);
+		const feedsPasswordStdin = /^(echo|printf|cat)$/u.test(verb) && consumesPasswordStdin(allSegments[segmentIndex + 1]);
 		const segmentText = words.map(unquote).join(" ");
 
 		segment.forEach((word, index) => {
@@ -169,7 +173,19 @@ function scanSecrets(text: string, source: FloorFinding["source"], tainted: read
 		for (const occurrence of segmentCommandReads(segmentText, segment)) {
 			record(occurrence, tracing, toDevNull, feedsPasswordStdin, source, findings);
 		}
-	}
+	});
+}
+
+/**
+ * Whether the next stage of the pipeline is a credential consumer reading the
+ * password from stdin. Bound to the stage that actually receives the secret:
+ * `printf … | tee /tmp/leak | docker login --password-stdin` keeps a copy in
+ * the middle, so the exemption must not reach past `tee`.
+ */
+function consumesPasswordStdin(next: Segment | undefined): boolean {
+	if (next === undefined || !next.pipedFromPrevious) return false;
+	if (!CREDENTIAL_CONSUMER.test(unquote(next.words[0]?.text ?? ""))) return false;
+	return next.words.some(word => unquote(word.text) === "--password-stdin");
 }
 
 function record(
@@ -308,6 +324,14 @@ interface Word {
 	text: string;
 }
 
+interface Segment {
+	words: Word[];
+	/** True when a `|` joined this segment to the one before it, so the
+	 *  previous segment's output is this segment's stdin. `;` and `&&` are not
+	 *  pipes: they pass nothing. */
+	pipedFromPrevious: boolean;
+}
+
 /**
  * Split a command into segments of words, keeping quotes and `$(…)` inside the
  * word that contains them. The host tokenizer cannot be used here: it strips
@@ -315,13 +339,15 @@ interface Word {
  * Redirects become their own words so `> /tmp/key` and `>/dev/null` read the
  * same way.
  */
-function splitWords(text: string): Word[][] {
-	const segments: Word[][] = [];
+function splitWords(text: string): Segment[] {
+	const segments: Segment[] = [];
 	let words: Word[] = [];
 	let current = "";
 	let quote: '"' | "'" | null = null;
 	let depth = 0;
 	let backtick = false;
+	let pipedFromPrevious = false;
+	let nextIsPiped = false;
 
 	const endWord = (): void => {
 		if (current.length > 0) words.push({ text: current });
@@ -329,7 +355,11 @@ function splitWords(text: string): Word[][] {
 	};
 	const endSegment = (): void => {
 		endWord();
-		if (words.length > 0) segments.push(words);
+		if (words.length > 0) segments.push({ words, pipedFromPrevious });
+		// The flag describes THIS separator, so it is consumed either way. An
+		// empty stage must not let a pipe two separators back reach forward.
+		pipedFromPrevious = nextIsPiped;
+		nextIsPiped = false;
 		words = [];
 	};
 
@@ -343,6 +373,20 @@ function splitWords(text: string): Word[][] {
 		if (char === '"' || char === "'") {
 			quote = char;
 			current += char;
+			continue;
+		}
+		// A backslash escapes exactly one character, so it is read as a pair.
+		// That makes `\` + newline a line continuation, which the shell deletes
+		// while the command carries on, and `\\` + newline an escaped backslash
+		// followed by a real newline, which ends the command.
+		if (char === "\\") {
+			const escaped = text[index + 1];
+			if (escaped === undefined) {
+				current += char;
+				continue;
+			}
+			if (escaped !== "\n") current += char + escaped;
+			index += 1;
 			continue;
 		}
 		if (char === "$" && text[index + 1] === "(") {
@@ -365,6 +409,12 @@ function splitWords(text: string): Word[][] {
 		}
 		// `&>` is one redirect of both streams, not a separator followed by one.
 		if (char === "|" || char === ";" || char === "\n" || (char === "&" && text[index + 1] !== ">")) {
+			// `||` and `&&` are two-character operators, consumed whole. Reading
+			// them one character at a time let the second `|` of `||` set the
+			// pipe flag, and `||` passes an exit status, not output.
+			const doubled = (char === "|" || char === "&") && text[index + 1] === char;
+			nextIsPiped = char === "|" && !doubled;
+			if (doubled) index += 1;
 			endSegment();
 			continue;
 		}
@@ -430,11 +480,15 @@ function occurrence(label: string, sink: string, context: { token: string; flag:
 		toString: () => label,
 		sink,
 		sinkAllowed: (toDevNull, feedsPasswordStdin) => {
-			if (toDevNull) return true;
-			if (feedsPasswordStdin) return true;
-			if (context === undefined) return false;
-			if (BODY_FLAG.test(context.flag) || BODY_FLAG_ATTACHED.test(context.token)) return false;
-			return AUTH_FLAG.test(context.flag) || AUTH_FLAG_ATTACHED.test(context.token);
+			if (context !== undefined) {
+				// The value's own flag decides first. A redirect discards what the
+				// command PRINTS, which says nothing about what it SENDS: without
+				// this order, appending `>/dev/null` to an exfiltration command
+				// turned off this whole entry.
+				if (BODY_FLAG.test(context.flag) || BODY_FLAG_ATTACHED.test(context.token)) return false;
+				if (AUTH_FLAG.test(context.flag) || AUTH_FLAG_ATTACHED.test(context.token)) return true;
+			}
+			return toDevNull || feedsPasswordStdin;
 		},
 	};
 }
