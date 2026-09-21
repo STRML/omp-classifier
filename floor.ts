@@ -140,9 +140,12 @@ function scanSecrets(text: string, source: FloorFinding["source"], tainted: read
 		const toDevNull = segment.some((_word, index) => isDevNullRedirect(segment, index));
 		const feedsPasswordStdin = passwordStdinPipe && /^(echo|printf|cat)$/u.test(verb);
 		const segmentText = words.map(unquote).join(" ");
-		const live = [...tainted, ...capturedOut];
 
 		segment.forEach((word, index) => {
+			// Read the taint fresh for every word. A snapshot taken before the
+			// loop missed `TOKEN=$(op read …) curl -d "$TOKEN" …`, where the
+			// capture and the body sink sit in the same segment.
+			const live = [...tainted, ...capturedOut];
 			// `token=$(op read …)` is a capture as the segment's own assignment
 			// and a request field as an argument to curl. Position is what tells
 			// them apart, so only assignment position counts.
@@ -211,7 +214,10 @@ function inAssignmentPosition(segment: readonly Word[], index: number): boolean 
  *  `1>/dev/null`. `2>/dev/null` discards the error message and prints the
  *  secret, so it is not an allowed sink. */
 function isDevNullRedirect(segment: readonly Word[], index: number): boolean {
-	const text = unquote(segment[index].text);
+	// A real redirect is never quoted: `echo ">/dev/null"` is an argument that
+	// prints, and unquoting it first made it look like the allowed sink.
+	const text = segment[index].text;
+	if (/["']/u.test(text)) return false;
 	const match = /^(\d?|&)>{1,2}(.*)$/u.exec(text);
 	if (match === null) return false;
 	if (match[1] !== "" && match[1] !== "1" && match[1] !== "&") return false;
