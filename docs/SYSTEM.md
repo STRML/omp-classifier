@@ -101,6 +101,33 @@ holds the per-session taint and wipes it at the same boundaries as the verdict c
 Today the floor runs in shadow. Every `decisions.jsonl` line carries a `floor` field saying what
 it would have done, and the live decision is unchanged until the `jev-v3` flip (#55).
 
+### The literal match (`literal-match.ts`)
+
+The other half of "code may grant an allow only for what code fully sees". A command matches
+only when both hold: every segment is an extracted action or an inert shape, and every extracted
+action is named in the user's own recent standalone words. One segment the parser does not
+understand makes the command incomplete, so a matched `rm` beside a `python3 -c` payload gets no
+fast path. An inert *verb* is not enough either: a redirect, a glob, a brace or a substitution
+anywhere in the segment makes it non-inert, because `echo "alias x=y" >> ~/.bashrc` writes a
+shell config while looking like an echo.
+
+Extracted actions are local: a delete whose real path resolves inside the working directory or
+the session temp directory, a branch delete, `gh pr merge <number>`, and a deploy script inside
+the working directory. Network egress, secrets and privilege are neither extracted nor inert,
+which is how they reach the reviewer instead. A command spelled as a path is a file rather than a
+verb, so `./rm` and `/tmp/evil/cat` are neither.
+
+Matching is on whole words in imperative or present form. "rebuild" does not authorize deleting
+`build`, a past-tense recount authorizes nothing, and a restrictive or conditional word within
+five words of a matched token cancels the match. A verb has to belong to the target it
+authorizes: only filler words or another target of the same command may sit between them, so
+"delete build then merge main" does not authorize deleting the branch `main`. Fenced code, inline
+code and quoted lines are stripped first, typographic apostrophes are folded so `don’t` cancels
+like `don't`, and a pinned or inherited message never produces a match.
+
+`literalMatch` is pure, and nothing calls it yet. Phase 2 step 5 gives it a branch in the
+decision order.
+
 ## L2 judgment
 
 One request, two inputs, no prose:
