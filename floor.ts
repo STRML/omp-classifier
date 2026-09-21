@@ -375,10 +375,17 @@ function splitWords(text: string): Segment[] {
 			current += char;
 			continue;
 		}
-		// A backslash-newline is a line continuation: the shell deletes both and
-		// the command carries on, so it is not a separator at all. Wrapping a
-		// long `docker login` line is the ordinary way to write one.
-		if (char === "\\" && text[index + 1] === "\n") {
+		// A backslash escapes exactly one character, so it is read as a pair.
+		// That makes `\` + newline a line continuation, which the shell deletes
+		// while the command carries on, and `\\` + newline an escaped backslash
+		// followed by a real newline, which ends the command.
+		if (char === "\\") {
+			const escaped = text[index + 1];
+			if (escaped === undefined) {
+				current += char;
+				continue;
+			}
+			if (escaped !== "\n") current += char + escaped;
 			index += 1;
 			continue;
 		}
@@ -402,8 +409,12 @@ function splitWords(text: string): Segment[] {
 		}
 		// `&>` is one redirect of both streams, not a separator followed by one.
 		if (char === "|" || char === ";" || char === "\n" || (char === "&" && text[index + 1] !== ">")) {
-			// `||` is a fallback, not a pipe: it passes an exit status.
-			nextIsPiped = char === "|" && text[index + 1] !== "|";
+			// `||` and `&&` are two-character operators, consumed whole. Reading
+			// them one character at a time let the second `|` of `||` set the
+			// pipe flag, and `||` passes an exit status, not output.
+			const doubled = (char === "|" || char === "&") && text[index + 1] === char;
+			nextIsPiped = char === "|" && !doubled;
+			if (doubled) index += 1;
 			endSegment();
 			continue;
 		}

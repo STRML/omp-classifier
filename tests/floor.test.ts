@@ -238,6 +238,19 @@ describe("floor entry 2 — a secret leaving its source for a sink that is not a
 		expect(asks("echo $DOCKER_TOKEN | ; docker login -u me --password-stdin")).toBe(true);
 	});
 
+	test("|| and && pass an exit status, not output", () => {
+		// Verified in bash: `echo LEFT || echo RIGHT` prints only LEFT, so the
+		// login never receives the secret the echo printed.
+		expect(asks("echo $DOCKER_TOKEN || docker login -u me --password-stdin")).toBe(true);
+		expect(asks("echo $DOCKER_TOKEN && docker login -u me --password-stdin")).toBe(true);
+	});
+
+	test("an escaped backslash ends the line, so it is not a continuation", () => {
+		// `\\` is one literal backslash; the newline after it still terminates
+		// the command. Only an odd trailing backslash continues a line.
+		expect(asks("echo $DOCKER_TOKEN \\\\\ndocker login -u me --password-stdin")).toBe(true);
+	});
+
 	test("--password-stdin excuses only what is piped straight into it", () => {
 		expect(asks("echo $DOCKER_TOKEN | docker login -u me --password-stdin")).toBe(false);
 		// A stage in between keeps a copy, so the exemption does not reach back.
