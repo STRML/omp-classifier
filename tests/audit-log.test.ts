@@ -366,4 +366,57 @@ describe("decision audit log", () => {
 			}
 		});
 	});
+
+	describe("the code floor, in shadow (Phase 2 step 1)", () => {
+		test("a floor hit is logged and still runs, because the floor decides nothing yet", async () => {
+			seq += 1;
+			// Jev answers SAFE, the floor says ask. Until the jev-v3 flip the live
+			// decision is Jev's: this test is what makes "shadow" a fact rather
+			// than a claim in the changelog.
+			const command = `security find-generic-password -s audit-shadow-${seq} -w | pbcopy`;
+			expect(await fire("tool_call", makeEvent(command), makeCtx({ sessionId: `audit-floor-${seq}` }))).toBeUndefined();
+			const lines = readDecisions();
+			expect(lines).toHaveLength(1);
+			expect(lines[0]).toMatchObject({ decision: "allow", layer: "verdict", verdict: "SAFE" });
+			expect(lines[0].floor).toEqual({ asks: true, entries: ["secret-sink"] });
+		});
+
+		test("the dialog outcome line carries the floor too, not just the verdict line", async () => {
+			seq += 1;
+			// The dialog path builds its line in requestPermission rather than in
+			// handleToolCall, which is how it used to come out half-filled.
+			setJevAnswer(jevUnsafeAnswer());
+			const command = `security find-generic-password -s audit-dialog-${seq} -w | pbcopy`;
+			await fire("tool_call", makeEvent(command), makeCtx({ sessionId: `audit-floor-dialog-${seq}` }));
+			const lines = readDecisions();
+			expect(lines).toHaveLength(2);
+			expect(lines[1].layer).toBe("headless");
+			for (const line of lines) {
+				expect(line.floor).toEqual({ asks: true, entries: ["secret-sink"] });
+			}
+		});
+
+		test("a command the floor passes logs asks false", async () => {
+			seq += 1;
+			expect(await fire("tool_call", makeEvent(`echo audit-floor-clean-${seq}`), makeCtx({ sessionId: `audit-floor-clean-${seq}` }))).toBeUndefined();
+			expect(readDecisions()[0].floor).toEqual({ asks: false, entries: [] });
+		});
+
+		test("taint crosses commands within one session, and never between sessions", async () => {
+			seq += 1;
+			const session = `audit-floor-taint-${seq}`;
+			const ctx = makeCtx({ sessionId: session });
+			await fire("tool_call", makeEvent(`KEY=$(security find-generic-password -s taint-${seq} -w)`), ctx);
+			await fire("tool_call", makeEvent(`echo $KEY > /tmp/leak-${seq}`), ctx);
+			const lines = readDecisions();
+			// A capture is an allowed sink, so the first command passes the floor.
+			expect(lines[0].floor).toEqual({ asks: false, entries: [] });
+			// Printing what it captured is not.
+			expect(lines[1].floor).toEqual({ asks: true, entries: ["secret-sink"] });
+
+			// A different session inherits nothing.
+			await fire("tool_call", makeEvent(`echo $KEY > /tmp/leak-other-${seq}`), makeCtx({ sessionId: `${session}-other` }));
+			expect(readDecisions()[2].floor).toEqual({ asks: false, entries: [] });
+		});
+	});
 });
