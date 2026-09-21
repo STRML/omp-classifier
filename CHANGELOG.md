@@ -2,6 +2,11 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-09-21
+
+- New `floor.ts`: the code floor from Phase 2 of the intent-aware judgment plan. Four entries always ask, whatever the model answers and whatever the user authorized: the built-in critical patterns, a secret reaching a sink that is not on the allowed list, a download piped into an interpreter, and obfuscated code (base64 into an interpreter or `exec`, marshal and pickle loads, runs of hex escapes, shell `eval` of a value). Entry 2 is destination-blind by design — it checks what a secret flows into, not where that goes — so a key in a request header passes the floor whatever host it names, and the host is judged above the floor. Allowed sinks, and only these: a `$(…)` capture assigned to a variable, `/dev/null`, a curl auth header or `-u` without `-v`/`--trace`, and `--password-stdin`. A capture taints the variable for the session, so a later `echo $KEY` asks.
+- The floor runs in shadow: every `decisions.jsonl` record gains a `floor` field (`asks` plus the entries that matched), computed once per tool call and read by no decision. The live verdict is byte-for-byte what it was, pinned by a test where Jev answers SAFE on a command the floor would stop. Per-session taint is wiped at the same boundaries as the verdict cache and grants.
+
 ## 2026-09-19
 
 - `decisions.jsonl` now carries the evidence ids and the authorization label behind Phase 0 item 5 of the intent-aware judgment plan: `userMessageIds` (the ids of the user messages in evidence for the tool call, snapshotted once per call and reused on every line it logs, including the critical, env-override, static-rule, grant, cap, and unclassified early returns before classification) and `authorization` (`Judgement.authorization`, carried onto the line whenever a judgement existed). Ids only, never message text and never a hash of it, so a false positive can be traced to exactly what the gate saw without rebuilding the transcript. No third `branch` field: `layer` already names the decision path (critical, environment, rule, granted, verdict, cached, unclassified, dialog, headless, cap, cwd, internal-error) and a second field would only duplicate it under different spelling.

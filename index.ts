@@ -81,6 +81,7 @@ import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 import { getConfigRootDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
+import { evaluateFloor, type FloorEntry } from "./floor";
 import { judgeBattery } from "./jev-judge";
 import {
 	buildJevState,
@@ -200,6 +201,14 @@ interface Grant {
 }
 const grants = new Map<string, Grant[]>();
 const GRANT_CAP = 50;
+
+/** Per-session taint for the code floor (plan Phase 2 step 1): the variables
+ *  a command in this session captured a secret into, so a later `echo $KEY`
+ *  is recognized as a secret reaching the transcript. Shadow state — the
+ *  floor is computed and logged, and decides nothing until the `jev-v3`
+ *  flip — and wiped at the same session boundaries as the other stores. */
+const floorTaint = new Map<string, string[]>();
+const FLOOR_TAINT_CAP = 50;
 
 /** Per-session classifier pause (issue #48): `/classifier off` adds the
  *  sessionId here. Same semantics as `config.enabled=false` scoped to one
@@ -765,6 +774,11 @@ export interface DecisionRecord {
 	ms: number;
 	/** Set when the plugin file changed on disk after this session loaded it. */
 	staleCode?: 0 | 1;
+	/** What the code floor would have done with this command (plan Phase 2
+	 *  step 1, logged in shadow per #55). It decides nothing: the line records
+	 *  the floor's verdict beside the live one so the disagreement can be
+	 *  measured before the `jev-v3` flip. */
+	floor?: { asks: boolean; entries: FloorEntry[] };
 }
 
 type DecisionLogInput = Omit<DecisionRecord, "ts">;
@@ -3841,6 +3855,35 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	/**
+	 * Run the code floor over one tool call and remember what it captured.
+	 *
+	 * Shadow only: the result is logged and read by no decision. Failures are
+	 * swallowed, because a measurement that throws must never block a command
+	 * the live path would have allowed.
+	 */
+	const shadowFloor = (ctx: ExtensionContext, commandText: string): DecisionRecord["floor"] | undefined => {
+		let sessionId: string | undefined;
+		try {
+			sessionId = ctx.sessionManager.getSessionId();
+		} catch {
+			// Same reason logDecisionFor tolerates this: an isolated SDK context
+			// has no session, and the floor still reports on the command itself.
+		}
+		try {
+			const carried = sessionId ? (floorTaint.get(sessionId) ?? []) : [];
+			const result = evaluateFloor({ command: commandText, taintedVars: carried });
+			if (sessionId && result.tainted.length > 0) {
+				const merged = [...carried, ...result.tainted.filter(name => !carried.includes(name))];
+				floorTaint.set(sessionId, merged.slice(-FLOOR_TAINT_CAP));
+			}
+			return { asks: result.asks, entries: [...new Set(result.findings.map(finding => finding.entry))] };
+		} catch (error) {
+			pi.logger.warn(`classifier: shadow floor failed: ${error instanceof Error ? error.message : String(error)}`);
+			return undefined;
+		}
+	};
+
 	/** Attach the host session to every audit line. Keeping this at the plugin
 	 * boundary makes status/replay joins useful even for static-rule, cap, and
 	 * dialog lines that never reached the model. */
@@ -4079,6 +4122,19 @@ export default function (pi: ExtensionAPI) {
 		// a second collectTaskEvidence call, and never the message text itself.
 		const auditUserMessageIds: string[] | undefined =
 			userEvidenceSnapshot && userEvidenceSnapshot.ids.length > 0 ? userEvidenceSnapshot.ids : undefined;
+		// The code floor, in shadow (plan Phase 2 step 1, rollout per #55). It
+		// is computed once per tool call, logged on every line the call writes,
+		// and read by nothing: the live decision below is byte-for-byte what it
+		// was before this field existed. The taint it returns still accumulates,
+		// so the shadow numbers for a two-command capture-then-print are real.
+		const floorShadow = shadowFloor(ctx, isEval ? evalCode : command);
+		// One object for the fields every line of this tool call shares. A
+		// function, not a constant, because the floor is computed per call and
+		// the ids are not: both are fixed by the time any line is written.
+		const auditFields = (): Pick<DecisionRecord, "userMessageIds" | "floor"> => ({
+			...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}),
+			...(floorShadow ? { floor: floorShadow } : {}),
+		});
 		// Grants are scoped to durable authorization/restriction language, not
 		// every progress message or host-generated message id. A new "status?"
 		// must not revoke approval; a later "do not publish" must.
@@ -4106,6 +4162,7 @@ export default function (pi: ExtensionAPI) {
 			if (!dryRun) {
 				cache.clear();
 				grants.clear();
+				floorTaint.clear();
 				classifierConfigSignature = configSignature;
 			}
 		}
@@ -4189,7 +4246,7 @@ export default function (pi: ExtensionAPI) {
 					`eval code blocked: ${evalCode.length} chars exceeds the ` +
 					`${config.maxCommandLength}-character review limit`;
 				const replay = replayDecision({ tool: "eval", command: evalCode, cwd: ctx.cwd, maxCommandLength: config.maxCommandLength, headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: replay.layer, why, cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
+				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: replay.layer, why, cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				addRefusal(ctx, evalCode, why, { source: "cap", cwd });
 				return {
 					block: true,
@@ -4216,7 +4273,7 @@ export default function (pi: ExtensionAPI) {
 			if (matchingGrant(ctx, normalizeEvalGrantTarget(evalCode), cwd, userScopeFingerprint)) {
 				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, grant: "session" });
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: replay.layer, why: "session grant", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
+					logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: replay.layer, why: "session grant", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 					return;
 				}
 			}
@@ -4274,7 +4331,7 @@ export default function (pi: ExtensionAPI) {
 					if (replay.decision === "allow") {
 						// Fresh SAFE auto-run logs layer "verdict"; a replayed cached
 						// verdict logs "cached" — provenance, same allow.
-						logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
+						logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
 						return;
 					}
 					// A SAFE on a target this session already refused is not a
@@ -4287,7 +4344,7 @@ export default function (pi: ExtensionAPI) {
 						flagList.length > 0
 							? `classifier-safe but flags: ${flagList.join(", ")}`
 							: replay.why;
-					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
+					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
 					return await requestPermission(ctx, target, "flagged for approval", why, "eval", flagList.length > 0 ? "follows verdict" : "despite prior refusal", userScopeFingerprint, auditUserMessageIds, judgement.authorization);
 				}
 				const detail =
@@ -4311,7 +4368,7 @@ export default function (pi: ExtensionAPI) {
 					...(judgement.modelId ? { modelId: judgement.modelId } : {}),
 					...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}),
 					...(judgement.jev ? { jev: judgement.jev } : {}),
-					...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}),
+					...auditFields(),
 					...(judgement.authorization ? { authorization: judgement.authorization } : {}),
 				});
 				// A refusal record (issue #30) needs a verdict that judged the
@@ -4326,7 +4383,7 @@ export default function (pi: ExtensionAPI) {
 				return await requestPermission(ctx, target, detail, judgement.reason, "eval", "follows verdict", userScopeFingerprint, auditUserMessageIds, judgement.authorization);
 			} catch (err) {
 				pi.logger.error(`classifier: ${err instanceof Error ? err.message : String(err)}`);
-				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "internal-error", why: "classifier failed; eval code not run", cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
+				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "internal-error", why: "classifier failed; eval code not run", cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				return {
 					block: true,
 					reason: refusalPayload(
@@ -4347,7 +4404,7 @@ export default function (pi: ExtensionAPI) {
 				`bash command blocked: ${command.length} chars exceeds the ` +
 				`${config.maxCommandLength}-character review limit`;
 			const replay = replayDecision({ tool: "bash", command, cwd: ctx.cwd, maxCommandLength: config.maxCommandLength, headless: !ctx.hasUI });
-			logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why, cmd: command, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
+			logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why, cmd: command, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				addRefusal(ctx, command, why, { source: "cap", cwd: ctx.cwd });
 			return {
 				block: true,
@@ -4444,7 +4501,7 @@ export default function (pi: ExtensionAPI) {
 			// that ExtensionContext does not expose. Passing the raw URL to
 			// resolveToCwd would mislabel it; skipping the gate would fail open.
 			if (cwdInput?.includes("://") || cwdInput?.includes("local:/")) {
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "cwd", why: "classifier cannot resolve an internal-URL cwd; command not run", cmd: command, cwd: cwdInput ?? ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "cwd", why: "classifier cannot resolve an internal-URL cwd; command not run", cmd: command, cwd: cwdInput ?? ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				return {
 					block: true,
 					reason: refusalPayload(
@@ -4505,7 +4562,7 @@ export default function (pi: ExtensionAPI) {
 			// without appearing in settings at all.
 			if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command))) {
 				const replay = replayDecision({ tool: "bash", command, cwd, riskFlags: ["critical"], headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "critical pattern: matches a built-in dangerous-command pattern", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "critical pattern: matches a built-in dangerous-command pattern", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				// A critical hit is a refusal (issue #30) however the dialog below
 				// ends: the pattern itself is the memory. An approval lifts it via
 				// requestPermission.
@@ -4528,7 +4585,7 @@ export default function (pi: ExtensionAPI) {
 			// values are not shown to the classifier — they can hold secrets.
 			if (env.key !== "") {
 				const replay = replayDecision({ tool: "bash", command, cwd, envKeys: env.keys, headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "environment override: command runs with caller-supplied env; not classified", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "environment override: command runs with caller-supplied env; not classified", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				return await requestPermission(
 					ctx,
 					target,
@@ -4559,7 +4616,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (rule?.approval === "allow" && !isBlanketPattern(rule.match)) {
 				const replay = replayDecision({ tool: "bash", command, cwd, staticRule: "allow", headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: `rule: ${rule.match}`, cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
+				logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: `rule: ${rule.match}`, cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				return;
 			}
 			if (!rule && policy.bashPolicy === "prompt") {
@@ -4619,7 +4676,7 @@ export default function (pi: ExtensionAPI) {
 			if (matchingGrant(ctx, grantKeyForCommand(command), cwd, userScopeFingerprint)) {
 				const replay = replayDecision({ tool: "bash", command, cwd, grant: "session" });
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "session grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "session grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 					return;
 				}
 			}
@@ -4638,7 +4695,7 @@ export default function (pi: ExtensionAPI) {
 			if (matchingPersistentGrant(command, cwd)) {
 				const replay = replayDecision({ tool: "bash", command, cwd, grant: "persistent" });
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "persistent grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "persistent grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 					return;
 				}
 			}
@@ -4716,7 +4773,7 @@ export default function (pi: ExtensionAPI) {
 					headless: !ctx.hasUI,
 				});
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: command, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: command, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
 					return;
 				}
 				// A SAFE on a target this session already refused is not a clean
@@ -4731,7 +4788,7 @@ export default function (pi: ExtensionAPI) {
 						: `classifier-safe despite prior refusal of "${priorTarget}"`;
 				const foot = trashFootnote(flags);
 				const dialogWhy = foot === "" ? why : `${why}\n${foot}`;
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", why, cmd: command, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", why, cmd: command, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
 				return await requestPermission(
 					ctx,
 					target,
@@ -4764,7 +4821,7 @@ export default function (pi: ExtensionAPI) {
 				...(judgement.modelId ? { modelId: judgement.modelId } : {}),
 				...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}),
 				...(judgement.jev ? { jev: judgement.jev } : {}),
-				...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}),
+				...auditFields(),
 				...(judgement.authorization ? { authorization: judgement.authorization } : {}),
 			});
 			// A refusal record (issue #30) needs a verdict that judged the
@@ -4781,7 +4838,7 @@ export default function (pi: ExtensionAPI) {
 			// Unexpected plugin error: fail closed rather than wave the command
 			// through on a path we cannot vouch for.
 			pi.logger.error(`classifier: ${err instanceof Error ? err.message : String(err)}`);
-			logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "internal-error", why: "classifier failed; command not run", cmd: command, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}) });
+			logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "internal-error", why: "classifier failed; command not run", cmd: command, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 			return {
 				block: true,
 				reason: refusalPayload(
@@ -4807,6 +4864,7 @@ export default function (pi: ExtensionAPI) {
 		// A session-scoped pause dies at boundaries too: a resumed session
 		// starts unpaused.
 		sessionOff.delete(sessionId);
+		floorTaint.delete(sessionId);
 	};
 	pi.on("session_start", dropCurrent);
 	pi.on("session_before_switch", dropCurrent);
@@ -4833,5 +4891,6 @@ export default function (pi: ExtensionAPI) {
 		grants.delete(sessionId);
 		// Same boundary rule for the session-scoped pause.
 		sessionOff.delete(sessionId);
+		floorTaint.delete(sessionId);
 	});
 }

@@ -79,6 +79,28 @@ parse prose, not the need to notice shapes without asking anyone.
 Invariant: no model call decides what this layer can decide, and this layer never guesses.
 Anything ambiguous falls through to L2.
 
+### The floor (`floor.ts`, shadow)
+
+The floor is the part of L1 that no answer above it can cross: the built-in critical patterns,
+a secret reaching a sink that is not allowed, a download piped into an interpreter, and
+obfuscated code. It exists because the intent-aware plan
+(`docs/plans/2026-09-19-intent-aware-judgment.md`) makes the gate much readier to allow work the
+user asked for, and something has to hold the line under that in code.
+
+Entry 2 is a source-and-sink model, and it is destination-blind on purpose. It asks what a
+secret flows *into*, never where that goes, so `curl -H "Authorization: Bearer $KEY"` passes the
+floor whatever host it names: a header is how a key is used for its purpose. Four sinks are
+allowed and no others: a `$(…)` capture assigned to a variable, `/dev/null`, a curl auth header
+or `-u` without tracing, and `--password-stdin`. A capture taints the variable for the rest of
+the session, so printing it later asks. The destination is judged above the floor, by
+`sends_local_data_outbound` and the reviewer.
+
+`evaluateFloor` is pure: taint arrives as an argument and leaves as a return value. The plugin
+holds the per-session taint and wipes it at the same boundaries as the verdict cache.
+
+Today the floor runs in shadow. Every `decisions.jsonl` line carries a `floor` field saying what
+it would have done, and the live decision is unchanged until the `jev-v3` flip (#55).
+
 ## L2 judgment
 
 One request, two inputs, no prose:
