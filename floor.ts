@@ -355,10 +355,10 @@ function splitWords(text: string): Segment[] {
 	};
 	const endSegment = (): void => {
 		endWord();
-		if (words.length > 0) {
-			segments.push({ words, pipedFromPrevious });
-			pipedFromPrevious = nextIsPiped;
-		}
+		if (words.length > 0) segments.push({ words, pipedFromPrevious });
+		// The flag describes THIS separator, so it is consumed either way. An
+		// empty stage must not let a pipe two separators back reach forward.
+		pipedFromPrevious = nextIsPiped;
 		nextIsPiped = false;
 		words = [];
 	};
@@ -373,6 +373,13 @@ function splitWords(text: string): Segment[] {
 		if (char === '"' || char === "'") {
 			quote = char;
 			current += char;
+			continue;
+		}
+		// A backslash-newline is a line continuation: the shell deletes both and
+		// the command carries on, so it is not a separator at all. Wrapping a
+		// long `docker login` line is the ordinary way to write one.
+		if (char === "\\" && text[index + 1] === "\n") {
+			index += 1;
 			continue;
 		}
 		if (char === "$" && text[index + 1] === "(") {

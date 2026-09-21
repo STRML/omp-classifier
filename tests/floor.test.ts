@@ -225,6 +225,19 @@ describe("floor entry 2 — a secret leaving its source for a sink that is not a
 		expect(asks("echo $API_KEY >/dev/null")).toBe(false);
 	});
 
+	test("a wrapped line is still one pipeline", () => {
+		// `\` before a newline is a line continuation: the shell deletes both.
+		// Wrapping a long `docker login` is the ordinary way to write one, and
+		// reading the newline as a separator made it ask.
+		expect(asks("printf %s $DOCKER_TOKEN \\\n| docker login -u me --password-stdin")).toBe(false);
+		expect(asks("echo $DOCKER_TOKEN |\\\ndocker login -u me --password-stdin")).toBe(false);
+		expect(evaluateFloor({ command: "KEY=$(security find-generic-password \\\n -s jev -w)" }).tainted).toEqual(["KEY"]);
+	});
+
+	test("an empty stage breaks the pipe, so the exemption cannot jump it", () => {
+		expect(asks("echo $DOCKER_TOKEN | ; docker login -u me --password-stdin")).toBe(true);
+	});
+
 	test("--password-stdin excuses only what is piped straight into it", () => {
 		expect(asks("echo $DOCKER_TOKEN | docker login -u me --password-stdin")).toBe(false);
 		// A stage in between keeps a copy, so the exemption does not reach back.
