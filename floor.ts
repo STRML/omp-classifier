@@ -207,24 +207,45 @@ function captureTarget(word: string): string | undefined {
  * carries the secret to the transcript. Anything added here needs the same
  * check.
  */
-const ASSIGNMENT_PREFIX = /^(env|local|declare|typeset|readonly|export|time|function|\{|[A-Za-z_][A-Za-z0-9_]*\(\))$/u;
+const ASSIGNMENT_PREFIX = /^(env|local|declare|typeset|readonly|export|function|\{|[A-Za-z_][A-Za-z0-9_]*\(\))$/u;
+
+/** Words that run a command of their own, so the word after them is that
+ *  command's NAME. An assignment there is a command name, not a capture, which
+ *  the shell then fails to find while printing what it expanded. */
+const EXEC_WRAPPER = /^(nohup|command|builtin|time|sudo|doas|timeout|xargs|stdbuf|nice|ionice)$/u;
 
 /**
  * Whether the shell will treat this word as an assignment rather than as a
  * command name or an argument.
  *
- * What decides is the nearest word back that is not itself an assignment: the
- * segment's start, or a word that keeps assignment position. `nohup env
- * TOKEN=$(…)` is a capture because `env` sits in front of it, while `nohup
- * TOKEN=$(…)` is a command name, and `curl -d token=$(…)` is an argument.
+ * Decided by scanning FORWARD, because that is how the shell decides: the
+ * command is the first word that is not an assignment, and every word after it
+ * is an argument. A backwards scan cannot tell `env TOKEN=$(…)` from `echo env
+ * TOKEN=$(…)`, where `env` is a word being printed, and it read the second one
+ * as a capture.
  */
 function inAssignmentPosition(segment: readonly Word[], index: number): boolean {
-	for (let before = index - 1; before >= 0; before -= 1) {
+	// Two facts, not one: whether a command name is still to come, and whether
+	// an assignment may appear here. `nohup` keeps the first and drops the
+	// second, which is why `nohup env FOO=$(…)` captures and `nohup FOO=$(…)`
+	// does not.
+	let inCommandPosition = true;
+	let assignmentsAllowed = true;
+	for (let before = 0; before < index; before += 1) {
 		const word = unquote(segment[before].text);
-		if (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(word)) continue;
-		return ASSIGNMENT_PREFIX.test(word);
+		if (inCommandPosition && assignmentsAllowed && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(word)) continue;
+		if (inCommandPosition && ASSIGNMENT_PREFIX.test(word)) {
+			assignmentsAllowed = true;
+			continue;
+		}
+		if (inCommandPosition && EXEC_WRAPPER.test(word)) {
+			assignmentsAllowed = false;
+			continue;
+		}
+		inCommandPosition = false;
+		assignmentsAllowed = false;
 	}
-	return true;
+	return inCommandPosition && assignmentsAllowed;
 }
 
 /** A redirect that discards the SECRET, which means stdout: `>/dev/null` or
