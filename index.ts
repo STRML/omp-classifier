@@ -3937,14 +3937,13 @@ export default function (pi: ExtensionAPI) {
 		tool: "bash" | "eval" = "bash",
 		logWhyPrefix = "",
 		userScopeFingerprint?: string,
-		/** The tool call's evidence snapshot ids (issue #33 audit fields),
-		 *  passed through from handleToolCall's single snapshot so the dialog
-		 *  or headless-block line carries the same ids as the verdict line it
-		 *  follows, or the ids alone when no judgement preceded it (critical,
-		 *  env override). */
-		userMessageIds?: string[],
-		/** `Judgement.authorization`, when a judgement preceded this dialog. */
-		authorization?: Judgement["authorization"],
+		/** The audit fields of the tool call this dialog belongs to, passed
+		 *  through from handleToolCall so the dialog or headless-block line
+		 *  carries the same evidence ids, authorization label and shadow floor
+		 *  as the verdict line it follows. One object rather than one parameter
+		 *  per field: this list grew a field per phase, and each time a caller
+		 *  was missed the log came out half-filled. */
+		auditExtras: Pick<DecisionRecord, "userMessageIds" | "authorization" | "floor"> = {},
 	): Promise<{ block: true; reason: string } | undefined> => {
 		const subject = tool === "eval" ? "eval code" : "bash command";
 		const detail = reason ? `${headline}: ${reason}` : headline;
@@ -3978,8 +3977,9 @@ export default function (pi: ExtensionAPI) {
 				ms: Date.now() - began,
 				...(approval ? { approval } : {}),
 				...(stale === "" ? {} : { staleCode: 1 as const }),
-				...(userMessageIds && userMessageIds.length > 0 ? { userMessageIds } : {}),
-				...(authorization ? { authorization } : {}),
+				...(auditExtras.userMessageIds && auditExtras.userMessageIds.length > 0 ? { userMessageIds: auditExtras.userMessageIds } : {}),
+				...(auditExtras.authorization ? { authorization: auditExtras.authorization } : {}),
+				...(auditExtras.floor ? { floor: auditExtras.floor } : {}),
 			});
 		const block = (whyOverride?: string, approval: DecisionRecord["approval"] = ctx.hasUI ? "deny" : "headless"): { block: true; reason: string } => {
 			// Verdict-driven callers pass "follows verdict" so the dialog/headless
@@ -4304,7 +4304,7 @@ export default function (pi: ExtensionAPI) {
 					},
 				));
 				if (!judgement) {
-					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", userScopeFingerprint, auditUserMessageIds);
+					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", userScopeFingerprint, auditFields());
 				}
 				if (!cached && judgement.verdict !== "UNAVAILABLE" && !judgement.noCache) remember(scoped, cacheKey, judgement);
 				const logCode = truncated(evalCode.replace(/\s+/gu, " ").trim(), 120);
@@ -4345,7 +4345,7 @@ export default function (pi: ExtensionAPI) {
 							? `classifier-safe but flags: ${flagList.join(", ")}`
 							: replay.why;
 					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
-					return await requestPermission(ctx, target, "flagged for approval", why, "eval", flagList.length > 0 ? "follows verdict" : "despite prior refusal", userScopeFingerprint, auditUserMessageIds, judgement.authorization);
+					return await requestPermission(ctx, target, "flagged for approval", why, "eval", flagList.length > 0 ? "follows verdict" : "despite prior refusal", userScopeFingerprint, { ...auditFields(), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
 				}
 				const detail =
 					judgement.verdict === "UNSAFE"
@@ -4380,7 +4380,7 @@ export default function (pi: ExtensionAPI) {
 				if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
 					addRefusal(ctx, evalCode, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
 				}
-				return await requestPermission(ctx, target, detail, judgement.reason, "eval", "follows verdict", userScopeFingerprint, auditUserMessageIds, judgement.authorization);
+				return await requestPermission(ctx, target, detail, judgement.reason, "eval", "follows verdict", userScopeFingerprint, { ...auditFields(), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
 			} catch (err) {
 				pi.logger.error(`classifier: ${err instanceof Error ? err.message : String(err)}`);
 				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "internal-error", why: "classifier failed; eval code not run", cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
@@ -4575,7 +4575,7 @@ export default function (pi: ExtensionAPI) {
 					"bash",
 					"",
 					userScopeFingerprint,
-					auditUserMessageIds,
+					auditFields(),
 				);
 			}
 
@@ -4594,7 +4594,7 @@ export default function (pi: ExtensionAPI) {
 					"bash",
 					"",
 					userScopeFingerprint,
-					auditUserMessageIds,
+					auditFields(),
 				);
 			}
 
@@ -4734,7 +4734,7 @@ export default function (pi: ExtensionAPI) {
 					"bash",
 					"",
 					undefined,
-					auditUserMessageIds,
+					auditFields(),
 				);
 			}
 			// A failed request is a transient failure, not a policy: do NOT
@@ -4797,8 +4797,7 @@ export default function (pi: ExtensionAPI) {
 					"bash",
 					flags.length > 0 ? "follows verdict" : "despite prior refusal",
 					userScopeFingerprint,
-					auditUserMessageIds,
-					judgement.authorization,
+					{ ...auditFields(), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) },
 				);
 			}
 			const verdict = judgement.verdict;
@@ -4833,7 +4832,7 @@ export default function (pi: ExtensionAPI) {
 			if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
 				addRefusal(ctx, command, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
 			}
-			return await requestPermission(ctx, target, detail, judgement.reason, "bash", "follows verdict", userScopeFingerprint, auditUserMessageIds, judgement.authorization);
+			return await requestPermission(ctx, target, detail, judgement.reason, "bash", "follows verdict", userScopeFingerprint, { ...auditFields(), ...(judgement.authorization ? { authorization: judgement.authorization } : {}) });
 		} catch (err) {
 			// Unexpected plugin error: fail closed rather than wave the command
 			// through on a path we cannot vouch for.

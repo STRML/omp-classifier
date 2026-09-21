@@ -381,6 +381,21 @@ describe("decision audit log", () => {
 			expect(lines[0].floor).toEqual({ asks: true, entries: ["secret-sink"] });
 		});
 
+		test("the dialog outcome line carries the floor too, not just the verdict line", async () => {
+			seq += 1;
+			// The dialog path builds its line in requestPermission rather than in
+			// handleToolCall, which is how it used to come out half-filled.
+			setJevAnswer(jevUnsafeAnswer());
+			const command = `security find-generic-password -s audit-dialog-${seq} -w | pbcopy`;
+			await fire("tool_call", makeEvent(command), makeCtx({ sessionId: `audit-floor-dialog-${seq}` }));
+			const lines = readDecisions();
+			expect(lines).toHaveLength(2);
+			expect(lines[1].layer).toBe("headless");
+			for (const line of lines) {
+				expect(line.floor).toEqual({ asks: true, entries: ["secret-sink"] });
+			}
+		});
+
 		test("a command the floor passes logs asks false", async () => {
 			seq += 1;
 			expect(await fire("tool_call", makeEvent(`echo audit-floor-clean-${seq}`), makeCtx({ sessionId: `audit-floor-clean-${seq}` }))).toBeUndefined();

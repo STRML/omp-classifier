@@ -123,47 +123,87 @@ function scanText(text: string, source: FloorFinding["source"], tainted: readonl
  * allowed sinks: a `$(…)` capture assigned to a variable, `/dev/null`, a curl
  * auth header or `-u` without tracing, or a `--password-stdin` pipe.
  *
- * Working on the host tokenizer's segments rather than the raw string is what
- * makes "which flag does this value belong to" answerable at all: the
- * tokenizer strips quotes and splits operators, so `-H "Authorization: Bearer
- * $KEY"` arrives as two tokens whose relationship is positional.
+ * This reads the command with `splitWords` rather than the host tokenizer,
+ * which was the source of two wrong answers: the tokenizer strips quotes and
+ * splits at `(`, so `KEY="$(security … -w)"` stopped looking like a capture
+ * and `curl -u me:$(op read …)` lost the flag its value belonged to. Keeping a
+ * substitution inside the word that contains it is what makes "which flag does
+ * this value belong to" answerable at all.
  */
 function scanSecrets(text: string, source: FloorFinding["source"], tainted: readonly string[], findings: FloorFinding[], capturedOut: string[]): void {
 	const shellTracing = SHELL_TRACING.test(text);
 	const passwordStdinPipe = PIPE_TO_PASSWORD_STDIN.test(text);
-	const segments = tokenizeShellSegments(text);
-	segments.forEach((tokens, index) => {
-		const previous = index > 0 ? segments[index - 1] : undefined;
-		const captureVariable = captureTarget(previous);
-		const segmentText = tokens.join(" ");
-		const tracing = shellTracing || (TRACING_CLIENT_VERB.test(tokens[0] ?? "") && tokens.some(token => CLIENT_TRACING.test(token)));
-		const toDevNull = tokens.some(token => token.startsWith(">/dev/null") || token === "/dev/null");
-		const feedsPasswordStdin = passwordStdinPipe && /^(echo|printf|cat)$/u.test(tokens[0] ?? "");
+	for (const segment of splitWords(text)) {
+		const words = segment.map(word => word.text);
+		const verb = unquote(words[0] ?? "");
+		const tracing = shellTracing || (TRACING_CLIENT_VERB.test(verb) && words.some(word => CLIENT_TRACING.test(unquote(word))));
+		const toDevNull = segment.some((_word, index) => isDevNullRedirect(segment, index));
+		const feedsPasswordStdin = passwordStdinPipe && /^(echo|printf|cat)$/u.test(verb);
+		const segmentText = words.join(" ");
+		const live = [...tainted, ...capturedOut];
 
-		// Taint captured earlier in this same text counts from here on, so a
-		// script body that captures on line 2 and prints on line 3 is caught.
-		for (const occurrence of secretOccurrences(segmentText, tokens, [...tainted, ...capturedOut])) {
-			if (captureVariable !== undefined) {
-				// `KEY=$(security … -w)`: the value never reaches a sink the user
-				// or the transcript can see. The variable carries the taint on.
-				if (!capturedOut.includes(captureVariable)) capturedOut.push(captureVariable);
-				if (!tracing) continue;
+		segment.forEach((word, index) => {
+			// `token=$(op read …)` is a capture as the segment's own assignment
+			// and a request field as an argument to curl. Position is what tells
+			// them apart, so only assignment position counts.
+			const captureVariable = inAssignmentPosition(segment, index) ? captureTarget(word.text) : undefined;
+			const flag = unquote(segment[index - 1]?.text ?? "");
+			for (const occurrence of occurrencesInWord(word.text, flag, live)) {
+				if (captureVariable !== undefined) {
+					// `KEY=$(security … -w)`, quoted or not: the value never reaches
+					// a sink the user or the transcript can see. The variable carries
+					// the taint on.
+					if (!capturedOut.includes(captureVariable)) capturedOut.push(captureVariable);
+					if (!tracing) continue;
+				}
+				record(occurrence, tracing, toDevNull, feedsPasswordStdin, source, findings);
 			}
-			if (tracing) {
-				findings.push({ entry: "secret-sink", detail: `${occurrence} under a tracing flag, which prints every expansion`, source });
-				continue;
-			}
-			if (occurrence.sinkAllowed(toDevNull, feedsPasswordStdin)) continue;
-			findings.push({ entry: "secret-sink", detail: `${occurrence} reaches ${occurrence.sink}`, source });
+		});
+
+		// A store read spelled as the segment's own command, rather than inside
+		// one word: `security … -w | pbcopy`. Its output is the segment's, so
+		// the sink is the segment's too.
+		for (const occurrence of segmentCommandReads(segmentText, segment)) {
+			record(occurrence, tracing, toDevNull, feedsPasswordStdin, source, findings);
 		}
-	});
+	}
 }
 
-/** `KEY=$(` leaves `KEY=$` as the tail of the previous segment. */
-function captureTarget(previous: readonly string[] | undefined): string | undefined {
-	const last = previous?.[previous.length - 1];
-	const match = last?.match(/^([A-Za-z_][A-Za-z0-9_]*)=\$$/u);
+function record(
+	occurrence: SecretOccurrence,
+	tracing: boolean,
+	toDevNull: boolean,
+	feedsPasswordStdin: boolean,
+	source: FloorFinding["source"],
+	findings: FloorFinding[],
+): void {
+	if (tracing) {
+		findings.push({ entry: "secret-sink", detail: `${occurrence} under a tracing flag, which prints every expansion`, source });
+		return;
+	}
+	if (occurrence.sinkAllowed(toDevNull, feedsPasswordStdin)) return;
+	findings.push({ entry: "secret-sink", detail: `${occurrence} reaches ${occurrence.sink}`, source });
+}
+
+/** `KEY=$(…)`, `KEY="$(…)"`, `export KEY='$(…)'`: the variable a capture
+ *  assigns to, or undefined when this word is not one. */
+function captureTarget(word: string): string | undefined {
+	const match = word.replace(/^export\s+/u, "").match(/^([A-Za-z_][A-Za-z0-9_]*)=["']?\$\(/u);
 	return match?.[1];
+}
+
+/** True when every word before this one is itself an assignment or `export`,
+ *  which is the only place a shell performs an assignment. */
+function inAssignmentPosition(segment: readonly Word[], index: number): boolean {
+	return segment
+		.slice(0, index)
+		.every(word => unquote(word.text) === "export" || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(word.text));
+}
+
+function isDevNullRedirect(segment: readonly Word[], index: number): boolean {
+	const text = segment[index].text;
+	if (/^>{1,2}\/dev\/null$/u.test(text)) return true;
+	return /^>{1,2}$/u.test(text) && segment[index + 1]?.text === "/dev/null";
 }
 
 interface SecretOccurrence {
@@ -173,30 +213,114 @@ interface SecretOccurrence {
 	sinkAllowed(toDevNull: boolean, feedsPasswordStdin: boolean): boolean;
 }
 
-function secretOccurrences(segmentText: string, tokens: readonly string[], tainted: readonly string[]): SecretOccurrence[] {
+/** Every secret this word carries: a store read spelled inside it, a
+ *  secret-named or tainted variable, or a path to a secret file. The word's
+ *  flag decides the sink for all of them. */
+function occurrencesInWord(word: string, flag: string, tainted: readonly string[]): SecretOccurrence[] {
 	const found: SecretOccurrence[] = [];
-	// A store read is a source wherever it is spelled, but WHERE it is spelled
-	// decides its sink. As the segment's own command its output goes to the
-	// transcript; inside a token it belongs to that token's flag, which is how
-	// `-H "Authorization: Bearer $(security … -w)"` stays an allowed sink.
-	for (const pattern of [KEYCHAIN_READ, PASSWORD_MANAGER_READ]) {
+	const context = { token: unquote(word), flag };
+	if (KEYCHAIN_READ.test(word)) found.push(occurrence("a keychain secret", sinkName(word, flag), context));
+	if (PASSWORD_MANAGER_READ.test(word)) found.push(occurrence("a password-manager secret", sinkName(word, flag), context));
+	const label = secretInToken(unquote(word), tainted);
+	if (label !== undefined) found.push(occurrence(label, sinkName(word, flag), context));
+	return found;
+}
+
+/** A store read that is the segment's own command rather than a substitution
+ *  inside one of its words, so its output is the segment's output. */
+function segmentCommandReads(segmentText: string, segment: readonly Word[]): SecretOccurrence[] {
+	const found: SecretOccurrence[] = [];
+	for (const [pattern, label] of [
+		[KEYCHAIN_READ, "a keychain secret"],
+		[PASSWORD_MANAGER_READ, "a password-manager secret"],
+	] as const) {
 		if (!pattern.test(segmentText)) continue;
-		const label = pattern === KEYCHAIN_READ ? "a keychain secret" : "a password-manager secret";
-		const index = tokens.findIndex(token => pattern.test(token));
-		if (index < 0) {
-			found.push(occurrence(label, "the transcript", undefined));
+		// Already counted by the word that contains it.
+		if (segment.some(word => pattern.test(word.text))) continue;
+		found.push(occurrence(label, "the transcript", undefined));
+	}
+	return found;
+}
+
+interface Word {
+	text: string;
+}
+
+/**
+ * Split a command into segments of words, keeping quotes and `$(…)` inside the
+ * word that contains them. The host tokenizer cannot be used here: it strips
+ * quotes and splits at `(`, which is exactly the structure this scan needs.
+ * Redirects become their own words so `> /tmp/key` and `>/dev/null` read the
+ * same way.
+ */
+function splitWords(text: string): Word[][] {
+	const segments: Word[][] = [];
+	let words: Word[] = [];
+	let current = "";
+	let quote: '"' | "'" | null = null;
+	let depth = 0;
+
+	const endWord = (): void => {
+		if (current.length > 0) words.push({ text: current });
+		current = "";
+	};
+	const endSegment = (): void => {
+		endWord();
+		if (words.length > 0) segments.push(words);
+		words = [];
+	};
+
+	for (let index = 0; index < text.length; index += 1) {
+		const char = text[index];
+		if (quote !== null) {
+			current += char;
+			if (char === quote) quote = null;
 			continue;
 		}
-		const flag = tokens[index - 1] ?? "";
-		found.push(occurrence(label, sinkName(tokens[index], flag), { token: tokens[index], flag }));
+		if (char === '"' || char === "'") {
+			quote = char;
+			current += char;
+			continue;
+		}
+		if (char === "$" && text[index + 1] === "(") {
+			depth += 1;
+			current += "$(";
+			index += 1;
+			continue;
+		}
+		if (depth > 0) {
+			if (char === ")") depth -= 1;
+			current += char;
+			continue;
+		}
+		if (char === "|" || char === ";" || char === "&" || char === "\n") {
+			endSegment();
+			continue;
+		}
+		if (char === ">" || char === "<") {
+			// `2>&1` keeps its digit with the operator; the point is only that a
+			// redirect is not part of the word beside it.
+			endWord();
+			current = char;
+			while (text[index + 1] === char) {
+				current += char;
+				index += 1;
+			}
+			endWord();
+			continue;
+		}
+		if (/\s/u.test(char)) {
+			endWord();
+			continue;
+		}
+		current += char;
 	}
-	tokens.forEach((token, index) => {
-		const flag = tokens[index - 1] ?? "";
-		const label = secretInToken(token, tainted);
-		if (label === undefined) return;
-		found.push(occurrence(label, sinkName(token, flag), { token, flag }));
-	});
-	return found;
+	endSegment();
+	return segments;
+}
+
+function unquote(word: string): string {
+	return word.replace(/^(["'])([\s\S]*)\1$/u, "$2");
 }
 
 function occurrence(label: string, sink: string, context: { token: string; flag: string } | undefined): SecretOccurrence {

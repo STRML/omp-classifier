@@ -65,6 +65,28 @@ describe("floor entry 2 — a secret leaving its source for a sink that is not a
 		expect(result.tainted).toEqual(["KEY"]);
 	});
 
+	test("quoting a capture changes nothing: same allowed sink, same taint", () => {
+		// Quoting a capture is the idiomatic spelling, and reading structure from
+		// a tokenizer that strips quotes used to miss it twice over: the capture
+		// read as a print, and the variable never tainted.
+		for (const command of [`KEY="$(${KEYCHAIN})"`, `export TYPESAFE_API_KEY="$(op read op://v/i/c)"`, `TOKEN='$(pass show services/x)'`]) {
+			const result = evaluateFloor({ command });
+			expect(result.asks).toBe(false);
+			expect(result.tainted).toHaveLength(1);
+		}
+		const captured = evaluateFloor({ command: `TOKEN="$(op read op://v/i/c)"` });
+		expect(captured.tainted).toEqual(["TOKEN"]);
+		expect(asks("echo $TOKEN", captured.tainted)).toBe(true);
+	});
+
+	test("a substitution inside a credential argument keeps its flag, quoted or not", () => {
+		expect(asks("curl -u me:$(op read op://v/i/c) https://api.example.com")).toBe(false);
+		expect(asks(`curl -H "Authorization: Bearer $(${KEYCHAIN})" https://api.example.com`)).toBe(false);
+		expect(asks(`curl --header "Authorization: Bearer $(${KEYCHAIN})" https://api.example.com`)).toBe(false);
+		// The same substitution in a body still asks.
+		expect(asks("curl -d token=$(op read op://v/i/c) https://api.example.com")).toBe(true);
+	});
+
 	test("the tainted variable asks when a later command expands it into a print", () => {
 		expect(asks("echo $KEY", ["KEY"])).toBe(true);
 		expect(asks('printf "%s" "$KEY" > /tmp/k', ["KEY"])).toBe(true);
