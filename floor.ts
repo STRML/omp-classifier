@@ -468,7 +468,10 @@ function pathFromToken(token: string): string | undefined {
 	return stripped;
 }
 
-function isSecretPath(candidate: string): boolean {
+/** Whether this path names a file whose contents are a secret. Exported
+ *  because the literal match needs the same list: a `cat` of one of these is
+ *  not an inert read. */
+export function isSecretPath(candidate: string): boolean {
 	if (/^https?:/iu.test(candidate)) return false;
 	const basename = candidate.split("/").pop() ?? candidate;
 	if (basename.startsWith(".env")) return true;
