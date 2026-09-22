@@ -8,7 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { buildAuthorizationState, summarizeActions } from "../authorization";
 import { collectTaskEvidence, collectToolEvidence, collectUserEvidence, operatorContextFromInput } from "../index";
 import { buildJevState, JEV_POLICY_VERSION } from "../jev";
-import { REDACTED, redactSecrets } from "../redact";
+import { REDACTED, redactSecrets, redactValue } from "../redact";
 
 // Built at run time so no literal token shape sits in the repository.
 const fake = (prefix: string, length: number, alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"): string =>
@@ -88,6 +88,23 @@ describe("redactSecrets", () => {
 		const prose = "Authorization: I approve the deploy to staging";
 		expect(redactSecrets(prose)).toBe(prose);
 		expect(redactSecrets(`Authorization: ApiKey ${opaque}`)).toBe(`Authorization: ApiKey ${REDACTED}`);
+	});
+
+	test("an escaped quote can't end a quoted secret early, and Digest params go whole (Codex round 2)", () => {
+		const escaped = JSON.stringify({ password: 'hunter"secondhalf123' });
+		expect(redactSecrets(escaped)).not.toContain("secondhalf123");
+		const digest = 'Authorization: Digest username="Mufasa", realm="testrealm@host.com", nonce="abcdef0123456789"';
+		const out = redactSecrets(digest);
+		expect(out).toBe(`Authorization: Digest ${REDACTED}`);
+		// The cost, stated: a quoted secret runs to the last quote on its line.
+		expect(redactSecrets('{"password":"x","user":"bob"}')).toBe(`{"password":"${REDACTED}"}`);
+	});
+
+	test("structured values lose everything under a secret key, whatever its content", () => {
+		const args = { command: "curl https://x.test", headers: { Authorization: 'Digest username="a", nonce="b"', "x-api-key": 'we"ird' }, env: { DB_PASSWORD: 'p"w' }, list: [SECRETS.github] };
+		const out = JSON.stringify(redactValue(args));
+		for (const leak of ["username", "we\\\"ird", "p\\\"w", SECRETS.github]) expect(out).not.toContain(leak);
+		expect(out).toContain("curl https://x.test");
 	});
 
 	test("a private key block is redacted whole", () => {
