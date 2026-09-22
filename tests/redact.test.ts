@@ -148,8 +148,7 @@ describe("redactSecrets", () => {
 		expect(JSON.stringify(redactValue({ CLIENT_SECRET_VALUE: "sample_value", PRIVATE_KEY_PEM: "sample_value" }))).not.toContain("sample_value");
 		// The cost, stated: a usage setting named with `token` redacts too.
 		expect(redactSecrets("TOKEN_LIMIT=4096")).toBe(`TOKEN_LIMIT=${REDACTED}`);
-		// grep's `path:line:` prefix is not a setting and keeps its path; any
-		// other shape with a secret word still redacts (#114 gate round 1).
+		// A path without a secret word reads normally (#114 gate round 1).
 		expect(redactSecrets("src/auth/authorization.ts:12: const x")).toBe("src/auth/authorization.ts:12: const x");
 		for (const text of ["client.secret.json=hunter2", "token.ts: hunter2", "APITokenFile=hunter2", "JWTTokenValue=hunter2", "SSHKeyPath=hunter2"]) {
 			expect(redactSecrets(text)).not.toContain("hunter2");
@@ -206,7 +205,7 @@ describe("redactSecrets", () => {
 			"[tool result bash hash=419a39187f6efc67]",
 			"uuid 123e4567-e89b-12d3-a456-426614174000",
 			"max_tokens: 1024",
-			"src/auth/token.ts:12: export function readToken()",
+			"src/auth/session.ts:12: export function readSession()",
 			"key: value",
 			"password reset flow",
 			"https://github.com/acme/repo.git",
@@ -226,13 +225,15 @@ describe("redactSecrets", () => {
 		}
 	});
 
-	test("grep's path:line: prefix is exempt only for a file name", () => {
-		expect(redactSecrets("DB_PASSWORD:12:hunter2")).not.toContain("hunter2");
-		// A dot suffix is not a file extension: `aws.password` is a setting.
-		for (const text of ["aws.password:12:hunter2", "a.b.pwd:12:hunter2", ".cookie:12:hunter2"]) expect(redactSecrets(text)).not.toContain("hunter2");
-		// A real grep hit keeps its path, and its content is still read.
-		expect(redactSecrets("config.env:12:API_KEY=hunter2")).toBe(`config.env:12:API_KEY=${REDACTED}`);
-		expect(redactSecrets("src/auth/token.ts:12: export")).toBe("src/auth/token.ts:12: export");
+	test("no grep-path exemption: the shape is ambiguous, so it redacts (#114 gate round 2)", () => {
+		// `client.secret.json:12:hunter2` is a grep hit or a secret, and no rule
+		// can tell which. Every shape with a secret word redacts; the cost is a
+		// grep hit on a secret-named file loses the rest of its line.
+		for (const text of ["client.secret.json:12:hunter2", "DB_PASSWORD:12:hunter2", "aws.password:12:hunter2", "a.b.pwd:12:hunter2"]) {
+			expect(redactSecrets(text)).not.toContain("hunter2");
+		}
+		expect(redactSecrets("src/auth/token.ts:12: export function readToken()")).toBe(`src/auth/token.ts:${REDACTED}`);
+		expect(redactSecrets("config.env:12:API_KEY=hunter2")).not.toContain("hunter2");
 	});
 
 	test("redaction is idempotent", () => {

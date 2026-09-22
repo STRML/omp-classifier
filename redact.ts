@@ -104,20 +104,6 @@ const NAME_THEN_SEPARATOR = /(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+)(?:\\?["'])?\s*
  *  `mysql --password hunter2`. It may open the text or a line. */
 const FLAG_THEN_VALUE = /(?:^|\s)--?([A-Za-z0-9_.-]+)[ \t]+(?=\S)/gu;
 
-/** `src/auth/token.ts:12:` is grep's file-and-line prefix, not a setting: a
- *  file name (it ends in an extension), a colon, digits, a colon. Only that
- *  exact shape is exempt, so `client.secret.json=hunter2`, `token.ts: hunter2`
- *  and `DB_PASSWORD:12:hunter2` still redact. */
-/** Extensions a grep hit names, from a fixed list: a dot suffix alone is not
- *  enough, since `aws.password` and `db.pwd` have one too. */
-const SOURCE_FILE = /\.(?:[cm]?[jt]sx?|py|rb|go|rs|java|kt|swift|c|h|cc|cpp|hpp|cs|php|sh|bash|zsh|md|txt|json|ya?ml|toml|ini|cfg|conf|env|lock|log|html|css|sql|xml)$/iu;
-
-function isGrepLocation(line: string, match: RegExpMatchArray): boolean {
-	if (!SOURCE_FILE.test(match[1])) return false;
-	const after = line.slice((match.index ?? 0) + match[1].length);
-	return /^:\d+:/u.test(after);
-}
-
 /**
  * Redact one line from its first secret marker to its end, whatever the
  * scheme or quoting after it. Every name on the line is asked, so a harmless
@@ -129,7 +115,6 @@ function redactLine(line: string): string {
 	for (const pattern of [NAME_THEN_SEPARATOR, FLAG_THEN_VALUE]) {
 		for (const match of line.matchAll(pattern)) {
 			if (!isSecretMarker(match[1])) continue;
-			if (pattern === NAME_THEN_SEPARATOR && isGrepLocation(line, match)) continue;
 			const end = match.index + match[0].length;
 			if (cut < 0 || end < cut) cut = end;
 			break;
