@@ -142,6 +142,14 @@ describe("redactSecrets", () => {
 		}
 		for (const name of ["maxTokens", "monkey", "PWD", "OLDPWD", "KEY", "turkey"]) expect(isSecretName(name)).toBe(false);
 		for (const name of ["pwd", "mypwd", "USERPWD", "db_pwd", "Pwd"]) expect(isSecretName(name)).toBe(true);
+		// A secret word anywhere among the name's words (#110 gate round 4).
+		for (const name of ["CLIENT_SECRET_VALUE", "PRIVATE_KEY_PEM", "GH_TOKEN_FILE", "api_key_id", "sshKeyPath", "db.credentials.path"]) expect(isSecretName(name)).toBe(true);
+		for (const text of ["CLIENT_SECRET_VALUE=sample_value", "PRIVATE_KEY_PEM=sample_value"]) expect(redactSecrets(text)).not.toContain("sample_value");
+		expect(JSON.stringify(redactValue({ CLIENT_SECRET_VALUE: "sample_value", PRIVATE_KEY_PEM: "sample_value" }))).not.toContain("sample_value");
+		// The cost, stated: a usage setting named with `token` redacts too.
+		expect(redactSecrets("TOKEN_LIMIT=4096")).toBe(`TOKEN_LIMIT=${REDACTED}`);
+		// A file name is not a setting: grep output keeps its path.
+		expect(redactSecrets("src/auth/token.ts:12: export function readToken()")).toBe("src/auth/token.ts:12: export function readToken()");
 		// Prefixed headers, dotted config keys, and all-caps glued names.
 		for (const text of ['-H "X-Authorization: VAL123x"', "aws.pwd=VAL123x", "MYPRIVATEKEY=VAL123x", "spring.datasource.password: VAL123x"]) {
 			expect(redactSecrets(text)).not.toContain("VAL123x");
@@ -190,7 +198,7 @@ describe("redactSecrets", () => {
 			"commit 8574b96c0ffee1234567890abcdef1234567890ab",
 			"[tool result bash hash=419a39187f6efc67]",
 			"uuid 123e4567-e89b-12d3-a456-426614174000",
-			"TOKEN_LIMIT=4096 max_tokens: 1024",
+			"max_tokens: 1024",
 			"src/auth/token.ts: export function readToken()",
 			"key: value",
 			"password reset flow",
