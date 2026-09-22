@@ -23,10 +23,11 @@
  * anything.
  */
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
-import { tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
+import { parseShell, type ShellCommand, type ShellRedirect, type ShellWord, verbName } from "./shell-ast";
 
-/** Which floor entry a finding came from. The numbers are the plan's. */
-export type FloorEntry = "critical" | "secret-sink" | "download-to-interpreter" | "obfuscated-code";
+/** Which floor entry a finding came from. The numbers are the plan's, plus
+ *  `unread-command` for a command the shell parser rejected. */
+export type FloorEntry = "critical" | "secret-sink" | "download-to-interpreter" | "obfuscated-code" | "unread-command";
 
 export interface FloorFinding {
 	entry: FloorEntry;
@@ -65,9 +66,15 @@ const SECRET_FILE_SUFFIX = /\.(pem|tfstate|key|p12|pfx|jks)$/iu;
 const SECRET_FILE_WORD = /credential|secret/iu;
 const SECRET_DIR = /(^|\/)\.(ssh|aws|gnupg)(\/|$)/u;
 
-/** Commands that read a secret value out of a store. */
+/** Commands that read a secret value out of a store. Matched against a
+ *  command's words joined, and against each word's own text, which is how
+ *  `bash -c 'op read …'` is caught. */
 const KEYCHAIN_READ = /\bsecurity\s+(find-generic-password|find-internet-password)\b[^\n;|&]*\s-(w|g)\b/u;
 const PASSWORD_MANAGER_READ = /\bop\s+read\b|\bpass\s+show\b|\bvault\s+kv\s+get\b|\bgcloud\s+secrets\s+versions\s+access\b|\baws\s+secretsmanager\s+get-secret-value\b/u;
+const STORE_READS = [
+	[KEYCHAIN_READ, "a keychain secret"],
+	[PASSWORD_MANAGER_READ, "a password-manager secret"],
+] as const;
 
 /** Shell tracing prints every expansion, so it prints the allowed sinks too. */
 const SHELL_TRACING = /(^|[\s;&|(])(set\s+-[a-z]*x|bash\s+-[a-z]*x|sh\s+-[a-z]*x)/u;
@@ -75,12 +82,15 @@ const SHELL_TRACING = /(^|[\s;&|(])(set\s+-[a-z]*x|bash\s+-[a-z]*x|sh\s+-[a-z]*x
  *  flags bundle, and one of them is verbose. */
 const CLIENT_TRACING = /^(--verbose|--trace|--trace-ascii|--trace-time|-[a-zA-Z]*v[a-zA-Z]*)$/u;
 const TRACING_CLIENT_VERB = /^(curl|wget|http|httpie)$/u;
+/** The clients whose `-H` and `-u` carry credentials. The header sink is
+ *  theirs alone: `echo -u "$API_KEY"` prints the key. */
+const HTTP_CLIENT = /^(curl|wget|http|https|httpie|xh)$/u;
 
 /** Curl flags whose value is a request body or an upload: never an allowed sink. */
 const BODY_FLAG = /^(-d|--data|--data-raw|--data-binary|--data-urlencode|--data-ascii|-F|--form|--form-string|-T|--upload-file)$/u;
 /** Flags whose value is an authorization header or a credential pair. */
 const AUTH_FLAG = /^(-H|--header|-u|--user|--oauth2-bearer)$/u;
-/** The same flags written as one token, `-HAuthorization: …` or `--header=…`. */
+/** The same flags written as one word, `-HAuthorization: …` or `--header=…`. */
 const AUTH_FLAG_ATTACHED = /^(-H|-u|--header=|--user=|--oauth2-bearer=)/u;
 const BODY_FLAG_ATTACHED = /^(-d|-F|-T|--data(-[a-z]+)?=|--form(-string)?=|--upload-file=)/u;
 
@@ -92,6 +102,17 @@ const PROCESS_SUBSTITUTION_FETCH = new RegExp(String.raw`\b(${INTERPRETER})\s+<\
  *  `--password-stdin` exemption is for handing a secret to one of these, not
  *  for any command that happens to carry the flag. */
 const CREDENTIAL_CONSUMER = /^(docker|podman|nerdctl|buildah|helm|gh|glab|npm|pnpm|yarn|crane|skopeo)$/u;
+
+/**
+ * Words that run the next word as a command without taking an argument of
+ * their own, so `nohup env TOKEN=$(…) cmd` still reaches `env`.
+ *
+ * Checked against a real bash: under these, `TOKEN=$(…)` written directly is
+ * a command NAME, not an assignment. The parser already knows that; this list
+ * only lets the `env` rule below see past them.
+ */
+const EXEC_WRAPPER = /^(nohup|command|builtin|exec)$/u;
+const ASSIGNMENT_WORD = /^([A-Za-z_][A-Za-z0-9_]*)=/u;
 
 const BASE64_DECODE = /\bbase64\s+(-{1,2}[dD]\b|--decode\b)/u;
 const DECODE_INTO_EXEC = /\b(exec|eval|compile)\s*\(\s*[^)]*\b(b64decode|b64_decode|urlsafe_b64decode|atob|from_base64)\b/u;
@@ -116,64 +137,175 @@ function scanText(text: string, source: FloorFinding["source"], tainted: readonl
 	if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(text))) {
 		findings.push({ entry: "critical", detail: "matches a built-in dangerous-command pattern", source });
 	}
-	scanSecrets(text, source, tainted, findings, capturedOut);
+	const parsed = parseShell(text);
+	if (parsed.ok) {
+		scanSecrets(parsed.commands, { shellTracing: SHELL_TRACING.test(text), tainted, captured: capturedOut, findings, source, visited: new Set() });
+		if (shellEvalOfNonLiteral(parsed.commands)) {
+			findings.push({ entry: "obfuscated-code", detail: "shell eval runs a value rather than a literal", source });
+		}
+	} else {
+		// A command the parser rejected was not read. Reading it as a command
+		// with no secret in it is the fail-open answer.
+		findings.push({ entry: "unread-command", detail: `the shell parser could not read it: ${parsed.reason}`, source });
+	}
 	scanDownloadToInterpreter(text, source, findings);
 	scanObfuscation(text, source, findings);
 }
 
+interface SecretScan {
+	shellTracing: boolean;
+	/** Carried in from earlier commands. */
+	tainted: readonly string[];
+	/** Captured by this call, live: a capture taints the words after it. */
+	captured: string[];
+	findings: FloorFinding[];
+	source: FloorFinding["source"];
+	/** Commands already read through the word that contains them. */
+	visited: Set<ShellCommand>;
+}
+
 /**
- * Entry 2. Every secret occurrence asks unless it lands in one of the four
- * allowed sinks: a `$(…)` capture assigned to a variable, `/dev/null`, a curl
- * auth header or `-u` without tracing, or a `--password-stdin` pipe.
+ * Entry 2. Every secret asks unless it lands in one of the four allowed sinks:
+ * an assignment (a capture), `/dev/null`, an HTTP client's auth header or `-u`
+ * without tracing, or a `--password-stdin` pipe.
  *
- * This reads the command with `splitWords` rather than the host tokenizer,
- * which was the source of two wrong answers: the tokenizer strips quotes and
- * splits at `(`, so `KEY="$(security … -w)"` stopped looking like a capture
- * and `curl -u me:$(op read …)` lost the flag its value belonged to. Keeping a
- * substitution inside the word that contains it is what makes "which flag does
- * this value belong to" answerable at all.
+ * The sources are found per word, whole: a store read, a secret-named or
+ * tainted variable, or a secret path anywhere in the word. The sink comes from
+ * the word's position, which the parser supplies. Which flag a value belongs to
+ * is option grammar and bash does not know it, so the floor uses it only to
+ * name a sink (body, header), never to decide whether a secret is there.
+ *
+ * A command inside a substitution is read through the word that holds it, so
+ * its output lands where that word lands: `KEY=$(op read …)` is a capture and
+ * `curl -H "Bearer $(op read …)"` a header.
  */
-function scanSecrets(text: string, source: FloorFinding["source"], tainted: readonly string[], findings: FloorFinding[], capturedOut: string[]): void {
-	const shellTracing = SHELL_TRACING.test(text);
-	const allSegments = splitWords(text);
-	allSegments.forEach((entry, segmentIndex) => {
-		const segment = entry.words;
-		const words = segment.map(word => word.text);
-		const verb = unquote(words[0] ?? "");
-		const tracing = shellTracing || (TRACING_CLIENT_VERB.test(verb) && words.some(word => CLIENT_TRACING.test(unquote(word))));
-		const toDevNull = segment.some((_word, index) => isDevNullRedirect(segment, index));
-		const feedsPasswordStdin = /^(echo|printf|cat)$/u.test(verb) && consumesPasswordStdin(allSegments[segmentIndex + 1]);
-		const segmentText = words.map(unquote).join(" ");
+function scanSecrets(commands: readonly ShellCommand[], scan: SecretScan): void {
+	const top = commands.filter(command => !command.nested);
+	top.forEach((command, index) => {
+		const printed = commandSecrets(command, scan);
+		if (printed.length === 0 || feedsPasswordStdin(command, top[index + 1])) return;
+		for (const label of printed) report(scan, `${label} reaches the transcript`);
+	});
+	// A command in a compound's header, such as `for f in $(…)`, belongs to no
+	// word. Where its output goes is not something this code can name, so it
+	// is read as a print.
+	for (const command of commands) {
+		if (scan.visited.has(command)) continue;
+		for (const label of commandSecrets(command, scan)) report(scan, `${label} reaches the transcript`);
+	}
+}
 
-		segment.forEach((word, index) => {
-			// Read the taint fresh for every word. A snapshot taken before the
-			// loop missed `TOKEN=$(op read …) curl -d "$TOKEN" …`, where the
-			// capture and the body sink sit in the same segment.
-			const live = [...tainted, ...capturedOut];
-			// `token=$(op read …)` is a capture as the segment's own assignment
-			// and a request field as an argument to curl. Position is what tells
-			// them apart, so only assignment position counts.
-			const captureVariable = inAssignmentPosition(segment, index) ? captureTarget(word.text) : undefined;
-			const flag = unquote(segment[index - 1]?.text ?? "");
-			for (const occurrence of occurrencesInWord(word.text, flag, live)) {
-				if (captureVariable !== undefined) {
-					// `KEY=$(security … -w)`, quoted or not: the value never reaches
-					// a sink the user or the transcript can see. The variable carries
-					// the taint on.
-					if (!capturedOut.includes(captureVariable)) capturedOut.push(captureVariable);
-					if (!tracing) continue;
-				}
-				record(occurrence, tracing, toDevNull, feedsPasswordStdin, source, findings);
-			}
-		});
+/** Read one command. Findings for sinks it names itself are recorded here;
+ *  the secrets that reach its stdout are returned, because whoever receives
+ *  that stdout decides the sink. */
+function commandSecrets(command: ShellCommand, scan: SecretScan): string[] {
+	scan.visited.add(command);
+	const tracing = scan.shellTracing || clientTracing(command);
+	const envIndexes = envAssignments(command);
+	for (const assign of command.assigns) capture(assign.name, assign.value, tracing, scan);
+	for (const index of envIndexes) capture(ASSIGNMENT_WORD.exec(command.words[index].value)?.[1] ?? "", command.words[index], tracing, scan);
 
-		// A store read spelled as the segment's own command, rather than inside
-		// one word: `security … -w | pbcopy`. Its output is the segment's, so
-		// the sink is the segment's too.
-		for (const occurrence of segmentCommandReads(segmentText, segment)) {
-			record(occurrence, tracing, toDevNull, feedsPasswordStdin, source, findings);
+	const printed = storeReads(command);
+	const headerSink = HTTP_CLIENT.test(verbName(command));
+	command.words.forEach((word, index) => {
+		if (envIndexes.includes(index)) return;
+		const sink = wordSink(command.words[index - 1]?.value ?? "", word.value, headerSink);
+		for (const label of wordSecrets(word, scan, true)) {
+			if (sink === "body") report(scan, `${label} reaches a request body or upload`);
+			else if (sink === "header" && tracing) report(scan, `${label} under a tracing flag, which prints every expansion`);
+			else if (sink === "output") printed.push(label);
 		}
 	});
+	for (const redirect of command.redirects) printed.push(...redirectSecrets(redirect, scan));
+	return routeStdout(command, printed, scan);
+}
+
+/** `KEY=$(op read …)` and `export KEY="$(…)"`: the value never reaches a sink
+ *  anyone can see, and the variable carries the taint on. */
+function capture(name: string, value: ShellWord | undefined, tracing: boolean, scan: SecretScan): void {
+	const labels = value ? wordSecrets(value, scan, true) : [];
+	if (labels.length === 0) return;
+	if (name !== "" && !scan.captured.includes(name)) scan.captured.push(name);
+	if (!tracing) return;
+	for (const label of labels) report(scan, `${label} under a tracing flag, which prints every expansion`);
+}
+
+/**
+ * The words `env` reads as assignments: `env TOKEN=$(…) cmd`, past any
+ * wrapper that takes no argument. The parser reads them as arguments, because
+ * to bash they are; `env` is the one command whose grammar this needs, since
+ * it is the ordinary way to hand a captured secret to one command.
+ */
+function envAssignments(command: ShellCommand): number[] {
+	const words = command.words;
+	let index = 0;
+	while (index < words.length && EXEC_WRAPPER.test(words[index].value)) index += 1;
+	if (words[index]?.value !== "env") return [];
+	const found: number[] = [];
+	for (index += 1; index < words.length && ASSIGNMENT_WORD.test(words[index].value); index += 1) found.push(index);
+	return found;
+}
+
+/** A store read that is the command itself, `security … -w | pbcopy`. One
+ *  spelled inside a single word, `bash -c 'op read …'`, is that word's. */
+function storeReads(command: ShellCommand): string[] {
+	const text = command.words.map(word => word.value).join(" ");
+	return STORE_READS.filter(([pattern]) => pattern.test(text) && !command.words.some(word => pattern.test(word.value))).map(([, label]) => label);
+}
+
+/** Every secret a word carries, including what its substitutions print. */
+function wordSecrets(word: ShellWord, scan: SecretScan, paths: boolean): string[] {
+	const labels: string[] = STORE_READS.filter(([pattern]) => pattern.test(word.value)).map(([, label]) => label);
+	const live = [...scan.tainted, ...scan.captured];
+	// Read from the text rather than from the parser's expansions, so a
+	// single-quoted `'echo $API_KEY'` handed to `bash -c` or `ssh` counts too.
+	for (const match of word.value.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/gu)) {
+		const name = match[1];
+		if (live.includes(name)) labels.push(`the captured secret in $${name}`);
+		else if (SECRET_VAR.test(name)) labels.push(`the secret-named variable $${name}`);
+	}
+	const filePath = paths ? secretPathIn(word.value) : undefined;
+	if (filePath !== undefined) labels.push(`the secret file ${filePath}`);
+	for (const command of word.commands) labels.push(...commandSecrets(command, scan));
+	return labels;
+}
+
+/** What a command reads through a redirect: `< ~/.ssh/id_rsa`, a here-string,
+ *  a heredoc body. An output target is a destination, so a path there is not
+ *  a read, but a secret expanded into its name still counts. */
+function redirectSecrets(redirect: ShellRedirect, scan: SecretScan): string[] {
+	if (redirect.direction === "out") return wordSecrets(redirect.target, scan, false);
+	if (redirect.body !== undefined) return wordSecrets(redirect.body, scan, false);
+	return wordSecrets(redirect.target, scan, !redirect.here);
+}
+
+type WordSink = "body" | "header" | "output";
+
+/** The sink a word's value reaches, from the flag in front of it or attached
+ *  to it. This names the sink only; the secret was found without it. */
+function wordSink(flag: string, value: string, headerSink: boolean): WordSink {
+	if (BODY_FLAG.test(flag) || BODY_FLAG_ATTACHED.test(value)) return "body";
+	if (headerSink && (AUTH_FLAG.test(flag) || AUTH_FLAG_ATTACHED.test(value))) return "header";
+	return "output";
+}
+
+/**
+ * Where the command's stdout goes: the stream it inherited, `/dev/null`, or a
+ * file. The last redirect of stdout wins, as in the shell. `2>/dev/null`
+ * discards the error message and prints the secret, and `>&2` moves stdout
+ * onto stderr, which still prints.
+ */
+function routeStdout(command: ShellCommand, printed: string[], scan: SecretScan): string[] {
+	if (printed.length === 0) return printed;
+	let destination: "stream" | "discard" | "file" = "stream";
+	for (const redirect of command.redirects) {
+		if (redirect.direction !== "out" || !["", "1", "&"].includes(redirect.fd)) continue;
+		if (redirect.duplicate && /^(\d+|-)$/u.test(redirect.target.value)) destination = "stream";
+		else destination = redirect.target.value === "/dev/null" ? "discard" : "file";
+	}
+	if (destination === "stream") return printed;
+	if (destination === "file") for (const label of printed) report(scan, `${label} reaches a file`);
+	return [];
 }
 
 /**
@@ -182,344 +314,39 @@ function scanSecrets(text: string, source: FloorFinding["source"], tainted: read
  * `printf … | tee /tmp/leak | docker login --password-stdin` keeps a copy in
  * the middle, so the exemption must not reach past `tee`.
  */
-function consumesPasswordStdin(next: Segment | undefined): boolean {
-	if (next === undefined || !next.pipedFromPrevious) return false;
-	if (!CREDENTIAL_CONSUMER.test(unquote(next.words[0]?.text ?? ""))) return false;
-	return next.words.some(word => unquote(word.text) === "--password-stdin");
+function feedsPasswordStdin(command: ShellCommand, next: ShellCommand | undefined): boolean {
+	if (!/^(echo|printf|cat)$/u.test(verbName(command))) return false;
+	if (next === undefined || next.join !== "pipe") return false;
+	if (!CREDENTIAL_CONSUMER.test(verbName(next))) return false;
+	return next.words.some(word => word.value === "--password-stdin");
 }
 
-function record(
-	occurrence: SecretOccurrence,
-	tracing: boolean,
-	toDevNull: boolean,
-	feedsPasswordStdin: boolean,
-	source: FloorFinding["source"],
-	findings: FloorFinding[],
-): void {
-	if (tracing) {
-		findings.push({ entry: "secret-sink", detail: `${occurrence} under a tracing flag, which prints every expansion`, source });
-		return;
-	}
-	if (occurrence.sinkAllowed(toDevNull, feedsPasswordStdin)) return;
-	findings.push({ entry: "secret-sink", detail: `${occurrence} reaches ${occurrence.sink}`, source });
+function clientTracing(command: ShellCommand): boolean {
+	return TRACING_CLIENT_VERB.test(verbName(command)) && command.words.some(word => CLIENT_TRACING.test(word.value));
 }
 
-/** `KEY=$(…)`, `KEY="$(…)"`, ``KEY=`…` ``: the variable a capture assigns to,
- *  or undefined when this word is not one. */
-function captureTarget(word: string): string | undefined {
-	const match = word.match(/^([A-Za-z_][A-Za-z0-9_]*)=["']?(\$\(|`)/u);
-	return match?.[1];
+function report(scan: SecretScan, detail: string): void {
+	scan.findings.push({ entry: "secret-sink", detail, source: scan.source });
 }
 
 /**
- * Words that can stand in front of an assignment without ending the
- * assignment position: `env TOKEN=$(…) cmd`, `local KEY=$(…)` in a function,
- * and the function header that encloses it.
- *
- * Checked against a real bash, not from memory, because the first version of
- * this list was wrong in the dangerous direction. `nohup`, `command` and
- * `builtin` do NOT keep assignment position: under them `TOKEN=$(…)` runs as
- * a command NAME, the substitution expands, and the shell's "not found" error
- * carries the secret to the transcript. Anything added here needs the same
- * check.
+ * A secret path anywhere in a word. `f=@~/.aws/credentials` and `@./key.pem`
+ * name one after a prefix. A word that opens with a dash may carry its value
+ * attached, `-sTconfig/secrets.pem`, and which letters are the flag is option
+ * grammar this code does not have, so every tail of it is a candidate. Asking
+ * too often is the floor's safe direction. A bare flag name such as
+ * `--kubeconfig` is a flag, not a path.
  */
-const ASSIGNMENT_PREFIX = /^(env|local|declare|typeset|readonly|export|function|\{|[A-Za-z_][A-Za-z0-9_]*\(\))$/u;
-
-/** Words that run a command of their own, so the word after them is that
- *  command's NAME. An assignment there is a command name, not a capture, which
- *  the shell then fails to find while printing what it expanded. */
-const EXEC_WRAPPER = /^(nohup|command|builtin|time|sudo|doas|timeout|xargs|stdbuf|nice|ionice)$/u;
-
-/**
- * Whether the shell will treat this word as an assignment rather than as a
- * command name or an argument.
- *
- * Decided by scanning FORWARD, because that is how the shell decides: the
- * command is the first word that is not an assignment, and every word after it
- * is an argument. A backwards scan cannot tell `env TOKEN=$(…)` from `echo env
- * TOKEN=$(…)`, where `env` is a word being printed, and it read the second one
- * as a capture.
- */
-function inAssignmentPosition(segment: readonly Word[], index: number): boolean {
-	// Two facts, not one: whether a command name is still to come, and whether
-	// an assignment may appear here. `nohup` keeps the first and drops the
-	// second, which is why `nohup env FOO=$(…)` captures and `nohup FOO=$(…)`
-	// does not.
-	let inCommandPosition = true;
-	let assignmentsAllowed = true;
-	for (let before = 0; before < index; before += 1) {
-		const word = unquote(segment[before].text);
-		if (inCommandPosition && assignmentsAllowed && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(word)) continue;
-		if (inCommandPosition && ASSIGNMENT_PREFIX.test(word)) {
-			assignmentsAllowed = true;
-			continue;
-		}
-		if (inCommandPosition && EXEC_WRAPPER.test(word)) {
-			assignmentsAllowed = false;
-			continue;
-		}
-		inCommandPosition = false;
-		assignmentsAllowed = false;
+function secretPathIn(value: string): string | undefined {
+	const stripped = value.replace(ASSIGNMENT_WORD, "").replace(/^@/u, "");
+	if (stripped.length === 0) return undefined;
+	if (!stripped.startsWith("-")) return isSecretPath(stripped) ? stripped : undefined;
+	if (/^-{1,2}[A-Za-z0-9][A-Za-z0-9-]*$/u.test(stripped)) return undefined;
+	for (let start = 1; start < stripped.length; start += 1) {
+		const tail = stripped.slice(start);
+		if (isSecretPath(tail)) return tail;
 	}
-	return inCommandPosition && assignmentsAllowed;
-}
-
-/** A redirect that discards the SECRET, which means stdout: `>/dev/null` or
- *  `1>/dev/null`. `2>/dev/null` discards the error message and prints the
- *  secret, so it is not an allowed sink. */
-function isDevNullRedirect(segment: readonly Word[], index: number): boolean {
-	// A real redirect is never quoted: `echo ">/dev/null"` is an argument that
-	// prints, and unquoting it first made it look like the allowed sink.
-	const text = segment[index].text;
-	if (/["']/u.test(text)) return false;
-	const match = /^(\d?|&)>{1,2}(&?)(.*)$/u.exec(text);
-	if (match === null) return false;
-	const [, fd, duplicated, target] = match;
-	// Only a redirect of stdout, or of both streams, discards the secret.
-	if (fd !== "" && fd !== "1" && fd !== "&") return false;
-	// `>&2` and `1>&2` point stdout at another open stream, which still prints.
-	if (duplicated === "&" && /^\d+$/u.test(target)) return false;
-	if (target === "/dev/null") return true;
-	return target === "" && unquote(segment[index + 1]?.text ?? "") === "/dev/null";
-}
-
-interface SecretOccurrence {
-	/** What was read, for the detail line. Never the value itself. */
-	toString(): string;
-	sink: string;
-	sinkAllowed(toDevNull: boolean, feedsPasswordStdin: boolean): boolean;
-}
-
-/** Every secret this word carries: a store read spelled inside it, a
- *  secret-named or tainted variable, or a path to a secret file. The word's
- *  flag decides the sink for all of them. */
-function occurrencesInWord(word: string, flag: string, tainted: readonly string[]): SecretOccurrence[] {
-	const found: SecretOccurrence[] = [];
-	const value = unquote(word);
-	const context = { token: value, flag };
-	if (KEYCHAIN_READ.test(value)) found.push(occurrence("a keychain secret", sinkName(value, flag), context));
-	if (PASSWORD_MANAGER_READ.test(value)) found.push(occurrence("a password-manager secret", sinkName(value, flag), context));
-	const label = secretInToken(value, tainted);
-	if (label !== undefined) found.push(occurrence(label, sinkName(value, flag), context));
-	return found;
-}
-
-/** A store read that is the segment's own command rather than a substitution
- *  inside one of its words, so its output is the segment's output. */
-function segmentCommandReads(segmentText: string, segment: readonly Word[]): SecretOccurrence[] {
-	const found: SecretOccurrence[] = [];
-	for (const [pattern, label] of [
-		[KEYCHAIN_READ, "a keychain secret"],
-		[PASSWORD_MANAGER_READ, "a password-manager secret"],
-	] as const) {
-		if (!pattern.test(segmentText)) continue;
-		// Already counted by the word that contains it.
-		if (segment.some(word => pattern.test(unquote(word.text)))) continue;
-		found.push(occurrence(label, "the transcript", undefined));
-	}
-	return found;
-}
-
-interface Word {
-	text: string;
-}
-
-interface Segment {
-	words: Word[];
-	/** True when a `|` joined this segment to the one before it, so the
-	 *  previous segment's output is this segment's stdin. `;` and `&&` are not
-	 *  pipes: they pass nothing. */
-	pipedFromPrevious: boolean;
-}
-
-/**
- * Split a command into segments of words, keeping quotes and `$(…)` inside the
- * word that contains them. The host tokenizer cannot be used here: it strips
- * quotes and splits at `(`, which is exactly the structure this scan needs.
- * Redirects become their own words so `> /tmp/key` and `>/dev/null` read the
- * same way.
- */
-function splitWords(text: string): Segment[] {
-	const segments: Segment[] = [];
-	let words: Word[] = [];
-	let current = "";
-	let quote: '"' | "'" | null = null;
-	let depth = 0;
-	let backtick = false;
-	let pipedFromPrevious = false;
-	let nextIsPiped = false;
-
-	const endWord = (): void => {
-		if (current.length > 0) words.push({ text: current });
-		current = "";
-	};
-	const endSegment = (): void => {
-		endWord();
-		if (words.length > 0) segments.push({ words, pipedFromPrevious });
-		// The flag describes THIS separator, so it is consumed either way. An
-		// empty stage must not let a pipe two separators back reach forward.
-		pipedFromPrevious = nextIsPiped;
-		nextIsPiped = false;
-		words = [];
-	};
-
-	for (let index = 0; index < text.length; index += 1) {
-		const char = text[index];
-		if (quote !== null) {
-			current += char;
-			if (char === quote) quote = null;
-			continue;
-		}
-		if (char === '"' || char === "'") {
-			quote = char;
-			current += char;
-			continue;
-		}
-		// A backslash escapes exactly one character, so it is read as a pair.
-		// That makes `\` + newline a line continuation, which the shell deletes
-		// while the command carries on, and `\\` + newline an escaped backslash
-		// followed by a real newline, which ends the command.
-		if (char === "\\") {
-			const escaped = text[index + 1];
-			if (escaped === undefined) {
-				current += char;
-				continue;
-			}
-			if (escaped !== "\n") current += char + escaped;
-			index += 1;
-			continue;
-		}
-		if (char === "$" && text[index + 1] === "(") {
-			depth += 1;
-			current += "$(";
-			index += 1;
-			continue;
-		}
-		if (char === "`") {
-			// Backticks are the older spelling of the same substitution, and a
-			// capture written with them is still a capture.
-			backtick = !backtick;
-			current += char;
-			continue;
-		}
-		if (depth > 0 || backtick) {
-			if (char === ")" && depth > 0) depth -= 1;
-			current += char;
-			continue;
-		}
-		// `&>` is one redirect of both streams, not a separator followed by one.
-		if (char === "|" || char === ";" || char === "\n" || (char === "&" && text[index + 1] !== ">")) {
-			// `||` and `&&` are two-character operators, consumed whole. Reading
-			// them one character at a time let the second `|` of `||` set the
-			// pipe flag, and `||` passes an exit status, not output.
-			const doubled = (char === "|" || char === "&") && text[index + 1] === char;
-			nextIsPiped = char === "|" && !doubled;
-			if (doubled) index += 1;
-			endSegment();
-			continue;
-		}
-		if (char === ">" || char === "<" || char === "&") {
-			// The fd digit belongs to the operator: `2>/dev/null` discards the
-			// error message and prints the secret, while `>/dev/null` discards
-			// the secret. Detaching the digit made those the same word, which
-			// turned every `2>/dev/null` into the allowed sink.
-			const fd = /(\d)$/u.exec(current)?.[1] ?? "";
-			if (fd !== "") current = current.slice(0, -1);
-			endWord();
-			if (char === "&") {
-				// `&>` and `&>>`: both streams, so the secret goes with them.
-				current = "&>";
-				index += 1;
-			} else {
-				current = fd + char;
-			}
-			const operator = char === "&" ? ">" : char;
-			while (text[index + 1] === operator) {
-				current += operator;
-				index += 1;
-			}
-			// `2>&1` and `>/dev/null` attach their target; a space-separated
-			// target becomes the next word and is read there.
-			while (index + 1 < text.length && !/[\s;|&<>]/u.test(text[index + 1])) {
-				current += text[index + 1];
-				index += 1;
-			}
-			if (text[index + 1] === "&") {
-				current += "&";
-				index += 1;
-				while (index + 1 < text.length && /\d/u.test(text[index + 1])) {
-					current += text[index + 1];
-					index += 1;
-				}
-			}
-			endWord();
-			continue;
-		}
-		if (/\s/u.test(char)) {
-			endWord();
-			continue;
-		}
-		current += char;
-	}
-	endSegment();
-	return segments;
-}
-
-/**
- * The word as the shell will see it. A shell joins `sec"urity"` back into one
- * word and `'-w'` into `-w`, so every match in this file runs on this, not on
- * the text as typed. Stripping only a surrounding pair left one quote pair
- * enough to hide a secret read from the floor.
- */
-function unquote(word: string): string {
-	return word.replace(/\\(["'])/gu, "$1").replace(/["']/gu, "");
-}
-
-function occurrence(label: string, sink: string, context: { token: string; flag: string } | undefined): SecretOccurrence {
-	return {
-		toString: () => label,
-		sink,
-		sinkAllowed: (toDevNull, feedsPasswordStdin) => {
-			if (context !== undefined) {
-				// The value's own flag decides first. A redirect discards what the
-				// command PRINTS, which says nothing about what it SENDS: without
-				// this order, appending `>/dev/null` to an exfiltration command
-				// turned off this whole entry.
-				if (BODY_FLAG.test(context.flag) || BODY_FLAG_ATTACHED.test(context.token)) return false;
-				if (AUTH_FLAG.test(context.flag) || AUTH_FLAG_ATTACHED.test(context.token)) return true;
-			}
-			return toDevNull || feedsPasswordStdin;
-		},
-	};
-}
-
-function sinkName(token: string, flag: string): string {
-	if (BODY_FLAG.test(flag) || BODY_FLAG_ATTACHED.test(token)) return "a request body or upload";
-	if (token.startsWith(">") || flag === ">" || flag === ">>") return "a file";
-	return "the transcript";
-}
-
-/** A secret read that is spelled as a value rather than a command: a
- *  secret-named variable, a tainted variable, or a path to a secret file. */
-function secretInToken(token: string, tainted: readonly string[]): string | undefined {
-	for (const name of variableNames(token)) {
-		if (tainted.includes(name)) return `the captured secret in $${name}`;
-		if (SECRET_VAR.test(name)) return `the secret-named variable $${name}`;
-	}
-	const filePath = pathFromToken(token);
-	if (filePath !== undefined && isSecretPath(filePath)) return `the secret file ${filePath}`;
 	return undefined;
-}
-
-function* variableNames(token: string): Generator<string> {
-	for (const match of token.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/gu)) yield match[1];
-}
-
-/** `f=@~/.aws/credentials` and `@./key.pem` both name a path. */
-function pathFromToken(token: string): string | undefined {
-	const stripped = token.replace(/^[A-Za-z_][A-Za-z0-9_]*=/u, "").replace(/^@/u, "");
-	if (stripped.length === 0 || stripped.startsWith("-")) return undefined;
-	return stripped;
 }
 
 /** Whether this path names a file whose contents are a secret. Exported
@@ -562,14 +389,9 @@ function scanObfuscation(text: string, source: FloorFinding["source"], findings:
 	if (HEX_ESCAPE_RUN.test(text)) {
 		findings.push({ entry: "obfuscated-code", detail: "a run of hex escapes hides what the command says", source });
 	}
-	if (shellEvalOfNonLiteral(text)) {
-		findings.push({ entry: "obfuscated-code", detail: "shell eval runs a value rather than a literal", source });
-	}
 }
 
-function shellEvalOfNonLiteral(text: string): boolean {
-	return tokenizeShellSegments(text).some(tokens => {
-		if (tokens[0] !== "eval") return false;
-		return tokens.slice(1).some(token => token.includes("$") || token.includes("`"));
-	});
+/** `eval "$CMD"` runs a value nobody wrote down; `eval "echo hi"` does not. */
+function shellEvalOfNonLiteral(commands: readonly ShellCommand[]): boolean {
+	return commands.some(command => verbName(command) === "eval" && command.words.slice(1).some(word => !word.literal));
 }
