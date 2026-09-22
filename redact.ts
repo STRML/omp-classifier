@@ -49,8 +49,11 @@ const SECRET_ENDING = /(?:token|secrets?|credentials?|api[_-]?keys?|private[_-]?
  *  `turkey`), and alone it is too common. */
 const SECRET_SEPARATED = /[_-]keys?$/iu;
 
-/** `privateKey` reads as `private_Key`: camelCase is a separator too. */
-const splitCamel = (name: string): string => name.replace(/([a-z0-9])([A-Z])/gu, "$1_$2");
+/** `privateKey` reads as `private_Key`, and an acronym ends where a word
+ *  starts: `APITokenFile` reads as `API_Token_File`, `SSHKeyPath` as
+ *  `SSH_Key_Path`. camelCase is a separator too. */
+const splitCamel = (name: string): string =>
+	name.replace(/([A-Z]+)([A-Z][a-z])/gu, "$1_$2").replace(/([a-z0-9])([A-Z])/gu, "$1_$2");
 
 /** A secret word anywhere among a name's words: `CLIENT_SECRET_VALUE`,
  *  `GH_TOKEN_FILE`, `db.credentials.json`. Whole words only, so `tokens` in
@@ -70,12 +73,7 @@ const wordsOf = (name: string): string[] =>
 		.filter(word => word.length > 0)
 		.map(word => word.toLowerCase());
 
-/** A name that ends in a file extension is a file (`token.ts:` in grep
- *  output), not a setting. The word rule leaves it to the other rules. */
-const FILE_NAME = /\.(?:[cm]?[jt]sx?|py|rb|go|rs|java|kt|swift|c|h|cpp|sh|md|txt|json|ya?ml|toml|lock|log|html|css)$/iu;
-
 function hasSecretWord(name: string): boolean {
-	if (FILE_NAME.test(name)) return false;
 	const words = wordsOf(name);
 	return words.some((word, index) => SECRET_WORDS.has(word) || (KEY_QUALIFIERS.has(word) && /^keys?$/u.test(words[index + 1] ?? "")));
 }
@@ -94,9 +92,7 @@ const SHELL_DIRECTORY_VARIABLES = new Set(["PWD", "OLDPWD"]);
  *  any prefix: `Proxy-Authorization`, `X-Authorization`, `Set-Cookie`. */
 const HEADER_MARKER = /(?:authorization|cookies?)$/iu;
 
-const HEADER_WORDS = new Set(["authorization", "cookie", "cookies"]);
-const isSecretMarker = (name: string): boolean =>
-	HEADER_MARKER.test(name) || wordsOf(name).some(word => HEADER_WORDS.has(word)) || isSecretName(name);
+const isSecretMarker = (name: string): boolean => HEADER_MARKER.test(name) || isSecretName(name);
 
 /** A name then `:` or `=`, possibly quoted or JSON-escaped: `API_KEY=`,
  *  `"password":`, `Authorization:`. Dots belong to the name, so a config key
@@ -105,6 +101,14 @@ const NAME_THEN_SEPARATOR = /\b([A-Za-z0-9_.-]+)(?:\\?["'])?\s*[:=][ \t]*/gu;
 /** A name as a command-line flag with its value after a space:
  *  `mysql --password hunter2`. It may open the text or a line. */
 const FLAG_THEN_VALUE = /(?:^|\s)--?([A-Za-z0-9_.-]+)[ \t]+(?=\S)/gu;
+
+/** `src/auth/token.ts:12:` is grep's file-and-line prefix, not a setting: a
+ *  colon, then digits, then a colon. Only that exact shape is exempt, so
+ *  `client.secret.json=hunter2` and `token.ts: hunter2` still redact. */
+function isGrepLocation(line: string, match: RegExpMatchArray): boolean {
+	const after = line.slice((match.index ?? 0) + match[1].length);
+	return /^:\d+:/u.test(after);
+}
 
 /**
  * Redact one line from its first secret marker to its end, whatever the
@@ -117,6 +121,7 @@ function redactLine(line: string): string {
 	for (const pattern of [NAME_THEN_SEPARATOR, FLAG_THEN_VALUE]) {
 		for (const match of line.matchAll(pattern)) {
 			if (!isSecretMarker(match[1])) continue;
+			if (pattern === NAME_THEN_SEPARATOR && isGrepLocation(line, match)) continue;
 			const end = match.index + match[0].length;
 			if (cut < 0 || end < cut) cut = end;
 			break;
