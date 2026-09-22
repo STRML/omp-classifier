@@ -19,6 +19,7 @@ const v3 = (verdict: "SAFE" | "UNSURE" | "UNSAFE", branch: 3 | 4 | 5 | 7): Shado
 	literalMatched: true,
 	overlay: [],
 	ms: 5,
+	live: "UNSURE",
 });
 const line = (over: Partial<DecisionRecord>): DecisionRecord => ({
 	ts: "2026-09-22T11:00:00Z",
@@ -86,6 +87,12 @@ describe("summarizeShadow", () => {
 		expect(report.matrix.unavailable).toEqual({ v3Allow: 1, v3Ask: 0 });
 		expect(report.deniedDuringOutage.map(row => row.cmd)).toEqual(["trash build"]);
 	});
+
+	test("a denial whose v3 has no live verdict is not counted (#110 gate round 2)", () => {
+		const report = summarizeShadow([line({ approval: "deny", v3: { ...v3("SAFE", 4), live: undefined } })], NOW - 24 * 3_600_000);
+		expect(report.calls).toBe(0);
+		expect(report.regressions).toEqual([]);
+	});
 });
 
 describe("readDecisionLog", () => {
@@ -102,6 +109,13 @@ describe("readDecisionLog", () => {
 			const log = readDecisionLog(file);
 			expect(log.lines).toHaveLength(2);
 			expect(log.malformed).toEqual([2]);
+			// Valid JSON that is no decision line, and a v3 with no live verdict
+			// (#110 gate round 2): both unreadable, neither counted.
+			const noLive = JSON.stringify(line({ approval: "deny", v3: { ...v3("SAFE", 4), live: undefined } }));
+			fs.writeFileSync(file, `{}\n${noLive}\n${good}\n`);
+			const strict = readDecisionLog(file);
+			expect(strict.malformed).toEqual([1, 2]);
+			expect(strict.lines).toHaveLength(1);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
