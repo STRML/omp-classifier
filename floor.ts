@@ -431,16 +431,23 @@ function report(scan: SecretScan, detail: string): void {
 }
 
 /**
- * A secret path the word can produce. Both renderings count, because
- * `${SAFE:-key.pem}` opens `key.pem` when SAFE is unset. Brace expansion runs
- * first, and a glob is tested against the secret names it could match.
+ * A secret path the word names. Both renderings count, because
+ * `${SAFE:-key.pem}` opens `key.pem` when SAFE is unset, and brace expansion
+ * runs first because it is fixed by the text alone.
+ *
+ * This is a check on names, and a name check has a stated limit (plan
+ * 2026-09-22-real-shell-parser.md, "What a name check cannot see"). A glob
+ * matches whatever is on disk, an assignment inside one expansion changes the
+ * next, and a symlink renames any file. Those are runtime values, and the
+ * floor reads them as the text they are written as: `*.pem` asks, `.e*`
+ * does not. The reviewer sees every one of them.
  */
 function secretPathIn(word: ShellWord): string | undefined {
 	for (const text of new Set([word.value, word.alternate])) {
 		const expanded = expandBraces(text);
 		if (expanded === undefined) return `${text}, a brace expansion too large to read`;
 		for (const candidate of expanded) {
-			const found = secretGlob(candidate) ?? secretPathInText(candidate);
+			const found = secretPathInText(candidate);
 			if (found !== undefined) return found;
 		}
 	}
@@ -582,64 +589,3 @@ function braceRange(from: string, to: string): string[] {
 	}
 	return values;
 }
-
-/** Names a glob is tested against, one per rule in `isSecretPath`. A glob
- *  that could match one of these could open a secret. */
-const SECRET_NAME_SAMPLES = [".env", ".env.local", ".netrc", ".npmrc", ".git-credentials", ".pgpass", "kubeconfig", "credentials", "id.pem", "state.tfstate", "id.key", "id.p12", "id.pfx", "id.jks", "secrets.json", "credential"];
-const SECRET_DIR_NAMES = [".ssh", ".aws", ".gnupg"];
-const GLOB = /[*?[]|[@!+](\()/u;
-
-/**
- * A glob that could name a secret file: `.e*`, `*.pem`, `.en[v]`, `@(a|.env)`,
- * `~/.ss?/id_rsa`. A glob made only of wildcards is not one, because `*`
- * never matches a dotfile and asking on every `ls *` would teach nobody
- * anything.
- */
-function secretGlob(candidate: string): string | undefined {
-	if (!GLOB.test(candidate)) return undefined;
-	const path = candidate.replace(ASSIGNMENT_WORD, "").replace(/^@(?!\()/u, "");
-	const segments = path.split("/");
-	const last = segments.pop() ?? "";
-	if (segments.some(segment => GLOB.test(segment) && SECRET_DIR_NAMES.some(name => globRegex(segment).test(name)))) return path;
-	if (!/[^*?]/u.test(last.replace(/\[[^\]]*\]/gu, ""))) return undefined;
-	return SECRET_NAME_SAMPLES.some(name => globRegex(last).test(name)) ? path : undefined;
-}
-
-/** One path segment's glob as a regex, extended globs included. A bare
- *  leading wildcard does not match a leading dot, as in bash without dotglob.
- *  An extended glob is left free to, because its alternatives can spell the
- *  dot themselves: `@(a|.env)` matches `.env`. */
-function globRegex(glob: string): RegExp {
-	const dotGuard = /^[*?[]/u.test(glob) && glob[1] !== "(" ? "(?!\\.)" : "";
-	return new RegExp(`^${dotGuard}${globBody(glob)}$`, "u");
-}
-
-function globBody(glob: string): string {
-	let body = "";
-	for (let index = 0; index < glob.length; index += 1) {
-		const char = glob[index];
-		const close = glob[index + 1] === "(" ? matchingParen(glob, index + 1) : undefined;
-		if ("@!+*?".includes(char) && close !== undefined) {
-			const inner = glob.slice(index + 2, close).split("|").map(globBody).join("|");
-			body += char === "!" ? ".*" : `(?:${inner})${char === "@" ? "" : char}`;
-			index = close;
-		} else if (char === "*") body += ".*";
-		else if (char === "?") body += ".";
-		else if (char === "[" && glob.indexOf("]", index + 2) > 0) {
-			const end = glob.indexOf("]", index + 2);
-			body += `[${glob.slice(index + 1, end).replace(/^!/u, "^").replace(/[\\\]]/gu, "\\$&")}]`;
-			index = end;
-		} else body += char.replace(/[.*+?^${}()|[\]\\/]/gu, "\\$&");
-	}
-	return body;
-}
-
-function matchingParen(text: string, open: number): number | undefined {
-	let depth = 0;
-	for (let index = open; index < text.length; index += 1) {
-		if (text[index] === "(") depth += 1;
-		if (text[index] === ")" && --depth === 0) return index;
-	}
-	return undefined;
-}
-
