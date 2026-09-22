@@ -83,7 +83,7 @@ import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-codi
 import { getConfigRootDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
 import { judgeBattery } from "./jev-judge";
-import { redactSecrets } from "./redact";
+import { redactSecrets, redactValue } from "./redact";
 import {
 	buildJevState,
 	DEFAULT_JEV_POLICY,
@@ -1539,7 +1539,9 @@ export function collectToolEvidence(
 				if (toolCall.type !== "toolCall") continue;
 				const name = typeof toolCall.name === "string" ? toolCall.name : "tool";
 				const args = toolCall.arguments;
-				const encoded = redactSecrets(encode(args));
+				// Structural first, so a value under a secret key goes whole; the
+				// text pass then catches what the structure did not name.
+				const encoded = redactSecrets(encode(redactValue(args)));
 				entries.push(`[tool call ${name} hash=${digest(encoded)}] ${truncated(encoded, 700)}`);
 			}
 			continue;
