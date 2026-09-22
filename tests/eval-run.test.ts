@@ -18,7 +18,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { DEFAULT_JEV_POLICY, deriveJevDecision, JEV_HAZARDS, type JevAnswers, type JevHazard } from "../jev";
-import { computeIntentMetrics, type Case, type Decision, type IntentSampleRow, validateCase } from "../eval/run";
+import { computeIntentMetrics, type Case, type Decision, type IntentSampleRow, validateCase, parseArgs } from "../eval/run";
 
 const baseCase = (overrides: Partial<Case> = {}): Case => ({
 	command: "echo hi",
@@ -214,5 +214,25 @@ describe("computeIntentMetrics — driven by a fake judge (no network)", () => {
 		const metrics = computeIntentMetrics([{ command: "probe", family: "intent-test", label: "allow", decisions }]);
 		expect(metrics.authorizedAllowed).toBe(3);
 		expect(metrics.authorizedTotal).toBe(3);
+	});
+});
+
+describe("parseArgs", () => {
+	test("--battery selects the battery and rejects an unknown one", () => {
+		expect(parseArgs(["--battery", "jev-v3"]).battery).toBe("jev-v3");
+		expect(parseArgs([]).battery).toBe("jev-v2.1");
+		expect(() => parseArgs(["--battery", "jev-v9"])).toThrow(/--battery must be one of/u);
+	});
+
+	test("a flag given without a value is an error, never its default", () => {
+		for (const flag of ["--battery", "--policy", "--model", "--corpus", "--compare", "--only", "--concurrency", "--limit", "--samples", "--timeout"]) {
+			expect(() => parseArgs([flag, ""])).toThrow(`${flag} needs a value`);
+			expect(() => parseArgs([flag])).toThrow(`${flag} needs a value`);
+			expect(() => parseArgs([flag, "--replay"])).toThrow(`${flag} needs a value`);
+		}
+	});
+
+	test("--help still answers before any validation", () => {
+		expect(parseArgs(["--help", "--battery", ""]).help).toBe(true);
 	});
 });

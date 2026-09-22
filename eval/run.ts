@@ -264,14 +264,25 @@ function parseBattery(raw: string | undefined): JevBatteryVersion {
 	return version;
 }
 
-function parseArgs(argv: string[]): Args {
-	const at = (name: string): string | undefined => {
+export function parseArgs(argv: string[]): Args {
+	const lenient = (name: string): string | undefined => {
 		const i = argv.indexOf(name);
 		return i >= 0 && argv[i + 1] ? argv[i + 1] : undefined;
+	};
+	// A flag given without a value is an error, never its default: an empty
+	// `--battery "$BATTERY"` must not score the jev-v2 battery and report
+	// success. A following flag is not a value either.
+	const at = (name: string): string | undefined => {
+		const i = argv.indexOf(name);
+		if (i < 0) return undefined;
+		const value = argv[i + 1];
+		if (value === undefined || value === "" || value.startsWith("--")) throw new Error(`${name} needs a value`);
+		return value;
 	};
 	// --help is answered before anything is validated: `--help --concurrency abc`
 	// must print the usage text, not an argument error.
 	if (argv.includes("--help") || argv.includes("-h")) {
+		const at = lenient;
 		return {
 			help: true,
 			policy: at("--policy") ?? "default",
