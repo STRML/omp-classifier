@@ -54,6 +54,7 @@
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { parseArgs as parseCliArgs } from "node:util";
 import { type AuthStorage, TYPESAFE_PROVIDER, TypeSafeJudge } from "@oh-my-pi/pi-ai";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
@@ -229,6 +230,7 @@ Flags:
                                 Diff this run against a previous report, a
                                 candidate policy file, or a policy id.
   --only <substring>            Keep cases whose command or family contains it.
+                                A value starting with a dash: --only=--force.
   --limit <n>                   Score at most n cases (0 = all).
   --samples <n>                 Draws per case, majority-scored (default: 3).
   --concurrency <n>             Cases in flight (default: 8, max 32).
@@ -264,31 +266,31 @@ function parseBattery(raw: string | undefined): JevBatteryVersion {
 	return version;
 }
 
+const ARG_OPTIONS = {
+	help: { type: "boolean", short: "h" },
+	replay: { type: "boolean" },
+	policy: { type: "string" },
+	battery: { type: "string" },
+	model: { type: "string" },
+	corpus: { type: "string" },
+	compare: { type: "string" },
+	only: { type: "string" },
+	concurrency: { type: "string" },
+	limit: { type: "string" },
+	samples: { type: "string" },
+	timeout: { type: "string" },
+} as const;
+
 export function parseArgs(argv: string[]): Args {
-	const lenient = (name: string): string | undefined => {
-		const i = argv.indexOf(name);
-		return i >= 0 && argv[i + 1] ? argv[i + 1] : undefined;
-	};
-	// A flag given without a value is an error, never its default: an empty
-	// `--battery "$BATTERY"` must not score the jev-v2 battery and report
-	// success. A following flag is not a value either.
-	const at = (name: string): string | undefined => {
-		const i = argv.indexOf(name);
-		if (i < 0) return undefined;
-		const value = argv[i + 1];
-		if (value === undefined || value === "" || value.startsWith("--")) throw new Error(`${name} needs a value`);
-		return value;
-	};
 	// --help is answered before anything is validated: `--help --concurrency abc`
 	// must print the usage text, not an argument error.
 	if (argv.includes("--help") || argv.includes("-h")) {
-		const at = lenient;
 		return {
 			help: true,
-			policy: at("--policy") ?? "default",
+			policy: "default",
 			battery: JEV_POLICY_VERSION,
-			model: at("--model") ?? DEFAULT_JEV_MODEL,
-			corpus: at("--corpus") ?? "all",
+			model: DEFAULT_JEV_MODEL,
+			corpus: "all",
 			compare: undefined,
 			concurrency: 8,
 			limit: 0,
@@ -298,6 +300,23 @@ export function parseArgs(argv: string[]): Args {
 			timeoutMs: JEV_TIMEOUT_MS,
 		};
 	}
+	// node:util's grammar, not a hand-rolled one: an unknown flag, a stray
+	// positional, or a flag with no value is an error, and a value that starts
+	// with a dash is written `--only=--force`. Two things it allows are refused
+	// here, because either one runs a different evaluation than the command
+	// line appears to ask for: a flag given twice, and an empty value (an empty
+	// `--battery "$BATTERY"` must not score the jev-v2 battery and succeed).
+	const parsed = parseCliArgs({ args: argv, options: ARG_OPTIONS, strict: true, allowPositionals: false, tokens: true });
+	const seen = new Set<string>();
+	for (const token of parsed.tokens) {
+		if (token.kind !== "option") continue;
+		if (seen.has(token.name)) throw new Error(`--${token.name} is given more than once`);
+		seen.add(token.name);
+		if (token.value === "") throw new Error(`--${token.name} needs a value`);
+	}
+	const values = parsed.values;
+	const at = (name: `--${Exclude<keyof typeof ARG_OPTIONS, "help" | "replay">}`): string | undefined =>
+		values[name.slice(2) as Exclude<keyof typeof ARG_OPTIONS, "help" | "replay">];
 	// Bare Number() turns a typo into NaN, and NaN is silently destructive here:
 	// `Math.max(1, NaN)` is NaN, `Array.from({ length: NaN })` is empty, so
 	// `--concurrency abc` spawns zero workers, `Promise.all([])` resolves at once,
@@ -306,7 +325,7 @@ export function parseArgs(argv: string[]): Args {
 	// `max` matters as much as `min` here: each sample is a real API call, so
 	// `--concurrency 100000` floods the endpoint and `--samples 1000` bills
 	// 100,000 requests from a typo. Bound both.
-	const boundedInt = (flag: string, fallback: number, min: number, max: number): number => {
+	const boundedInt = (flag: Parameters<typeof at>[0], fallback: number, min: number, max: number): number => {
 		const raw = at(flag);
 		if (raw === undefined) return fallback;
 		const value = Number(raw);
@@ -316,7 +335,7 @@ export function parseArgs(argv: string[]): Args {
 		return value;
 	};
 	return {
-		help: argv.includes("--help") || argv.includes("-h"),
+		help: false,
 		policy: at("--policy") ?? "default",
 		battery: parseBattery(at("--battery")),
 		model: at("--model") ?? DEFAULT_JEV_MODEL,
@@ -335,7 +354,7 @@ export function parseArgs(argv: string[]): Args {
 		// in the aggregate, so a real change to it reads as noise against the whole
 		// corpus; this is how you spend samples on the family in question instead.
 		only: at("--only"),
-		replay: argv.includes("--replay"),
+		replay: values.replay === true,
 		timeoutMs: boundedInt("--timeout", JEV_TIMEOUT_MS / 1_000, 1, 300) * 1_000,
 	};
 }

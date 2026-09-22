@@ -227,9 +227,29 @@ describe("parseArgs", () => {
 	test("a flag given without a value is an error, never its default", () => {
 		for (const flag of ["--battery", "--policy", "--model", "--corpus", "--compare", "--only", "--concurrency", "--limit", "--samples", "--timeout"]) {
 			expect(() => parseArgs([flag, ""])).toThrow(`${flag} needs a value`);
-			expect(() => parseArgs([flag])).toThrow(`${flag} needs a value`);
-			expect(() => parseArgs([flag, "--replay"])).toThrow(`${flag} needs a value`);
+			expect(() => parseArgs([flag])).toThrow();
+			expect(() => parseArgs([flag, "--replay"])).toThrow();
 		}
+	});
+
+	test("a flag given twice is an error, whichever copy is empty", () => {
+		expect(() => parseArgs(["--battery", "jev-v2.1", "--battery", ""])).toThrow("--battery is given more than once");
+		expect(() => parseArgs(["--only", "a", "--only", "b"])).toThrow("--only is given more than once");
+	});
+
+	test("a value that starts with a dash is written inline", () => {
+		expect(parseArgs(["--only=--force"]).only).toBe("--force");
+		expect(parseArgs(["--only", "push"]).only).toBe("push");
+	});
+
+	test("an unknown flag or a stray word is an error", () => {
+		expect(() => parseArgs(["--batery", "jev-v3"])).toThrow();
+		expect(() => parseArgs(["jev-v3"])).toThrow();
+	});
+
+	test("numeric flags keep their bounds and --replay its switch", () => {
+		expect(parseArgs(["--samples", "5", "--replay"])).toMatchObject({ samples: 5, replay: true });
+		expect(() => parseArgs(["--samples", "abc"])).toThrow(/--samples must be an integer/u);
 	});
 
 	test("--help still answers before any validation", () => {
