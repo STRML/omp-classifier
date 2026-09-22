@@ -27,11 +27,13 @@ import {
 	jevUnsureAnswer,
 	setJevAnswer,
 	ALLOW_ONCE,
+	removeConfigFile,
 } from "./fixtures";
 
 let seq = 0;
 
 beforeEach(async () => {
+	removeConfigFile();
 	await loadPlugin(makeSettings([]));
 	setJevAnswer(jevSafeAnswer());
 });

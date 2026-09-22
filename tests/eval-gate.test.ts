@@ -27,6 +27,7 @@ import {
 let seq = 0;
 
 beforeEach(async () => {
+	removeConfigFile();
 	await loadPlugin(makeSettings([]));
 	setJevAnswer(jevSafeAnswer());
 });

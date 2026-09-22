@@ -33,6 +33,7 @@ import {
 	resultText,
 	selectCalls,
 	setJevAnswer,
+	removeConfigFile,
 } from "./fixtures";
 
 let dir = "";
@@ -89,6 +90,7 @@ function writeTestConfig(raw: Record<string, unknown>): void {
 }
 
 beforeEach(async () => {
+	removeConfigFile();
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-persistent-grants-"));
 	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));

@@ -36,6 +36,7 @@ import {
 	selectCalls,
 	setJevAnswer,
 	writeConfigFile,
+	removeConfigFile,
 } from "./fixtures";
 
 let dir = "";
@@ -51,6 +52,7 @@ const readDecisions = (): DecisionRecord[] =>
 		.map(line => JSON.parse(line) as DecisionRecord);
 
 beforeEach(async () => {
+	removeConfigFile();
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-grants-"));
 	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));
