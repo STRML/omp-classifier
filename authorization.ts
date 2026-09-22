@@ -133,8 +133,12 @@ function readsAsSentence(parts: readonly string[]): boolean {
  *  written as a sentence. The hash is unsalted on purpose — two segments naming
  *  one target have to look like one target. */
 function presentTarget(raw: string): string {
-	const value = raw.trim();
-	if (value.length === 0) return "";
+	// Shell punctuation that rode along on the edge of a word: `"$(cat
+	// ~/.ssh/id_rsa)"` arrives as one token, and `id_rsa)` matches nothing the
+	// user wrote. A target with nothing but punctuation left, such as the `$`
+	// of `curl $(cat url.txt)`, is no target at all.
+	const value = raw.trim().replace(/^[("'`{]+/u, "").replace(/[)"'`}]+$/u, "");
+	if (!/[A-Za-z0-9]/u.test(value)) return "";
 	// camelCase and snake_case are both split, so `itWasAlreadyApproved` and
 	// `it_was_already_approved` are read the same way as the hyphenated form.
 	const parts = value
