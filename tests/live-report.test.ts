@@ -116,6 +116,14 @@ describe("readDecisionLog", () => {
 			const strict = readDecisionLog(file);
 			expect(strict.malformed).toEqual([1, 2]);
 			expect(strict.lines).toHaveLength(1);
+			// An approval or verdict outside the type's values (#110 gate round 3).
+			const bogusApproval = JSON.stringify({ ...line({ v3: v3("SAFE", 4) }), approval: "bogus" });
+			const bogusVerdict = JSON.stringify({ ...line({ decision: "allow", layer: "verdict", v3: v3("SAFE", 3) }), verdict: "MAYBE" });
+			fs.writeFileSync(file, `${bogusApproval}\n${bogusVerdict}\n${good}\n`);
+			expect(readDecisionLog(file).malformed).toEqual([1, 2]);
+			const bogusBranch = JSON.stringify(line({ decision: "allow", layer: "verdict", v3: { ...v3("SAFE", 3), branch: 9 as 3 } }));
+			fs.writeFileSync(file, `${bogusBranch}\n${good}\n`);
+			expect(readDecisionLog(file).malformed).toEqual([1]);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

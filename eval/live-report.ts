@@ -101,6 +101,9 @@ export function summarizeShadow(lines: readonly DecisionRecord[], sinceMs: numbe
 }
 
 const VERDICTS = new Set(["SAFE", "UNSAFE", "UNSURE", "UNAVAILABLE"]);
+/** DecisionRecord["approval"], value for value: an unknown answer is no answer
+ *  this report can count, so the line is unreadable rather than skipped. */
+const APPROVALS = new Set(["allow-once", "allow-session", "always-allow", "deny", "headless", "unavailable"]);
 
 /** A v3 record this report can read: an error, or a decision that names the
  *  live verdict it ran beside. A v3 without `live` can't be told from an
@@ -115,6 +118,9 @@ function isShadowRecord(value: unknown): boolean {
 		typeof record.verdict === "string" &&
 		VERDICTS.has(record.verdict) &&
 		typeof record.branch === "number" &&
+		Number.isInteger(record.branch) &&
+		record.branch >= 1 &&
+		record.branch <= 7 &&
 		typeof record.reasonCode === "string"
 	);
 }
@@ -132,6 +138,8 @@ function isDecisionLine(value: unknown): value is DecisionRecord {
 		typeof line.layer === "string" &&
 		typeof line.cmd === "string" &&
 		(line.cached === 0 || line.cached === 1) &&
+		(line.approval === undefined || (typeof line.approval === "string" && APPROVALS.has(line.approval))) &&
+		(line.verdict === null || line.verdict === undefined || (typeof line.verdict === "string" && VERDICTS.has(line.verdict))) &&
 		(line.v3 === undefined || isShadowRecord(line.v3))
 	);
 }
