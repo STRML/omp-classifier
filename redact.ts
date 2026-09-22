@@ -34,6 +34,9 @@ const whole = (): string => REDACTED;
  *     not: `accessToken`, `AUTHTOKEN`, `client_secret`, `GH_TOKEN`. `token`
  *     is singular, so `max_tokens` and `input_tokens` (usage counts tool
  *     results print) are not secret.
+ *   - a secret word anywhere among the name's words, split on `_`, `-`, `.`
+ *     and camelCase: `CLIENT_SECRET_VALUE`, `GH_TOKEN_FILE`; or `key` right
+ *     after a qualifier such as private, api or signing: `PRIVATE_KEY_PEM`.
  *   - a name ending in `key` after a `_`, a `-` or a camelCase boundary:
  *     `DJANGO_SECRET_KEY`, `privateKey`. Not glued, and not alone: `monkey`
  *     and a bare `$KEY` are no secrets.
@@ -49,10 +52,38 @@ const SECRET_SEPARATED = /[_-]keys?$/iu;
 /** `privateKey` reads as `private_Key`: camelCase is a separator too. */
 const splitCamel = (name: string): string => name.replace(/([a-z0-9])([A-Z])/gu, "$1_$2");
 
+/** A secret word anywhere among a name's words: `CLIENT_SECRET_VALUE`,
+ *  `GH_TOKEN_FILE`, `db.credentials.json`. Whole words only, so `tokens` in
+ *  `max_tokens` is not `token`. */
+const SECRET_WORDS = new Set([
+	"password", "passwords", "passphrase", "passphrases", "passwd", "pwd",
+	"token", "secret", "secrets", "credential", "credentials", "apikey", "apikeys", "privatekey", "accesskey",
+]);
+/** A word that makes the `key` after it a secret, anywhere in the name:
+ *  `PRIVATE_KEY_PEM`, `api_key_id`, `SSH_KEY_PATH`. */
+const KEY_QUALIFIERS = new Set(["api", "private", "access", "secret", "signing", "encryption", "master", "ssh", "client", "auth", "gpg", "pgp", "deploy"]);
+
+/** A name's words: split on `_`, `-`, `.` and camelCase, lower-cased. */
+const wordsOf = (name: string): string[] =>
+	splitCamel(name)
+		.split(/[_.-]+/u)
+		.filter(word => word.length > 0)
+		.map(word => word.toLowerCase());
+
+/** A name that ends in a file extension is a file (`token.ts:` in grep
+ *  output), not a setting. The word rule leaves it to the other rules. */
+const FILE_NAME = /\.(?:[cm]?[jt]sx?|py|rb|go|rs|java|kt|swift|c|h|cpp|sh|md|txt|json|ya?ml|toml|lock|log|html|css)$/iu;
+
+function hasSecretWord(name: string): boolean {
+	if (FILE_NAME.test(name)) return false;
+	const words = wordsOf(name);
+	return words.some((word, index) => SECRET_WORDS.has(word) || (KEY_QUALIFIERS.has(word) && /^keys?$/u.test(words[index + 1] ?? "")));
+}
+
 export function isSecretName(name: string): boolean {
 	const words = splitCamel(name);
 	if (SHELL_DIRECTORY_VARIABLES.has(name)) return false;
-	return SECRET_ANYWHERE.test(words) || SECRET_ENDING.test(words) || SECRET_SEPARATED.test(words);
+	return SECRET_ANYWHERE.test(words) || SECRET_ENDING.test(words) || SECRET_SEPARATED.test(words) || hasSecretWord(name);
 }
 
 /** The working-directory variables POSIX shells set, always in upper case.
@@ -63,7 +94,9 @@ const SHELL_DIRECTORY_VARIABLES = new Set(["PWD", "OLDPWD"]);
  *  any prefix: `Proxy-Authorization`, `X-Authorization`, `Set-Cookie`. */
 const HEADER_MARKER = /(?:authorization|cookies?)$/iu;
 
-const isSecretMarker = (name: string): boolean => HEADER_MARKER.test(name) || isSecretName(name);
+const HEADER_WORDS = new Set(["authorization", "cookie", "cookies"]);
+const isSecretMarker = (name: string): boolean =>
+	HEADER_MARKER.test(name) || wordsOf(name).some(word => HEADER_WORDS.has(word)) || isSecretName(name);
 
 /** A name then `:` or `=`, possibly quoted or JSON-escaped: `API_KEY=`,
  *  `"password":`, `Authorization:`. Dots belong to the name, so a config key
