@@ -137,6 +137,10 @@ function presentTarget(raw: string): string {
 	// ~/.ssh/id_rsa)"` arrives as one token, and `id_rsa)` matches nothing the
 	// user wrote. A target with nothing but punctuation left, such as the `$`
 	// of `curl $(cat url.txt)`, is no target at all.
+	// Read the ORIGINAL for command-text markers, because the trim below takes
+	// exactly those markers off: stripping the backticks from `` `consented` ``
+	// first had made an agent-authored word look like a name.
+	const carriesCommandText = /\s|\$|`|\n/u.test(raw);
 	const value = raw.trim().replace(/^[("'`{]+/u, "").replace(/[)"'`}]+$/u, "");
 	if (!/[A-Za-z0-9]/u.test(value)) return "";
 	// camelCase and snake_case are both split, so `itWasAlreadyApproved` and
@@ -149,7 +153,6 @@ function presentTarget(raw: string): string {
 	// a newline therefore means the text came out of the command, and a quoted
 	// word can carry a whole command: the tokenizer strips the quotes, so
 	// `echo "$(rm -rf build)"` handed `$(rm -rf build` straight to the model.
-	const carriesCommandText = /\s|\$|`|\n/u.test(value);
 	const isName =
 		value.length <= TARGET_MAX_LENGTH && !carriesCommandText && !parts.some(part => REVIEWER_WORD.test(part)) && !readsAsSentence(parts);
 	if (isName) return value;
@@ -229,7 +232,7 @@ const DEPLOY_NAME = /^(deploy|publish|release|ship)/u;
 const DEPLOY_SCRIPT = /(deploy|publish|release)[^/]*\.(sh|ts|js|mjs|py|rb)$/u;
 /** Flags that widen an action, worth carrying into the summary because the user
  *  has to have asked for the wide version. */
-const WIDENING_FLAG = /^--(admin|force|force-with-lease|no-verify|hard|prod|production|yes|all)$/u;
+const WIDENING_FLAG = /^(--(admin|force|force-with-lease|no-verify|hard|prod|production|yes|all)(=.*)?|-f)$/u;
 
 const URL = /^[a-z][a-z0-9+.-]*:\/\/([^/\s]+)/iu;
 /** Any redirect, including an input one: all of them are the segment's
@@ -252,7 +255,7 @@ const UNREAD_SHAPE: ReadonlyArray<readonly [RegExp, string]> = [
 	[/\$\(/u, "command-substitution"],
 	[/`[^`]*`/u, "backtick-substitution"],
 	[/<\(|>\(/u, "process-substitution"],
-	[/<<(?!<)-?\s*['"]?[A-Za-z_]/u, "heredoc"],
+	[/<<(?!<)-?\s*['"]?[A-Za-z0-9_]/u, "heredoc"],
 	[/<<</u, "here-string"],
 ];
 
@@ -268,7 +271,7 @@ const UNREAD_SHAPE: ReadonlyArray<readonly [RegExp, string]> = [
  * declines simply leaves its body to be tokenized, which invents actions
  * instead of hiding them, and that is the direction to fail in.
  */
-const HEREDOC_OPENER = /(?<!<)<<(?!<)-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1\s*$/u;
+const HEREDOC_OPENER = /(?<!<)<<(?!<)-?\s*(['"]?)([A-Za-z0-9_][A-Za-z0-9_.-]*)\1\s*$/u;
 /** `2>&1` and `>&2` point one stream at another and name no file. The host
  *  tokenizer breaks at `&`, so left in they arrive as a stray `1` segment that
  *  reads as an unknown command. */
@@ -448,7 +451,7 @@ function secretReads(tokens: readonly string[], tainted: readonly string[]): Raw
 	};
 	const store = secretStoreRead(tokens.join(" "));
 	if (store !== undefined) add(store);
-	for (const token of tokens) {
+	tokens.forEach((token, index) => {
 		// The name without its sigil: a `$` in a target is command text and
 		// would be hashed, which would make every secret variable opaque.
 		const variables = secretVariableNames(token, tainted);
@@ -456,10 +459,10 @@ function secretReads(tokens: readonly string[], tainted: readonly string[]): Raw
 		// A word that expands a variable is not a path this code can resolve,
 		// and `$AWS_SECRET_ACCESS_KEY` reads as a secret FILE to the path rule
 		// (its name carries "secret"), which reported one secret twice.
-		if (variables.length > 0) continue;
-		const path = secretPathInToken(token, verb);
+		if (variables.length > 0) return;
+		const path = secretPathInToken(token, verb, tokens[index - 1] ?? "");
 		if (path !== undefined) add(basename(path));
-	}
+	});
 	return targets.length === 0 ? [] : [{ kind: "secret-read", targets }];
 }
 
@@ -475,7 +478,7 @@ function secretReads(tokens: readonly string[], tainted: readonly string[]): Raw
  */
 const FLAG_TAKING_VALUE: Record<string, RegExp> = {
 	git: /^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix)$/u,
-	ssh: /^(-[bcDEeFIiJLlmOoPpQRSWw])$/u,
+	ssh: /^(-[BbcDEeFIiJLlmOoPpQRSWw])$/u,
 	scp: /^(-[cFiJloPS])$/u,
 	sftp: /^(-[BbcDFiJloPRS])$/u,
 	rsync: /^(-e|--rsh|--exclude|--include|--files-from|--log-file|--out-format|--compare-dest)$/u,
@@ -484,7 +487,9 @@ const FLAG_TAKING_VALUE: Record<string, RegExp> = {
 	python3: /^(-[WXm]|--check-hash-based-pycs)$/u,
 	node: /^(-r|--require|--import|--loader|--experimental-loader|--conditions)$/u,
 	bun: /^(-r|--preload|--config|--cwd)$/u,
-	deno: /^(--allow-read|--allow-write|--config|--import-map)$/u,
+	// Deno's permission flags take an OPTIONAL value, given with `=`. Listing
+	// them made `deno --allow-read script.ts` eat the script.
+	deno: /^(--config|--import-map)$/u,
 	perl: /^(-[IMm])$/u,
 	ruby: /^(-[IrE])$/u,
 	gh: /^(-R|--repo|-F|-f|-H|--field|--raw-field|--jq|--template)$/u,
@@ -591,7 +596,7 @@ function findAction(tokens: readonly string[], args: readonly string[], verb: st
 
 /** `host:path` or `user@host:path`, the spelling scp, sftp and rsync use for
  *  the far end. The negative lookahead keeps a URL's `//` out of it. */
-const REMOTE_OPERAND = /^([A-Za-z0-9._-]+@)?([A-Za-z0-9._-]+):(?!\/\/)/u;
+const REMOTE_OPERAND = /^([A-Za-z0-9._-]+@)?(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+):(?!\/\/)/u;
 
 /**
  * The remote endpoint a network command names.
@@ -638,8 +643,14 @@ function deployTargets(tokens: readonly string[], verb: string): string[] {
 	return [named, ...widening.filter(word => word !== named)];
 }
 
+/** The widening a command asks for, in whatever spelling. `-f`,
+ *  `--force-with-lease=main` and `--force` are one request, and recognizing
+ *  only the bare long form made a force push and an ordinary push the same
+ *  summary. */
 function wideningWords(tokens: readonly string[]): string[] {
-	return tokens.filter(token => WIDENING_FLAG.test(token)).map(token => token.replace(/^--/u, "").replace(/-with-lease$/u, ""));
+	return tokens
+		.filter(token => WIDENING_FLAG.test(token))
+		.map(token => (token === "-f" ? "force" : token.replace(/^--/u, "").replace(/=.*$/u, "").replace(/-with-lease$/u, "")));
 }
 
 /** Group the raw actions by kind, in ACTION_KINDS order so two commands with
