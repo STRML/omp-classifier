@@ -107,7 +107,7 @@ type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "UNAVAILABLE";
  * (plan Phase 2 step 8). Labels and numbers only, never message text. It is
  * logged beside the live verdict and read by no decision until the flip.
  */
-export type ShadowV3 =
+export type ShadowV3 = (
 	| {
 			verdict: JevVerdict;
 			branch: DecisionBranch;
@@ -121,7 +121,13 @@ export type ShadowV3 =
 			/** Why the authorization request failed; the level then reads `none`. */
 			authorizationError?: string;
 	  }
-	| { error: string; ms: number };
+	| { error: string; ms: number }
+) & {
+	/** The live jev-v2 verdict this shadow ran beside. A dialog line carries
+	 *  no verdict of its own, so this is how a report tells a denied dialog
+	 *  that followed a real verdict from one that followed an outage. */
+	live?: JevVerdict;
+};
 
 interface Judgement {
 	verdict: Verdict;
@@ -164,6 +170,14 @@ interface Judgement {
 	persistRefusal?: boolean;
 	/** The jev-v3 shadow for this classification, when it ran. */
 	v3?: ShadowV3;
+}
+
+/** A cached judgement minus its shadow. The shadow ran for the call that
+ *  filled the cache; carried onto a later call's dialog line it would read as
+ *  a fresh shadow result for a call that asked nothing. */
+function withoutShadow(judgement: Judgement): Judgement {
+	const { v3: _shadow, ...rest } = judgement;
+	return rest;
 }
 
 /** The judgement fields every decision line carries once a judgement exists.
@@ -3755,6 +3769,14 @@ export default function (pi: ExtensionAPI) {
 			} catch {
 				sessionId = undefined;
 			}
+			// The session's own artifacts directory is its scratch space: a delete
+			// the user named there may match, like one under the working directory.
+			let sessionTempDir: string | undefined;
+			try {
+				sessionTempDir = ctx.sessionManager.getArtifactsDir() ?? undefined;
+			} catch {
+				sessionTempDir = undefined;
+			}
 			const shell = input.language === "shell";
 			// The eval tool's code is no shell: it is one run-code action whose
 			// arguments nothing here can name.
@@ -3782,6 +3804,7 @@ export default function (pi: ExtensionAPI) {
 						homeDir: os.homedir(),
 						userMessages: snapshot.messages,
 						...(snapshot.pinned ? { pinnedUserMessage: snapshot.pinned.text } : {}),
+						...(sessionTempDir ? { sessionTempDir } : {}),
 						resolveRealPath: realPathOf,
 					})
 				: undefined;
@@ -3903,7 +3926,7 @@ export default function (pi: ExtensionAPI) {
 					: hadUserEvidence
 						? "grounded"
 						: "not-required";
-			const v3 = shadow ? await shadow : undefined;
+			const v3 = shadow ? { ...(await shadow), live: decision.verdict } : undefined;
 			return annotateJudgement({
 				verdict: decision.verdict,
 				reason: decision.reason,
@@ -3928,7 +3951,7 @@ export default function (pi: ExtensionAPI) {
 			// missing key, a non-2xx, or a body whose answers do not match the
 			// battery says nothing about the command, and a cached non-answer
 			// would keep the session from re-asking once the endpoint recovers.
-			const v3 = shadow ? await shadow : undefined;
+			const v3 = shadow ? { ...(await shadow), live: "UNAVAILABLE" as const } : undefined;
 			return annotateJudgement({
 				verdict: "UNAVAILABLE",
 				reason: `Jev unavailable: ${truncated(err instanceof Error ? err.message : String(err), 160)}`,
@@ -4531,7 +4554,7 @@ export default function (pi: ExtensionAPI) {
 				: {};
 			try {
 				let classifyError = "";
-				const judgement = cached ?? (await classify(ctx, evalCode, cwd, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, reviewOperatorContext, evidenceSnapshot, "code").catch(
+				const judgement = cached ? withoutShadow(cached) : (await classify(ctx, evalCode, cwd, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, reviewOperatorContext, evidenceSnapshot, "code").catch(
 					(err: unknown) => {
 						classifyError = err instanceof Error ? err.message : String(err);
 						pi.logger.warn(`classifier: classify failed: ${classifyError}`);
@@ -4951,7 +4974,7 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			let classifyError = "";
-			const judgement = cached ?? (await classify(ctx, command, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot).catch((err: unknown) => {
+			const judgement = cached ? withoutShadow(cached) : (await classify(ctx, command, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot).catch((err: unknown) => {
 				// Provider errors (quota exhausted, auth, HTTP failures) previously
 				// vanished into an opaque "unavailable". Keep the message so the
 				// permission dialog says WHY.

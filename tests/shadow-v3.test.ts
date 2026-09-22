@@ -75,7 +75,7 @@ describe("the shadow rides the live classification", () => {
 		const v3 = last().v3;
 		expect(v3).toBeDefined();
 		expect(JSON.stringify(v3)).not.toContain("pineapple");
-		expect(Object.keys(v3 ?? {}).sort()).toEqual(["authorization", "branch", "literalMatched", "ms", "namedFirm", "overlay", "reasonCode", "verdict"]);
+		expect(Object.keys(v3 ?? {}).sort()).toEqual(["authorization", "branch", "literalMatched", "live", "ms", "namedFirm", "overlay", "reasonCode", "verdict"]);
 	});
 
 	test("shadowV3 false: no shadow requests and no v3 field", async () => {
@@ -94,6 +94,23 @@ describe("the shadow rides the live classification", () => {
 		const line = last();
 		expect(line.verdict).toBe("SAFE");
 		expect(line.v3).toMatchObject({ error: expect.stringContaining("shadow judge unavailable") });
+	});
+
+	test("a cached verdict's dialog line carries no shadow (#110 gate round 1)", async () => {
+		setJevAnswer(jevUnsureAnswer());
+		const ctx = makeCtx({ sessionId: session(), hasUI: false });
+		await fire("tool_call", makeEvent("echo cached-dialog"), ctx);
+		const firstCount = readDecisions().length;
+		await fire("tool_call", makeEvent("echo cached-dialog"), ctx);
+		const second = readDecisions().slice(firstCount);
+		expect(second.length).toBeGreaterThan(0);
+		for (const entry of second) expect(entry.v3).toBeUndefined();
+		expect(shadowCalls).toHaveLength(2);
+	});
+
+	test("the shadow records the live verdict it ran beside", async () => {
+		await fire("tool_call", makeEvent("echo live-verdict"), makeCtx({ sessionId: session(), hasUI: true }));
+		expect(last().v3).toMatchObject({ live: "SAFE" });
 	});
 
 	test("a cached verdict asks nothing, shadow included", async () => {
@@ -120,6 +137,21 @@ describe("the shadow decides by the jev-v3 order", () => {
 			expect(v3).toMatchObject({ branch: 4, verdict: "SAFE", authorization: "named", namedFirm: true, literalMatched: true });
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a named delete inside the session's artifacts dir can match (#110 gate round 1)", async () => {
+		const artifacts = fs.mkdtempSync(path.join(os.tmpdir(), "omp-shadow-artifacts-"));
+		fs.mkdirSync(path.join(artifacts, "scratch"));
+		try {
+			setJevAnswer(jevUnsureAnswer());
+			setShadowAuthorization("named", { none: 0.02, goal: 0.03, named: 0.95 });
+			const ctx = makeCtx({ sessionId: session(), hasUI: false, artifactsDir: artifacts, branch: [user("delete the scratch dir")] });
+			await fire("tool_call", makeEvent(`trash ${path.join(artifacts, "scratch")}`), ctx);
+			const v3 = readDecisions().find(entry => entry.v3 !== undefined)?.v3;
+			expect(v3).toMatchObject({ literalMatched: true, branch: 4 });
+		} finally {
+			fs.rmSync(artifacts, { recursive: true, force: true });
 		}
 	});
 

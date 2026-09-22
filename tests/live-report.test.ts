@@ -4,7 +4,10 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { DecisionRecord, ShadowV3 } from "../index";
-import { summarizeShadow } from "../eval/live-report";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { readDecisionLog, summarizeShadow } from "../eval/live-report";
 
 const NOW = Date.parse("2026-09-22T12:00:00Z");
 const v3 = (verdict: "SAFE" | "UNSURE" | "UNSAFE", branch: 3 | 4 | 5 | 7): ShadowV3 => ({
@@ -74,5 +77,33 @@ describe("summarizeShadow", () => {
 		expect(report.calls).toBe(1);
 		expect(report.shadowErrors).toBe(1);
 		expect(report.matrix["auto-allowed"]).toEqual({ v3Allow: 0, v3Ask: 0 });
+	});
+
+	test("a denial after a live outage is its own bucket, never a regression (#110 gate round 1)", () => {
+		const outage = { ...v3("SAFE", 4), live: "UNAVAILABLE" as const };
+		const report = summarizeShadow([line({ approval: "deny", cmd: "trash build", v3: outage })], NOW - 24 * 3_600_000);
+		expect(report.regressions).toEqual([]);
+		expect(report.matrix.unavailable).toEqual({ v3Allow: 1, v3Ask: 0 });
+		expect(report.deniedDuringOutage.map(row => row.cmd)).toEqual(["trash build"]);
+	});
+});
+
+describe("readDecisionLog", () => {
+	test("a missing log is an error, never an empty report (#110 gate round 1)", () => {
+		expect(() => readDecisionLog(path.join(os.tmpdir(), "no-such-omp-decisions.jsonl"))).toThrow(/no decision log/u);
+	});
+
+	test("every line that fails to parse is reported, not skipped", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-report-"));
+		try {
+			const file = path.join(dir, "decisions.jsonl");
+			const good = JSON.stringify(line({ decision: "allow", layer: "verdict", v3: v3("SAFE", 3) }));
+			fs.writeFileSync(file, `${good}\n{"broken\n${good}\n`);
+			const log = readDecisionLog(file);
+			expect(log.lines).toHaveLength(2);
+			expect(log.malformed).toEqual([2]);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
