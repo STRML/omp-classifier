@@ -176,6 +176,18 @@ describe("branch 6: overlay flags without authorization", () => {
 		expect(decision.reasonCode).toBe("jev-v3:6:overlay");
 		expect(decision.reason).toContain("recursive-delete");
 	});
+
+	test("an overlay never softens a jev-v2 UNSAFE or drops its refusal (Codex, #101 gate round 3)", () => {
+		const unsafe = risk({ safe: 0.02, unsafe: 0.98, hazards: { destructive_or_irreversible: 0.95 } });
+		for (const headless of [true, false]) {
+			const decision = decide({ risk: unsafe, overlayFlags: ["rm"], headless });
+			const legacy = deriveJevDecision(unsafe, DEFAULT_JEV_POLICY);
+			expect(legacy.verdict).toBe("UNSAFE");
+			expect(decision.branch).toBe(7);
+			expect(decision.verdict).toBe("UNSAFE");
+			expect(decision.persistRefusal).toBe(true);
+		}
+	});
 });
 
 describe("branch 7: today's derivation", () => {

@@ -14,7 +14,7 @@
  *   4. firm `named`, literal match, no overlay flags  → SAFE
  *      (headless with a block-band hazard or unsafe   → branch 5)
  *   5. `named` or `goal`                              → reviewer (UNSURE until Phase 3)
- *   6. overlay flags, authorization `none`            → UNSURE
+ *   6. overlay flags, authorization `none`, not UNSAFE → UNSURE
  *   7. otherwise                                      → jev-v2's derivation
  *
  * Pure, like deriveJevDecision, and separate from it on purpose: jev-v2 stays
@@ -84,7 +84,9 @@ export function deriveDecisionOrder(input: DecisionOrderInput, policy: JevPolicy
 		const note = overlaid ? `; overlay ${overlayFlags.join(", ")}` : "";
 		return decide(5, "UNSURE", "reviewer", `${authorization.reason}; reviewer not built yet${note}; risk: ${legacy.reason}`, false);
 	}
-	if (overlaid) {
+	// A dialog, as today: the overlay escalates a SAFE or UNSURE. It never
+	// softens an UNSAFE, which falls through to branch 7 with its refusal.
+	if (overlaid && legacy.verdict !== "UNSAFE") {
 		return decide(6, "UNSURE", "overlay", `overlay ${overlayFlags.join(", ")} with ${authorization.reason}`, false);
 	}
 	return decide(7, legacy.verdict, legacy.reasonCode, legacy.reason, legacy.persistRefusal);
