@@ -673,6 +673,9 @@ export interface CtxOptions {
 	/** Session branch entries for evidence collection (issue #31). Empty by
 	 *  default; the gate reads getBranch() only when evidenceUserMessages > 0. */
 	branch?: ReadonlyArray<{ type: string; message?: { role?: string; attribution?: string; content?: unknown } }>;
+	/** The session's artifacts directory, which the jev-v3 shadow treats as
+	 *  its scratch root. None by default. */
+	artifactsDir?: string;
 }
 
 /** The labels the plugin's permission dialog offers. "Always allow" is
@@ -691,7 +694,11 @@ export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 	const currentModel = "model" in options ? options.model : { id: "test-model" };
 	const ctx = {
 		cwd: options.cwd ?? "/workspace",
-		sessionManager: { getSessionId: () => options.sessionId ?? "session-1", getBranch: () => options.branch ?? [] },
+		sessionManager: {
+			getSessionId: () => options.sessionId ?? "session-1",
+			getBranch: () => options.branch ?? [],
+			getArtifactsDir: () => options.artifactsDir ?? null,
+		},
 		hasUI: options.hasUI ?? false,
 		ui: {
 			select: async (title: string, items: Array<{ label: string; description?: string }>) => {

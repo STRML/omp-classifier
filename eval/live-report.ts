@@ -14,7 +14,12 @@
  * that filled the cache.
  *
  * The flip criterion (plan "Flip"): no call the user denied under jev-v2 that
- * jev-v3 would have allowed. Those rows are listed in full.
+ * jev-v3 would have allowed. Those rows are listed in full. A call whose live
+ * judgment was an outage (`v3.live` UNAVAILABLE) is its own bucket: the user
+ * answered a dialog that no judge had decided.
+ *
+ * A missing log or any line that fails to parse makes the report INCOMPLETE,
+ * and the command exits 1: a flip decision can't rest on a log it couldn't read.
  */
 import * as fs from "node:fs";
 import { parseArgs } from "node:util";
@@ -34,12 +39,18 @@ export interface ShadowReport {
 	matrix: Record<LiveOutcome, { v3Allow: number; v3Ask: number }>;
 	/** The flip criterion's violations: denied live, allowed by v3. */
 	regressions: Array<{ ts: string; cmd: string; branch: number; reasonCode: string }>;
+	/** Denied during a live outage, allowed by v3: listed, but no regression,
+	 *  because jev-v2 never judged them. */
+	deniedDuringOutage: Array<{ ts: string; cmd: string; branch: number; reasonCode: string }>;
 	/** Blocked headless live, allowed by v3: the subagent case the plan targets. */
 	unblocked: Array<{ ts: string; cmd: string; branch: number; reasonCode: string }>;
 }
 
 function liveOutcome(line: DecisionRecord): LiveOutcome | undefined {
 	if (line.cached === 1) return undefined;
+	const terminal = line.approval !== undefined || (line.decision === "allow" && line.layer === "verdict");
+	if (!terminal) return undefined;
+	if (line.v3?.live === "UNAVAILABLE" || line.approval === "unavailable") return "unavailable";
 	switch (line.approval) {
 		case "allow-once":
 		case "allow-session":
@@ -49,10 +60,8 @@ function liveOutcome(line: DecisionRecord): LiveOutcome | undefined {
 			return "user-denied";
 		case "headless":
 			return "headless-blocked";
-		case "unavailable":
-			return "unavailable";
 		case undefined:
-			return line.decision === "allow" && line.layer === "verdict" ? "auto-allowed" : undefined;
+			return "auto-allowed";
 	}
 }
 
@@ -65,6 +74,7 @@ export function summarizeShadow(lines: readonly DecisionRecord[], sinceMs: numbe
 		byBranch: {},
 		matrix: Object.fromEntries(outcomes.map(outcome => [outcome, { v3Allow: 0, v3Ask: 0 }])) as ShadowReport["matrix"],
 		regressions: [],
+		deniedDuringOutage: [],
 		unblocked: [],
 	};
 	for (const line of lines) {
@@ -82,23 +92,34 @@ export function summarizeShadow(lines: readonly DecisionRecord[], sinceMs: numbe
 		report.matrix[outcome][allows ? "v3Allow" : "v3Ask"]++;
 		const row = { ts: line.ts, cmd: line.cmd, branch: v3.branch, reasonCode: v3.reasonCode };
 		if (allows && outcome === "user-denied") report.regressions.push(row);
+		if (allows && outcome === "unavailable" && line.approval === "deny") report.deniedDuringOutage.push(row);
 		if (allows && outcome === "headless-blocked") report.unblocked.push(row);
 	}
 	return report;
 }
 
-export function readDecisionLog(file: string): DecisionRecord[] {
-	if (!fs.existsSync(file)) return [];
-	const lines: DecisionRecord[] = [];
-	for (const raw of fs.readFileSync(file, "utf8").split("\n")) {
-		if (raw.trim() === "") continue;
-		try {
-			lines.push(JSON.parse(raw) as DecisionRecord);
-		} catch {
-			// A torn last line from a concurrent write is not a decision.
-		}
-	}
-	return lines;
+export interface DecisionLog {
+	lines: DecisionRecord[];
+	/** Line numbers (1-based) that did not parse. */
+	malformed: number[];
+}
+
+/** Read the log strictly: a missing file throws, and every line that fails to
+ *  parse is reported, never skipped in silence. */
+export function readDecisionLog(file: string): DecisionLog {
+	if (!fs.existsSync(file)) throw new Error(`no decision log at ${file}`);
+	const log: DecisionLog = { lines: [], malformed: [] };
+	fs.readFileSync(file, "utf8")
+		.split("\n")
+		.forEach((raw, index) => {
+			if (raw.trim() === "") return;
+			try {
+				log.lines.push(JSON.parse(raw) as DecisionRecord);
+			} catch {
+				log.malformed.push(index + 1);
+			}
+		});
+	return log;
 }
 
 function render(report: ShadowReport): string {
@@ -119,6 +140,7 @@ function render(report: ShadowReport): string {
 		...branches,
 		"",
 		...list("REGRESSIONS (denied live, v3 would allow)", report.regressions),
+		...list("denied during a live outage, v3 would allow", report.deniedDuringOutage),
 		...list("headless blocks v3 would allow", report.unblocked),
 	].join("\n");
 }
@@ -128,5 +150,10 @@ if (import.meta.main) {
 	const hours = values.hours === undefined ? 24 : Number(values.hours);
 	if (!Number.isFinite(hours) || hours <= 0) throw new Error(`--hours must be a positive number; got '${values.hours}'`);
 	const file = values.file ?? decisionsLogPath();
-	console.log(render(summarizeShadow(readDecisionLog(file), Date.now() - hours * 3_600_000)));
+	const log = readDecisionLog(file);
+	console.log(render(summarizeShadow(log.lines, Date.now() - hours * 3_600_000)));
+	if (log.malformed.length > 0) {
+		console.log(`\nINCOMPLETE: ${log.malformed.length} line(s) did not parse (${log.malformed.slice(0, 10).join(", ")}). Fix or remove them before reading this report.`);
+		process.exit(1);
+	}
 }
