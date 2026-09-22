@@ -128,6 +128,16 @@ describe("the summary names what the command does, from a fixed vocabulary", () 
 		expect(entry("node -e 'console.log(1)'", "run-code")?.targets).toEqual(["node -c"]);
 	});
 
+	test("a redirect is the segment's plumbing, not the verb's argument", () => {
+		// Left in the argument list, `> log` reads as a second thing being
+		// deleted, and `> ~/.ssh/id_rsa` reads as a secret being read.
+		expect(entry("rm -rf build > log", "delete")?.targets).toEqual(["build"]);
+		expect(entry("rm -rf build > log", "write")?.targets).toEqual(["log"]);
+		expect(entry("rm -rf build >log", "delete")?.targets).toEqual(["build"]);
+		expect(kinds("cat notes.txt > ~/.ssh/authorized_keys")).toEqual(["read", "write"]);
+		expect(entry("python3 < script.py", "run-code")?.targets).toEqual(["python3"]);
+	});
+
 	test("a bare push names no ref, and the summary invents none", () => {
 		expect(entry("git push", "git-publish")).toEqual({ kind: "git-publish", count: 1, targets: [] });
 	});
