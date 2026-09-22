@@ -252,46 +252,86 @@ const UNREAD_SHAPE: ReadonlyArray<readonly [RegExp, string]> = [
 	[/\$\(/u, "command-substitution"],
 	[/`[^`]*`/u, "backtick-substitution"],
 	[/<\(|>\(/u, "process-substitution"],
-	[/<<-?\s*['"]?[A-Za-z_]/u, "heredoc"],
+	[/<<(?!<)-?\s*['"]?[A-Za-z_]/u, "heredoc"],
+	[/<<</u, "here-string"],
 ];
 
-const HEREDOC_OPENER = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/u;
+/**
+ * A real heredoc opener: `<<WORD` or `<<-'WORD'`, not the here-string `<<<`,
+ * and sitting at the end of the command so that what follows it is a body
+ * rather than more arguments.
+ *
+ * Both restrictions are there because stripping the wrong thing hides real
+ * commands. `echo "text << EOF"` on one line and `rm -rf build` on the next
+ * read as an opener with no terminator, and every line after it was dropped:
+ * the delete disappeared from the summary entirely. An opener this pattern
+ * declines simply leaves its body to be tokenized, which invents actions
+ * instead of hiding them, and that is the direction to fail in.
+ */
+const HEREDOC_OPENER = /(?<!<)<<(?!<)-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1\s*$/u;
 /** `2>&1` and `>&2` point one stream at another and name no file. The host
  *  tokenizer breaks at `&`, so left in they arrive as a stray `1` segment that
  *  reads as an unknown command. */
 const STREAM_DUPLICATION = /(\d?)>&(\d)/gu;
 
+/** Whether the character at `position` sits inside a quoted run of the line. */
+function insideQuotes(line: string, position: number): boolean {
+	let quote: string | null = null;
+	for (let index = 0; index < position; index += 1) {
+		const char = line[index];
+		if (char === "\\") {
+			index += 1;
+			continue;
+		}
+		if (quote === null && (char === '"' || char === "'")) quote = char;
+		else if (char === quote) quote = null;
+	}
+	return quote !== null;
+}
+
 /**
  * The command with what the tokenizer would misread taken out: stream
- * duplications, and heredoc bodies.
+ * duplications, and heredoc bodies. `dropped` records whether any text was
+ * removed without being read, so the summary can say so.
  *
- * A heredoc's body is data. Tokenized, `cat <<EOF\nrm -rf build\nEOF` invented
- * a delete out of text that is never run. The `heredoc` marker from
- * UNREAD_SHAPE still records that a body was there and was not read.
+ * A heredoc's body is data. Tokenized, `cat <<EOF\nrm -rf build\nEOF`
+ * invented a delete out of text that is never run.
  */
-function readable(command: string): string {
+function readable(command: string): { text: string; dropped: boolean } {
 	const withoutStreams = command.replace(STREAM_DUPLICATION, "");
 	const lines = withoutStreams.split("\n");
 	const kept: string[] = [];
+	let dropped = false;
 	for (let index = 0; index < lines.length; index += 1) {
-		const opener = HEREDOC_OPENER.exec(lines[index]);
-		kept.push(lines[index].replace(HEREDOC_OPENER, ""));
-		if (opener === null) continue;
+		const line = lines[index];
+		const opener = HEREDOC_OPENER.exec(line);
+		if (opener === null || insideQuotes(line, opener.index)) {
+			kept.push(line);
+			continue;
+		}
+		kept.push(line.slice(0, opener.index));
 		// Everything up to and including the terminator line belongs to the
 		// body; an unterminated heredoc runs to the end.
 		const terminator = opener[2];
+		const from = index;
 		index += 1;
 		while (index < lines.length && lines[index].trim() !== terminator) index += 1;
+		if (index > from) dropped = true;
 	}
-	return kept.join("\n");
+	return { text: kept.join("\n"), dropped };
 }
 
 export function summarizeActions(input: ActionSummaryInput): ActionSummaryEntry[] {
 	const raw: RawAction[] = [];
 	const tainted = input.taintedVars ?? [];
 	const unread = UNREAD_SHAPE.filter(([pattern]) => pattern.test(input.command)).map(([, name]) => name);
+	const { text, dropped } = readable(input.command);
+	// Text removed without being read is reported as such. A body that is data
+	// and a body that was executable look the same from here, so the summary
+	// says only that something was taken out.
+	if (dropped) unread.push("unparsed-command-text");
 	if (unread.length > 0) raw.push({ kind: "other", targets: unread });
-	for (const tokens of tokenizeShellSegments(readable(input.command))) {
+	for (const tokens of tokenizeShellSegments(text)) {
 		if (tokens.length === 0) continue;
 		raw.push(...classifySegment(tokens, tainted));
 	}
@@ -399,6 +439,9 @@ function takePrivilege(tokens: readonly string[], actions: RawAction[]): readonl
  * run, the thing being read, or the value of a flag.
  */
 function secretReads(tokens: readonly string[], tainted: readonly string[]): RawAction[] {
+	// The verb decides whether a short flag names a destination: `-c` is curl's
+	// cookie jar and bash's whole command.
+	const verb = basename(tokens[0] ?? "");
 	const targets: string[] = [];
 	const add = (target: string): void => {
 		if (!targets.includes(target)) targets.push(target);
@@ -414,7 +457,7 @@ function secretReads(tokens: readonly string[], tainted: readonly string[]): Raw
 		// and `$AWS_SECRET_ACCESS_KEY` reads as a secret FILE to the path rule
 		// (its name carries "secret"), which reported one secret twice.
 		if (variables.length > 0) continue;
-		const path = secretPathInToken(token);
+		const path = secretPathInToken(token, verb);
 		if (path !== undefined) add(basename(path));
 	}
 	return targets.length === 0 ? [] : [{ kind: "secret-read", targets }];
