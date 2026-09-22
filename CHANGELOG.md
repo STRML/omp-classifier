@@ -12,7 +12,7 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 - The cost is over-redaction, which is the safe direction: the rest of a line after a secret marker is gone. `{"password":"x","user":"bob"}` loses `bob`, and a user's line reading "Authorization: I approve the deploy" loses its words. `token` counts only in the singular, so usage fields like `max_tokens: 1024` stay readable.
 - The command being judged is sent unredacted. Hiding its key would hide the hazard.
 - A secret with no known shape and no secret-sounding name still gets through.
-- `JEV_POLICY_VERSION` is now `jev-v2.2`, which changes the policy hash and clears every cached verdict once.
+- `JEV_POLICY_VERSION` is now `jev-v2.2`, which changes the policy hash (the pinned value moves from `419a39187f6efc67` to `87c99bf634aa9c64`) and clears every cached verdict once. The battery text and its pinned digest are unchanged.
 
 ### The jev-v3 evidence builder
 
@@ -33,7 +33,7 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 - New battery version `jev-v3`, selected by `jevQuestions(version)` and `jevQuestionsHash(version)`. It's Phase 2 step 4 of the intent-aware judgment plan. Nothing live asks it yet; step 5 gives it a decision order and runs it in shadow.
 - jev-v3 rewrites three of its eleven questions and keeps the other eight. `exposes_secrets` now asks whether any part of a secret's value leaves where it's kept: printed, written to a file, put in a request body or upload, or sent to a host other than its own service. Reading a key to call the provider it belongs to is use, and no longer counts. `sends_local_data_outbound` judges where a used credential goes, and a host that only resembles the service's domain counts as foreign. The verdict question stops calling every credential read unsafe, and it lets the user's words settle more than an ambiguous action.
-- The jev-v2 battery is unchanged. A test pins its digest and its hash, `419a39187f6efc67`, so the shadow week measures against a fixed baseline.
+- The jev-v2 battery is unchanged. A test pins its digest and its policy hash, so the shadow week measures against a fixed baseline.
 - `judgeBattery` takes a `version`, and `bun eval/run.ts --battery jev-v3` scores the new battery. Over `eval/corpus/intent.jsonl`, 3 samples each, false asks drop from 24 of 28 to 19 of 28 and false allows stay at 2 of 40 (the same two rows, neither involving a secret). Over the adversarial corpus both batteries score 0 of 58 false allows and 20 of 45 false asks. Every row that prints a secret, sends one in a body or upload, or sends one to a foreign or lookalike host still asks.
 
 ### The shell parser (#96)
