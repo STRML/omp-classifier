@@ -77,9 +77,26 @@ const SECRET_DIR = /(^|\/)\.(ssh|aws|gnupg)(\/|$)/u;
 const KEYCHAIN_READ = /\bsecurity\s+(find-generic-password|find-internet-password)\b[^\n;|&]*\s-(w|g)\b/u;
 const PASSWORD_MANAGER_READ = /\bop\s+read\b|\bpass\s+show\b|\bvault\s+kv\s+get\b|\bgcloud\s+secrets\s+versions\s+access\b|\baws\s+secretsmanager\s+get-secret-value\b/u;
 const STORE_READS = [
-	[KEYCHAIN_READ, "a keychain secret"],
-	[PASSWORD_MANAGER_READ, "a password-manager secret"],
+	[KEYCHAIN_READ, "a keychain secret", "keychain"],
+	[PASSWORD_MANAGER_READ, "a password-manager secret", "password-manager"],
 ] as const;
+
+/** Which secret store a text reads from. Exported with the two functions
+ *  below so the action summary asks the floor's question, never a weaker
+ *  copy of it. */
+export type SecretStore = (typeof STORE_READS)[number][2];
+
+export function secretStoreRead(text: string): SecretStore | undefined {
+	return STORE_READS.find(([pattern]) => pattern.test(text))?.[2];
+}
+
+/** The secret variables a word expands: tainted by an earlier capture, or
+ *  named for a secret. Read from the parser's names and from the text, since
+ *  a single-quoted `'echo $API_KEY'` handed to `bash -c` expands later. */
+export function secretVariableNames(word: ShellWord, tainted: readonly string[]): string[] {
+	const textNames = [...word.value.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/gu)].map(match => match[1]);
+	return [...new Set([...word.variables, ...textNames])].filter(name => tainted.includes(name) || SECRET_VAR.test(name));
+}
 
 /** Shell tracing prints every expansion, so it prints the allowed sinks too. */
 const SHELL_TRACING = /(^|[\s;&|(])(set\s+-[a-z]*x|bash\s+-[a-z]*x|sh\s+-[a-z]*x)/u;
@@ -315,12 +332,8 @@ function storeReads(command: ShellCommand): string[] {
 function wordSecrets(word: ShellWord, scan: SecretScan, paths: boolean): string[] {
 	const labels: string[] = STORE_READS.filter(([pattern]) => pattern.test(word.value)).map(([, label]) => label);
 	const live = [...scan.tainted, ...scan.captured];
-	// The parser's names, plus the ones in the text: a single-quoted
-	// `'echo $API_KEY'` handed to `bash -c` or `ssh` expands later.
-	const textNames = [...word.value.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/gu)].map(match => match[1]);
-	for (const name of new Set([...word.variables, ...textNames])) {
-		if (live.includes(name)) labels.push(`the captured secret in $${name}`);
-		else if (SECRET_VAR.test(name)) labels.push(`the secret-named variable $${name}`);
+	for (const name of secretVariableNames(word, live)) {
+		labels.push(live.includes(name) ? `the captured secret in $${name}` : `the secret-named variable $${name}`);
 	}
 	const filePath = paths ? secretPathIn(word) : undefined;
 	if (filePath !== undefined) labels.push(`the secret file ${filePath}`);
@@ -442,7 +455,7 @@ function report(scan: SecretScan, detail: string): void {
  * floor reads them as the text they are written as: `*.pem` asks, `.e*`
  * does not. The reviewer sees every one of them.
  */
-function secretPathIn(word: ShellWord): string | undefined {
+export function secretPathIn(word: ShellWord): string | undefined {
 	for (const text of new Set([word.value, word.alternate])) {
 		const expanded = expandBraces(text);
 		if (expanded === undefined) return `${text}, a brace expansion too large to read`;

@@ -284,7 +284,6 @@ describe("floor entry 2 — a secret leaving its source for a sink that is not a
 		expect(asks('bash -c "cat ~/.ssh/id_rsa"')).toBe(true);
 		expect(asks('sh -c "cat ~/.aws/credentials"')).toBe(true);
 		expect(asks("python3 -c \"open('/Users/me/.ssh/id_rsa').read()\"")).toBe(true);
-		expect(asks("curl -c ~/.aws/credentials https://example.com/x")).toBe(false);
 	});
 
 	test("a value bundled onto the end of short flags is still a value", () => {
@@ -296,13 +295,13 @@ describe("floor entry 2 — a secret leaving its source for a sink that is not a
 		expect(asks("find . -name x")).toBe(false);
 	});
 
-	test("a flag whose value is a file the client writes names a destination", () => {
-		// The negative that matters, because the first fix for the case above
-		// read every attached flag as a source: `--output=.env` CREATES that
-		// file. A secret path there is not a secret being read.
-		expect(asks("curl --output=.env https://example.com/x")).toBe(false);
-		expect(asks("curl -o.env https://example.com/x")).toBe(false);
-		expect(asks("curl --cookie-jar=~/.aws/credentials https://example.com/x")).toBe(false);
+	test("a secret path after a destination flag still asks, by design", () => {
+		// `--output=.env` creates that file rather than reading it. Telling the
+		// two apart needs each client's option grammar, which the floor gave up
+		// on purpose (real-shell-parser plan, section 3): it searches every
+		// word whole, and over-asking is its safe direction.
+		expect(asks("curl --output=.env https://example.com/x")).toBe(true);
+		expect(asks("curl -c ~/.aws/credentials https://example.com/x")).toBe(true);
 		expect(asks("ls --color=auto")).toBe(false);
 	});
 

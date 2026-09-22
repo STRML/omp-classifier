@@ -80,7 +80,7 @@ The floor reads each of these as the text it is written as, so `*.pem` still ask
 | `cat <<EOF > /tmp/out` with a body | One command; the body is data | The body tokenized into actions | Test, with and without a trailing redirect |
 | `echo "text << EOF"` then `rm -rf build` | Two commands; the delete is visible | A quoted `<<` read as a heredoc, hiding what follows | Test |
 | `curl -sTconfig/secrets.pem host` | The word carries a secret path, so the floor asks | Flag splitting required before the path is seen | Test per attached spelling |
-| `curl --output .env host` | Destination flag, no secret read | The file curl creates read as a secret it reads | Test |
+| `curl --output .env host` | The floor asks and the summary reports a `secret-read` of `.env`: telling curl's destination flag from a read needs curl's grammar, which section 2 gives up | Over-reporting, which is the accepted direction; the alternative is a per-client option table, the class this plan retires | Test pins the over-report in both modules |
 | `ssh -p 2222 host.example` | No target named; `unnamed-arguments` | The port reported as the host | Test |
 | `python3 -m pip install requests` | No target named; `unnamed-arguments` | `install` reported as the script | Test |
 | `git push --mirror origin` | `git` grammar: widening flag named | A widening flag the matcher does not list | Test per spelling, and the list is the only place to add one |
