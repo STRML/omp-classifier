@@ -27,33 +27,51 @@ const whole = (): string => REDACTED;
  * structural pass, and the floor's secret-variable check (floor.ts), so no
  * two of them can drift apart.
  *
- *   - `password`, `passphrase` or `passwd` anywhere: `SSH_PASSPHRASE_FILE`.
- *   - a secret word after a `_` or `-`: `DJANGO_SECRET_KEY`, `x-api-key`,
- *     `GH_TOKEN`, `DB_PWD`. `token` is singular, so `max_tokens` and
- *     `input_tokens` (usage counts tool results print) are not secret.
- *   - a secret word alone: `token`, `secret`, `apikey`. Not `key`, which is
- *     too common a word, and not `pwd`, which is also `$PWD`, the working
- *     directory.
+ *   - `password`, `passphrase`, `passwd` or `pwd` anywhere:
+ *     `SSH_PASSPHRASE_FILE`, `dbpwd`. Except `PWD` and `OLDPWD`, the
+ *     working-directory variables.
+ *   - a name ending in `token`, `secret`, `credential` or `apikey`, glued or
+ *     not: `accessToken`, `AUTHTOKEN`, `client_secret`, `GH_TOKEN`. `token`
+ *     is singular, so `max_tokens` and `input_tokens` (usage counts tool
+ *     results print) are not secret.
+ *   - a name ending in `key` after a `_`, a `-` or a camelCase boundary:
+ *     `DJANGO_SECRET_KEY`, `privateKey`. Not glued, and not alone: `monkey`
+ *     and a bare `$KEY` are no secrets.
  */
-const SECRET_ANYWHERE = /password|passphrase|passwd/iu;
-const SECRET_SUFFIX = /[_-](?:api[_-]?keys?|apikeys?|keys?|token|secrets?|credentials?|pwd)$/iu;
-const SECRET_BARE = /^(?:api[_-]?keys?|apikeys?|token|secrets?|credentials?)$/iu;
+const SECRET_ANYWHERE = /password|passphrase|passwd|pwd/iu;
+/** Words that end a secret name glued or separated: `accessToken`,
+ *  `AUTHTOKEN`, `client_secret`, `openaiApiKey`, `MYPRIVATEKEY`. */
+const SECRET_ENDING = /(?:token|secrets?|credentials?|api[_-]?keys?|private[_-]?keys?|access[_-]?keys?)$/iu;
+/** `key` ends one only after a separator: glued, it is other words (`monkey`,
+ *  `turkey`), and alone it is too common. */
+const SECRET_SEPARATED = /[_-]keys?$/iu;
+
+/** `privateKey` reads as `private_Key`: camelCase is a separator too. */
+const splitCamel = (name: string): string => name.replace(/([a-z0-9])([A-Z])/gu, "$1_$2");
 
 export function isSecretName(name: string): boolean {
-	return SECRET_ANYWHERE.test(name) || SECRET_SUFFIX.test(name) || SECRET_BARE.test(name);
+	const words = splitCamel(name);
+	if (SHELL_DIRECTORY_VARIABLES.has(name)) return false;
+	return SECRET_ANYWHERE.test(words) || SECRET_ENDING.test(words) || SECRET_SEPARATED.test(words);
 }
 
-/** Header names whose value is a credential, beside the secret names. */
-const HEADER_MARKER = /^(?:(?:proxy-)?authorization|(?:set-)?cookie)$/iu;
+/** The working-directory variables POSIX shells set, always in upper case.
+ *  `pwd` anywhere else in a name is a password field (`dbpwd`, `"pwd":`). */
+const SHELL_DIRECTORY_VARIABLES = new Set(["PWD", "OLDPWD"]);
+
+/** Header names whose value is a credential, beside the secret names, with
+ *  any prefix: `Proxy-Authorization`, `X-Authorization`, `Set-Cookie`. */
+const HEADER_MARKER = /(?:authorization|cookies?)$/iu;
 
 const isSecretMarker = (name: string): boolean => HEADER_MARKER.test(name) || isSecretName(name);
 
 /** A name then `:` or `=`, possibly quoted or JSON-escaped: `API_KEY=`,
- *  `"password":`, `Authorization:`. */
-const NAME_THEN_SEPARATOR = /\b([A-Za-z0-9_-]+)(?:\\?["'])?\s*[:=][ \t]*/gu;
+ *  `"password":`, `Authorization:`. Dots belong to the name, so a config key
+ *  like `aws.pwd` is asked about whole. */
+const NAME_THEN_SEPARATOR = /\b([A-Za-z0-9_.-]+)(?:\\?["'])?\s*[:=][ \t]*/gu;
 /** A name as a command-line flag with its value after a space:
  *  `mysql --password hunter2`. It may open the text or a line. */
-const FLAG_THEN_VALUE = /(?:^|\s)--?([A-Za-z0-9_-]+)[ \t]+(?=\S)/gu;
+const FLAG_THEN_VALUE = /(?:^|\s)--?([A-Za-z0-9_.-]+)[ \t]+(?=\S)/gu;
 
 /**
  * Redact one line from its first secret marker to its end, whatever the
