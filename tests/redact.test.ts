@@ -82,6 +82,7 @@ describe("redactSecrets", () => {
 			[`{"command":"echo \\"password\\": \\"hunter2\\""}`, "hunter2"],
 			[`PASSWORD=abc;defgh`, "abc;defgh"],
 			[`{"db_pwd": "x"}`, `"x"`],
+			[`{"pwd": "x"}`, `"x"`],
 		];
 		for (const [text, secret] of cases) {
 			const out = redactSecrets(text);
@@ -130,6 +131,20 @@ describe("redactSecrets", () => {
 			expect(isSecretName(name)).toBe(true);
 			expect(redactSecrets(`${name}=hunter2`)).toBe(`${name}=${REDACTED}`);
 			expect(JSON.stringify(redactValue({ [name]: "hunter2" }))).not.toContain("hunter2");
+		}
+		// camelCase and glued names, which a separator-only rule dropped
+		// (security review of 05e4115).
+		for (const text of ['{"accessToken": "abc123xyz"}', '{"clientSecret":"s3cr3tvalue"}', "AUTHTOKEN=abcdef123", '{"privateKey":"xyzxyz"}', "ghtoken=abcdef", '{"openaiApiKey":"k"}']) {
+			expect(redactSecrets(text)).toContain(REDACTED);
+		}
+		for (const name of ["accessToken", "refreshToken", "privateKey", "sshKey", "clientSecret"]) {
+			expect(JSON.stringify(redactValue({ [name]: "hunter2" }))).not.toContain("hunter2");
+		}
+		for (const name of ["maxTokens", "monkey", "PWD", "OLDPWD", "KEY", "turkey"]) expect(isSecretName(name)).toBe(false);
+		for (const name of ["pwd", "mypwd", "USERPWD", "db_pwd", "Pwd"]) expect(isSecretName(name)).toBe(true);
+		// Prefixed headers, dotted config keys, and all-caps glued names.
+		for (const text of ['-H "X-Authorization: VAL123x"', "aws.pwd=VAL123x", "MYPRIVATEKEY=VAL123x", "spring.datasource.password: VAL123x"]) {
+			expect(redactSecrets(text)).not.toContain("VAL123x");
 		}
 		// Usage counts and plain words stay readable.
 		for (const text of ["max_tokens: 1024", "input_tokens=528", "key: value", "monkey: banana"]) expect(redactSecrets(text)).toBe(text);
