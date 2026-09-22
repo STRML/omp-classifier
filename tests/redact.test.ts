@@ -113,6 +113,29 @@ describe("redactSecrets", () => {
 		expect(out).toContain("curl https://x.test");
 	});
 
+	test("text and structure share one marker vocabulary (fresh gate round 1)", () => {
+		// Every key the structural pass blanks also redacts as text: the class was
+		// a name one side knew and the other did not.
+		for (const key of ["Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie", "api_key", "x-api-key", "DB_PASSWORD", "client_secret", "GH_TOKEN", "private_key"]) {
+			expect(JSON.stringify(redactValue({ [key]: "opaque-value-1" }))).not.toContain("opaque-value-1");
+			expect(redactSecrets(`${key}: opaque-value-1`)).toBe(`${key}: ${REDACTED}`);
+		}
+		expect(redactSecrets("Set-Cookie: session=opaque-session-value; HttpOnly")).toBe(`Set-Cookie: ${REDACTED}`);
+	});
+
+	test("a secret flag with its value after a space is redacted; --password-stdin is not a value", () => {
+		expect(redactSecrets("mysql -u root --password hunter2 -e 'select 1'")).toBe(`mysql -u root --password ${REDACTED}`);
+		expect(redactSecrets("curl --api-key $KEY https://x.test")).toBe(`curl --api-key ${REDACTED}`);
+		const stdin = "echo $T | docker login --password-stdin registry.example.com";
+		expect(redactSecrets(stdin)).toBe(stdin);
+	});
+
+	test("a PGP private key block is redacted whole", () => {
+		const body = fake("", 64);
+		const pgp = `-----BEGIN PGP PRIVATE KEY BLOCK-----\n\n${body}\n-----END PGP PRIVATE KEY BLOCK-----`;
+		expect(redactSecrets(`gpg: ${pgp} done`)).toBe(`gpg: ${REDACTED} done`);
+	});
+
 	test("a private key block is redacted whole", () => {
 		const body = fake("", 64);
 		const pem = `-----BEGIN OPENSSH PRIVATE KEY-----\n${body}\n${body}\n-----END OPENSSH PRIVATE KEY-----`;

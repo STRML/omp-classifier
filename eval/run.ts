@@ -208,9 +208,11 @@ const JEV_TIMEOUT_MS = 25_000;
  * semantics: it keys the reply cache and the report filenames, and a stale entry
  * answered a different question.
  *  v6: score the bounded review and shared deterministic replay tail (prompt era);
- *  v7: Jev port — cached answers instead of replies, policy scoring plus sweep.
+ *  v7: Jev port — cached answers instead of replies, policy scoring plus sweep;
+ *  v8: evidence in the judged state is redacted (jev-v2.2), so an answer
+ *      cached over unredacted evidence answered a different question.
  */
-const HARNESS_VERSION = 7;
+const HARNESS_VERSION = 8;
 
 function usage(): string {
 	return `Usage: bun eval/run.ts [flags]

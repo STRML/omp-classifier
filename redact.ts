@@ -27,13 +27,24 @@ const whole = (): string => REDACTED;
  *  `max_tokens` and `input_tokens` are usage counts tool results print. */
 const SECRET_NAME = String.raw`[A-Za-z0-9_-]*(?:api[_-]?keys?|apikeys?|token|secrets?|passwords?|passwd|pwd|private[_-]?keys?|access[_-]?keys?|credentials?)`;
 
+/** Every marker that says "a secret follows", in one vocabulary shared by the
+ *  text rules and the structural keys, so one can't know a name the other
+ *  misses: header names that carry credentials, and secret-sounding names. */
+const SECRET_MARKER = String.raw`(?:(?:proxy-)?authorization|(?:set-)?cookie|${SECRET_NAME})`;
+
 const RULES: readonly Rule[] = [
 	// A private key block, whole. An unterminated block runs to the end.
-	{ pattern: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gu, replace: whole },
-	// An authorization header: everything after it to the end of the line,
-	// whatever the scheme (Bearer, Basic, Digest, AWS4-HMAC-SHA256, ...). There
-	// is no header grammar left to miss. The key may be quoted or JSON-escaped.
-	{ pattern: /\b((?:proxy-)?authorization(?:\\?["'])?\s*[:=][ \t]*)[^\r\n]*/giu, replace: (_m, keep) => `${keep}${REDACTED}` },
+	// PEM and PGP armor both: `PRIVATE KEY` and `PRIVATE KEY BLOCK`.
+	{ pattern: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)/gu, replace: whole },
+	// A secret marker followed by `:` or `=` (`Authorization:`, `Set-Cookie:`,
+	// `API_KEY=`, `"password":`): everything after it to the end of the line,
+	// whatever the scheme or quoting. The marker may be quoted or JSON-escaped.
+	// There is no header or quoting grammar left to miss.
+	{ pattern: new RegExp(`(\\b${SECRET_MARKER}(?:\\\\?["'])?\\s*[:=][ \\t]*)[^\\r\\n]*`, "giu"), replace: (_m, keep) => `${keep}${REDACTED}` },
+	// The same marker as a command-line flag with its value after a space:
+	// `mysql --password hunter2`, `--api-key $KEY`. `--password-stdin` is a
+	// different word and stays.
+	{ pattern: new RegExp(`(\\s--?${SECRET_MARKER}[ \\t]+)(?=\\S)[^\\r\\n]*`, "giu"), replace: (_m, keep) => `${keep}${REDACTED}` },
 	{ pattern: /\b(bearer\s+)[^\s"'\\,;]{8,}/giu, replace: (_m, keep) => `${keep}${REDACTED}` },
 	// Token formats with a published prefix.
 	{ pattern: /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}/gu, replace: whole },
@@ -47,16 +58,10 @@ const RULES: readonly Rule[] = [
 	{ pattern: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/gu, replace: whole },
 	// The password in a URL's userinfo. The user and host stay.
 	{ pattern: /(\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+(@)/giu, replace: (_m, head, at) => `${head}${REDACTED}${at}` },
-	// A value assigned to a secret-sounding name, `API_KEY=...` or
-	// `"password": "...`: everything after it to the end of the line, quoted
-	// or not, closed or not. That errs toward redacting too much, by design:
-	// `{"password":"x","user":"bob"}` loses `bob`, and a user's line that
-	// starts `token: ...` loses its words.
-	{ pattern: new RegExp(`(\\b${SECRET_NAME}(?:\\\\?["'])?\\s*[:=][ \\t]*)[^\\r\\n]*`, "giu"), replace: (_m, keep) => `${keep}${REDACTED}` },
 ];
 
 /** A key whose value is a credential whatever it looks like. */
-const SECRET_KEY = new RegExp(`^(?:authorization|proxy-authorization|cookie|set-cookie|${SECRET_NAME})$`, "iu");
+const SECRET_KEY = new RegExp(`^${SECRET_MARKER}$`, "iu");
 
 /**
  * Redact a structured value before it is serialized: every value under a
