@@ -594,3 +594,7 @@ describe("the floor is pure", () => {
 		}
 	});
 });
+
+test("a passphrase-named variable is a secret source, like a password (#110 gate round 2)", () => {
+	expect(evaluateFloor({ command: 'echo "$SSH_PASSPHRASE"', language: "shell", taintedVars: [] }).asks).toBe(true);
+});

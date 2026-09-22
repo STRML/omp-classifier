@@ -123,6 +123,16 @@ describe("redactSecrets", () => {
 		expect(redactSecrets("Set-Cookie: session=opaque-session-value; HttpOnly")).toBe(`Set-Cookie: ${REDACTED}`);
 	});
 
+	test("every secret-variable name the floor knows is redacted too (#110 gate round 2)", () => {
+		// The floor's list is *_KEY, *_TOKEN, *_SECRET, *PASSWORD*, *PASSPHRASE*.
+		for (const name of ["DJANGO_SECRET_KEY", "SSH_PASSPHRASE", "AWS_SECRET_ACCESS_KEY", "STRIPE_API_KEY", "GH_TOKEN", "DB_PASSWORD", "GOOGLE_CREDENTIALS", "SIGNING_KEY"]) {
+			expect(redactSecrets(`${name}=hunter2`)).toBe(`${name}=${REDACTED}`);
+			expect(JSON.stringify(redactValue({ [name]: "hunter2" }))).not.toContain("hunter2");
+		}
+		// Usage counts and plain words stay readable.
+		for (const text of ["max_tokens: 1024", "input_tokens=528", "key: value", "monkey: banana"]) expect(redactSecrets(text)).toBe(text);
+	});
+
 	test("a secret flag with its value after a space is redacted; --password-stdin is not a value", () => {
 		expect(redactSecrets("mysql -u root --password hunter2 -e 'select 1'")).toBe(`mysql -u root --password ${REDACTED}`);
 		expect(redactSecrets("curl --api-key $KEY https://x.test")).toBe(`curl --api-key ${REDACTED}`);
