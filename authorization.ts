@@ -170,6 +170,9 @@ const URL = /^[a-z][a-z0-9+.-]*:\/\/([^/\s]+)/iu;
 /** A redirect that creates or truncates a file. `2>&1` and `>/dev/null` write
  *  nothing anyone can read back, so neither is a write. */
 const REDIRECT = /^(\d|&)?>>?(.*)$/u;
+/** Any redirect, including an input one: all of them are the segment's
+ *  plumbing rather than the verb's arguments. */
+const ANY_REDIRECT = /^(\d|&)?(?:>>?|<<?)(.*)$/u;
 
 export function summarizeActions(input: ActionSummaryInput): ActionSummaryEntry[] {
 	const raw: RawAction[] = [];
@@ -182,7 +185,10 @@ export function summarizeActions(input: ActionSummaryInput): ActionSummaryEntry[
 
 function classifySegment(tokens: readonly string[]): RawAction[] {
 	const actions: RawAction[] = [];
-	const rest = takePrivilege(tokens, actions);
+	// A redirect belongs to the segment, not to the verb's arguments. Left in,
+	// `rm -rf build > log` reports a delete of `log`, and `cat x > ~/.ssh/id_rsa`
+	// reports a secret READ of the file it is overwriting.
+	const rest = withoutRedirects(takePrivilege(tokens, actions));
 	if (rest.length === 0) return actions;
 	const secrets = secretReads(rest);
 	actions.push(...secrets);
@@ -191,8 +197,24 @@ function classifySegment(tokens: readonly string[]): RawAction[] {
 	// store read has already named the segment. Privilege does NOT stand in for
 	// it: `sudo frobnicate` must still report the verb nobody recognized.
 	if (!(main.kind === "other" && secrets.length > 0)) actions.push(main);
-	actions.push(...redirectWrites(rest));
+	actions.push(...redirectWrites(tokens));
 	return actions;
+}
+
+/** The segment's words with its redirects removed: the operator, and the word
+ *  after a bare `>` or `<`, which is the operator's target rather than the
+ *  verb's argument. */
+function withoutRedirects(tokens: readonly string[]): string[] {
+	const kept: string[] = [];
+	for (let index = 0; index < tokens.length; index += 1) {
+		const match = ANY_REDIRECT.exec(tokens[index]);
+		if (match === null) {
+			kept.push(tokens[index]);
+			continue;
+		}
+		if (match[2] === "") index += 1;
+	}
+	return kept;
 }
 
 /** Record a privilege action and return the command it wraps, or the segment
