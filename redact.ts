@@ -108,8 +108,12 @@ const FLAG_THEN_VALUE = /(?:^|\s)--?([A-Za-z0-9_.-]+)[ \t]+(?=\S)/gu;
  *  file name (it ends in an extension), a colon, digits, a colon. Only that
  *  exact shape is exempt, so `client.secret.json=hunter2`, `token.ts: hunter2`
  *  and `DB_PASSWORD:12:hunter2` still redact. */
+/** Extensions a grep hit names, from a fixed list: a dot suffix alone is not
+ *  enough, since `aws.password` and `db.pwd` have one too. */
+const SOURCE_FILE = /\.(?:[cm]?[jt]sx?|py|rb|go|rs|java|kt|swift|c|h|cc|cpp|hpp|cs|php|sh|bash|zsh|md|txt|json|ya?ml|toml|ini|cfg|conf|env|lock|log|html|css|sql|xml)$/iu;
+
 function isGrepLocation(line: string, match: RegExpMatchArray): boolean {
-	if (!/\.[A-Za-z0-9]{1,8}$/u.test(match[1])) return false;
+	if (!SOURCE_FILE.test(match[1])) return false;
 	const after = line.slice((match.index ?? 0) + match[1].length);
 	return /^:\d+:/u.test(after);
 }

@@ -228,6 +228,10 @@ describe("redactSecrets", () => {
 
 	test("grep's path:line: prefix is exempt only for a file name", () => {
 		expect(redactSecrets("DB_PASSWORD:12:hunter2")).not.toContain("hunter2");
+		// A dot suffix is not a file extension: `aws.password` is a setting.
+		for (const text of ["aws.password:12:hunter2", "a.b.pwd:12:hunter2", ".cookie:12:hunter2"]) expect(redactSecrets(text)).not.toContain("hunter2");
+		// A real grep hit keeps its path, and its content is still read.
+		expect(redactSecrets("config.env:12:API_KEY=hunter2")).toBe(`config.env:12:API_KEY=${REDACTED}`);
 		expect(redactSecrets("src/auth/token.ts:12: export")).toBe("src/auth/token.ts:12: export");
 	});
 
