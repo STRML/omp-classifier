@@ -468,6 +468,16 @@ describe("the floor reads the parser's view (plan 2026-09-22-real-shell-parser.m
 		expect(asks("echo $API_KEY >&-")).toBe(false);
 	});
 
+	test("|& pipes both streams, so it feeds --password-stdin (#93)", () => {
+		expect(asks("echo $DOCKER_TOKEN |& docker login -u me --password-stdin")).toBe(false);
+	});
+
+	test("time keeps assignment position, so its capture is a capture (#90)", () => {
+		const captured = evaluateFloor({ command: "time TOKEN=$(op read op://v/i/c) curl -s https://api.example.com" });
+		expect(captured.asks).toBe(false);
+		expect(captured.tainted).toEqual(["TOKEN"]);
+	});
+
 	test("the host tokenizer is gone from the floor", async () => {
 		const source = await Bun.file(new URL("../floor.ts", import.meta.url)).text();
 		expect(source).not.toContain("shell-tokenize");
