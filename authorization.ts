@@ -262,13 +262,21 @@ const DEPLOY_SCRIPT = /(deploy|publish|release)[^/]*\.(sh|ts|js|mjs|py|rb)$/u;
 /** Flags that widen an action, worth carrying into the summary because the user
  *  has to have asked for the wide version. */
 const WIDENING_LONG = /^--(admin|force|force-with-lease|force-if-includes|no-verify|hard|prod|production|yes|all|mirror|delete|delete-branch|tags|prune)(=.*)?$/u;
-/** Short spellings: a cluster carrying `f` (`-f`, `-fdx`) is force, `-d` is
- *  delete (`git push -d`, `gh pr merge -d`), `-y` is yes. */
-const WIDENING_SHORT: ReadonlyArray<readonly [RegExp, string]> = [
-	[/^-[a-zA-Z]*f[a-zA-Z]*$/u, "force"],
-	[/^-d$/u, "delete"],
-	[/^-y$/u, "yes"],
-];
+
+/**
+ * Short widening spellings, per grammar. A short flag's meaning is its tool's
+ * own: `-f` is force to `git push`, a config file to `git config`, a field to
+ * `gh api`. So a short spelling counts only where this table says what it
+ * means, and everywhere else it is an unnamed argument.
+ */
+type ShortWidening = ReadonlyArray<readonly [RegExp, string]>;
+const NO_SHORT: ShortWidening = [];
+const FORCE_CLUSTER = /^-[a-zA-Z]*f[a-zA-Z]*$/u;
+const SHORT_WIDENING: Record<string, ShortWidening> = {
+	"git-push": [[FORCE_CLUSTER, "force"], [/^-d$/u, "delete"]],
+	"git-clean": [[FORCE_CLUSTER, "force"]],
+	"gh-pr-merge": [[/^-d$/u, "delete"]],
+};
 
 /** CLIs whose first words are a subcommand path: `kubectl delete pod`, `aws s3
  *  rm`, `npm publish`, `docker push`. Their path is what separates a read from
@@ -372,16 +380,46 @@ function secretReads(command: ShellCommand, tainted: readonly string[]): RawActi
 	return targets.length === 0 ? [] : [{ kind: "secret-read", targets }];
 }
 
-/** A command's operands under a grammar this module has: its words after the
- *  verb, with flags, and the values of flags that take one, removed. Past
- *  `--`, every word is an operand. */
-function operands(words: readonly string[], valued: RegExp | undefined): string[] {
-	const found: string[] = [];
-	for (let index = 1; index < words.length; index += 1) {
+/**
+ * What an action names, and the invariant that keeps the summary honest:
+ * every word after the verb is either named or covered by
+ * `unnamed-arguments`. `taken` maps a word's position to the target it
+ * becomes, or to undefined when it is accounted for without one (a flag whose
+ * meaning is part of a named target). Every other word is unnamed, apart from
+ * a URL, whose host needs no grammar. Dropping a word silently had made `gh
+ * api -X DELETE URL` read as `gh api URL`.
+ */
+type Taken = Map<number, string | undefined>;
+
+function claimTargets(words: readonly string[], taken: ReadonlyMap<number, string | undefined>, widening: readonly string[] = []): string[] {
+	const named = [...taken.entries()].sort(([a], [b]) => a - b).flatMap(([, target]) => (target === undefined ? [] : [target]));
+	const rest = words.filter((_, index) => index > 0 && !taken.has(index));
+	const hosts = urlHosts(rest);
+	// A deploy-named script is recognized by its own name wherever it sits, as
+	// a URL is: `bash deploy.sh --prod` names the deploy it runs.
+	const scripts = rest.map(basename).filter(name => DEPLOY_SCRIPT.test(name));
+	const unnamed = rest.some(word => !URL.test(word) && !DEPLOY_SCRIPT.test(basename(word)));
+	// Widening comes after the named targets whatever its position, so `git
+	// push --force origin main` and `git push origin main --force` read alike.
+	return [...named, ...widening, ...scripts, ...hosts, ...(unnamed ? [UNNAMED] : [])];
+}
+
+/** Every argument unnamed except URL hosts: the claim for a verb whose
+ *  grammar this module does not have. */
+function unnamedTargets(words: readonly string[]): string[] {
+	return claimTargets(words, new Map());
+}
+
+/** Positions of a command's operands under a grammar this module has, from
+ *  `from` on. A flag in `valued` takes the next word; past `--`, every word
+ *  is an operand. */
+function operandIndexes(words: readonly string[], valued: RegExp | undefined, from = 1): number[] {
+	const found: number[] = [];
+	for (let index = from; index < words.length; index += 1) {
 		const word = words[index];
-		if (word === "--") return [...found, ...words.slice(index + 1)];
+		if (word === "--") return [...found, ...words.map((_, at) => at).slice(index + 1)];
 		if (!word.startsWith("-") || word === "-") {
-			found.push(word);
+			found.push(index);
 			continue;
 		}
 		// `--flag=value` carries its own value; only the spaced form eats the
@@ -391,28 +429,45 @@ function operands(words: readonly string[], valued: RegExp | undefined): string[
 	return found;
 }
 
-/**
- * Every URL host in the arguments from `from` on, which needs no grammar, and
- * the marker when any argument is something else. A URL does not stand for
- * the rest: `curl -X DELETE https://api.example.com/item` is not the same
- * request as a plain fetch of it, and the marker is what says so.
- */
-function unnamedTargets(words: readonly string[], from = 1): string[] {
-	const args = words.slice(from);
-	const hosts = urlHosts(args);
-	return args.some(word => !URL.test(word)) ? [...hosts, UNNAMED] : hosts;
+/** Every widening flag from `from` on, long spellings always and short ones
+ *  only as `short` defines them, each name once. Their positions are marked
+ *  taken, and the names are returned for claimTargets to place. */
+function takeWidening(words: readonly string[], short: ShortWidening, taken: Taken, from = 1): string[] {
+	const names: string[] = [];
+	for (let index = from; index < words.length; index += 1) {
+		if (taken.has(index)) continue;
+		const long = WIDENING_LONG.exec(words[index]);
+		const name = long !== null ? long[1].replace(/-with-lease$|-if-includes$/u, "") : short.find(([pattern]) => pattern.test(words[index]))?.[1];
+		if (name === undefined) continue;
+		taken.set(index, undefined);
+		if (!names.includes(name)) names.push(name);
+	}
+	return names;
 }
 
 /**
- * A subcommand CLI's verb and the plain words that lead its arguments, up to
- * two: `kubectl-delete-pod`, `npm-publish`. No flag has appeared yet, so no
- * flag's value can be among them, which is why this needs no option grammar.
- * `from` is where the unnamed arguments start.
+ * A subcommand CLI's path: the verb and its first two plain words,
+ * `kubectl-delete-pod`, `npm-audit`. A leading flag is skipped rather than
+ * ending the path, because `npm --silent audit` and `npm --silent publish`
+ * are opposite requests. The skipped flag stays unnamed, and if it took a
+ * value, that value can stand in the path, which is why the path carries the
+ * marker whenever a flag came first.
  */
-function subcommandPath(words: readonly string[]): { path: string; from: number } {
-	let from = 1;
-	while (from < words.length && from <= SUBCOMMAND_DEPTH && SUBCOMMAND_WORD.test(words[from])) from += 1;
-	return { path: [basename(words[0]), ...words.slice(1, from)].join("-"), from };
+function subcommandPath(words: readonly string[], taken: Taken): string[] {
+	const path: string[] = [];
+	for (let index = 1; index < words.length && path.length < SUBCOMMAND_DEPTH; index += 1) {
+		// Flags are skipped only on the way to the first word: after it, a flag
+		// ends the path, or `docker rm --force web` would read `web` as part of
+		// the subcommand.
+		if (words[index].startsWith("-")) {
+			if (path.length > 0) break;
+			continue;
+		}
+		if (!SUBCOMMAND_WORD.test(words[index])) break;
+		path.push(words[index]);
+		taken.set(index, undefined);
+	}
+	return path;
 }
 
 function urlHosts(words: readonly string[]): string[] {
@@ -426,19 +481,14 @@ function classifyVerb(command: readonly ShellWord[]): RawAction {
 	const words = command.map(word => word.value);
 	const spelling = words[0];
 	const verb = basename(spelling);
-	// The first word that is not a flag. Without the verb's grammar a flag's
-	// value can stand here, which can cost a kind, never a target: no target
-	// below is read from it.
-	const sub = words.slice(1).find(word => !word.startsWith("-")) ?? "";
-
 	if (DEPLOY_NAME.test(verb) || DEPLOY_SCRIPT.test(verb)) return { kind: "deploy", targets: deployTargets(words, verb) };
-	if (PATH_DELETE_VERB.test(verb)) return { kind: "delete", targets: operands(words, undefined) };
+	if (PATH_DELETE_VERB.test(verb)) return { kind: "delete", targets: pathDeleteTargets(words) };
 	if (DELETE_VERB.test(verb)) return { kind: "delete", targets: unnamedTargets(words) };
 	if (verb === "git") return gitAction(words);
 	if (/^(gh|glab)$/u.test(verb)) return ghAction(words, verb);
-	if (PACKAGE_MANAGER.test(verb)) return subcommandAction(words, PACKAGE_NETWORK_SUBCOMMAND.test(sub) ? "network" : "run-code");
-	if (CONTAINER_VERB.test(verb)) return subcommandAction(words, CONTAINER_NETWORK_SUBCOMMAND.test(sub) ? "network" : "run-code");
-	if (SUBCOMMAND_CLI.test(verb)) return subcommandAction(words, "network");
+	if (PACKAGE_MANAGER.test(verb)) return subcommandAction(words, PACKAGE_NETWORK_SUBCOMMAND);
+	if (CONTAINER_VERB.test(verb)) return subcommandAction(words, CONTAINER_NETWORK_SUBCOMMAND);
+	if (SUBCOMMAND_CLI.test(verb)) return subcommandAction(words, undefined);
 	if (NETWORK_VERB.test(verb)) return { kind: "network", targets: unnamedTargets(words) };
 	if (SEARCH_VERB.test(verb)) return findAction(words, verb);
 	// The program text is never carried into the summary, only the verb that
@@ -451,57 +501,85 @@ function classifyVerb(command: readonly ShellWord[]): RawAction {
 	return { kind: "other", targets: [spelling] };
 }
 
-function subcommandAction(words: readonly string[], kind: ActionKind): RawAction {
-	const { path, from } = subcommandPath(words);
-	// Long spellings only: `-f` is force to `docker rm` and a manifest file to
-	// `kubectl delete`, and which one is each tool's own grammar.
-	return { kind, targets: [path, ...wideningWords(words, false), ...unnamedTargets(words, from)] };
+/** `rm`, `trash` and `unlink` take no flag with a value, so their grammar is
+ *  complete: every flag is accounted for and every operand is a path. */
+function pathDeleteTargets(words: readonly string[]): string[] {
+	const taken: Taken = new Map();
+	const operands = operandIndexes(words, undefined);
+	for (let index = 1; index < words.length; index += 1) taken.set(index, operands.includes(index) ? words[index] : undefined);
+	return claimTargets(words, taken);
+}
+
+/** A subcommand CLI. `network` lists the subcommands that reach the network;
+ *  undefined means every one does. Only long widening spellings count here:
+ *  `-f` is force to `docker rm` and a manifest to `kubectl delete`. */
+function subcommandAction(words: readonly string[], network: RegExp | undefined): RawAction {
+	const taken: Taken = new Map();
+	const path = subcommandPath(words, taken);
+	const kind: ActionKind = network === undefined || path.some(word => network.test(word)) ? "network" : "run-code";
+	const widening = takeWidening(words, NO_SHORT, taken);
+	return { kind, targets: [[basename(words[0]), ...path].join("-"), ...claimTargets(words, taken, widening)] };
 }
 
 function gitAction(words: readonly string[]): RawAction {
-	const args = operands(words, FLAG_TAKING_VALUE.git);
-	const sub = args[0] ?? "";
+	const taken: Taken = new Map();
+	const args = operandIndexes(words, FLAG_TAKING_VALUE.git);
+	const subIndex = args[0];
+	const sub = subIndex === undefined ? "" : words[subIndex];
+	if (subIndex !== undefined) taken.set(subIndex, sub === "push" ? undefined : `git-${sub}`);
 	// A bare `git push` names no ref: the remote and branch come from the
 	// repository's own configuration, and inventing `origin` here would put a
-	// name in the summary that the command never said. The widening flag rides
+	// name in the summary that the command never said. The widening rides
 	// along, because `git push origin main --force` is a different request.
 	if (sub === "push") {
-		const refs = operands(words.slice(words.indexOf("push")), FLAG_TAKING_VALUE["git-push"]);
-		return { kind: "git-publish", targets: [...refs, ...wideningWords(words)] };
+		for (const index of operandIndexes(words, FLAG_TAKING_VALUE["git-push"], subIndex + 1)) taken.set(index, words[index]);
+		const widening = takeWidening(words, SHORT_WIDENING["git-push"], taken, subIndex + 1);
+		return { kind: "git-publish", targets: claimTargets(words, taken, widening) };
 	}
 	const rest = args.slice(1);
 	if (sub === "branch" && words.some(word => /^(-d|-D|--delete)$/u.test(word))) {
 		// `-D` deletes a branch that was never merged, which is the widening.
-		const forced = words.includes("-D") ? ["force"] : [];
-		return { kind: "branch-delete", targets: [...rest, ...forced] };
+		taken.set(subIndex, undefined);
+		for (const index of rest) taken.set(index, words[index]);
+		words.forEach((word, index) => {
+			if (/^(-d|-D|--delete)$/u.test(word)) taken.set(index, undefined);
+		});
+		return { kind: "branch-delete", targets: claimTargets(words, taken, words.includes("-D") ? ["force"] : []) };
 	}
 	// Past the subcommand, git's per-subcommand grammar is not one this module
-	// has: the refs and paths are unnamed, and the widening is named, so
+	// has: refs, paths and flags are unnamed, and the widening is named, so
 	// `git reset --hard` and `git clean -fdx` are not a plain reset and clean.
-	const named = [`git-${sub}`, ...wideningWords(words), ...(rest.length > 0 ? unnamedTargets(["git", ...rest]) : [])];
-	if (GIT_NETWORK_SUBCOMMAND.test(sub)) return { kind: "network", targets: named };
+	const widening = takeWidening(words, SHORT_WIDENING[`git-${sub}`] ?? NO_SHORT, taken, (subIndex ?? 0) + 1);
+	const targets = claimTargets(words, taken, widening);
+	if (GIT_NETWORK_SUBCOMMAND.test(sub)) return { kind: "network", targets };
 	if (GIT_AMBIGUOUS_SUBCOMMAND.test(sub)) {
 		const reading = words.some(word => GIT_READING_FLAG.test(word)) || rest.length === 0;
-		return { kind: reading ? "read" : "write", targets: named };
+		return { kind: reading ? "read" : "write", targets };
 	}
-	if (GIT_READ_SUBCOMMAND.test(sub)) return { kind: "read", targets: named };
-	if (GIT_WRITE_SUBCOMMAND.test(sub)) return { kind: "write", targets: named };
-	return { kind: "other", targets: named };
+	if (GIT_READ_SUBCOMMAND.test(sub)) return { kind: "read", targets };
+	if (GIT_WRITE_SUBCOMMAND.test(sub)) return { kind: "write", targets };
+	return { kind: "other", targets };
 }
 
 function ghAction(words: readonly string[], verb: string): RawAction {
-	const args = operands(words, FLAG_TAKING_VALUE[verb]);
-	const sub = args[0] ?? "";
-	if (sub === "pr" && args[1] === "merge") {
-		const numbers = args.slice(2).filter(word => /^\d+$/u.test(word));
-		const unnamed = args.slice(2).some(word => !/^\d+$/u.test(word)) ? [UNNAMED] : [];
-		return { kind: "merge", targets: [...numbers, ...wideningWords(words), ...unnamed] };
+	const taken: Taken = new Map();
+	const args = operandIndexes(words, FLAG_TAKING_VALUE[verb]);
+	const [first, second] = [args[0], args[1]].map(index => (index === undefined ? "" : words[index]));
+	if (first === "pr" && second === "merge") {
+		taken.set(args[0], undefined);
+		taken.set(args[1], undefined);
+		for (const index of args.slice(2)) if (/^\d+$/u.test(words[index])) taken.set(index, words[index]);
+		const widening = takeWidening(words, SHORT_WIDENING["gh-pr-merge"], taken);
+		return { kind: "merge", targets: claimTargets(words, taken, widening) };
 	}
 	// `gh repo view` and `gh repo delete` are opposite requests, so the
 	// subcommand path is named to its second word.
-	const depth = SUBCOMMAND_WORD.test(args[1] ?? "") ? 2 : 1;
-	const path = [verb, ...args.slice(0, depth)].join("-");
-	return { kind: "network", targets: [path, ...wideningWords(words), ...unnamedTargets(["gh", ...args.slice(depth)])] };
+	const depth = SUBCOMMAND_WORD.test(second) ? 2 : 1;
+	const pathIndexes = args.slice(0, depth);
+	pathIndexes.forEach((index, at) => taken.set(index, at === 0 ? [verb, ...pathIndexes.map(i => words[i])].join("-") : undefined));
+	const widening = takeWidening(words, NO_SHORT, taken);
+	const targets = claimTargets(words, taken, widening);
+	return { kind: "network", targets: pathIndexes.length === 0 ? [verb, ...targets] : targets };
 }
 
 /** `find` and `fd` run other commands when asked, and `find` deletes when
@@ -515,27 +593,16 @@ function findAction(words: readonly string[], verb: string): RawAction {
 
 /** A deploy script's first operand, which is the one grammar-free claim the
  *  plan keeps: whatever the script does, its first word is what the user has
- *  to have named. */
+ *  to have named. With no operand, the script's own name stands in. Short
+ *  flags are the script's grammar, so only long widening spellings count. */
 function deployTargets(words: readonly string[], verb: string): string[] {
-	const argument = operands(words, undefined)[0];
-	const widening = wideningWords(words);
-	const named = argument ?? widening[0] ?? verb.replace(/\.(sh|ts|js|mjs|py|rb)$/u, "");
-	return [named, ...widening.filter(word => word !== named)];
-}
-
-/** The widening a command asks for, in whatever spelling. `-f`,
- *  `--force-with-lease=main` and `--force` are one request, and recognizing
- *  only the bare long form made a force push and an ordinary push the same
- *  summary. */
-function wideningWords(words: readonly string[], short = true): string[] {
-	const found: string[] = [];
-	for (const word of words) {
-		const long = WIDENING_LONG.exec(word);
-		const shortName = short ? WIDENING_SHORT.find(([pattern]) => pattern.test(word))?.[1] : undefined;
-		const name = long !== null ? long[1].replace(/-with-lease$|-if-includes$/u, "") : shortName;
-		if (name !== undefined && !found.includes(name)) found.push(name);
-	}
-	return found;
+	const taken: Taken = new Map();
+	const argument = operandIndexes(words, undefined)[0];
+	if (argument !== undefined) taken.set(argument, words[argument]);
+	const widening = takeWidening(words, NO_SHORT, taken);
+	const targets = claimTargets(words, taken, widening);
+	const named = argument !== undefined || widening.length > 0;
+	return named ? targets : [verb.replace(/\.(sh|ts|js|mjs|py|rb)$/u, ""), ...targets];
 }
 
 /** Group the raw actions by kind, in ACTION_KINDS order so two commands with
