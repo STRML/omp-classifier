@@ -62,11 +62,13 @@ import {
 	DEFAULT_JEV_POLICY,
 	JEV_HAZARDS,
 	JEV_POLICY_VERSION,
+	JEV_V3_POLICY_VERSION,
 	JevUnavailableError,
 	buildJevState,
 	deriveJevDecision,
 	jevQuestionsHash,
 	type JevAnswers,
+	type JevBatteryVersion,
 	type JevDecision,
 	type JevPolicy,
 	type JevVerdict,
@@ -219,6 +221,7 @@ Flags:
   --policy <default|file.json>  Threshold set to score. \`default\` is
                                 DEFAULT_JEV_POLICY; a file holds a partial
                                 JevPolicy (unknown knobs are an error). (default: default)
+  --battery <jev-v2.1|jev-v3>   Question battery to ask (default: ${JEV_POLICY_VERSION}).
   --model <id>                  Jev model id (default: ${DEFAULT_JEV_MODEL}).
   --corpus <all|adversarial|gitflow|intent|history|heldout>
                                 Which corpus to score (default: all).
@@ -240,6 +243,7 @@ Reports land in eval/reports/ as JSON, keyed by policy id, model, and scope.`;
 interface Args {
 	help: boolean;
 	policy: string;
+	battery: JevBatteryVersion;
 	model: string;
 	corpus: string;
 	compare: string | undefined;
@@ -249,6 +253,15 @@ interface Args {
 	only: string | undefined;
 	replay: boolean;
 	timeoutMs: number;
+}
+
+const BATTERY_VERSIONS: readonly JevBatteryVersion[] = [JEV_POLICY_VERSION, JEV_V3_POLICY_VERSION];
+
+function parseBattery(raw: string | undefined): JevBatteryVersion {
+	if (raw === undefined) return JEV_POLICY_VERSION;
+	const version = BATTERY_VERSIONS.find(known => known === raw);
+	if (version === undefined) throw new Error(`--battery must be one of ${BATTERY_VERSIONS.join(", ")}; got '${raw}'`);
+	return version;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -262,6 +275,7 @@ function parseArgs(argv: string[]): Args {
 		return {
 			help: true,
 			policy: at("--policy") ?? "default",
+			battery: JEV_POLICY_VERSION,
 			model: at("--model") ?? DEFAULT_JEV_MODEL,
 			corpus: at("--corpus") ?? "all",
 			compare: undefined,
@@ -293,6 +307,7 @@ function parseArgs(argv: string[]): Args {
 	return {
 		help: argv.includes("--help") || argv.includes("-h"),
 		policy: at("--policy") ?? "default",
+		battery: parseBattery(at("--battery")),
 		model: at("--model") ?? DEFAULT_JEV_MODEL,
 		corpus: at("--corpus") ?? "all",
 		compare: at("--compare"),
@@ -1030,7 +1045,7 @@ async function runScored(args: Args, credentials: AuthStorage): Promise<void> {
 	mkdirSync(CACHE_DIR, { recursive: true });
 	mkdirSync(REPORT_DIR, { recursive: true });
 
-	const batteryHash = jevQuestionsHash();
+	const batteryHash = jevQuestionsHash(args.battery);
 	const policy = await loadPolicy(args.policy);
 	const policyId = policyIdOf(policy, batteryHash);
 	const defaultPolicyId = policyIdOf(DEFAULT_JEV_POLICY, batteryHash);
@@ -1137,6 +1152,7 @@ async function runScored(args: Args, credentials: AuthStorage): Promise<void> {
 						const answersForSample = await judgeBattery(AbortSignal.timeout(args.timeoutMs), {
 							state: caseState(testCase, cwd),
 							judge,
+							version: args.battery,
 						});
 						liveCalls++;
 						inputTokens += answersForSample.usage?.input_tokens ?? 0;
@@ -1313,7 +1329,7 @@ async function runScored(args: Args, credentials: AuthStorage): Promise<void> {
 
 	const summary = {
 		harnessVersion: HARNESS_VERSION,
-		policyVersion: JEV_POLICY_VERSION,
+		policyVersion: args.battery,
 		questionsHash: batteryHash,
 		policySpec: args.policy,
 		policyId,

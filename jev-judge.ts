@@ -62,6 +62,7 @@ import {
 	JevUnavailableError,
 	jevQuestions,
 	type JevAnswers,
+	type JevBatteryVersion,
 	type JevChoiceOption,
 	type JevHazard,
 } from "./jev";
@@ -91,6 +92,8 @@ export interface JudgeBatteryOptions {
 	 * any JSON state — `Judge.judge` narrows it to `JudgmentState` at the call.
 	 */
 	state: unknown;
+	/** Which battery to ask. Omitted, it is the live jev-v2 battery. */
+	version?: JevBatteryVersion;
 	/**
 	 * The judge to ask. Production omits it and passes `context` + `settings`;
 	 * a test or a CLI passes a resolved judge (`resolveJudge(...)`, or a
@@ -123,7 +126,7 @@ export interface JudgeBatteryOptions {
  */
 export async function judgeBattery(signal: AbortSignal | undefined, options: JudgeBatteryOptions): Promise<JevAnswers> {
 	const judge = options.judge ?? judgeForClassification(options);
-	const battery = jevQuestions() as JevBattery;
+	const battery = jevQuestions(options.version) as JevBattery;
 	const startedAt = performance.now();
 	let result: JudgmentResult<JevBattery>;
 	try {
