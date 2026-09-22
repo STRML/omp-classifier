@@ -6,6 +6,7 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ### The jev-v3 shadow
 
+- `eval/weekly-report.sh` runs the shadow report every Monday through a launchd agent (`eval/launchd/`) and posts it to the shadow-week issue as counts only, since logged command text can hold a secret (#71). New `--counts-only` flag on `eval/live-report.ts`. The reader now accepts the prompt-era `PARSE_ERROR` verdict, which 461 lines of the live log carry.
 - Every fresh classification now also runs the jev-v3 judgment in shadow: Phase 2 step 8. It builds jev-v3 evidence (`collectTaskEvidenceV3`), asks the jev-v3 battery and the authorization question in parallel (`judgeJevV3`), runs the literal match and the overlay flags, and takes the decision order (`deriveDecisionOrder`). It runs on the bash path and the eval tool path. The eval path has no literal match.
 - The result rides the decision line as `v3`: verdict, branch, reason code, authorization level, whether `named` was firm, whether the literal match held, the overlay flags, and latency. Labels and numbers only, never message text. Every line that follows a judgement carries it, dialog lines included. A shadow failure logs `{ error }` and changes nothing live.
 - It costs two more Jev requests per fresh classification. The live verdict waits for the slower of the live and shadow requests, which run in parallel. The new `shadowV3` config key (default `true`, `/classifier shadowV3 false`) turns it off. It stays out of the config signature, so flipping it clears no cache.

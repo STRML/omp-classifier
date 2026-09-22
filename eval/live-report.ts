@@ -3,7 +3,7 @@
  * Where the jev-v3 shadow disagrees with the live jev-v2 gate (plan
  * `docs/plans/2026-09-19-intent-aware-judgment.md`, Phase 2 step 8).
  *
- *   bun eval/live-report.ts [--hours 24] [--file <decisions.jsonl>]
+ *   bun eval/live-report.ts [--hours 24] [--file <decisions.jsonl>] [--counts-only]
  *
  * It reads the decision log and counts terminal lines only: every gated call
  * ends in exactly one, either an auto-allow (`layer: verdict`, decision allow)
@@ -101,6 +101,10 @@ export function summarizeShadow(lines: readonly DecisionRecord[], sinceMs: numbe
 }
 
 const VERDICTS = new Set(["SAFE", "UNSAFE", "UNSURE", "UNAVAILABLE"]);
+/** Line verdicts the log holds from before the Jev port: the prompt-era
+ *  classifier wrote PARSE_ERROR when its reply had no verdict. Real history,
+ *  not corruption; such lines carry no v3 and count for nothing. */
+const LEGACY_VERDICTS = new Set(["PARSE_ERROR"]);
 /** DecisionRecord["approval"], value for value: an unknown answer is no answer
  *  this report can count, so the line is unreadable rather than skipped. */
 const APPROVALS = new Set(["allow-once", "allow-session", "always-allow", "deny", "headless", "unavailable"]);
@@ -150,7 +154,7 @@ function isDecisionLine(value: unknown): value is DecisionRecord {
 		typeof line.cmd === "string" &&
 		(line.cached === 0 || line.cached === 1) &&
 		(line.approval === undefined || (typeof line.approval === "string" && APPROVALS.has(line.approval))) &&
-		(line.verdict === null || line.verdict === undefined || (typeof line.verdict === "string" && VERDICTS.has(line.verdict))) &&
+		(line.verdict === null || line.verdict === undefined || (typeof line.verdict === "string" && (VERDICTS.has(line.verdict) || LEGACY_VERDICTS.has(line.verdict)))) &&
 		(line.v3 === undefined || isShadowRecord(line.v3))
 	);
 }
@@ -184,7 +188,12 @@ export function readDecisionLog(file: string): DecisionLog {
 	return log;
 }
 
-function render(report: ShadowReport): string {
+/**
+ * `countsOnly` prints each list's size and none of its rows. The rows carry
+ * logged command text, which can hold a secret (#71), so anything posted
+ * somewhere public (the weekly comment on #116) uses counts only.
+ */
+export function render(report: ShadowReport, options: { countsOnly?: boolean } = {}): string {
 	const rows = Object.entries(report.matrix).map(
 		([outcome, cell]) => `  ${outcome.padEnd(17)} ${String(cell.v3Allow).padStart(9)} ${String(cell.v3Ask).padStart(9)}`,
 	);
@@ -192,7 +201,9 @@ function render(report: ShadowReport): string {
 		.sort(([a], [b]) => Number(a) - Number(b))
 		.map(([branch, count]) => `  branch ${branch}: ${count}`);
 	const list = (title: string, items: ShadowReport["regressions"]) =>
-		items.length === 0 ? [`${title}: none`] : [`${title}: ${items.length}`, ...items.map(item => `  ${item.ts}  b${item.branch} ${item.reasonCode}  ${item.cmd}`)];
+		items.length === 0
+			? [`${title}: none`]
+			: [`${title}: ${items.length}`, ...(options.countsOnly ? [] : items.map(item => `  ${item.ts}  b${item.branch} ${item.reasonCode}  ${item.cmd}`))];
 	return [
 		`jev-v3 shadow since ${report.since}: ${report.calls} calls, ${report.shadowErrors} shadow errors`,
 		"",
@@ -208,12 +219,12 @@ function render(report: ShadowReport): string {
 }
 
 if (import.meta.main) {
-	const { values } = parseArgs({ args: Bun.argv.slice(2), options: { hours: { type: "string" }, file: { type: "string" } }, strict: true });
+	const { values } = parseArgs({ args: Bun.argv.slice(2), options: { hours: { type: "string" }, file: { type: "string" }, "counts-only": { type: "boolean" } }, strict: true });
 	const hours = values.hours === undefined ? 24 : Number(values.hours);
 	if (!Number.isFinite(hours) || hours <= 0) throw new Error(`--hours must be a positive number; got '${values.hours}'`);
 	const file = values.file ?? decisionsLogPath();
 	const log = readDecisionLog(file);
-	console.log(render(summarizeShadow(log.lines, Date.now() - hours * 3_600_000)));
+	console.log(render(summarizeShadow(log.lines, Date.now() - hours * 3_600_000), { countsOnly: values["counts-only"] === true }));
 	if (log.malformed.length > 0) {
 		console.log(`\nINCOMPLETE: ${log.malformed.length} line(s) did not parse (${log.malformed.slice(0, 10).join(", ")}). Fix or remove them before reading this report.`);
 		process.exit(1);

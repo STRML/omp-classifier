@@ -179,4 +179,15 @@ Reports include final host handoff, review/recovery counts, approval overrides,
 interruption rates, and p50/p95 latency. Treat generated held-out numbers as a
 repeatable regression fixture, not as a substitute for fresh production history.
 
+The jev-v3 shadow has its own report, over the live decision log:
+
+```bash
+bun eval/live-report.ts --hours 168               # live outcome vs jev-v3, by branch
+bun eval/live-report.ts --hours 168 --counts-only # the same with no command text
+```
+
+`eval/weekly-report.sh` runs it every Monday through a launchd agent
+(`eval/launchd/`, install steps in the plist) and posts the counts to the
+shadow-week issue. The full report stays in `~/.omp/omp-classifier/`.
+
 MIT licensed.

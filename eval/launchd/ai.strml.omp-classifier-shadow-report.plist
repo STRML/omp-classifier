@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Runs eval/weekly-report.sh every Monday at 09:00 local time (#116).
+  Install: replace REPO_PATH below with the checkout's absolute path, copy to
+  ~/Library/LaunchAgents/, then
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.strml.omp-classifier-shadow-report.plist
+  A Mac asleep at 09:00 runs the job when it wakes.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.strml.omp-classifier-shadow-report</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>REPO_PATH/eval/weekly-report.sh</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Weekday</key>
+		<integer>1</integer>
+		<key>Hour</key>
+		<integer>9</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/tmp/omp-classifier-shadow-report.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/omp-classifier-shadow-report.log</string>
+</dict>
+</plist>
