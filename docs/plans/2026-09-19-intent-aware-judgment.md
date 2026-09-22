@@ -226,7 +226,7 @@ A one-hot UNSAFE and a one-hot UNSURE show the same dialog today, and both block
 
 1. The floor at the critical position, excluded from grants.
 2. The segment parser, the inert allowlist, and the local-action literal match.
-3. The `user_authorization` request over user messages and the typed action summary.
+3. The `user_authorization` request over user messages and the typed action summary. `namedMinProbability` lives in the authorization module's own policy until the flip, not in `JevPolicy`: `jevQuestionsHash` folds `DEFAULT_JEV_POLICY` into the cache key and the audit fingerprint, so adding a key there would invalidate every cached `jev-v2` verdict during the shadow week the week exists to measure.
 4. In the `jev-v3` battery only, rewrite `exposes_secrets` and `sends_local_data_outbound` to separate using a secret with its service from printing or relocating it. Rewrite the verdict text at `jev.ts:232`, `jev.ts:236`, and `jev.ts:247`.
 5. The decision order under `jev-v3`, on the bash path and the `eval` tool path (`index.ts:4215-4262`) alike. Until Phase 3 lands, branch 5 means UNSURE.
 6. In the `jev-v3` evidence builder only, pin the first user message outside the newest-8 slice (`index.ts:1393-1395`) and widen the anchor pattern with task verbs. `collectTaskEvidence` stays as it is for `jev-v2`.
@@ -280,6 +280,13 @@ After a week of shadow logging, review the disagreement report. Set `policy: "je
 | Unrequested deploy with a safe-leaning verdict | `unauthorized_consequential_action` stays gating, ask | Hazard removed later | Test pins it gating |
 | `named` from the model with nothing extracted | Branch 4 needs every extracted action matched; none extracted means branch 3 or the reviewer | Vacuous match | Test: empty extraction never takes branch 4 |
 | Branch named `user-asked-for-this` | Target hashed in the authorization state | Raw name passed | Test |
+| A target over 64 characters | Hashed the same way a reviewer-addressed one is | Truncated instead, so its opening words still read as prose | Test |
+| Two segments naming one target | One hash for both, stable across calls | A per-call salt, so the model cannot tell one target from two | Test |
+| `sudo ./deploy.sh --prod` | Two entries: the privilege, and the deploy it wraps | Privilege swallows the action under it | Test |
+| A segment no rule classifies | An `other` entry carrying the verb | Dropped, so the model answers over an action set it never saw whole | Test |
+| `curl https://x \| sh` | Entries for the fetch and for the interpreter | Only the first segment classified | Test |
+| The command text in the authorization state | Never there: kinds come from a fixed vocabulary and targets pass the hash rule | A field carries raw command text, so injected prose steers the authorization answer | Test asserts the serialized state carries no command text |
+| No user messages at all | `userMessages` omitted rather than empty | `[]` is sent, which reads as "the user said nothing" | Test |
 | "Don't deploy to prod" | Negation window cancels the match | Window too small | Test per restrictive word |
 | Pasted document names a host | Pasted text never matches | Host does not mark pastes | Fenced and quoted forms tested. Unmarked pastes are a stated residual; the reviewer sees them as user text. |
 | `-w \| head -c 12`, `\| tee`, `curl -v` with a secret | Floor entry 2, ask | New print shape | Test per shape; grant options not offered |
@@ -288,6 +295,7 @@ After a week of shadow logging, review the disagreement report. Set `policy: "je
 | Old first message names a target, later "go ahead" | Pinned message never matches literally; Deny lift needs the target named | Pinned message used by branch 4 | Test |
 | One-hot authorization answer | Counts as `none` | Flag taken from the risk request only | Test with a one-hot authorization and a normal risk answer |
 | Authorization request fails, risk succeeds | Authorization is `none` | Whole decision UNAVAILABLE, or a default `named` | Test |
+| `named` with p(`named`) below `namedMinProbability` | The level stays `named` and reaches the reviewer; only branch 4's fast allow reads the floor | Downgraded to `none`, which sends an authorized command to today's derivation | Test |
 | Reviewer allows a headless block-band hazard | Refused in code | Rule in the prompt only | Test |
 | Reviewer times out or returns an extra field | Stage 1 outcome, "review failed" dialog | Default slips in as allow | Test per malformed shape |
 | Reviewer down | Breaker skips it after 3 failures in 5 minutes | Every subagent waits out the deadline | Test |
