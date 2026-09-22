@@ -3862,7 +3862,11 @@ export default function (pi: ExtensionAPI) {
 	 * swallowed, because a measurement that throws must never block a command
 	 * the live path would have allowed.
 	 */
-	const shadowFloor = (ctx: ExtensionContext, commandText: string): DecisionRecord["floor"] | undefined => {
+	const shadowFloor = (ctx: ExtensionContext, commandText: string, language: "shell" | "code", maxLength: number): DecisionRecord["floor"] | undefined => {
+		// The length cap blocks this call further down, before anything reads
+		// the text. Parsing it first would spend the work the cap exists to
+		// bound, so an over-limit command is reported unread instead.
+		if (commandText.length > maxLength) return { asks: true, entries: ["unread-command"] };
 		let sessionId: string | undefined;
 		try {
 			sessionId = ctx.sessionManager.getSessionId();
@@ -3872,7 +3876,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		try {
 			const carried = sessionId ? (floorTaint.get(sessionId) ?? []) : [];
-			const result = evaluateFloor({ command: commandText, taintedVars: carried });
+			const result = evaluateFloor({ command: commandText, language, taintedVars: carried });
 			if (sessionId && result.tainted.length > 0) {
 				const merged = [...carried, ...result.tainted.filter(name => !carried.includes(name))];
 				floorTaint.set(sessionId, merged.slice(-FLOOR_TAINT_CAP));
@@ -4127,7 +4131,7 @@ export default function (pi: ExtensionAPI) {
 		// and read by nothing: the live decision below is byte-for-byte what it
 		// was before this field existed. The taint it returns still accumulates,
 		// so the shadow numbers for a two-command capture-then-print are real.
-		const floorShadow = shadowFloor(ctx, isEval ? evalCode : command);
+		const floorShadow = shadowFloor(ctx, isEval ? evalCode : command, isEval ? "code" : "shell", config.maxCommandLength);
 		// One object for the fields every line of this tool call shares. A
 		// function, not a constant, because the floor is computed per call and
 		// the ids are not: both are fixed by the time any line is written.

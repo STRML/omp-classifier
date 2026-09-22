@@ -42,7 +42,9 @@ export interface ShellWord {
 	value: string;
 	/** True when every part was a literal: no expansion, no substitution. */
 	literal: boolean;
-	/** Names this word expands, `${BRACED}` included. */
+	/** Names this word expands, anywhere inside it: `${BRACED}`, the
+	 *  `$API_KEY` in `${SAFE:-$API_KEY}`, `${#LEN}`, and the bare names an
+	 *  arithmetic expansion reads. */
 	variables: string[];
 	/** True when the word contains a command substitution. */
 	substitution: boolean;
@@ -59,7 +61,8 @@ export interface ShellWord {
 }
 
 export interface ShellRedirect {
-	direction: "in" | "out";
+	/** `both` is `<>`, which opens its target for reading and writing. */
+	direction: "in" | "out" | "both";
 	append: boolean;
 	/** `>&1` and `2>&1` name an open stream rather than a file. */
 	duplicate: boolean;
@@ -79,6 +82,8 @@ export interface ShellAssign {
 	name: string;
 	/** Absent for a bare `NAME=`; carries the substitution flag for a capture. */
 	value: ShellWord | undefined;
+	/** The elements of `arr=(a "$B")`, and the index of `arr[$i]=x`. */
+	array: ShellWord[];
 }
 
 export interface ShellCommand {
@@ -91,6 +96,12 @@ export interface ShellCommand {
 	 *  top level, so `echo "$(rm -rf build)"` reports the delete as its own
 	 *  command and marks it nested. */
 	nested: boolean;
+	/**
+	 * Set for `[[ … ]]`, `(( … ))` and `let`, which evaluate their words and
+	 * print nothing. The first word is a synthetic verb (`[[`, `((`, `let`),
+	 * and the rest are every word inside the expression.
+	 */
+	expression?: "test" | "arithmetic";
 	/**
 	 * Set when this entry stands for a command shape the adapter could not
 	 * decompose, naming the shape. It carries no words, and a caller must read
@@ -145,6 +156,8 @@ const REDIR = {
 	dupIn: operatorOf("a <&0", "Redirect"),
 	heredoc: operatorOf("a <<EOF\nbody\nEOF\n", "Redirect"),
 	heredocDash: operatorOf("a <<-EOF\nbody\nEOF\n", "Redirect"),
+	readWrite: operatorOf("a <> b", "Redirect"),
+	clobber: operatorOf("a >| b", "Redirect"),
 	both: operatorOf("a &> b", "Redirect"),
 	bothAppend: operatorOf("a &>> b", "Redirect"),
 } as const;
@@ -219,6 +232,14 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 		command.redirects = redirs.map((redir: any) => readRedirect(redir, source, out));
 		return [command];
 	}
+	const expression = EXPRESSION_SHAPES[type];
+	if (expression !== undefined) {
+		const command: ShellCommand = { words: [], assigns: [], redirects: [], join, nested, expression: expression.kind };
+		out.push(command);
+		command.words = [literalWord(expression.verb), ...expressionWords(cmd, expression.kind === "arithmetic", source, out)];
+		command.redirects = redirs.map((redir: any) => readRedirect(redir, source, out));
+		return [command];
+	}
 	// Every other command shape: a subshell, a block, a loop, a conditional, a
 	// function, `time`, `coproc`, or whatever the grammar gains next. The
 	// statements inside are found by walking rather than by enumerating the
@@ -248,6 +269,35 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 	return own;
 }
 
+/** The shapes that evaluate words without running a command. Read as an
+ *  unnamed marker they were invisible to the floor, and under `set -x` the
+ *  shell prints what `[[ -n "$API_KEY" ]]` expanded. */
+const EXPRESSION_SHAPES: Record<string, { kind: "test" | "arithmetic"; verb: string }> = {
+	TestClause: { kind: "test", verb: "[[" },
+	ArithmCmd: { kind: "arithmetic", verb: "((" },
+	LetClause: { kind: "arithmetic", verb: "let" },
+};
+
+/** Every word inside an expression, outermost first. In arithmetic a bare
+ *  name is a variable, so it counts as one. */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function expressionWords(node: any, arithmetic: boolean, source: string, out: ShellCommand[]): ShellWord[] {
+	const words: ShellWord[] = [];
+	syntax.Walk(node, (inner: unknown) => {
+		if (!inner || nodeType(inner) !== "Word") return true;
+		const word = readWord(inner, source, out);
+		if (arithmetic && word.literal && IDENTIFIER.test(word.value)) word.variables.push(word.value);
+		words.push(word);
+		// The word read its own parts, substitutions included.
+		return false;
+	});
+	return words;
+}
+
+const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+
+const literalWord = (text: string): ShellWord => ({ source: text, value: text, literal: true, variables: [], substitution: false, commands: [] });
+
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 function readCall(cmd: any, command: ShellCommand, source: string, out: ShellCommand[]): void {
 	command.assigns = (cmd.Assigns ?? []).map((assign: any) => readAssign(assign, source, out));
@@ -263,7 +313,7 @@ function readCall(cmd: any, command: ShellCommand, source: string, out: ShellCom
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 function readDecl(cmd: any, command: ShellCommand, source: string, out: ShellCommand[]): void {
 	const variant = cmd.Variant?.Value ?? "declare";
-	command.words = [{ source: variant, value: variant, literal: true, variables: [], substitution: false, commands: [] }];
+	command.words = [literalWord(variant)];
 	for (const assign of cmd.Args ?? []) {
 		if (assign.Naked && !assign.Name) command.words.push(readWord(assign.Value, source, out));
 		else command.assigns.push(readAssign(assign, source, out));
@@ -273,11 +323,19 @@ function readDecl(cmd: any, command: ShellCommand, source: string, out: ShellCom
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 function readAssign(assign: any, source: string, out: ShellCommand[]): ShellAssign {
 	const value = assign.Value ? readWord(assign.Value, source, out) : undefined;
-	// `arr=(a $(b))` and `arr[$(i)]=x` carry commands outside the value word.
-	// They belong to no word, so they are collected into the flat list only.
-	if (assign.Array) collectSubstitutions(assign.Array, source, out);
-	if (assign.Index) collectSubstitutions(assign.Index, source, out);
-	return { name: assign.Name?.Value ?? "", value };
+	// `arr=("$API_KEY")` assigns a value the value word never held. Left out,
+	// the array was a capture of nothing and `${arr[0]}` printed a secret the
+	// floor never saw leave.
+	const array: ShellWord[] = [];
+	for (const node of [assign.Array, assign.Index]) {
+		if (!node) continue;
+		syntax.Walk(node, (inner: unknown) => {
+			if (!inner || nodeType(inner) !== "Word") return true;
+			array.push(readWord(inner, source, out));
+			return false;
+		});
+	}
+	return { name: assign.Name?.Value ?? "", value, array };
 }
 
 /**
@@ -342,12 +400,30 @@ const joinOf = (op: number): ShellJoin => {
 	return "pipe";
 };
 
+const REDIRECT_DIRECTION = new Map<number, ShellRedirect["direction"]>([
+	[REDIR.out, "out"],
+	[REDIR.append, "out"],
+	[REDIR.clobber, "out"],
+	[REDIR.dupOut, "out"],
+	[REDIR.both, "out"],
+	[REDIR.bothAppend, "out"],
+	[REDIR.in, "in"],
+	[REDIR.dupIn, "in"],
+	[REDIR.hereString, "in"],
+	[REDIR.heredoc, "in"],
+	[REDIR.heredocDash, "in"],
+	[REDIR.readWrite, "both"],
+]);
+
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 function readRedirect(redir: any, source: string, out: ShellCommand[]): ShellRedirect {
 	const op = redir.Op as number;
+	const direction = REDIRECT_DIRECTION.get(op);
+	// An operator this table does not name is a redirect this adapter did not
+	// read. Guessing a direction is how `<>` came to read as output only.
+	if (direction === undefined) throw new Error(`unknown redirect operator ${op}`);
 	const duplicate = op === REDIR.dupOut || op === REDIR.dupIn;
 	const here = op === REDIR.hereString || op === REDIR.heredoc || op === REDIR.heredocDash;
-	const direction: "in" | "out" = here || op === REDIR.in || op === REDIR.dupIn ? "in" : "out";
 	const both = op === REDIR.both || op === REDIR.bothAppend;
 	const redirect: ShellRedirect = {
 		direction,
@@ -378,30 +454,31 @@ function readWord(word: any, source: string, out: ShellCommand[]): ShellWord {
 					case "Lit":
 						return part.Value ?? "";
 					case "SglQuoted":
-						return part.Value ?? "";
+						// `$'\x2eenv'` is `.env` to the shell.
+						return part.Dollar ? decodeAnsiC(part.Value ?? "") : (part.Value ?? "");
 					case "DblQuoted":
 						return render(part.Parts ?? []);
-					case "ParamExp": {
+					case "ParamExp":
 						literal = false;
-						const name = part.Param?.Value ?? "";
-						if (name !== "") variables.push(name);
-						return `$${name}`;
-					}
+						// `${SAFE:-$API_KEY}` is more than its name: keep the
+						// text so the default, the index and the slice stay
+						// visible. The names come from the walk below.
+						return part.Short ? `$${part.Param?.Value ?? ""}` : sliceOf(part, source);
 					case "CmdSubst":
 						literal = false;
 						substitution = true;
 						return "$(…)";
 					default:
 						// An arithmetic expansion, a process substitution, an
-						// extended glob: read but not rendered, and never
-						// literal.
+						// extended glob: kept as written, and never literal.
 						literal = false;
-						return "";
+						return sliceOf(part, source);
 				}
 			})
 			.join("");
 
 	const value = render(word.Parts ?? []);
+	collectVariables(word, variables);
 	// One walk per word visits each node once, as one walk per call did: the
 	// words of a call are disjoint subtrees.
 	const commands = collectSubstitutions(word, source, out);
@@ -431,3 +508,57 @@ export function verbName(command: ShellCommand): string {
 	const verb = verbOf(command);
 	return verb.split("/").filter(part => part.length > 0).pop() ?? verb;
 }
+
+/**
+ * Every name a word expands: each parameter expansion however deep, and each
+ * bare name inside arithmetic. Stops at a substitution, whose commands are
+ * read as commands.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function collectVariables(word: any, variables: string[]): void {
+	const add = (name: string): void => {
+		if (name !== "" && !variables.includes(name)) variables.push(name);
+	};
+	syntax.Walk(word, (inner: unknown) => {
+		if (!inner) return true;
+		const type = nodeType(inner);
+		if (type === "CmdSubst" || type === "ProcSubst") return false;
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		if (type === "ParamExp") add((inner as any).Param?.Value ?? "");
+		if (type !== "ArithmExp") return true;
+		for (const name of arithmeticNames(inner)) add(name);
+		return false;
+	});
+}
+
+/** The names an arithmetic expression reads, bare or `$`-prefixed. A
+ *  separate walk rather than a flag on the outer one, because the Go build
+ *  hands back a fresh wrapper per visit and a node cannot be told from itself. */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function arithmeticNames(node: any): string[] {
+	const names: string[] = [];
+	syntax.Walk(node, (inner: unknown) => {
+		if (!inner) return true;
+		const type = nodeType(inner);
+		if (type === "CmdSubst" || type === "ProcSubst") return false;
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		const value = type === "ParamExp" ? ((inner as any).Param?.Value ?? "") : type === "Lit" ? ((inner as any).Value ?? "") : "";
+		if (IDENTIFIER.test(value)) names.push(value);
+		return true;
+	});
+	return names;
+}
+
+/** Decode the body of `$'…'` the way bash does, for the escapes that can
+ *  spell a path: hex, octal, unicode, and the single-character ones. */
+function decodeAnsiC(body: string): string {
+	const simple: Record<string, string> = { n: "\n", t: "\t", r: "\r", a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", v: "\v", "\\": "\\", "'": "'", '"': '"', "?": "?" };
+	return body.replace(/\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|c.|.)/gsu, (whole, escape: string) => {
+		const kind = escape[0];
+		if (kind === "x" || kind === "u" || kind === "U") return String.fromCodePoint(Number.parseInt(escape.slice(1), 16));
+		if (/[0-7]/u.test(kind)) return String.fromCodePoint(Number.parseInt(escape, 8));
+		if (kind === "c") return String.fromCodePoint(escape.charCodeAt(1) & 0x1f);
+		return simple[escape] ?? whole;
+	});
+}
+

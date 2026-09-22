@@ -23,10 +23,11 @@
  * anything.
  */
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
-import { parseShell, type ShellCommand, type ShellRedirect, type ShellWord, verbName } from "./shell-ast";
+import { parseShell, type ShellCommand, type ShellRedirect, type ShellWord, verbName, verbOf } from "./shell-ast";
 
 /** Which floor entry a finding came from. The numbers are the plan's, plus
- *  `unread-command` for a command the shell parser rejected. */
+ *  `unread-command` for a command the shell parser rejected or could not
+ *  decompose. */
 export type FloorEntry = "critical" | "secret-sink" | "download-to-interpreter" | "obfuscated-code" | "unread-command";
 
 export interface FloorFinding {
@@ -39,6 +40,10 @@ export interface FloorFinding {
 
 export interface FloorInput {
 	command: string;
+	/** What `command` is written in. The eval tool carries Python or
+	 *  JavaScript, which the shell model cannot read, so only the text scans
+	 *  run over it. Defaults to shell. */
+	language?: "shell" | "code";
 	/** The body of a script the command runs, when Phase 4 read one. */
 	scriptSource?: string | null;
 	/** Variables earlier commands in this session captured a secret into. */
@@ -123,7 +128,8 @@ const HEX_ESCAPE_RUN = /(\\x[0-9a-fA-F]{2}){8,}/u;
 export function evaluateFloor(input: FloorInput): FloorResult {
 	const findings: FloorFinding[] = [];
 	const tainted: string[] = [];
-	scanText(input.command, "command", input.taintedVars ?? [], findings, tainted);
+	if (input.language === "code") scanCode(input.command, findings);
+	else scanText(input.command, "command", input.taintedVars ?? [], findings, tainted);
 	if (input.scriptSource) {
 		// A script body is judged by the same entries as the command that runs
 		// it, so a name like `build.sh` stops mattering. Variables the body
@@ -133,11 +139,33 @@ export function evaluateFloor(input: FloorInput): FloorResult {
 	return { asks: findings.length > 0, findings, tainted };
 }
 
+/**
+ * Code the shell model cannot read. Entries 1, 3 and 4 are text scans and run
+ * as they do on a command. For entry 2 the floor cannot trace a sink through
+ * Python or JavaScript, so a store read anywhere in the code asks.
+ */
+function scanCode(text: string, findings: FloorFinding[]): void {
+	if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(text))) {
+		findings.push({ entry: "critical", detail: "matches a built-in dangerous-command pattern", source: "command" });
+	}
+	for (const [pattern, label] of STORE_READS) {
+		if (pattern.test(text)) findings.push({ entry: "secret-sink", detail: `${label} read in code whose sink the floor cannot trace`, source: "command" });
+	}
+	scanDownloadToInterpreter(text, "command", findings);
+	scanObfuscation(text, "command", findings);
+}
+
 function scanText(text: string, source: FloorFinding["source"], tainted: readonly string[], findings: FloorFinding[], capturedOut: string[]): void {
 	if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(text))) {
 		findings.push({ entry: "critical", detail: "matches a built-in dangerous-command pattern", source });
 	}
 	const parsed = parseShell(text);
+	const unread = parsed.ok ? parsed.commands.find(command => command.unreadShape !== undefined) : undefined;
+	if (unread !== undefined) {
+		// The adapter could not decompose this shape. Something ran there that
+		// the floor did not read, which is the same answer as a parse failure.
+		findings.push({ entry: "unread-command", detail: `a ${unread.unreadShape} the shell adapter could not read`, source });
+	}
 	if (parsed.ok) {
 		scanSecrets(parsed.commands, { shellTracing: SHELL_TRACING.test(text), tainted, captured: capturedOut, findings, source, visited: new Set() });
 		if (shellEvalOfNonLiteral(parsed.commands)) {
@@ -202,11 +230,12 @@ function commandSecrets(command: ShellCommand, scan: SecretScan): string[] {
 	scan.visited.add(command);
 	const tracing = scan.shellTracing || clientTracing(command);
 	const envIndexes = envAssignments(command);
-	for (const assign of command.assigns) capture(assign.name, assign.value, tracing, scan);
-	for (const index of envIndexes) capture(ASSIGNMENT_WORD.exec(command.words[index].value)?.[1] ?? "", command.words[index], tracing, scan);
+	for (const assign of command.assigns) capture(assign.name, [...(assign.value ? [assign.value] : []), ...assign.array], tracing, scan);
+	for (const index of envIndexes) capture(ASSIGNMENT_WORD.exec(command.words[index].value)?.[1] ?? "", [command.words[index]], tracing, scan);
+	if (command.expression !== undefined) return expressionSecrets(command, tracing, scan);
 
 	const printed = storeReads(command);
-	const headerSink = HTTP_CLIENT.test(verbName(command));
+	const headerSink = HTTP_CLIENT.test(trustedVerb(command));
 	command.words.forEach((word, index) => {
 		if (envIndexes.includes(index)) return;
 		const sink = wordSink(command.words[index - 1]?.value ?? "", word.value, headerSink);
@@ -220,10 +249,23 @@ function commandSecrets(command: ShellCommand, scan: SecretScan): string[] {
 	return routeStdout(command, printed, scan);
 }
 
-/** `KEY=$(op read …)` and `export KEY="$(…)"`: the value never reaches a sink
- *  anyone can see, and the variable carries the taint on. */
-function capture(name: string, value: ShellWord | undefined, tracing: boolean, scan: SecretScan): void {
-	const labels = value ? wordSecrets(value, scan, true) : [];
+/** `[[ -n "$API_KEY" ]]` and `(( … ))` evaluate their words and print
+ *  nothing, unless the shell is tracing, which prints the expanded test. Their
+ *  redirects still count: `[[ … ]] < ~/.ssh/id_rsa` is not a thing anyone
+ *  writes, but it is read like any other. */
+function expressionSecrets(command: ShellCommand, tracing: boolean, scan: SecretScan): string[] {
+	for (const word of command.words) {
+		for (const label of wordSecrets(word, scan, true)) {
+			if (tracing) report(scan, `${label} under a tracing flag, which prints every expansion`);
+		}
+	}
+	return routeStdout(command, command.redirects.flatMap(redirect => redirectSecrets(redirect, scan)), scan);
+}
+
+/** `KEY=$(op read …)`, `export KEY="$(…)"` and `arr=("$API_KEY")`: the value
+ *  never reaches a sink anyone can see, and the variable carries the taint on. */
+function capture(name: string, values: readonly ShellWord[], tracing: boolean, scan: SecretScan): void {
+	const labels = values.flatMap(value => wordSecrets(value, scan, true));
 	if (labels.length === 0) return;
 	if (name !== "" && !scan.captured.includes(name)) scan.captured.push(name);
 	if (!tracing) return;
@@ -243,7 +285,9 @@ function envAssignments(command: ShellCommand): number[] {
 	if (words[index]?.value !== "env") return [];
 	const found: number[] = [];
 	for (index += 1; index < words.length && ASSIGNMENT_WORD.test(words[index].value); index += 1) found.push(index);
-	return found;
+	// `env TOKEN=$(…)` with no command after it prints the environment,
+	// TOKEN included. Only a command to hand the variable to makes it a capture.
+	return index < words.length ? found : [];
 }
 
 /** A store read that is the command itself, `security … -w | pbcopy`. One
@@ -257,10 +301,10 @@ function storeReads(command: ShellCommand): string[] {
 function wordSecrets(word: ShellWord, scan: SecretScan, paths: boolean): string[] {
 	const labels: string[] = STORE_READS.filter(([pattern]) => pattern.test(word.value)).map(([, label]) => label);
 	const live = [...scan.tainted, ...scan.captured];
-	// Read from the text rather than from the parser's expansions, so a
-	// single-quoted `'echo $API_KEY'` handed to `bash -c` or `ssh` counts too.
-	for (const match of word.value.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/gu)) {
-		const name = match[1];
+	// The parser's names, plus the ones in the text: a single-quoted
+	// `'echo $API_KEY'` handed to `bash -c` or `ssh` expands later.
+	const textNames = [...word.value.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/gu)].map(match => match[1]);
+	for (const name of new Set([...word.variables, ...textNames])) {
 		if (live.includes(name)) labels.push(`the captured secret in $${name}`);
 		else if (SECRET_VAR.test(name)) labels.push(`the secret-named variable $${name}`);
 	}
@@ -274,6 +318,7 @@ function wordSecrets(word: ShellWord, scan: SecretScan, paths: boolean): string[
  *  a heredoc body. An output target is a destination, so a path there is not
  *  a read, but a secret expanded into its name still counts. */
 function redirectSecrets(redirect: ShellRedirect, scan: SecretScan): string[] {
+	// `<>` opens its target for reading too, so it is read like `<`.
 	if (redirect.direction === "out") return wordSecrets(redirect.target, scan, false);
 	if (redirect.body !== undefined) return wordSecrets(redirect.body, scan, false);
 	return wordSecrets(redirect.target, scan, !redirect.here);
@@ -299,8 +344,10 @@ function routeStdout(command: ShellCommand, printed: string[], scan: SecretScan)
 	if (printed.length === 0) return printed;
 	let destination: "stream" | "discard" | "file" = "stream";
 	for (const redirect of command.redirects) {
-		if (redirect.direction !== "out" || !["", "1", "&"].includes(redirect.fd)) continue;
-		if (redirect.duplicate && /^(\d+|-)$/u.test(redirect.target.value)) destination = "stream";
+		if (!redirectsStdout(redirect)) continue;
+		// `1<>file` and `1<&3` point stdout somewhere this code does not follow.
+		if (redirect.direction !== "out") destination = "file";
+		else if (redirect.duplicate && /^(\d+|-)$/u.test(redirect.target.value)) destination = "stream";
 		else destination = redirect.target.value === "/dev/null" ? "discard" : "file";
 	}
 	if (destination === "stream") return printed;
@@ -315,10 +362,31 @@ function routeStdout(command: ShellCommand, printed: string[], scan: SecretScan)
  * the middle, so the exemption must not reach past `tee`.
  */
 function feedsPasswordStdin(command: ShellCommand, next: ShellCommand | undefined): boolean {
-	if (!/^(echo|printf|cat)$/u.test(verbName(command))) return false;
+	if (!/^(echo|printf|cat)$/u.test(trustedVerb(command))) return false;
+	// `echo $TOKEN >&2 | docker login` prints to stderr; the pipe gets nothing.
+	if (command.redirects.some(redirectsStdout)) return false;
 	if (next === undefined || next.join !== "pipe") return false;
-	if (!CREDENTIAL_CONSUMER.test(verbName(next))) return false;
+	if (!CREDENTIAL_CONSUMER.test(trustedVerb(next))) return false;
 	return next.words.some(word => word.value === "--password-stdin");
+}
+
+/** Whether a redirect moves this command's stdout. The default fd is stdout
+ *  for output operators and stdin for the rest. */
+function redirectsStdout(redirect: ShellRedirect): boolean {
+	if (redirect.direction === "out") return ["", "1", "&"].includes(redirect.fd);
+	return redirect.fd === "1";
+}
+
+/**
+ * The verb as PATH will resolve it, or "" when the shell will run something
+ * else. An exemption belongs to the real client, and `/tmp/docker` or
+ * `./curl` is a file the agent can write. Tracing still reads `verbName`,
+ * because asking more is the safe side there.
+ */
+function trustedVerb(command: ShellCommand): string {
+	const verb = verbOf(command);
+	if (verb.includes("/") || !(command.words[0]?.literal ?? false)) return "";
+	return verb;
 }
 
 function clientTracing(command: ShellCommand): boolean {
