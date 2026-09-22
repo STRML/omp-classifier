@@ -222,7 +222,7 @@ Flags:
   --policy <default|file.json>  Threshold set to score. \`default\` is
                                 DEFAULT_JEV_POLICY; a file holds a partial
                                 JevPolicy (unknown knobs are an error). (default: default)
-  --battery <jev-v2.1|jev-v3>   Question battery to ask (default: ${JEV_POLICY_VERSION}).
+  --battery <${JEV_POLICY_VERSION}|${JEV_V3_POLICY_VERSION}>   Question battery to ask (default: ${JEV_POLICY_VERSION}).
   --model <id>                  Jev model id (default: ${DEFAULT_JEV_MODEL}).
   --corpus <all|adversarial|gitflow|intent|history|heldout>
                                 Which corpus to score (default: all).
