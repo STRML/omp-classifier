@@ -148,8 +148,15 @@ describe("redactSecrets", () => {
 		expect(JSON.stringify(redactValue({ CLIENT_SECRET_VALUE: "sample_value", PRIVATE_KEY_PEM: "sample_value" }))).not.toContain("sample_value");
 		// The cost, stated: a usage setting named with `token` redacts too.
 		expect(redactSecrets("TOKEN_LIMIT=4096")).toBe(`TOKEN_LIMIT=${REDACTED}`);
-		// A file name is not a setting: grep output keeps its path.
-		expect(redactSecrets("src/auth/token.ts:12: export function readToken()")).toBe("src/auth/token.ts:12: export function readToken()");
+		// grep's `path:line:` prefix is not a setting and keeps its path; any
+		// other shape with a secret word still redacts (#114 gate round 1).
+		expect(redactSecrets("src/auth/authorization.ts:12: const x")).toBe("src/auth/authorization.ts:12: const x");
+		for (const text of ["client.secret.json=hunter2", "token.ts: hunter2", "APITokenFile=hunter2", "JWTTokenValue=hunter2", "SSHKeyPath=hunter2"]) {
+			expect(redactSecrets(text)).not.toContain("hunter2");
+		}
+		expect(JSON.stringify(redactValue({ "client.secret.json": "hunter2", APITokenFile: "hunter2", SSHKeyPath: "hunter2" }))).not.toContain("hunter2");
+		// A header word inside a longer name is the user's words, not a header.
+		expect(redactSecrets("authorization_status: approved by user")).toBe("authorization_status: approved by user");
 		// Prefixed headers, dotted config keys, and all-caps glued names.
 		for (const text of ['-H "X-Authorization: VAL123x"', "aws.pwd=VAL123x", "MYPRIVATEKEY=VAL123x", "spring.datasource.password: VAL123x"]) {
 			expect(redactSecrets(text)).not.toContain("VAL123x");
@@ -199,7 +206,7 @@ describe("redactSecrets", () => {
 			"[tool result bash hash=419a39187f6efc67]",
 			"uuid 123e4567-e89b-12d3-a456-426614174000",
 			"max_tokens: 1024",
-			"src/auth/token.ts: export function readToken()",
+			"src/auth/token.ts:12: export function readToken()",
 			"key: value",
 			"password reset flow",
 			"https://github.com/acme/repo.git",
