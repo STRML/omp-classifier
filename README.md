@@ -83,6 +83,7 @@ Plugin settings live in `~/.omp/omp-classifier.json`. View or change them with `
 | `maxCommandLength` | `8000` | Commands longer than this are blocked (bounds 64-100000; values outside fall back to the default). |
 | `evidenceUserMessages` | `3` | How many recent user messages (0-6) ride into the state as user evidence. `0` sends no evidence. Values outside the bounds fall back to the default. |
 | `persistentGrants` | `true` | Offers **Always allow** on bash dialogs (30-day exact-command grants in `omp-classifier-grants.json`). Kill-switch: `false` stops offering them and stops honoring live ones; the stored file stays on disk. |
+| `shadowV3` | `true` | Runs the jev-v3 judgment in shadow beside the live one and logs it on the same decision line as `v3`. It decides nothing, and it costs two more Jev requests per fresh classification. `bun eval/live-report.ts` shows where the two disagree. |
 
 Changing any key flushes the verdict cache and the session grants. To silence the judge quickly, `/classifier enabled false` takes effect on the very next command. `omp plugin disable` needs a session restart, since interceptors bind when a session begins.
 

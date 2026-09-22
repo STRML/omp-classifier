@@ -4,6 +4,14 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-22
 
+### The jev-v3 shadow
+
+- Every fresh classification now also runs the jev-v3 judgment in shadow: Phase 2 step 8. It builds jev-v3 evidence (`collectTaskEvidenceV3`), asks the jev-v3 battery and the authorization question in parallel (`judgeJevV3`), runs the literal match and the overlay flags, and takes the decision order (`deriveDecisionOrder`). It runs on the bash path and the eval tool path. The eval path has no literal match.
+- The result rides the decision line as `v3`: verdict, branch, reason code, authorization level, whether `named` was firm, whether the literal match held, the overlay flags, and latency. Labels and numbers only, never message text. Every line that follows a judgement carries it, dialog lines included. A shadow failure logs `{ error }` and changes nothing live.
+- It costs two more Jev requests per fresh classification. The live verdict waits for the slower of the live and shadow requests, which run in parallel. The new `shadowV3` config key (default `true`, `/classifier shadowV3 false`) turns it off. It stays out of the config signature, so flipping it clears no cache.
+- New `bun eval/live-report.ts [--hours 24]` counts the shadow against the live outcome, by branch, and lists every call the user denied that jev-v3 would have allowed. That list must be empty for a week before the flip.
+- `literalMatch` now compares a delete target's real path against the working directory's real path. It resolved only the target, so a symlinked working directory (macOS `/var` is `/private/var`) never matched its own files.
+
 ### Evidence redaction (policy `jev-v2.2`)
 
 - One definition of a secret name, `isSecretName` in `redact.ts`, now serves redaction and the floor alike: `password`, `passphrase` or `passwd` anywhere, a secret word after `_` or `-` (`DJANGO_SECRET_KEY`, `GH_TOKEN`), or a secret word alone (`token`, `secret`). So `SSH_PASSPHRASE_FILE=` is redacted, and the floor counts it as a secret source. `$PWD`, a bare `$KEY` and `max_tokens` are not secret. (Found by the Codex gates on #110 and #112.)
