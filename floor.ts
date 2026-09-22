@@ -23,6 +23,7 @@
  * anything.
  */
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import { isSecretName } from "./redact";
 import { parseShell, type ShellCommand, type ShellRedirect, type ShellWord, verbName, verbOf } from "./shell-ast";
 
 /** Which floor entry a finding came from. The numbers are the plan's, plus
@@ -58,12 +59,12 @@ export interface FloorResult {
 	tainted: string[];
 }
 
-/** Secret-named environment variables (plan: `*_KEY`, `*_TOKEN`, `*_SECRET`,
- *  `*PASSWORD*`, and `*PASSPHRASE*`). Matched case-insensitively on the variable name. The
- *  separator is required, so a bare `$KEY` is not a source by its name alone:
- *  the case that matters, `KEY=$(security … -w)`, is covered by taint, which
- *  knows rather than guesses. */
-const SECRET_VAR = /_(api_?key|key|token|secret|credentials?)$|password|passphrase/iu;
+// Secret-named environment variables (plan: `*_KEY`, `*_TOKEN`, `*_SECRET`,
+// `*PASSWORD*`, `*PASSPHRASE*`) are `isSecretName` in redact.ts, the one
+// definition redaction reads too. A bare `$KEY` is not a source by its name
+// alone: the case that matters, `KEY=$(security … -w)`, is covered by taint,
+// which knows rather than guesses.
+
 
 /** Files whose contents are secrets. Also the Phase 4 script-read denylist. */
 const SECRET_FILE_BASENAMES = new Set([".netrc", ".npmrc", ".git-credentials", ".pgpass", "kubeconfig", "credentials"]);
@@ -95,7 +96,7 @@ export function secretStoreRead(text: string): SecretStore | undefined {
  *  a single-quoted `'echo $API_KEY'` handed to `bash -c` expands later. */
 export function secretVariableNames(word: ShellWord, tainted: readonly string[]): string[] {
 	const textNames = [...word.value.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/gu)].map(match => match[1]);
-	return [...new Set([...word.variables, ...textNames])].filter(name => tainted.includes(name) || SECRET_VAR.test(name));
+	return [...new Set([...word.variables, ...textNames])].filter(name => tainted.includes(name) || isSecretName(name));
 }
 
 /** Shell tracing prints every expansion, so it prints the allowed sinks too. */

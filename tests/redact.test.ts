@@ -8,7 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { buildAuthorizationState, summarizeActions } from "../authorization";
 import { collectTaskEvidence, collectTaskEvidenceV3, collectToolEvidence, collectUserEvidence, operatorContextFromInput } from "../index";
 import { buildJevState, JEV_POLICY_VERSION } from "../jev";
-import { REDACTED, redactSecrets, redactValue } from "../redact";
+import { isSecretName, REDACTED, redactSecrets, redactValue } from "../redact";
 
 // Built at run time so no literal token shape sits in the repository.
 const fake = (prefix: string, length: number, alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"): string =>
@@ -81,7 +81,7 @@ describe("redactSecrets", () => {
 			[`{"command":"curl -H \\"Authorization: Bearer ${opaque}\\""}`, opaque],
 			[`{"command":"echo \\"password\\": \\"hunter2\\""}`, "hunter2"],
 			[`PASSWORD=abc;defgh`, "abc;defgh"],
-			[`{"pwd": "x"}`, `"x"`],
+			[`{"db_pwd": "x"}`, `"x"`],
 		];
 		for (const [text, secret] of cases) {
 			const out = redactSecrets(text);
@@ -125,7 +125,9 @@ describe("redactSecrets", () => {
 
 	test("every secret-variable name the floor knows is redacted too (#110 gate round 2)", () => {
 		// The floor's list is *_KEY, *_TOKEN, *_SECRET, *PASSWORD*, *PASSPHRASE*.
-		for (const name of ["DJANGO_SECRET_KEY", "SSH_PASSPHRASE", "AWS_SECRET_ACCESS_KEY", "STRIPE_API_KEY", "GH_TOKEN", "DB_PASSWORD", "GOOGLE_CREDENTIALS", "SIGNING_KEY"]) {
+		for (const name of ["DJANGO_SECRET_KEY", "SSH_PASSPHRASE", "SSH_PASSPHRASE_FILE", "DB_PASSWORD_HASH", "AWS_SECRET_ACCESS_KEY", "STRIPE_API_KEY", "GH_TOKEN", "DB_PASSWORD", "GOOGLE_CREDENTIALS", "SIGNING_KEY"]) {
+			// The floor and redaction ask the same predicate (#112 gate round 1).
+			expect(isSecretName(name)).toBe(true);
 			expect(redactSecrets(`${name}=hunter2`)).toBe(`${name}=${REDACTED}`);
 			expect(JSON.stringify(redactValue({ [name]: "hunter2" }))).not.toContain("hunter2");
 		}
@@ -140,8 +142,11 @@ describe("redactSecrets", () => {
 		expect(redactSecrets("--password hunter2")).toBe(`--password ${REDACTED}`);
 		expect(redactSecrets("--api-key opaque-value-1")).toBe(`--api-key ${REDACTED}`);
 		expect(redactSecrets("ok\n--password hunter2\nnext")).toBe(`ok\n--password ${REDACTED}\nnext`);
-		const stdin = "echo $T | docker login --password-stdin registry.example.com";
-		expect(redactSecrets(stdin)).toBe(stdin);
+		// A name with `password` in it is secret anywhere (the floor's rule), so
+		// `--password-stdin` takes the rest of its line too: over-redaction, the
+		// safe direction. `$PWD` is the working directory, never a secret.
+		expect(redactSecrets("echo $T | docker login --password-stdin registry.example.com")).toBe(`echo $T | docker login --password-stdin ${REDACTED}`);
+		expect(redactSecrets("PWD=/home/you/project")).toBe("PWD=/home/you/project");
 	});
 
 	test("a PGP private key block is redacted whole", () => {

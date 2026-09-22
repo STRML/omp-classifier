@@ -597,4 +597,8 @@ describe("the floor is pure", () => {
 
 test("a passphrase-named variable is a secret source, like a password (#110 gate round 2)", () => {
 	expect(evaluateFloor({ command: 'echo "$SSH_PASSPHRASE"', language: "shell", taintedVars: [] }).asks).toBe(true);
+	expect(evaluateFloor({ command: 'echo "$SSH_PASSPHRASE_FILE"', language: "shell", taintedVars: [] }).asks).toBe(true);
+	// The working directory and a bare $KEY are no secrets by name.
+	expect(evaluateFloor({ command: 'echo "$PWD"', language: "shell", taintedVars: [] }).asks).toBe(false);
+	expect(evaluateFloor({ command: 'echo "$KEY"', language: "shell", taintedVars: [] }).asks).toBe(false);
 });
