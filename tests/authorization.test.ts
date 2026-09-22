@@ -237,7 +237,9 @@ describe("the summary names what the command does, from a fixed vocabulary", () 
 		expect(entry("git push -d origin main", "git-publish")?.targets).toContain("delete");
 		expect(entry("git push --tags origin", "git-publish")?.targets).toContain("tags");
 		expect(entry("git reset --hard HEAD~3", "write")?.targets).toEqual(["git-reset", "hard", "unnamed-arguments"]);
-		expect(entry("git clean -fdx", "write")?.targets).toEqual(["git-clean", "force"]);
+		expect(entry("git clean -f", "write")?.targets).toEqual(["git-clean", "force"]);
+		// A cluster needs each flag's arity to split, so it is unnamed.
+		expect(entry("git clean -fdx", "write")?.targets).toEqual(["git-clean", "unnamed-arguments"]);
 		expect(entry("gh pr merge 42 -d", "merge")?.targets).toEqual(["42", "delete"]);
 		// A short flag means force only where the grammar is known: to kubectl,
 		// `-f` is a file.
@@ -246,21 +248,26 @@ describe("the summary names what the command does, from a fixed vocabulary", () 
 	});
 
 	test("every word is named or marked unnamed, never dropped (#94 review round 2)", () => {
-		const target = (command: string) => JSON.stringify(summarize(command).flatMap(action => action.targets));
-		for (const [a, b] of [
-			["npm --silent audit", "npm --silent publish"],
-			["docker --debug pull app:1", "docker --debug push app:1"],
-			["gh api https://api.github.com/repos/o/r", "gh api -X DELETE https://api.github.com/repos/o/r"],
-		]) {
-			expect({ a, b, same: target(a) === target(b) }).toEqual({ a, b, same: false });
-		}
-		expect(entry("npm --silent audit", "network")?.targets).toEqual(["npm-audit", "unnamed-arguments"]);
 		expect(entry("gh api -X DELETE https://api.github.com/repos/o/r", "network")?.targets).toEqual(["gh-api", "api.github.com", "unnamed-arguments"]);
-		// A flag this module cannot name is covered, not dropped. `--soft` and
-		// no flag at all both read as "arguments not named", which is true.
 		expect(entry("git reset --soft HEAD~1", "write")?.targets).toEqual(["git-reset", "unnamed-arguments"]);
 		// Flag position does not change the summary of one request.
+		const target = (command: string) => JSON.stringify(summarize(command).flatMap(action => action.targets));
 		expect(target("git push --force origin main")).toBe(target("git push origin main --force"));
+	});
+
+	test("opposed requests that differ only in unnamed words read alike, and say so (#94 review round 3)", () => {
+		// Plan section 2, "Opposed requests". Past a flag, which word is the
+		// subcommand is each CLI's grammar, and `-X`'s value is gh's. The
+		// summary names what it can and marks the rest; the risk judgment reads
+		// the command itself and still tells DELETE from GET.
+		for (const command of ["npm --silent audit", "npm --silent publish", "npm --prefix foo --silent audit", "gh api -X GET https://x.example.com", "gh api -X DELETE https://x.example.com"]) {
+			const targets = summarize(command).flatMap(action => action.targets);
+			expect({ command, marked: targets.includes("unnamed-arguments") }).toEqual({ command, marked: true });
+		}
+		expect(entry("npm --silent audit", "run-code")?.targets).toEqual(["npm", "unnamed-arguments"]);
+		// The first subcommand word decides the kind: this runs a local script.
+		expect(entry("npm run publish", "run-code")?.targets).toEqual(["npm-run-publish"]);
+		expect(kinds("npm publish")).toEqual(["network"]);
 	});
 
 	test("a deploy-named script is named wherever it sits", () => {
@@ -268,12 +275,12 @@ describe("the summary names what the command does, from a fixed vocabulary", () 
 		expect(entry("bash scripts/rsync-to-prod.sh dist/", "run-code")?.targets).toEqual(["bash", "unnamed-arguments"]);
 	});
 
-	test("a short flag widens only where its tool's grammar says so (#94 review round 2)", () => {
-		for (const command of ["git config -f other.cfg --get x", "gh api -f name=v repos/o/r", "./deploy.sh -cf config.yml", "git commit -m fix"]) {
+	test("a short flag widens only in its exact spelling, where its tool's grammar says so (#94 review rounds 2 and 3)", () => {
+		for (const command of ["git config -f other.cfg --get x", "gh api -f name=v repos/o/r", "./deploy.sh -cf config.yml", "git push -of origin main", "git clean -ef -n", "git push -uf origin main"]) {
 			const targets = summarize(command).flatMap(action => action.targets);
 			expect({ command, force: targets.includes("force") }).toEqual({ command, force: false });
 		}
-		expect(entry("git push -uf origin main", "git-publish")?.targets).toContain("force");
+		expect(entry("git push -f origin main", "git-publish")?.targets).toContain("force");
 	});
 
 	test("a cut target list says it was cut (#94 review round 1)", () => {

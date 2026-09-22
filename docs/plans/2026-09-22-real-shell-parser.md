@@ -52,6 +52,19 @@ So the summary narrows what it claims. Targets are extracted only for grammars t
 
 Every other command reports its kind and an `unnamed-arguments` marker, with no targets. The model then reads "a network action whose target this code could not name" instead of a name that is wrong. A missing target costs a `goal` judgment some precision. A wrong target is an authorization argument built from a misparse.
 
+#### Opposed requests
+
+The same limit applies to subcommands and short flags. A subcommand CLI's path is named only up to its first flag: past a flag, whether the next word is a subcommand or that flag's value is the CLI's own grammar (`npm --prefix foo audit`). A short widening flag counts only in its exact spelling, because splitting a cluster such as `git push -of` needs each flag's arity.
+
+So two opposed requests that differ only in words the summary can't name read alike, and each one carries `unnamed-arguments`:
+
+| Reads alike | Why |
+| --- | --- |
+| `npm --silent audit`, `npm --silent publish` | the subcommand sits past a flag |
+| `gh api -X GET URL`, `gh api -X DELETE URL` | the method is `-X`'s value |
+
+This costs the authorization answer precision, not safety. The risk judgment reads the command itself and still tells `DELETE` from `GET`; the summary only answers whether the user asked for the action. Review rounds 2 and 3 on #94 each found a new spelling of this, which is the same evidence that closed Group A. #98 tracks it.
+
 ### 3. The floor stops splitting flags
 
 The floor's question is whether a secret reaches a sink. It does not need to know which flag a value belongs to in order to find the secret: it needs that only to name the sink. So the secret search runs over each literal word whole, and `-sTconfig/secrets.pem` is a word containing a secret path.
