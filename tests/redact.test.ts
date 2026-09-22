@@ -214,6 +214,23 @@ describe("redactSecrets", () => {
 		expect(redactSecrets(text)).toBe(text);
 	});
 
+	test("redaction runs in linear time on hostile input (security review of 4a960c0)", () => {
+		// Evidence is redacted before it is cut, so input size is unbounded.
+		// Each shape below was quadratic before: a name or URL scheme matched
+		// from every "." boundary, and an acronym split backtracked a run of
+		// capitals. 400k characters took minutes; each now runs in milliseconds.
+		for (const hostile of ["a.".repeat(200_000), `${"A".repeat(200_000)}=x`, `${"a.".repeat(200_000)}b`, "a:".repeat(100_000), " --a".repeat(100_000)]) {
+			const started = performance.now();
+			redactSecrets(hostile);
+			expect(performance.now() - started).toBeLessThan(500);
+		}
+	});
+
+	test("grep's path:line: prefix is exempt only for a file name", () => {
+		expect(redactSecrets("DB_PASSWORD:12:hunter2")).not.toContain("hunter2");
+		expect(redactSecrets("src/auth/token.ts:12: export")).toBe("src/auth/token.ts:12: export");
+	});
+
 	test("redaction is idempotent", () => {
 		const once = redactSecrets(`x ${SECRETS.github} OPENAI_API_KEY=${fake("", 20)}`);
 		expect(redactSecrets(once)).toBe(once);
