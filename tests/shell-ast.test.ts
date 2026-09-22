@@ -188,7 +188,43 @@ describe("commands inside every compound shape are reached", () => {
 		// dropped it.
 		expect(verbs("for f in $(ls); do rm -rf $f; done")).toEqual(["ls", "rm"]);
 		expect(verbs("case $(hostname) in a) rm -rf b;; esac")).toEqual(["hostname", "rm"]);
-		expect(verbs("declare KEY=$(op read op://v/i/c)")).toEqual(["op"]);
+	});
+
+	test("declare, local and export are commands whose arguments are assignments", () => {
+		// Read as an unnamed compound, `export KEY="$(op read …)"` lost the
+		// assignment and kept only the read, so the floor saw a print.
+		const [declared, read] = commands('export -x KEY="$(op read op://v/i/c)" OTHER');
+		expect(verbName(declared)).toBe("export");
+		expect(declared.words.map(word => word.value)).toEqual(["export", "-x"]);
+		expect(declared.assigns.map(assign => assign.name)).toEqual(["KEY", "OTHER"]);
+		expect(declared.assigns[0].value?.commands).toEqual([read]);
+		expect(verbs("f() { local KEY=$(op read op://v/i/c); }")).toEqual(["local", "op"]);
+	});
+});
+
+describe("a word links to the commands its substitutions run", () => {
+	test("a word holds the commands at its own level, and no deeper", () => {
+		const list = commands('echo "$(cat "$(op read op://v/i/c)")" plain');
+		expect(list.map(verbName)).toEqual(["echo", "cat", "op"]);
+		const [echo, cat, op] = list;
+		expect(echo.words[1].commands).toEqual([cat]);
+		expect(cat.words[1].commands).toEqual([op]);
+		expect(echo.words[2].commands).toEqual([]);
+	});
+
+	test("a pipeline inside a substitution is all at the word's level", () => {
+		const [echo, op, base64] = commands("echo $(op read op://v/i/c | base64)");
+		expect(echo.words[1].commands).toEqual([op, base64]);
+	});
+
+	test("a redirect target and a heredoc body carry their commands", () => {
+		const [cat, op] = commands("cat <<EOF\n$(op read op://v/i/c) $GH_TOKEN\nEOF\n");
+		expect(cat.redirects[0].body?.commands).toEqual([op]);
+		expect(cat.redirects[0].body?.variables).toEqual(["GH_TOKEN"]);
+		// A quoted delimiter keeps the body literal: nothing runs.
+		expect(verbs("cat <<'EOF'\n$(op read op://v/i/c)\nEOF\n")).toEqual(["cat"]);
+		const [echo, hostname] = commands("echo hi > \"$(hostname).log\"");
+		expect(echo.redirects[0].target.commands).toEqual([hostname]);
 	});
 
 	test("nothing is collected twice", () => {

