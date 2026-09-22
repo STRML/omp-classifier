@@ -22,32 +22,64 @@ interface Rule {
 
 const whole = (): string => REDACTED;
 
-/** A name that says its value is a secret, with any prefix: `OPENAI_API_KEY`,
- *  `x-api-key`, `client_secret`, `DB_PASSWORD`, and any `_KEY` or
- *  `_PASSPHRASE` (`DJANGO_SECRET_KEY`, `SSH_PASSPHRASE`), a superset of the
- *  floor's secret variable names. `token` has no plural here:
- *  `max_tokens` and `input_tokens` are usage counts tool results print. */
-const SECRET_NAME = String.raw`[A-Za-z0-9_-]*(?:api[_-]?keys?|apikeys?|[_-]keys?|token|secrets?|passwords?|passphrases?|passwd|pwd|private[_-]?keys?|access[_-]?keys?|credentials?)`;
+/**
+ * What makes a name secret: one definition, read by the text pass, the
+ * structural pass, and the floor's secret-variable check (floor.ts), so no
+ * two of them can drift apart.
+ *
+ *   - `password`, `passphrase` or `passwd` anywhere: `SSH_PASSPHRASE_FILE`.
+ *   - a secret word after a `_` or `-`: `DJANGO_SECRET_KEY`, `x-api-key`,
+ *     `GH_TOKEN`, `DB_PWD`. `token` is singular, so `max_tokens` and
+ *     `input_tokens` (usage counts tool results print) are not secret.
+ *   - a secret word alone: `token`, `secret`, `apikey`. Not `key`, which is
+ *     too common a word, and not `pwd`, which is also `$PWD`, the working
+ *     directory.
+ */
+const SECRET_ANYWHERE = /password|passphrase|passwd/iu;
+const SECRET_SUFFIX = /[_-](?:api[_-]?keys?|apikeys?|keys?|token|secrets?|credentials?|pwd)$/iu;
+const SECRET_BARE = /^(?:api[_-]?keys?|apikeys?|token|secrets?|credentials?)$/iu;
 
-/** Every marker that says "a secret follows", in one vocabulary shared by the
- *  text rules and the structural keys, so one can't know a name the other
- *  misses: header names that carry credentials, and secret-sounding names. */
-const SECRET_MARKER = String.raw`(?:(?:proxy-)?authorization|(?:set-)?cookie|${SECRET_NAME})`;
+export function isSecretName(name: string): boolean {
+	return SECRET_ANYWHERE.test(name) || SECRET_SUFFIX.test(name) || SECRET_BARE.test(name);
+}
+
+/** Header names whose value is a credential, beside the secret names. */
+const HEADER_MARKER = /^(?:(?:proxy-)?authorization|(?:set-)?cookie)$/iu;
+
+const isSecretMarker = (name: string): boolean => HEADER_MARKER.test(name) || isSecretName(name);
+
+/** A name then `:` or `=`, possibly quoted or JSON-escaped: `API_KEY=`,
+ *  `"password":`, `Authorization:`. */
+const NAME_THEN_SEPARATOR = /\b([A-Za-z0-9_-]+)(?:\\?["'])?\s*[:=][ \t]*/gu;
+/** A name as a command-line flag with its value after a space:
+ *  `mysql --password hunter2`. It may open the text or a line. */
+const FLAG_THEN_VALUE = /(?:^|\s)--?([A-Za-z0-9_-]+)[ \t]+(?=\S)/gu;
+
+/**
+ * Redact one line from its first secret marker to its end, whatever the
+ * scheme or quoting after it. Every name on the line is asked, so a harmless
+ * `https:` before a `token=` doesn't hide it. That errs toward redacting too
+ * much, by design: `{"password":"x","user":"bob"}` loses `bob`.
+ */
+function redactLine(line: string): string {
+	let cut = -1;
+	for (const pattern of [NAME_THEN_SEPARATOR, FLAG_THEN_VALUE]) {
+		for (const match of line.matchAll(pattern)) {
+			if (!isSecretMarker(match[1])) continue;
+			const end = match.index + match[0].length;
+			if (cut < 0 || end < cut) cut = end;
+			break;
+		}
+	}
+	return cut < 0 ? line : `${line.slice(0, cut)}${REDACTED}`;
+}
 
 const RULES: readonly Rule[] = [
 	// A private key block, whole. An unterminated block runs to the end.
 	// PEM and PGP armor both: `PRIVATE KEY` and `PRIVATE KEY BLOCK`.
 	{ pattern: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)/gu, replace: whole },
-	// A secret marker followed by `:` or `=` (`Authorization:`, `Set-Cookie:`,
-	// `API_KEY=`, `"password":`): everything after it to the end of the line,
-	// whatever the scheme or quoting. The marker may be quoted or JSON-escaped.
-	// There is no header or quoting grammar left to miss.
-	{ pattern: new RegExp(`(\\b${SECRET_MARKER}(?:\\\\?["'])?\\s*[:=][ \\t]*)[^\\r\\n]*`, "giu"), replace: (_m, keep) => `${keep}${REDACTED}` },
-	// The same marker as a command-line flag with its value after a space:
-	// `mysql --password hunter2`, `--api-key $KEY`. `--password-stdin` is a
-	// different word and stays.
-	// It may open the text or a line.
-	{ pattern: new RegExp(`((?:^|\\s)--?${SECRET_MARKER}[ \\t]+)(?=\\S)[^\\r\\n]*`, "gimu"), replace: (_m, keep) => `${keep}${REDACTED}` },
+	// Every line from its first secret marker on (see redactLine).
+	{ pattern: /[^\r\n]+/gu, replace: line => redactLine(line) },
 	{ pattern: /\b(bearer\s+)[^\s"'\\,;]{8,}/giu, replace: (_m, keep) => `${keep}${REDACTED}` },
 	// Token formats with a published prefix.
 	{ pattern: /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}/gu, replace: whole },
@@ -63,8 +95,6 @@ const RULES: readonly Rule[] = [
 	{ pattern: /(\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+(@)/giu, replace: (_m, head, at) => `${head}${REDACTED}${at}` },
 ];
 
-/** A key whose value is a credential whatever it looks like. */
-const SECRET_KEY = new RegExp(`^${SECRET_MARKER}$`, "iu");
 
 /**
  * Redact a structured value before it is serialized: every value under a
@@ -76,7 +106,7 @@ export function redactValue(value: unknown): unknown {
 	if (typeof value === "string") return redactSecrets(value);
 	if (Array.isArray(value)) return value.map(redactValue);
 	if (value === null || typeof value !== "object") return value;
-	return Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, SECRET_KEY.test(key) ? REDACTED : redactValue(inner)]));
+	return Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, isSecretMarker(key) ? REDACTED : redactValue(inner)]));
 }
 
 export function redactSecrets(text: string): string {
