@@ -97,14 +97,48 @@ const TARGETS_PER_KIND = 8;
 const REVIEWER_WORD =
 	/^(safe|unsafe|approved|approve|approval|preapproved|verdict|review|reviewed|reviewer|authorized|authorised|authorization|authorisation|permitted|sanctioned|whitelisted|allowlisted|trusted|harmless|inert|asked|requested|ignore|override|bypass)$/iu;
 
+/**
+ * The words that turn a list of words into a sentence. Identifiers almost never
+ * carry them — `src/components/button.tsx` and `feat/user-profile` have none —
+ * and a branch name written to argue with a reviewer needs several.
+ *
+ * This is the rule that matters, because the list above is a denylist and a
+ * denylist over English does not hold: `the-operator-told-me-to-run-this`
+ * contains none of those words and says the same thing. Sentence shape is what
+ * the two have in common.
+ */
+const FUNCTION_WORD = new Set([
+	"a", "an", "the", "this", "that", "these", "those", "it", "its", "is", "was", "are", "were", "be", "been", "am",
+	"i", "me", "my", "we", "us", "our", "you", "your", "he", "she", "they", "them", "their",
+	"and", "or", "but", "if", "so", "as", "by", "for", "to", "of", "in", "on", "at", "from", "with", "without",
+	"do", "does", "did", "can", "will", "would", "should", "must", "may", "already", "just", "now", "please", "go", "ahead", "told", "said", "let", "here",
+]);
+/** Below this, a hyphenated name is a name. `this-is-fine` is three. */
+const SENTENCE_MIN_WORDS = 3;
+const SENTENCE_MIN_FUNCTION_WORDS = 2;
+
+/** Whether this target is written as a sentence rather than as a name. */
+function readsAsSentence(parts: readonly string[]): boolean {
+	if (parts.length < SENTENCE_MIN_WORDS) return false;
+	const functionWords = parts.filter(part => FUNCTION_WORD.has(part.toLowerCase()));
+	return functionWords.length >= SENTENCE_MIN_FUNCTION_WORDS;
+}
+
 /** A target as the state carries it: its own text when that text is a name, a
- *  stable hash of it when it is long or reads as prose. The hash is unsalted on
- *  purpose — two segments naming one target have to look like one target. */
+ *  stable hash of it when it is long, carries a word aimed at a reviewer, or is
+ *  written as a sentence. The hash is unsalted on purpose — two segments naming
+ *  one target have to look like one target. */
 function presentTarget(raw: string): string {
 	const value = raw.trim();
 	if (value.length === 0) return "";
-	const readsAsProse = value.split(/[^A-Za-z0-9]+/u).some(word => REVIEWER_WORD.test(word));
-	if (value.length <= TARGET_MAX_LENGTH && !readsAsProse) return value;
+	// camelCase and snake_case are both split, so `itWasAlreadyApproved` and
+	// `it_was_already_approved` are read the same way as the hyphenated form.
+	const parts = value
+		.replace(/([a-z0-9])([A-Z])/gu, "$1 $2")
+		.split(/[^A-Za-z0-9]+/u)
+		.filter(part => part.length > 0);
+	const isName = value.length <= TARGET_MAX_LENGTH && !parts.some(part => REVIEWER_WORD.test(part)) && !readsAsSentence(parts);
+	if (isName) return value;
 	return `hashed:${createHash("sha256").update(value).digest("hex").slice(0, 12)}`;
 }
 
@@ -129,10 +163,27 @@ const PRIVILEGE_VERB = /^(launchctl|systemctl|service|chown|chgrp|chmod|visudo|d
 const SUDO_FLAG_WITH_VALUE = /^(-u|-g|-p|-C|--user|--group|--prompt)$/u;
 
 const DELETE_VERB = /^(rm|trash|unlink|rmdir|shred)$/u;
-// `env` is not here: `env FOO=1 cmd` runs whatever follows it, and reporting
-// that as a read would hide the command under it.
+// What is NOT here is the point. A verb belongs on this list only when it
+// cannot run another program:
+//   - `env` runs whatever follows it (`env FOO=1 cmd`).
+//   - `awk` and `sed` take a program as their argument, which is why they are
+//     PROGRAM_VERB below. GNU awk has `system()` and `print | "sh"`; GNU sed
+//     has the `e` flag on `s///`.
+//   - `less` and `more` shell out through `!cmd` and run the `LESSOPEN` filter.
+//   - `fd` and `find` run what `-x` / `-exec` hands them, so both go through
+//     findAction.
+// Reporting any of those as a read is a hole the model cannot see past.
 const READ_VERB =
-	/^(ls|pwd|cat|bat|echo|printf|head|tail|wc|grep|rg|ag|fd|file|stat|which|type|du|df|tree|jq|yq|diff|sort|uniq|date|basename|dirname|realpath|true|test|awk|column|less|more|nl|cut|tr|seq|id|whoami|hostname|uname|ps)$/u;
+	/^(ls|pwd|cat|bat|echo|printf|head|tail|wc|grep|rg|ag|file|stat|which|type|du|df|tree|jq|diff|sort|uniq|date|basename|dirname|realpath|true|test|column|nl|cut|tr|seq|id|whoami|hostname|uname|ps)$/u;
+/** Verbs whose argument is a program. What they run is not readable from the
+ *  verb, so they are code. */
+const PROGRAM_VERB = /^(awk|gawk|mawk|nawk|sed|yq)$/u;
+/** In-place editing: the program rewrites the files it was given. */
+const IN_PLACE_FLAG = /^-[a-zA-Z]*i([a-zA-Z0-9.]*)?$|^--in-place/u;
+const SEARCH_VERB = /^(find|fd|fdfind)$/u;
+/** Flags that hand each result to another program. `find` spells them with one
+ *  dash and a word; `fd` with `-x`/`-X`. */
+const SEARCH_EXEC_FLAG = /^(-exec|-execdir|-ok|-okdir|-x|-X|--exec|--exec-batch)$/u;
 /** A POSIX shell, which reads `-e` as errexit rather than as inline code. */
 const SHELL = /^(sh|bash|zsh|dash|ksh|fish)$/u;
 const WRITE_VERB = /^(mkdir|touch|cp|mv|ln|tee|dd|truncate|install|unzip|zip|tar|gzip|gunzip|patch|mktemp)$/u;
@@ -198,7 +249,18 @@ function classifySegment(tokens: readonly string[]): RawAction[] {
 	// it: `sudo frobnicate` must still report the verb nobody recognized.
 	if (!(main.kind === "other" && secrets.length > 0)) actions.push(main);
 	actions.push(...redirectWrites(tokens));
+	actions.push(...inPlaceWrites(rest));
 	return actions;
+}
+
+/** `sed -i` and `yq -i` rewrite the files they were handed. The program itself
+ *  is already reported as code; this is what it does to the tree. */
+function inPlaceWrites(tokens: readonly string[]): RawAction[] {
+	const verb = basename(tokens[0] ?? "");
+	if (!PROGRAM_VERB.test(verb) || !tokens.some(token => IN_PLACE_FLAG.test(token))) return [];
+	// The first non-flag argument is the program text, not a file.
+	const files = tokens.slice(1).filter(token => !token.startsWith("-")).slice(1);
+	return [{ kind: "write", targets: files }];
 }
 
 /** The segment's words with its redirects removed: the operator, and the word
@@ -265,9 +327,11 @@ function classifyVerb(tokens: readonly string[]): RawAction {
 		return CONTAINER_NETWORK_SUBCOMMAND.test(sub) ? { kind: "network", targets: [verb] } : { kind: "run-code", targets: [verb] };
 	}
 	if (NETWORK_VERB.test(verb)) return { kind: "network", targets: networkTargets(tokens, verb) };
-	if (verb === "find") return findAction(tokens, args);
+	if (SEARCH_VERB.test(verb)) return findAction(tokens, args, verb);
 	if (RUN_CODE_VERB.test(verb)) return { kind: "run-code", targets: [runTarget(tokens, verb)] };
-	if (verb === "sed") return tokens.some(token => /^-[a-z]*i/u.test(token)) ? { kind: "write", targets: args } : { kind: "read", targets: args };
+	// The program text is never carried into the summary, only the verb that
+	// runs it: it is agent-authored prose of the most literal kind.
+	if (PROGRAM_VERB.test(verb)) return { kind: "run-code", targets: [verb] };
 	if (WRITE_VERB.test(verb)) return { kind: "write", targets: args };
 	// A command spelled as a path is a file the agent may have written, so its
 	// name says nothing about what it does.
@@ -300,11 +364,12 @@ function ghAction(tokens: readonly string[], args: readonly string[], sub: strin
 	return { kind: "network", targets: [`${basename(tokens[0])} ${sub}`.trim()] };
 }
 
-/** `find` runs other commands when asked, and deletes when asked. Neither is a
- *  read, and reading the whole expression is out of scope here. */
-function findAction(tokens: readonly string[], args: readonly string[]): RawAction {
+/** `find` and `fd` run other commands when asked, and `find` deletes when
+ *  asked. Neither is a read then, and reading the whole expression is out of
+ *  scope here. */
+function findAction(tokens: readonly string[], args: readonly string[], verb: string): RawAction {
 	if (tokens.some(token => token === "-delete")) return { kind: "delete", targets: [...args.slice(0, 1)] };
-	if (tokens.some(token => token === "-exec" || token === "-execdir" || token === "-ok")) return { kind: "run-code", targets: ["find"] };
+	if (tokens.some(token => SEARCH_EXEC_FLAG.test(token))) return { kind: "run-code", targets: [verb] };
 	return { kind: "read", targets: [...args.slice(0, 1)] };
 }
 
