@@ -7,7 +7,7 @@ import type { DecisionRecord, ShadowV3 } from "../index";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { readDecisionLog, summarizeShadow } from "../eval/live-report";
+import { readDecisionLog, render, summarizeShadow } from "../eval/live-report";
 
 const NOW = Date.parse("2026-09-22T12:00:00Z");
 const v3 = (verdict: "SAFE" | "UNSURE" | "UNSAFE", branch: 3 | 4 | 5 | 7): ShadowV3 => ({
@@ -132,6 +132,33 @@ describe("readDecisionLog", () => {
 			const both = readDecisionLog(file);
 			expect(both.malformed).toEqual([1]);
 			expect(both.lines).toHaveLength(1);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("render", () => {
+	test("counts-only prints each list's size and no command text", () => {
+		const report = summarizeShadow(
+			[line({ approval: "deny", cmd: "curl -H 'Authorization: Bearer leaky' x", v3: v3("SAFE", 4) }), line({ approval: "headless", cmd: "gh pr merge 42", v3: v3("SAFE", 4) })],
+			NOW - 24 * 3_600_000,
+		);
+		const full = render(report);
+		expect(full).toContain("leaky");
+		const counts = render(report, { countsOnly: true });
+		expect(counts).not.toContain("leaky");
+		expect(counts).not.toContain("gh pr merge");
+		expect(counts).toContain("REGRESSIONS (denied live, v3 would allow): 1");
+		expect(counts).toContain("headless blocks v3 would allow: 1");
+	});
+
+	test("a prompt-era PARSE_ERROR line is history, not a malformed line", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-report-legacy-"));
+		try {
+			const file = path.join(dir, "decisions.jsonl");
+			fs.writeFileSync(file, `${JSON.stringify({ ...line({ layer: "verdict" }), verdict: "PARSE_ERROR" })}\n`);
+			expect(readDecisionLog(file).malformed).toEqual([]);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
