@@ -126,6 +126,10 @@ describe("redactSecrets", () => {
 	test("a secret flag with its value after a space is redacted; --password-stdin is not a value", () => {
 		expect(redactSecrets("mysql -u root --password hunter2 -e 'select 1'")).toBe(`mysql -u root --password ${REDACTED}`);
 		expect(redactSecrets("curl --api-key $KEY https://x.test")).toBe(`curl --api-key ${REDACTED}`);
+		// At the start of the text or of a line too (key 102 round 2).
+		expect(redactSecrets("--password hunter2")).toBe(`--password ${REDACTED}`);
+		expect(redactSecrets("--api-key opaque-value-1")).toBe(`--api-key ${REDACTED}`);
+		expect(redactSecrets("ok\n--password hunter2\nnext")).toBe(`ok\n--password ${REDACTED}\nnext`);
 		const stdin = "echo $T | docker login --password-stdin registry.example.com";
 		expect(redactSecrets(stdin)).toBe(stdin);
 	});
