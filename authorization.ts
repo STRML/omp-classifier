@@ -24,7 +24,7 @@
  */
 import { createHash } from "node:crypto";
 import { tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
-import { isSecretPath } from "./floor";
+import { isSecretPath, pathInToken, secretStoreRead, secretVariableNames } from "./floor";
 
 /**
  * The vocabulary. Every segment of every command lands on exactly one of these
@@ -77,6 +77,10 @@ export interface ActionSummaryEntry {
 
 export interface ActionSummaryInput {
 	command: string;
+	/** Variables an earlier command in this session captured a secret into.
+	 *  The floor carries the same list; a summary that ignored it would report
+	 *  `echo $KEY` as a plain print. */
+	taintedVars?: readonly string[];
 }
 
 /** Above this length a target stops being a name and starts being a payload. */
@@ -227,21 +231,22 @@ const ANY_REDIRECT = /^(\d|&)?(?:>>?|<<?)(.*)$/u;
 
 export function summarizeActions(input: ActionSummaryInput): ActionSummaryEntry[] {
 	const raw: RawAction[] = [];
+	const tainted = input.taintedVars ?? [];
 	for (const tokens of tokenizeShellSegments(input.command)) {
 		if (tokens.length === 0) continue;
-		raw.push(...classifySegment(tokens));
+		raw.push(...classifySegment(tokens, tainted));
 	}
 	return collect(raw);
 }
 
-function classifySegment(tokens: readonly string[]): RawAction[] {
+function classifySegment(tokens: readonly string[], tainted: readonly string[]): RawAction[] {
 	const actions: RawAction[] = [];
 	// A redirect belongs to the segment, not to the verb's arguments. Left in,
 	// `rm -rf build > log` reports a delete of `log`, and `cat x > ~/.ssh/id_rsa`
 	// reports a secret READ of the file it is overwriting.
 	const rest = withoutRedirects(takePrivilege(tokens, actions));
 	if (rest.length === 0) return actions;
-	const secrets = secretReads(rest);
+	const secrets = secretReads(rest, tainted);
 	actions.push(...secrets);
 	const main = classifyVerb(rest);
 	// `other` is the fallback for a segment nothing else claimed, and a secret
@@ -296,16 +301,30 @@ function takePrivilege(tokens: readonly string[], actions: RawAction[]): readonl
 	return tokens.slice(index);
 }
 
-/** Credential material this segment reads, whether spelled as a store command
- *  or as a path. The floor decides what a secret PATH is, so both modules
- *  answer that question the same way. */
-function secretReads(tokens: readonly string[]): RawAction[] {
-	const verb = basename(tokens[0]);
+/**
+ * Credential material this segment reads: a store read, a secret-named or
+ * tainted variable, or a path to a secret file. Every question here is the
+ * floor's own, asked through floor.ts, because a second weaker definition of
+ * "secret" is a hole by construction. The first version of this function had
+ * three: it skipped any token starting with a dash, so
+ * `--upload-file=~/.aws/credentials` was invisible; it never looked at
+ * variables, so `$AWS_SECRET_ACCESS_KEY` was invisible; and it tested the raw
+ * token as a path, so an `@` or `name=` prefix decided the answer.
+ *
+ * Every token is checked, including the verb: a secret can be the thing being
+ * run, the thing being read, or the value of a flag.
+ */
+function secretReads(tokens: readonly string[], tainted: readonly string[]): RawAction[] {
 	const targets: string[] = [];
-	if (/^(security|op|pass|vault)$/u.test(verb)) targets.push(verb);
-	for (const token of tokens.slice(1)) {
-		if (token.startsWith("-")) continue;
-		if (isSecretPath(token)) targets.push(basename(token));
+	const add = (target: string): void => {
+		if (!targets.includes(target)) targets.push(target);
+	};
+	const store = secretStoreRead(tokens.join(" "));
+	if (store !== undefined) add(store);
+	for (const token of tokens) {
+		for (const name of secretVariableNames(token, tainted)) add(`$${name}`);
+		const path = pathInToken(token);
+		if (path !== undefined && isSecretPath(path)) add(basename(path));
 	}
 	return targets.length === 0 ? [] : [{ kind: "secret-read", targets }];
 }
