@@ -59,6 +59,7 @@ import {
 } from "./authorization";
 import {
 	JEV_HAZARDS,
+	JEV_V3_POLICY_VERSION,
 	JevUnavailableError,
 	jevQuestions,
 	type JevAnswers,
@@ -174,6 +175,41 @@ export async function judgeAuthorization(signal: AbortSignal | undefined, option
 		throw new JevUnavailableError(`authorization judgment failed: ${err instanceof Error ? err.message : String(err)}`);
 	}
 	return toAuthorizationAnswer(result, battery, Math.round(performance.now() - startedAt));
+}
+
+export interface JevV3Judgment {
+	risk: JevAnswers;
+	/** Undefined when the authorization request failed; `deriveAuthorization`
+	 *  reads that as `none`. */
+	authorization: JevAuthorizationAnswer | undefined;
+	/** Why the authorization request failed, for the audit line. */
+	authorizationError?: string;
+}
+
+/**
+ * Ask the jev-v3 risk battery and the authorization question in parallel,
+ * each over its own state. Wall time is the slower of the two.
+ *
+ * The two failures are not equal. A risk request that fails throws
+ * `JevUnavailableError`, because there is no judgment without it. An
+ * authorization request that fails only costs the command its fast path: the
+ * result carries `authorization: undefined` and the risk answer still decides.
+ */
+export async function judgeJevV3(
+	signal: AbortSignal | undefined,
+	options: Omit<JudgeBatteryOptions, "state" | "version"> & { riskState: unknown; authorizationState: unknown },
+): Promise<JevV3Judgment> {
+	const { riskState, authorizationState, ...rest } = options;
+	// Resolved once so both requests ask the same judge.
+	const judge = rest.judge ?? judgeForClassification({ ...rest, state: riskState });
+	const [risk, authorization] = await Promise.allSettled([
+		judgeBattery(signal, { judge, state: riskState, version: JEV_V3_POLICY_VERSION }),
+		judgeAuthorization(signal, { judge, state: authorizationState }),
+	]);
+	if (risk.status === "rejected") throw risk.reason;
+	if (authorization.status === "fulfilled") return { risk: risk.value, authorization: authorization.value };
+	const reason = authorization.reason;
+	return { risk: risk.value, authorization: undefined, authorizationError: reason instanceof Error ? reason.message : String(reason) };
 }
 
 function toAuthorizationAnswer(
