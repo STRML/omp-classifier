@@ -24,7 +24,7 @@
  */
 import { createHash } from "node:crypto";
 import { secretPathIn, secretStoreRead, secretVariableNames } from "./floor";
-import { redactSecrets } from "./redact";
+import { REDACTED, redactSecrets } from "./redact";
 import { parseShell, type ShellCommand, type ShellWord } from "./shell-ast";
 
 /**
@@ -156,6 +156,9 @@ function presentTarget(raw: string): string {
 	// `echo "$(rm -rf build)"` handed `$(rm -rf build` straight to the model.
 	const isName =
 		value.length <= TARGET_MAX_LENGTH && !carriesCommandText && !parts.some(part => REVIEWER_WORD.test(part)) && !readsAsSentence(parts);
+	// A secret-shaped target is redacted, never hashed: an unsalted hash of a
+	// secret lets anyone holding the state test guesses against it offline.
+	if (redactSecrets(value) !== value) return REDACTED;
 	if (isName) return value;
 	return `hashed:${createHash("sha256").update(value).digest("hex").slice(0, 12)}`;
 }

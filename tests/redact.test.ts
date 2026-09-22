@@ -5,8 +5,8 @@
  * characters each, keys included.
  */
 import { describe, expect, test } from "bun:test";
-import { buildAuthorizationState } from "../authorization";
-import { collectToolEvidence } from "../index";
+import { buildAuthorizationState, summarizeActions } from "../authorization";
+import { collectTaskEvidence, collectToolEvidence, collectUserEvidence, operatorContextFromInput } from "../index";
 import { buildJevState, JEV_POLICY_VERSION } from "../jev";
 import { REDACTED, redactSecrets } from "../redact";
 
@@ -62,6 +62,32 @@ describe("redactSecrets", () => {
 			expect(out).toContain(REDACTED);
 		}
 		expect(redactSecrets(`OPENAI_API_KEY=${value}`)).toBe(`OPENAI_API_KEY=${REDACTED}`);
+	});
+
+	test("quoted, JSON-escaped and any-scheme credentials are redacted (Codex round 1)", () => {
+		const basic = "dXNlcjpwYXNzd29yZA==";
+		const opaque = fake("", 22);
+		const cases: Array<[string, string]> = [
+			[`{"Authorization":"Basic ${basic}"}`, basic],
+			[`Authorization: ApiKey ${opaque}`, opaque],
+			[`{"password":"abc;defgh"}`, "abc;defgh"],
+			[`{"command":"curl -H \\"Authorization: Bearer ${opaque}\\""}`, opaque],
+			[`{"command":"echo \\"password\\": \\"hunter2\\""}`, "hunter2"],
+			[`PASSWORD=abc;defgh`, "abc;defgh"],
+			[`{"pwd": "x"}`, `"x"`],
+		];
+		for (const [text, secret] of cases) {
+			const out = redactSecrets(text);
+			expect(out).not.toContain(secret);
+			expect(out).toContain(REDACTED);
+			expect(redactSecrets(out)).toBe(out);
+		}
+		// A URL query keeps its other parameters.
+		expect(redactSecrets(`https://x.test/cb?token=${opaque}&page=2`)).toBe(`https://x.test/cb?token=${REDACTED}&page=2`);
+		// Prose after the header name is a user's words, not a credential.
+		const prose = "Authorization: I approve the deploy to staging";
+		expect(redactSecrets(prose)).toBe(prose);
+		expect(redactSecrets(`Authorization: ApiKey ${opaque}`)).toBe(`Authorization: ApiKey ${REDACTED}`);
 	});
 
 	test("a private key block is redacted whole", () => {
@@ -125,6 +151,33 @@ describe("redaction reaches every judge state", () => {
 		const branch = [{ type: "message", message: { role: "toolResult", toolName: "bash", content: [{ type: "text", text: `${padding} ${secret} tail` }] } }];
 		const evidence = collectToolEvidence(branch) ?? "";
 		expect(evidence).not.toContain(secret.slice(0, 16));
+	});
+
+	test("user messages and operator context are redacted before they are cut", () => {
+		// A cut through `DB_PASSWORD=hunter2` leaves `DB_PASSWORD=hunte`, which
+		// no longer reads as a six-character value.
+		const long = `${"a".repeat(990)} DB_PASSWORD=hunter2 ${"b".repeat(2_000)}`;
+		const snapshot = collectTaskEvidence([{ type: "message", id: "m1", message: { role: "user", attribution: "user", content: long } }], 1);
+		expect(snapshot.messages[0]).not.toContain("hunte");
+		expect(collectUserEvidence([{ type: "message", message: { role: "user", attribution: "user", content: long } }], 1)[0]).not.toContain("hunte");
+		const context = operatorContextFromInput(`${"c".repeat(480)} DB_PASSWORD=hunter2 tail`);
+		expect(context).not.toContain("hunte");
+	});
+
+	test("an evidence hash covers the redacted text, so it can't verify a guessed password", () => {
+		const result = (text: string) => [{ type: "message", message: { role: "toolResult", toolName: "bash", content: [{ type: "text", text }] } }];
+		const hashOf = (text: string) => /hash=([0-9a-f]+)/u.exec(collectToolEvidence(result(text)) ?? "")?.[1];
+		expect(hashOf("DB_PASSWORD=hunter2 ok")).toBe(hashOf("DB_PASSWORD=letmein9 ok"));
+		const call = (command: string) => [{ type: "message", message: { role: "bashExecution", command, output: command } }];
+		const hashes = (command: string) => [...(collectToolEvidence(call(command)) ?? "").matchAll(/hash=([0-9a-f]+)/gu)].map(m => m[1]);
+		expect(hashes("export GH_TOKEN=aaaaaaaaaa")).toEqual(hashes("export GH_TOKEN=bbbbbbbbbb"));
+	});
+
+	test("a secret-shaped action target is redacted, not hashed", () => {
+		const branch = SECRETS.github;
+		const entry = summarizeActions({ command: `git branch -D ${branch}` }).find(action => action.kind === "branch-delete");
+		expect(entry?.targets.join(" ")).not.toContain(branch);
+		expect(entry?.targets).toContain(REDACTED);
 	});
 
 	test("the policy version marks the change", () => {

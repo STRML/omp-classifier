@@ -1384,7 +1384,7 @@ export function collectUserEvidence(
 		// An image-only message has no words to quote. Counting it would make the list
 		// non-empty and switch on the citation exemptions meant for real user text.
 		if (text.trim() === "") continue;
-		messages.push(headAndTail(text, EVIDENCE_MESSAGE_MAX_CHARS));
+		messages.push(headAndTail(redactSecrets(text), EVIDENCE_MESSAGE_MAX_CHARS));
 	}
 	return limit > 0 ? messages.slice(-limit) : [];
 }
@@ -1426,7 +1426,7 @@ export function collectTaskEvidence(branch: ReadonlyArray<EvidenceBranchEntry>, 
 		const text = textOf(message.content);
 		if (text.trim() === "") continue;
 		const id = message.id ?? entry.id ?? `user-${index}`;
-		all.push({ text: headAndTail(text, EVIDENCE_MESSAGE_MAX_CHARS), id, index, anchored: TASK_SCOPE_RE.test(text) });
+		all.push({ text: headAndTail(redactSecrets(text), EVIDENCE_MESSAGE_MAX_CHARS), id, index, anchored: TASK_SCOPE_RE.test(text) });
 	}
 	if (all.length === 0) return { messages: [], ids: [] };
 	const tail = new Set(all.slice(-limit).map(item => item.id));
@@ -1499,7 +1499,7 @@ function scopeFingerprint(messages: readonly string[] | undefined): string {
 export function operatorContextFromInput(value: unknown): string | undefined {
 	if (typeof value !== "string") return undefined;
 	const flat = value.replace(/\s+/gu, " ").trim();
-	return flat === "" ? undefined : truncated(flat, OPERATOR_CONTEXT_MAX_CHARS);
+	return flat === "" ? undefined : truncated(redactSecrets(flat), OPERATOR_CONTEXT_MAX_CHARS);
 }
 
 /**
@@ -1524,6 +1524,8 @@ export function collectToolEvidence(
 			return "[unserializable tool arguments]";
 		}
 	};
+	// Every digest covers redacted text. A hash of the raw text would let
+	// anyone holding the evidence test password guesses against it offline.
 	const digest = (value: string): string => createHash("sha256").update(value).digest("hex").slice(0, 16);
 	for (const entry of branch) {
 		if (entry.type !== "message") continue;
@@ -1537,22 +1539,22 @@ export function collectToolEvidence(
 				if (toolCall.type !== "toolCall") continue;
 				const name = typeof toolCall.name === "string" ? toolCall.name : "tool";
 				const args = toolCall.arguments;
-				const encoded = encode(args);
-				entries.push(`[tool call ${name} hash=${digest(encoded)}] ${truncated(redactSecrets(encoded), 700)}`);
+				const encoded = redactSecrets(encode(args));
+				entries.push(`[tool call ${name} hash=${digest(encoded)}] ${truncated(encoded, 700)}`);
 			}
 			continue;
 		}
 		if (role === "toolResult") {
 			const name = typeof message.toolName === "string" ? message.toolName : "tool";
-			const content = textOf(message.content);
-			if (content.trim() !== "") entries.push(`[tool result ${name} hash=${digest(content)}] ${truncated(redactSecrets(content).replace(/\s+/gu, " ").trim(), 700)}`);
+			const content = redactSecrets(textOf(message.content));
+			if (content.trim() !== "") entries.push(`[tool result ${name} hash=${digest(content)}] ${truncated(content.replace(/\s+/gu, " ").trim(), 700)}`);
 			continue;
 		}
 		if (role === "bashExecution") {
-			const command = typeof message.command === "string" ? message.command : "";
-			const output = typeof message.output === "string" ? message.output : "";
-			if (command !== "") entries.push(`[bash execution hash=${digest(command)}] ${truncated(redactSecrets(command), 700)}`);
-			if (output.trim() !== "") entries.push(`[bash output hash=${digest(output)}] ${truncated(redactSecrets(output).replace(/\s+/gu, " ").trim(), 500)}`);
+			const command = typeof message.command === "string" ? redactSecrets(message.command) : "";
+			const output = typeof message.output === "string" ? redactSecrets(message.output) : "";
+			if (command !== "") entries.push(`[bash execution hash=${digest(command)}] ${truncated(command, 700)}`);
+			if (output.trim() !== "") entries.push(`[bash output hash=${digest(output)}] ${truncated(output.replace(/\s+/gu, " ").trim(), 500)}`);
 		}
 	}
 	if (entries.length === 0) return undefined;
