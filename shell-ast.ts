@@ -40,6 +40,10 @@ export interface ShellWord {
 	 * or a store read reads this.
 	 */
 	value: string;
+	/** The word with every expansion replaced by its default or operand, or
+	 *  by nothing: what the shell produces when the variables are unset. A
+	 *  path check reads both, because `${SAFE:-key.pem}` opens `key.pem`. */
+	alternate: string;
 	/** True when every part was a literal: no expansion, no substitution. */
 	literal: boolean;
 	/** Names this word expands, anywhere inside it: `${BRACED}`, the
@@ -296,7 +300,7 @@ function expressionWords(node: any, arithmetic: boolean, source: string, out: Sh
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 
-const literalWord = (text: string): ShellWord => ({ source: text, value: text, literal: true, variables: [], substitution: false, commands: [] });
+const literalWord = (text: string): ShellWord => ({ source: text, value: text, alternate: text, literal: true, variables: [], substitution: false, commands: [] });
 
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 function readCall(cmd: any, command: ShellCommand, source: string, out: ShellCommand[]): void {
@@ -441,48 +445,64 @@ function readRedirect(redir: any, source: string, out: ShellCommand[]): ShellRed
 
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 function readWord(word: any, source: string, out: ShellCommand[]): ShellWord {
-	if (!word) return { source: "", value: "", literal: true, variables: [], substitution: false, commands: [] };
+	if (!word) return { ...literalWord(""), source: "" };
+	const flags = { literal: true, substitution: false };
+	const value = renderParts(word.Parts ?? [], source, "value", false, flags);
+	const alternate = renderParts(word.Parts ?? [], source, "alternate", false, { literal: true, substitution: false });
 	const variables: string[] = [];
-	let literal = true;
-	let substitution = false;
-
-	// biome-ignore lint/suspicious/noExplicitAny: untyped AST
-	const render = (parts: any[]): string =>
-		parts
-			.map(part => {
-				switch (nodeType(part)) {
-					case "Lit":
-						return part.Value ?? "";
-					case "SglQuoted":
-						// `$'\x2eenv'` is `.env` to the shell.
-						return part.Dollar ? decodeAnsiC(part.Value ?? "") : (part.Value ?? "");
-					case "DblQuoted":
-						return render(part.Parts ?? []);
-					case "ParamExp":
-						literal = false;
-						// `${SAFE:-$API_KEY}` is more than its name: keep the
-						// text so the default, the index and the slice stay
-						// visible. The names come from the walk below.
-						return part.Short ? `$${part.Param?.Value ?? ""}` : sliceOf(part, source);
-					case "CmdSubst":
-						literal = false;
-						substitution = true;
-						return "$(…)";
-					default:
-						// An arithmetic expansion, a process substitution, an
-						// extended glob: kept as written, and never literal.
-						literal = false;
-						return sliceOf(part, source);
-				}
-			})
-			.join("");
-
-	const value = render(word.Parts ?? []);
 	collectVariables(word, variables);
 	// One walk per word visits each node once, as one walk per call did: the
 	// words of a call are disjoint subtrees.
 	const commands = collectSubstitutions(word, source, out);
-	return { source: sliceOf(word, source), value, literal, variables, substitution, commands };
+	return { source: sliceOf(word, source), value, alternate, literal: flags.literal, variables, substitution: flags.substitution, commands };
+}
+
+/**
+ * `value` keeps each expansion visible as `$NAME` or its source text.
+ * `alternate` replaces each one with what it produces when the variable is
+ * unset: its default or operand (`${SAFE:-key.pem}` gives `key.pem`), or
+ * nothing (`$SAFE.env` gives `.env`). A substitution gives nothing in both.
+ */
+type Rendering = "value" | "alternate";
+
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function renderParts(parts: any[], source: string, mode: Rendering, quoted: boolean, flags: { literal: boolean; substitution: boolean }): string {
+	return parts.map(part => renderPart(part, source, mode, quoted, flags)).join("");
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function renderPart(part: any, source: string, mode: Rendering, quoted: boolean, flags: { literal: boolean; substitution: boolean }): string {
+	switch (nodeType(part)) {
+		case "Lit":
+			return unescapeLit(part.Value ?? "", quoted);
+		case "SglQuoted":
+			// `$'\x2eenv'` is `.env` to the shell.
+			return part.Dollar ? decodeAnsiC(part.Value ?? "") : (part.Value ?? "");
+		case "DblQuoted":
+			return renderParts(part.Parts ?? [], source, mode, true, flags);
+		case "ParamExp": {
+			flags.literal = false;
+			if (mode === "value") return part.Short ? `$${part.Param?.Value ?? ""}` : sliceOf(part, source);
+			const operand = part.Exp?.Word ?? part.Repl?.With;
+			return operand ? renderParts(operand.Parts ?? [], source, mode, quoted, flags) : "";
+		}
+		case "CmdSubst":
+			flags.literal = false;
+			flags.substitution = true;
+			return mode === "value" ? "$(…)" : "";
+		default:
+			// An arithmetic expansion, a process substitution, an extended
+			// glob: kept as written, and never literal.
+			flags.literal = false;
+			return sliceOf(part, source);
+	}
+}
+
+/** Quote removal for backslashes, which the parser leaves in a literal.
+ *  Unquoted, a backslash escapes any character, so `.e\nv` is `.env`. Inside
+ *  double quotes it escapes only `$`, backtick, `"`, `\` and a newline. */
+function unescapeLit(text: string, quoted: boolean): string {
+	return quoted ? text.replace(/\\([$`"\\\n])/gu, "$1") : text.replace(/\\(.)/gsu, "$1");
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
@@ -549,16 +569,24 @@ function arithmeticNames(node: any): string[] {
 	return names;
 }
 
+/** A code point bash would emit, or the escape as written when it is out of
+ *  range. */
+const codePoint = (value: number, written: string): string => (value <= 0x10ffff ? String.fromCodePoint(value) : written);
+
 /** Decode the body of `$'…'` the way bash does, for the escapes that can
  *  spell a path: hex, octal, unicode, and the single-character ones. */
 function decodeAnsiC(body: string): string {
 	const simple: Record<string, string> = { n: "\n", t: "\t", r: "\r", a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", v: "\v", "\\": "\\", "'": "'", '"': '"', "?": "?" };
-	return body.replace(/\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|c.|.)/gsu, (whole, escape: string) => {
+	const decoded = body.replace(/\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|c.|.)/gsu, (whole, escape: string) => {
 		const kind = escape[0];
-		if (kind === "x" || kind === "u" || kind === "U") return String.fromCodePoint(Number.parseInt(escape.slice(1), 16));
-		if (/[0-7]/u.test(kind)) return String.fromCodePoint(Number.parseInt(escape, 8));
+		// `\x` with no digits after it is a literal backslash and x.
+		if (kind === "x" || kind === "u" || kind === "U") return escape.length > 1 ? codePoint(Number.parseInt(escape.slice(1), 16), whole) : whole;
+		if (/[0-7]/u.test(kind)) return codePoint(Number.parseInt(escape, 8), whole);
 		if (kind === "c") return String.fromCodePoint(escape.charCodeAt(1) & 0x1f);
 		return simple[escape] ?? whole;
 	});
+	// Bash builds the string in C, so a NUL ends it: `$'key.pem\0x'` is
+	// `key.pem`.
+	return decoded.split("\0")[0];
 }
 

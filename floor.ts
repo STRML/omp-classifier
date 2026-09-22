@@ -142,14 +142,28 @@ export function evaluateFloor(input: FloorInput): FloorResult {
 /**
  * Code the shell model cannot read. Entries 1, 3 and 4 are text scans and run
  * as they do on a command. For entry 2 the floor cannot trace a sink through
- * Python or JavaScript, so a store read anywhere in the code asks.
+ * Python or JavaScript, so a store read or a secret file named anywhere in
+ * the code asks.
+ *
+ * Code spells a command as a list as often as a string:
+ * `subprocess.run(['op', 'read', …])`. So the store-read patterns run over the
+ * code's words with the quotes, brackets and commas between them dropped,
+ * not over its text.
  */
 function scanCode(text: string, findings: FloorFinding[]): void {
 	if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(text))) {
 		findings.push({ entry: "critical", detail: "matches a built-in dangerous-command pattern", source: "command" });
 	}
+	const words = (text.match(/[A-Za-z0-9_@%+=:./~-]+/gu) ?? []).join(" ");
 	for (const [pattern, label] of STORE_READS) {
-		if (pattern.test(text)) findings.push({ entry: "secret-sink", detail: `${label} read in code whose sink the floor cannot trace`, source: "command" });
+		if (pattern.test(words)) findings.push({ entry: "secret-sink", detail: `${label} read in code whose sink the floor cannot trace`, source: "command" });
+	}
+	// Only string literals shaped like a path: `import secrets` and
+	// `os.environ["AWS_SECRET_ACCESS_KEY"]` are names, not files.
+	for (const match of text.matchAll(/(["'`])((?:\\.|(?!\1)[^\\\n])*)\1/gu)) {
+		const literal = match[2];
+		if (/\s/u.test(literal) || !/[./~]/u.test(literal) || !isSecretPath(literal)) continue;
+		findings.push({ entry: "secret-sink", detail: `the secret file ${literal} named in code whose sink the floor cannot trace`, source: "command" });
 	}
 	scanDownloadToInterpreter(text, "command", findings);
 	scanObfuscation(text, "command", findings);
@@ -308,7 +322,7 @@ function wordSecrets(word: ShellWord, scan: SecretScan, paths: boolean): string[
 		if (live.includes(name)) labels.push(`the captured secret in $${name}`);
 		else if (SECRET_VAR.test(name)) labels.push(`the secret-named variable $${name}`);
 	}
-	const filePath = paths ? secretPathIn(word.value) : undefined;
+	const filePath = paths ? secretPathIn(word) : undefined;
 	if (filePath !== undefined) labels.push(`the secret file ${filePath}`);
 	for (const command of word.commands) labels.push(...commandSecrets(command, scan));
 	return labels;
@@ -342,17 +356,36 @@ function wordSink(flag: string, value: string, headerSink: boolean): WordSink {
  */
 function routeStdout(command: ShellCommand, printed: string[], scan: SecretScan): string[] {
 	if (printed.length === 0) return printed;
-	let destination: "stream" | "discard" | "file" = "stream";
-	for (const redirect of command.redirects) {
-		if (!redirectsStdout(redirect)) continue;
-		// `1<>file` and `1<&3` point stdout somewhere this code does not follow.
-		if (redirect.direction !== "out") destination = "file";
-		else if (redirect.duplicate && /^(\d+|-)$/u.test(redirect.target.value)) destination = "stream";
-		else destination = redirect.target.value === "/dev/null" ? "discard" : "file";
-	}
-	if (destination === "stream") return printed;
+	const destination = stdoutDestination(command);
+	if (destination === "pipe" || destination === "stderr") return printed;
 	if (destination === "file") for (const label of printed) report(scan, `${label} reaches a file`);
 	return [];
+}
+
+type StdoutDestination = "pipe" | "stderr" | "discard" | "file";
+
+/**
+ * Where the command's stdout ends up after its redirects, applied left to
+ * right as the shell applies them. `1>&1` changes nothing, `1<> /dev/null`
+ * discards, and `>&2` moves stdout onto a stream that still prints but no
+ * longer feeds the pipe.
+ */
+function stdoutDestination(command: ShellCommand): StdoutDestination {
+	let destination: StdoutDestination = "pipe";
+	for (const redirect of command.redirects) {
+		if (redirectsStdout(redirect)) destination = redirectDestination(redirect, destination);
+	}
+	return destination;
+}
+
+function redirectDestination(redirect: ShellRedirect, current: StdoutDestination): StdoutDestination {
+	const target = redirect.target.value;
+	if (redirect.duplicate && target === "1") return current;
+	if (redirect.duplicate && target === "-") return "discard";
+	// Another descriptor: stderr prints, and one this code did not follow is
+	// read as printing too.
+	if (redirect.duplicate && /^\d+$/u.test(target)) return "stderr";
+	return target === "/dev/null" ? "discard" : "file";
 }
 
 /**
@@ -364,7 +397,7 @@ function routeStdout(command: ShellCommand, printed: string[], scan: SecretScan)
 function feedsPasswordStdin(command: ShellCommand, next: ShellCommand | undefined): boolean {
 	if (!/^(echo|printf|cat)$/u.test(trustedVerb(command))) return false;
 	// `echo $TOKEN >&2 | docker login` prints to stderr; the pipe gets nothing.
-	if (command.redirects.some(redirectsStdout)) return false;
+	if (stdoutDestination(command) !== "pipe") return false;
 	if (next === undefined || next.join !== "pipe") return false;
 	if (!CREDENTIAL_CONSUMER.test(trustedVerb(next))) return false;
 	return next.words.some(word => word.value === "--password-stdin");
@@ -398,14 +431,31 @@ function report(scan: SecretScan, detail: string): void {
 }
 
 /**
- * A secret path anywhere in a word. `f=@~/.aws/credentials` and `@./key.pem`
+ * A secret path the word can produce. Both renderings count, because
+ * `${SAFE:-key.pem}` opens `key.pem` when SAFE is unset. Brace expansion runs
+ * first, and a glob is tested against the secret names it could match.
+ */
+function secretPathIn(word: ShellWord): string | undefined {
+	for (const text of new Set([word.value, word.alternate])) {
+		const expanded = expandBraces(text);
+		if (expanded === undefined) return `${text}, a brace expansion too large to read`;
+		for (const candidate of expanded) {
+			const found = secretGlob(candidate) ?? secretPathInText(candidate);
+			if (found !== undefined) return found;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * A secret path anywhere in a word's text. `f=@~/.aws/credentials` and `@./key.pem`
  * name one after a prefix. A word that opens with a dash may carry its value
  * attached, `-sTconfig/secrets.pem`, and which letters are the flag is option
  * grammar this code does not have, so every tail of it is a candidate. Asking
  * too often is the floor's safe direction. A bare flag name such as
  * `--kubeconfig` is a flag, not a path.
  */
-function secretPathIn(value: string): string | undefined {
+function secretPathInText(value: string): string | undefined {
 	const stripped = value.replace(ASSIGNMENT_WORD, "").replace(/^@/u, "");
 	if (stripped.length === 0) return undefined;
 	if (!stripped.startsWith("-")) return isSecretPath(stripped) ? stripped : undefined;
@@ -463,3 +513,133 @@ function scanObfuscation(text: string, source: FloorFinding["source"], findings:
 function shellEvalOfNonLiteral(commands: readonly ShellCommand[]): boolean {
 	return commands.some(command => verbName(command) === "eval" && command.words.slice(1).some(word => !word.literal));
 }
+
+/** Brace expansion, as the shell does it before anything else: every
+ *  combination of `{a,b}` groups and `{1..3}` ranges. Undefined when there
+ *  are more than a command could reasonably mean, which the caller reads as
+ *  unreadable rather than as nothing. */
+const BRACE_LIMIT = 1024;
+
+function expandBraces(text: string): string[] | undefined {
+	const results: string[] = [];
+	const pending = [text];
+	while (pending.length > 0) {
+		const current = pending.pop() as string;
+		const group = firstBraceGroup(current);
+		if (group === undefined) results.push(current);
+		else for (const alternative of group.alternatives) pending.push(current.slice(0, group.start) + alternative + current.slice(group.end + 1));
+		if (results.length + pending.length > BRACE_LIMIT) return undefined;
+	}
+	return results;
+}
+
+function firstBraceGroup(text: string): { start: number; end: number; alternatives: string[] } | undefined {
+	for (let start = text.indexOf("{"); start >= 0; start = text.indexOf("{", start + 1)) {
+		const end = matchingBrace(text, start);
+		if (end === undefined) return undefined;
+		const alternatives = braceAlternatives(text.slice(start + 1, end));
+		if (alternatives !== undefined) return { start, end, alternatives };
+	}
+	return undefined;
+}
+
+function matchingBrace(text: string, start: number): number | undefined {
+	let depth = 0;
+	for (let index = start; index < text.length; index += 1) {
+		if (text[index] === "{") depth += 1;
+		if (text[index] === "}" && --depth === 0) return index;
+	}
+	return undefined;
+}
+
+/** The top-level alternatives of a brace body, or undefined when the body is
+ *  not an expansion (`${VAR}`, `{}`, `{solo}`). */
+function braceAlternatives(body: string): string[] | undefined {
+	const range = /^(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])$/u.exec(body);
+	if (range !== null) return braceRange(range[1], range[2]);
+	const parts: string[] = [];
+	let depth = 0;
+	let from = 0;
+	for (let index = 0; index < body.length; index += 1) {
+		if (body[index] === "{") depth += 1;
+		if (body[index] === "}") depth -= 1;
+		if (body[index] !== "," || depth !== 0) continue;
+		parts.push(body.slice(from, index));
+		from = index + 1;
+	}
+	parts.push(body.slice(from));
+	return parts.length > 1 ? parts : undefined;
+}
+
+function braceRange(from: string, to: string): string[] {
+	const numeric = /\d/u.test(from);
+	const [a, b] = numeric ? [Number(from), Number(to)] : [from.charCodeAt(0), to.charCodeAt(0)];
+	const step = a <= b ? 1 : -1;
+	const values: string[] = [];
+	for (let value = a; values.length <= BRACE_LIMIT; value += step) {
+		values.push(numeric ? String(value) : String.fromCharCode(value));
+		if (value === b) break;
+	}
+	return values;
+}
+
+/** Names a glob is tested against, one per rule in `isSecretPath`. A glob
+ *  that could match one of these could open a secret. */
+const SECRET_NAME_SAMPLES = [".env", ".env.local", ".netrc", ".npmrc", ".git-credentials", ".pgpass", "kubeconfig", "credentials", "id.pem", "state.tfstate", "id.key", "id.p12", "id.pfx", "id.jks", "secrets.json", "credential"];
+const SECRET_DIR_NAMES = [".ssh", ".aws", ".gnupg"];
+const GLOB = /[*?[]|[@!+](\()/u;
+
+/**
+ * A glob that could name a secret file: `.e*`, `*.pem`, `.en[v]`, `@(a|.env)`,
+ * `~/.ss?/id_rsa`. A glob made only of wildcards is not one, because `*`
+ * never matches a dotfile and asking on every `ls *` would teach nobody
+ * anything.
+ */
+function secretGlob(candidate: string): string | undefined {
+	if (!GLOB.test(candidate)) return undefined;
+	const path = candidate.replace(ASSIGNMENT_WORD, "").replace(/^@(?!\()/u, "");
+	const segments = path.split("/");
+	const last = segments.pop() ?? "";
+	if (segments.some(segment => GLOB.test(segment) && SECRET_DIR_NAMES.some(name => globRegex(segment).test(name)))) return path;
+	if (!/[^*?]/u.test(last.replace(/\[[^\]]*\]/gu, ""))) return undefined;
+	return SECRET_NAME_SAMPLES.some(name => globRegex(last).test(name)) ? path : undefined;
+}
+
+/** One path segment's glob as a regex, extended globs included. A bare
+ *  leading wildcard does not match a leading dot, as in bash without dotglob.
+ *  An extended glob is left free to, because its alternatives can spell the
+ *  dot themselves: `@(a|.env)` matches `.env`. */
+function globRegex(glob: string): RegExp {
+	const dotGuard = /^[*?[]/u.test(glob) && glob[1] !== "(" ? "(?!\\.)" : "";
+	return new RegExp(`^${dotGuard}${globBody(glob)}$`, "u");
+}
+
+function globBody(glob: string): string {
+	let body = "";
+	for (let index = 0; index < glob.length; index += 1) {
+		const char = glob[index];
+		const close = glob[index + 1] === "(" ? matchingParen(glob, index + 1) : undefined;
+		if ("@!+*?".includes(char) && close !== undefined) {
+			const inner = glob.slice(index + 2, close).split("|").map(globBody).join("|");
+			body += char === "!" ? ".*" : `(?:${inner})${char === "@" ? "" : char}`;
+			index = close;
+		} else if (char === "*") body += ".*";
+		else if (char === "?") body += ".";
+		else if (char === "[" && glob.indexOf("]", index + 2) > 0) {
+			const end = glob.indexOf("]", index + 2);
+			body += `[${glob.slice(index + 1, end).replace(/^!/u, "^").replace(/[\\\]]/gu, "\\$&")}]`;
+			index = end;
+		} else body += char.replace(/[.*+?^${}()|[\]\\/]/gu, "\\$&");
+	}
+	return body;
+}
+
+function matchingParen(text: string, open: number): number | undefined {
+	let depth = 0;
+	for (let index = open; index < text.length; index += 1) {
+		if (text[index] === "(") depth += 1;
+		if (text[index] === ")" && --depth === 0) return index;
+	}
+	return undefined;
+}
+

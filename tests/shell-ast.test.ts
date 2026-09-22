@@ -118,6 +118,22 @@ describe("a word keeps every expansion inside it", () => {
 		expect(word("'\\x2eenv'").value).toBe("\\x2eenv");
 	});
 
+	test("backslashes are removed the way the shell removes them", () => {
+		expect(word(".e\\nv").value).toBe(".env");
+		expect(word('".e\\nv"').value).toBe(".e\\nv");
+		expect(word('"a\\$b"').value).toBe("a$b");
+		expect(word("$'key.pem\\0rest'").value).toBe("key.pem");
+		expect(word("$'\\x'").value).toBe("\\x");
+		expect(word("$'\\U110000'").value).toBe("\\U110000");
+	});
+
+	test("the alternate rendering takes each default, or nothing", () => {
+		expect(word("${SAFE:-key.pem}").alternate).toBe("key.pem");
+		expect(word("$SAFE.env").alternate).toBe(".env");
+		expect(word('"${X/a/b}c"').alternate).toBe("bc");
+		expect(word('"$(cat x)y"').alternate).toBe("y");
+	});
+
 	test("an array assignment carries its elements", () => {
 		const [assign] = commands('arr=("$API_KEY" plain)')[0].assigns;
 		expect(assign.array.map(element => element.value)).toEqual(["$API_KEY", "plain"]);
