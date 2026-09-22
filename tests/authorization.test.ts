@@ -226,8 +226,20 @@ describe("the summary names what the command does, from a fixed vocabulary", () 
 		// omitted the delete in the first command and invented one in the second.
 		expect(kinds(`echo "$(rm -rf build)"`)).toContain("other");
 		expect(entry(`echo "$(rm -rf build)"`, "other")?.targets).toEqual(["command-substitution"]);
-		expect(entry("cat <<EOF\nrm -rf build\nEOF", "other")?.targets).toEqual(["heredoc"]);
+		expect(entry("cat <<EOF\nrm -rf build\nEOF", "other")?.targets).toEqual(["heredoc", "unparsed-command-text"]);
 		// The heredoc body is data, so it invents no delete.
+		expect(kinds("cat <<EOF\nrm -rf build\nEOF")).not.toContain("delete");
+	});
+
+	test("a heredoc opener that is not one hides nothing", () => {
+		// The dangerous direction of the same rule. `<<` inside a quoted string
+		// read as an opener with no terminator, and every line after it was
+		// dropped: the delete vanished from the summary.
+		expect(kinds('echo "text << EOF"\nrm -rf build')).toContain("delete");
+		// A here-string is not a heredoc, so it never swallows what follows.
+		expect(kinds('cat <<<"hello"\nrm -rf build')).toContain("delete");
+		// A real body is removed, and the summary says text was removed.
+		expect(entry("cat <<EOF\nrm -rf build\nEOF", "other")?.targets).toEqual(["heredoc", "unparsed-command-text"]);
 		expect(kinds("cat <<EOF\nrm -rf build\nEOF")).not.toContain("delete");
 	});
 
