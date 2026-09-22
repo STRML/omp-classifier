@@ -149,6 +149,45 @@ describe("these never match literally, whatever the user's words say", () => {
 	});
 });
 
+describe("segments come from the shell parser (plan 2026-09-22-real-shell-parser.md)", () => {
+	const ASKED = ["delete the build dir"];
+
+	test("a command the parser rejects never matches", () => {
+		const result = match("rm -rf build && echo 'unterminated", ASKED);
+		expect(result.matched).toBe(false);
+		expect(result.reason).toContain("could not read");
+	});
+
+	test("a delete inside a substitution is an action the outer command hides", () => {
+		expect(matched('echo "$(rm -rf build)"', ASKED)).toBe(false);
+		expect(matched("rm -rf build && echo $(rm -rf src)", ASKED)).toBe(false);
+	});
+
+	test("a heredoc body is data, and a quoted heredoc operator is text", () => {
+		// The body mentions a delete the user never asked for, and it must not
+		// be read as one. The redirect still makes the cat incomplete.
+		expect(match("cat <<EOF\nrm -rf src\nEOF\n", ASKED).actions).toEqual([]);
+		// A quoted `<<` hid every line after it from the regex splitter. The
+		// delete must be visible; the echo stays incomplete on its `<`.
+		expect(match('echo "text << EOF"\nrm -rf build', ASKED).actions.map(action => action.target)).toEqual(["build"]);
+	});
+
+	test("an assignment or a redirect on an inert verb is not inert", () => {
+		expect(matched("rm -rf build && FOO=1 echo done", ASKED)).toBe(false);
+		expect(matched("rm -rf build && echo done >> ~/.bashrc", ASKED)).toBe(false);
+	});
+
+	test("a compound is read through, and its test clause is not inert", () => {
+		expect(matched("(rm -rf build)", ASKED)).toBe(true);
+		expect(matched("[[ -d build ]] && rm -rf build", ASKED)).toBe(false);
+	});
+
+	test("the host tokenizer is gone from the literal match", async () => {
+		const source = await Bun.file(new URL("../literal-match.ts", import.meta.url)).text();
+		expect(source).not.toContain("shell-tokenize");
+	});
+});
+
 describe("delete: the target must be under the working directory and named as a whole word", () => {
 	test("a path outside the working directory never matches, even when the basename is named", () => {
 		// Failure matrix: user named /tmp/build, the command deletes /srv/prod/build.
