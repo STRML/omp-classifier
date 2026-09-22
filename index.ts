@@ -83,6 +83,7 @@ import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-codi
 import { getConfigRootDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
 import { judgeBattery } from "./jev-judge";
+import { redactSecrets } from "./redact";
 import {
 	buildJevState,
 	DEFAULT_JEV_POLICY,
@@ -1537,21 +1538,21 @@ export function collectToolEvidence(
 				const name = typeof toolCall.name === "string" ? toolCall.name : "tool";
 				const args = toolCall.arguments;
 				const encoded = encode(args);
-				entries.push(`[tool call ${name} hash=${digest(encoded)}] ${truncated(encoded, 700)}`);
+				entries.push(`[tool call ${name} hash=${digest(encoded)}] ${truncated(redactSecrets(encoded), 700)}`);
 			}
 			continue;
 		}
 		if (role === "toolResult") {
 			const name = typeof message.toolName === "string" ? message.toolName : "tool";
 			const content = textOf(message.content);
-			if (content.trim() !== "") entries.push(`[tool result ${name} hash=${digest(content)}] ${truncated(content.replace(/\s+/gu, " ").trim(), 700)}`);
+			if (content.trim() !== "") entries.push(`[tool result ${name} hash=${digest(content)}] ${truncated(redactSecrets(content).replace(/\s+/gu, " ").trim(), 700)}`);
 			continue;
 		}
 		if (role === "bashExecution") {
 			const command = typeof message.command === "string" ? message.command : "";
 			const output = typeof message.output === "string" ? message.output : "";
-			if (command !== "") entries.push(`[bash execution hash=${digest(command)}] ${truncated(command, 700)}`);
-			if (output.trim() !== "") entries.push(`[bash output hash=${digest(output)}] ${truncated(output.replace(/\s+/gu, " ").trim(), 500)}`);
+			if (command !== "") entries.push(`[bash execution hash=${digest(command)}] ${truncated(redactSecrets(command), 700)}`);
+			if (output.trim() !== "") entries.push(`[bash output hash=${digest(output)}] ${truncated(redactSecrets(output).replace(/\s+/gu, " ").trim(), 500)}`);
 		}
 	}
 	if (entries.length === 0) return undefined;

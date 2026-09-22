@@ -54,13 +54,14 @@
  *     jev-judge.ts, which rides OMP's own judgment module.
  */
 import { createHash } from "node:crypto";
+import { redactSecrets } from "./redact";
 
 /**
  * Identity of the decision policy. Bump it when the battery or the meaning of a
  * threshold changes: jevQuestionsHash folds it into the fingerprint that the
  * audit log records, so a replay can tell which policy produced a decision.
  */
-export const JEV_POLICY_VERSION = "jev-v2.1";
+export const JEV_POLICY_VERSION = "jev-v2.2";
 /**
  * The intent-aware battery. It runs in shadow beside JEV_POLICY_VERSION and
  * decides nothing until the flip; its questions differ from jev-v2 only where
@@ -583,9 +584,11 @@ export function buildJevState(input: {
 	const evidence: Record<string, unknown> = {};
 	// Copied, not aliased: callers pass live session state, and a mutation while
 	// the request is in flight must not change what was judged.
-	if (input.userMessages !== undefined && input.userMessages.length > 0) evidence.userMessages = [...input.userMessages];
+	// Evidence is redacted of secret-shaped values (jev-v2.2); the command is not,
+	// because it is what gets judged.
+	if (input.userMessages !== undefined && input.userMessages.length > 0) evidence.userMessages = input.userMessages.map(redactSecrets);
 	if (input.userMessageIds !== undefined && input.userMessageIds.length > 0) evidence.userMessageIds = [...input.userMessageIds];
-	if (input.operatorContext !== undefined && input.operatorContext !== "") evidence.operatorContext = input.operatorContext;
+	if (input.operatorContext !== undefined && input.operatorContext !== "") evidence.operatorContext = redactSecrets(input.operatorContext);
 	const state: Record<string, unknown> = {
 		...input.extra,
 		notice: JEV_STATE_NOTICE,
