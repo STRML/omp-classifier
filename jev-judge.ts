@@ -136,6 +136,11 @@ export async function judgeBattery(signal: AbortSignal | undefined, options: Jud
 	return toJevAnswers(result, battery, Math.round(performance.now() - startedAt));
 }
 
+/** How far a returned distribution may sit from summing to 1 before it stops
+ *  being a distribution. Wide enough for rounding at two decimals, narrow
+ *  enough that three independent 0.8s cannot pass. */
+const DISTRIBUTION_TOLERANCE = 0.05;
+
 /**
  * The authorization battery as the native module types it: one choice question,
  * whose option labels are the plan's three levels.
@@ -199,6 +204,17 @@ function toAuthorizationAnswer(
 	}
 	const confidence = unitNumber(answer.confidence);
 	if (confidence === undefined) throw fieldError("answers.user_authorization.confidence", "is missing or not a number in 0..1");
+	// Each probability being in 0..1 is not a distribution. `{none: 0.8, goal:
+	// 0.8, named: 0.8}` passes every per-value check and would clear the
+	// `named` floor while saying nothing, and a `choice` that is not the
+	// argmax is an answer disagreeing with itself. Both are no answer.
+	const total = Object.values(probabilities).reduce((sum, value) => sum + value, 0);
+	if (Math.abs(total - 1) > DISTRIBUTION_TOLERANCE) {
+		throw fieldError("answers.user_authorization.probabilities", `sums to ${total.toFixed(2)} rather than 1`);
+	}
+	if (labels.some(label => probabilities[label] > probabilities[level])) {
+		throw fieldError("answers.user_authorization.choice", "is not the option with the most probability");
+	}
 
 	const usage = usageFrom(result.usage);
 	return {
