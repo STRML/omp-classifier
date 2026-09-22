@@ -53,7 +53,7 @@ const SECRET_SEPARATED = /[_-]keys?$/iu;
  *  starts: `APITokenFile` reads as `API_Token_File`, `SSHKeyPath` as
  *  `SSH_Key_Path`. camelCase is a separator too. */
 const splitCamel = (name: string): string =>
-	name.replace(/([A-Z]+)([A-Z][a-z])/gu, "$1_$2").replace(/([a-z0-9])([A-Z])/gu, "$1_$2");
+	name.replace(/([A-Z])(?=[A-Z][a-z])/gu, "$1_").replace(/([a-z0-9])(?=[A-Z])/gu, "$1_");
 
 /** A secret word anywhere among a name's words: `CLIENT_SECRET_VALUE`,
  *  `GH_TOKEN_FILE`, `db.credentials.json`. Whole words only, so `tokens` in
@@ -96,16 +96,20 @@ const isSecretMarker = (name: string): boolean => HEADER_MARKER.test(name) || is
 
 /** A name then `:` or `=`, possibly quoted or JSON-escaped: `API_KEY=`,
  *  `"password":`, `Authorization:`. Dots belong to the name, so a config key
- *  like `aws.pwd` is asked about whole. */
-const NAME_THEN_SEPARATOR = /\b([A-Za-z0-9_.-]+)(?:\\?["'])?\s*[:=][ \t]*/gu;
+ *  like `aws.pwd` is asked about whole. The lookbehind starts a match only at
+ *  the start of a name, so a run like `a.a.a.a…` is scanned once rather than
+ *  once per `.`: linear time on input of any length. */
+const NAME_THEN_SEPARATOR = /(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+)(?:\\?["'])?\s*[:=][ \t]*/gu;
 /** A name as a command-line flag with its value after a space:
  *  `mysql --password hunter2`. It may open the text or a line. */
 const FLAG_THEN_VALUE = /(?:^|\s)--?([A-Za-z0-9_.-]+)[ \t]+(?=\S)/gu;
 
 /** `src/auth/token.ts:12:` is grep's file-and-line prefix, not a setting: a
- *  colon, then digits, then a colon. Only that exact shape is exempt, so
- *  `client.secret.json=hunter2` and `token.ts: hunter2` still redact. */
+ *  file name (it ends in an extension), a colon, digits, a colon. Only that
+ *  exact shape is exempt, so `client.secret.json=hunter2`, `token.ts: hunter2`
+ *  and `DB_PASSWORD:12:hunter2` still redact. */
 function isGrepLocation(line: string, match: RegExpMatchArray): boolean {
+	if (!/\.[A-Za-z0-9]{1,8}$/u.test(match[1])) return false;
 	const after = line.slice((match.index ?? 0) + match[1].length);
 	return /^:\d+:/u.test(after);
 }
@@ -148,7 +152,7 @@ const RULES: readonly Rule[] = [
 	{ pattern: /\bnpm_[A-Za-z0-9]{36}/gu, replace: whole },
 	{ pattern: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/gu, replace: whole },
 	// The password in a URL's userinfo. The user and host stay.
-	{ pattern: /(\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+(@)/giu, replace: (_m, head, at) => `${head}${REDACTED}${at}` },
+	{ pattern: /((?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+(@)/giu, replace: (_m, head, at) => `${head}${REDACTED}${at}` },
 ];
 
 
