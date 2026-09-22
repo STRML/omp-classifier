@@ -23,9 +23,11 @@ interface Rule {
 const whole = (): string => REDACTED;
 
 /** A name that says its value is a secret, with any prefix: `OPENAI_API_KEY`,
- *  `x-api-key`, `client_secret`, `DB_PASSWORD`. `token` has no plural here:
+ *  `x-api-key`, `client_secret`, `DB_PASSWORD`, and any `_KEY` or
+ *  `_PASSPHRASE` (`DJANGO_SECRET_KEY`, `SSH_PASSPHRASE`), a superset of the
+ *  floor's secret variable names. `token` has no plural here:
  *  `max_tokens` and `input_tokens` are usage counts tool results print. */
-const SECRET_NAME = String.raw`[A-Za-z0-9_-]*(?:api[_-]?keys?|apikeys?|token|secrets?|passwords?|passwd|pwd|private[_-]?keys?|access[_-]?keys?|credentials?)`;
+const SECRET_NAME = String.raw`[A-Za-z0-9_-]*(?:api[_-]?keys?|apikeys?|[_-]keys?|token|secrets?|passwords?|passphrases?|passwd|pwd|private[_-]?keys?|access[_-]?keys?|credentials?)`;
 
 /** Every marker that says "a secret follows", in one vocabulary shared by the
  *  text rules and the structural keys, so one can't know a name the other

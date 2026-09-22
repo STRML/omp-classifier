@@ -59,11 +59,11 @@ export interface FloorResult {
 }
 
 /** Secret-named environment variables (plan: `*_KEY`, `*_TOKEN`, `*_SECRET`,
- *  `*PASSWORD*`). Matched case-insensitively on the variable name. The
+ *  `*PASSWORD*`, and `*PASSPHRASE*`). Matched case-insensitively on the variable name. The
  *  separator is required, so a bare `$KEY` is not a source by its name alone:
  *  the case that matters, `KEY=$(security … -w)`, is covered by taint, which
  *  knows rather than guesses. */
-const SECRET_VAR = /_(api_?key|key|token|secret|credentials?)$|password/iu;
+const SECRET_VAR = /_(api_?key|key|token|secret|credentials?)$|password|passphrase/iu;
 
 /** Files whose contents are secrets. Also the Phase 4 script-read denylist. */
 const SECRET_FILE_BASENAMES = new Set([".netrc", ".npmrc", ".git-credentials", ".pgpass", "kubeconfig", "credentials"]);
