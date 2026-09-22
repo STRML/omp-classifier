@@ -124,6 +124,14 @@ describe("readDecisionLog", () => {
 			const bogusBranch = JSON.stringify(line({ decision: "allow", layer: "verdict", v3: { ...v3("SAFE", 3), branch: 9 as 3 } }));
 			fs.writeFileSync(file, `${bogusBranch}\n${good}\n`);
 			expect(readDecisionLog(file).malformed).toEqual([1]);
+			// Both shapes at once (#113): an error that also carries a decision,
+			// and a decision that also carries an error.
+			const errorAndDecision = JSON.stringify(line({ approval: "deny", v3: { ...v3("SAFE", 4), error: "timeout" } as never }));
+			const errorOnly = JSON.stringify(line({ decision: "allow", layer: "verdict", v3: { error: "timeout", ms: 25_000, live: "SAFE" } }));
+			fs.writeFileSync(file, `${errorAndDecision}\n${errorOnly}\n`);
+			const both = readDecisionLog(file);
+			expect(both.malformed).toEqual([1]);
+			expect(both.lines).toHaveLength(1);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

@@ -105,13 +105,24 @@ const VERDICTS = new Set(["SAFE", "UNSAFE", "UNSURE", "UNAVAILABLE"]);
  *  this report can count, so the line is unreadable rather than skipped. */
 const APPROVALS = new Set(["allow-once", "allow-session", "always-allow", "deny", "headless", "unavailable"]);
 
-/** A v3 record this report can read: an error, or a decision that names the
- *  live verdict it ran beside. A v3 without `live` can't be told from an
- *  outage, so it is unreadable rather than guessed. */
+/** The fields only a decision carries. An error record with any of them is
+ *  both shapes at once, and neither reading of it can be trusted. */
+const DECISION_FIELDS = ["verdict", "branch", "reasonCode", "authorization", "namedFirm", "literalMatched", "overlay"];
+
+/** A v3 record this report can read: exactly one of its two shapes. An error
+ *  carries only `error`, `ms` and `live`; a decision names the live verdict it
+ *  ran beside and carries no `error`. A v3 without `live` can't be told from
+ *  an outage, so it is unreadable rather than guessed. */
 function isShadowRecord(value: unknown): boolean {
 	if (typeof value !== "object" || value === null) return false;
 	const record = value as Record<string, unknown>;
-	if (typeof record.error === "string") return true;
+	if ("error" in record) {
+		return (
+			typeof record.error === "string" &&
+			DECISION_FIELDS.every(field => !(field in record)) &&
+			(record.live === undefined || (typeof record.live === "string" && VERDICTS.has(record.live)))
+		);
+	}
 	return (
 		typeof record.live === "string" &&
 		VERDICTS.has(record.live) &&
