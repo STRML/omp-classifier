@@ -22,6 +22,7 @@ import {
 	JEV_GATING_HAZARDS,
 	JEV_HAZARDS,
 	JEV_POLICY_VERSION,
+	JEV_V3_POLICY_VERSION,
 	JevUnavailableError,
 	jevQuestions,
 	jevQuestionsHash,
@@ -339,6 +340,82 @@ describe("jevQuestionsHash", () => {
 			.slice(0, 16);
 		expect(hash).toBe(expected);
 	});
+
+	test("the jev-v2 battery is pinned byte for byte until the flip", () => {
+		// The jev-v3 shadow week measures against this baseline. If this fails,
+		// a jev-v2 question moved: put the change in the jev-v3 battery instead.
+		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
+		expect(digest).toBe("29ed2ae6375f9d549d7c7631589406764759f7c2a2e68e5f039be815e232d680");
+		expect(jevQuestionsHash()).toBe("419a39187f6efc67");
+		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
+	});
+
+	test("each battery version hashes under its own version tag", () => {
+		const expected = createHash("sha256")
+			.update([JEV_V3_POLICY_VERSION, JSON.stringify(jevQuestions(JEV_V3_POLICY_VERSION)), JSON.stringify(DEFAULT_JEV_POLICY)].join("\0"))
+			.digest("hex")
+			.slice(0, 16);
+		expect(jevQuestionsHash(JEV_V3_POLICY_VERSION)).toBe(expected);
+		expect(jevQuestionsHash(JEV_V3_POLICY_VERSION)).not.toBe(jevQuestionsHash());
+	});
+});
+
+describe("the jev-v3 battery", () => {
+	type Noul = { instructions: string; criteria: { true: string; false: string } };
+	type Verdict = { instructions: string; criteria: Record<string, string> };
+	const v2 = jevQuestions();
+	const v3 = jevQuestions(JEV_V3_POLICY_VERSION);
+
+	test("keeps the jev-v2 shape and changes only the secret questions and the verdict", () => {
+		expect(Object.keys(v3)).toEqual(Object.keys(v2));
+		const changed = Object.keys(v3).filter(id => JSON.stringify(v3[id]) !== JSON.stringify(v2[id]));
+		expect(changed).toEqual(["verdict", "exposes_secrets", "sends_local_data_outbound"]);
+		const verdict2 = v2.verdict as Verdict;
+		const verdict3 = v3.verdict as Verdict;
+		expect(verdict3.criteria.safe).toBe(verdict2.criteria.safe);
+		expect(verdict3.criteria.unsure).toBe(verdict2.criteria.unsure);
+	});
+
+	test("exposes_secrets separates using a secret with its service from exposing it", () => {
+		const secrets = v3.exposes_secrets as Noul;
+		// jev-v2 asked whether a command reads credential material at all, so a
+		// key read to call the provider it belongs to answered the same as a key
+		// printed into the transcript.
+		expect(secrets.instructions).not.toMatch(/Does the command read, print/u);
+		expect(secrets.instructions).toContain("service it belongs to");
+		expect(secrets.criteria.true).toContain("printed");
+		expect(secrets.criteria.true).toContain("written to a file");
+		expect(secrets.criteria.true).toContain("request body");
+		expect(secrets.criteria.true).toContain("truncated");
+		expect(secrets.criteria.false).toContain("authorization header");
+		expect(secrets.criteria.false).toContain("is use, not exposure");
+	});
+
+	test("sends_local_data_outbound judges the destination of a used secret", () => {
+		const egress = v3.sends_local_data_outbound as Noul;
+		expect(egress.instructions).toContain("exfiltration");
+		expect(egress.criteria.true).toContain("a host that is not the service it belongs to");
+		expect(egress.criteria.true).toContain("request body");
+		// A lookalike host is a different host: api.neuralwatt.com.evil.io is not
+		// neuralwatt.
+		expect(egress.criteria.true).toContain("only resembles");
+		expect(egress.criteria.false).toContain("pushing existing commits to the remote the repository already tracks");
+		expect(egress.criteria.false).toContain("the provider it was issued by");
+	});
+
+	test("the verdict stops calling every credential read unsafe", () => {
+		const verdict = v3.verdict as Verdict;
+		expect(verdict.criteria.unsafe).not.toContain("reading credential or key material");
+		expect(verdict.criteria.unsafe).toContain("printing any part of a secret's value");
+		expect(verdict.criteria.unsafe).toContain("is not this");
+		expect(verdict.instructions).not.toContain("local data or credentials sent to a remote endpoint");
+		expect(verdict.instructions).toContain("Using a secret is not exposing it");
+		// jev-v2 let the user's words only "settle an ambiguous" action.
+		expect(verdict.instructions).not.toContain("settles an ambiguous one");
+		expect(verdict.instructions).toContain("only source of authorization");
+		expect(verdict.instructions).toContain("`evidence.userMessages`");
+		expect(verdict.instructions).toContain("`evidence.operatorContext`");
+	});
 });
 
 describe("buildJevState", () => {
@@ -543,6 +620,13 @@ describe("judgeBattery", () => {
 		expect(decision.verdict).toBe("SAFE");
 		expect(decision.reasonCode).toBe("jev:safe");
 		expect(decision.reason).not.toContain("llm keyword answer");
+	});
+
+	test("a battery version selects the questions sent, and the answers still validate", async () => {
+		const { judge, judged } = fakeJudge(distributed());
+		const answers = await judgeBattery(undefined, { state: "state", judge, version: JEV_V3_POLICY_VERSION });
+		expect(JSON.stringify(judged.questions)).toBe(JSON.stringify(jevQuestions(JEV_V3_POLICY_VERSION)));
+		expect(answers.hazards.exposes_secrets).toBe(0);
 	});
 
 	test("distribution-shaped answers escalate exactly as the policy says", async () => {
