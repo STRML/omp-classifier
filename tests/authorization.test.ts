@@ -69,7 +69,9 @@ describe("the summary names what the command does, from a fixed vocabulary", () 
 	});
 
 	test("a network target is the host, not the whole URL", () => {
-		expect(entry("curl -s https://api.example.com/v1/ping", "network")?.targets).toEqual(["api.example.com"]);
+		expect(entry("curl https://api.example.com/v1/ping", "network")?.targets).toEqual(["api.example.com"]);
+		// Any other argument is marked unnamed; the URL does not stand for it.
+		expect(entry("curl -s https://api.example.com/v1/ping", "network")?.targets).toEqual(["api.example.com", "unnamed-arguments"]);
 	});
 
 	test("the git and gh actions the plan separates stay separate", () => {
@@ -199,9 +201,53 @@ describe("the summary names what the command does, from a fixed vocabulary", () 
 	});
 
 	test("a URL host is named in any word, with no grammar needed", () => {
-		expect(entry("curl -s https://api.example.com/v1/x", "network")?.targets).toEqual(["api.example.com"]);
+		expect(entry("curl https://api.example.com/v1/x", "network")?.targets).toEqual(["api.example.com"]);
 		expect(entry("git clone https://github.com/o/r.git", "network")?.targets).toEqual(["git-clone", "github.com"]);
-		expect(entry("python3 fetch.py https://data.example.org/a.csv", "run-code")?.targets).toEqual(["python3", "data.example.org"]);
+		expect(entry("python3 fetch.py https://data.example.org/a.csv", "run-code")?.targets).toEqual(["python3", "data.example.org", "unnamed-arguments"]);
+	});
+
+	test("opposite requests from one CLI summarize differently (#94 review round 1)", () => {
+		const target = (command: string) => summarize(command).flatMap(action => action.targets)[0];
+		for (const [read, write] of [
+			["npm audit", "npm publish"],
+			["docker pull app:1", "docker push app:1"],
+			["gh repo view o/r", "gh repo delete o/r --yes"],
+			["kubectl get pods", "kubectl delete pod web-1"],
+			["aws s3 ls s3://bucket", "aws s3 rm s3://bucket/key"],
+			["terraform plan", "terraform apply -auto-approve"],
+		]) {
+			expect({ read, write, same: target(read) === target(write) }).toEqual({ read, write, same: false });
+		}
+		expect(entry("npm publish", "network")?.targets).toEqual(["npm-publish"]);
+		expect(entry("gh repo delete o/r --yes", "network")?.targets).toEqual(["gh-repo-delete", "yes", "unnamed-arguments"]);
+		expect(entry("kubectl delete pod web-1", "network")?.targets).toEqual(["kubectl-delete-pod", "unnamed-arguments"]);
+	});
+
+	test("a URL never hides the other arguments (#94 review round 1)", () => {
+		expect(entry("curl -X DELETE https://api.example.com/item", "network")?.targets).toEqual(["api.example.com", "unnamed-arguments"]);
+		expect(entry("git clone https://github.com/o/r.git dest", "network")?.targets).toEqual(["git-clone", "github.com", "unnamed-arguments"]);
+		expect(entry("gh api -X DELETE repos/o/r", "network")?.targets).toEqual(["gh-api", "unnamed-arguments"]);
+	});
+
+	test("every widening a git write carries is named (#94 review round 1)", () => {
+		expect(entry("git push --mirror origin", "git-publish")?.targets).toEqual(["origin", "mirror"]);
+		expect(entry("git push origin --delete main", "git-publish")?.targets).toEqual(["origin", "main", "delete"]);
+		expect(entry("git push -d origin main", "git-publish")?.targets).toContain("delete");
+		expect(entry("git push --tags origin", "git-publish")?.targets).toContain("tags");
+		expect(entry("git reset --hard HEAD~3", "write")?.targets).toEqual(["git-reset", "hard", "unnamed-arguments"]);
+		expect(entry("git clean -fdx", "write")?.targets).toEqual(["git-clean", "force"]);
+		expect(entry("gh pr merge 42 -d", "merge")?.targets).toEqual(["42", "delete"]);
+		// A short flag means force only where the grammar is known: to kubectl,
+		// `-f` is a file.
+		expect(entry("kubectl delete -f manifest.yaml", "network")?.targets).toEqual(["kubectl-delete", "unnamed-arguments"]);
+		expect(entry("docker rm --force web", "run-code")?.targets).toEqual(["docker-rm", "force", "unnamed-arguments"]);
+	});
+
+	test("a cut target list says it was cut (#94 review round 1)", () => {
+		const eight = entry("rm a1 a2 a3 a4 a5 a6 a7 a8", "delete")?.targets;
+		const nine = entry("rm a1 a2 a3 a4 a5 a6 a7 a8 prod", "delete")?.targets;
+		expect(eight).toHaveLength(8);
+		expect(nine).toEqual([...(eight ?? []), "more:1"]);
 	});
 
 	test("a widening flag survives into the summary", () => {

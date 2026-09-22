@@ -249,7 +249,7 @@ const GIT_READING_FLAG = /^(--get|--get-all|--get-regexp|--get-urls|--list|-l|-v
 const FLAG_TAKING_VALUE: Record<string, RegExp> = {
 	git: /^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix)$/u,
 	"git-push": /^(-o|--push-option|--repo|--receive-pack|--exec)$/u,
-	gh: /^(-R|--repo|-F|-f|-H|--field|--raw-field|--jq|--template|-t|--title|-b|--body|--body-file|-B|--base|--head|--subject|--match-head-commit|--author-email)$/u,
+	gh: /^(-R|--repo|-F|-f|-H|--field|--raw-field|--jq|--template|-t|--title|-b|--body|--body-file|-B|--base|--head|--subject|--match-head-commit|--author-email|-X|--method)$/u,
 	glab: /^(-R|--repo)$/u,
 };
 
@@ -261,7 +261,21 @@ const DEPLOY_NAME = /^(deploy|publish|release|ship)/u;
 const DEPLOY_SCRIPT = /(deploy|publish|release)[^/]*\.(sh|ts|js|mjs|py|rb)$/u;
 /** Flags that widen an action, worth carrying into the summary because the user
  *  has to have asked for the wide version. */
-const WIDENING_FLAG = /^(--(admin|force|force-with-lease|no-verify|hard|prod|production|yes|all)(=.*)?|-f)$/u;
+const WIDENING_LONG = /^--(admin|force|force-with-lease|force-if-includes|no-verify|hard|prod|production|yes|all|mirror|delete|delete-branch|tags|prune)(=.*)?$/u;
+/** Short spellings: a cluster carrying `f` (`-f`, `-fdx`) is force, `-d` is
+ *  delete (`git push -d`, `gh pr merge -d`), `-y` is yes. */
+const WIDENING_SHORT: ReadonlyArray<readonly [RegExp, string]> = [
+	[/^-[a-zA-Z]*f[a-zA-Z]*$/u, "force"],
+	[/^-d$/u, "delete"],
+	[/^-y$/u, "yes"],
+];
+
+/** CLIs whose first words are a subcommand path: `kubectl delete pod`, `aws s3
+ *  rm`, `npm publish`, `docker push`. Their path is what separates a read from
+ *  a publish or a delete, so it is named. */
+const SUBCOMMAND_CLI = /^(aws|gcloud|az|kubectl|helm|terraform|flyctl|heroku|vercel|netlify)$/u;
+const SUBCOMMAND_WORD = /^[a-z][a-z0-9-]*$/u;
+const SUBCOMMAND_DEPTH = 2;
 
 const URL = /^[a-z][a-z0-9+.-]*:\/\/([^/\s]+)/iu;
 
@@ -377,11 +391,28 @@ function operands(words: readonly string[], valued: RegExp | undefined): string[
 	return found;
 }
 
-/** The marker for an action that takes arguments this module cannot name,
- *  plus every URL host its words carry, which needs no grammar at all. */
-function unnamedTargets(words: readonly string[]): string[] {
-	const hosts = urlHosts(words);
-	return words.length > 1 && hosts.length === 0 ? [UNNAMED] : hosts;
+/**
+ * Every URL host in the arguments from `from` on, which needs no grammar, and
+ * the marker when any argument is something else. A URL does not stand for
+ * the rest: `curl -X DELETE https://api.example.com/item` is not the same
+ * request as a plain fetch of it, and the marker is what says so.
+ */
+function unnamedTargets(words: readonly string[], from = 1): string[] {
+	const args = words.slice(from);
+	const hosts = urlHosts(args);
+	return args.some(word => !URL.test(word)) ? [...hosts, UNNAMED] : hosts;
+}
+
+/**
+ * A subcommand CLI's verb and the plain words that lead its arguments, up to
+ * two: `kubectl-delete-pod`, `npm-publish`. No flag has appeared yet, so no
+ * flag's value can be among them, which is why this needs no option grammar.
+ * `from` is where the unnamed arguments start.
+ */
+function subcommandPath(words: readonly string[]): { path: string; from: number } {
+	let from = 1;
+	while (from < words.length && from <= SUBCOMMAND_DEPTH && SUBCOMMAND_WORD.test(words[from])) from += 1;
+	return { path: [basename(words[0]), ...words.slice(1, from)].join("-"), from };
 }
 
 function urlHosts(words: readonly string[]): string[] {
@@ -405,12 +436,9 @@ function classifyVerb(command: readonly ShellWord[]): RawAction {
 	if (DELETE_VERB.test(verb)) return { kind: "delete", targets: unnamedTargets(words) };
 	if (verb === "git") return gitAction(words);
 	if (/^(gh|glab)$/u.test(verb)) return ghAction(words, verb);
-	if (PACKAGE_MANAGER.test(verb)) {
-		return PACKAGE_NETWORK_SUBCOMMAND.test(sub) ? { kind: "network", targets: [verb, ...urlHosts(words)] } : { kind: "run-code", targets: [verb, ...unnamedTargets(words)] };
-	}
-	if (CONTAINER_VERB.test(verb)) {
-		return CONTAINER_NETWORK_SUBCOMMAND.test(sub) ? { kind: "network", targets: [verb, ...urlHosts(words)] } : { kind: "run-code", targets: [verb, ...unnamedTargets(words)] };
-	}
+	if (PACKAGE_MANAGER.test(verb)) return subcommandAction(words, PACKAGE_NETWORK_SUBCOMMAND.test(sub) ? "network" : "run-code");
+	if (CONTAINER_VERB.test(verb)) return subcommandAction(words, CONTAINER_NETWORK_SUBCOMMAND.test(sub) ? "network" : "run-code");
+	if (SUBCOMMAND_CLI.test(verb)) return subcommandAction(words, "network");
 	if (NETWORK_VERB.test(verb)) return { kind: "network", targets: unnamedTargets(words) };
 	if (SEARCH_VERB.test(verb)) return findAction(words, verb);
 	// The program text is never carried into the summary, only the verb that
@@ -421,6 +449,13 @@ function classifyVerb(command: readonly ShellWord[]): RawAction {
 	// name says nothing about what it does.
 	if (READ_VERB.test(verb) && !spelling.includes("/")) return { kind: "read", targets: unnamedTargets(words) };
 	return { kind: "other", targets: [spelling] };
+}
+
+function subcommandAction(words: readonly string[], kind: ActionKind): RawAction {
+	const { path, from } = subcommandPath(words);
+	// Long spellings only: `-f` is force to `docker rm` and a manifest file to
+	// `kubectl delete`, and which one is each tool's own grammar.
+	return { kind, targets: [path, ...wideningWords(words, false), ...unnamedTargets(words, from)] };
 }
 
 function gitAction(words: readonly string[]): RawAction {
@@ -440,14 +475,18 @@ function gitAction(words: readonly string[]): RawAction {
 		const forced = words.includes("-D") ? ["force"] : [];
 		return { kind: "branch-delete", targets: [...rest, ...forced] };
 	}
-	if (GIT_NETWORK_SUBCOMMAND.test(sub)) return { kind: "network", targets: [`git-${sub}`, ...urlHosts(words)] };
+	// Past the subcommand, git's per-subcommand grammar is not one this module
+	// has: the refs and paths are unnamed, and the widening is named, so
+	// `git reset --hard` and `git clean -fdx` are not a plain reset and clean.
+	const named = [`git-${sub}`, ...wideningWords(words), ...(rest.length > 0 ? unnamedTargets(["git", ...rest]) : [])];
+	if (GIT_NETWORK_SUBCOMMAND.test(sub)) return { kind: "network", targets: named };
 	if (GIT_AMBIGUOUS_SUBCOMMAND.test(sub)) {
 		const reading = words.some(word => GIT_READING_FLAG.test(word)) || rest.length === 0;
-		return { kind: reading ? "read" : "write", targets: [`git-${sub}`] };
+		return { kind: reading ? "read" : "write", targets: named };
 	}
-	if (GIT_READ_SUBCOMMAND.test(sub)) return { kind: "read", targets: [`git-${sub}`] };
-	if (GIT_WRITE_SUBCOMMAND.test(sub)) return { kind: "write", targets: [`git-${sub}`] };
-	return { kind: "other", targets: [`git-${sub}`] };
+	if (GIT_READ_SUBCOMMAND.test(sub)) return { kind: "read", targets: named };
+	if (GIT_WRITE_SUBCOMMAND.test(sub)) return { kind: "write", targets: named };
+	return { kind: "other", targets: named };
 }
 
 function ghAction(words: readonly string[], verb: string): RawAction {
@@ -455,9 +494,14 @@ function ghAction(words: readonly string[], verb: string): RawAction {
 	const sub = args[0] ?? "";
 	if (sub === "pr" && args[1] === "merge") {
 		const numbers = args.slice(2).filter(word => /^\d+$/u.test(word));
-		return { kind: "merge", targets: [...numbers, ...wideningWords(words)] };
+		const unnamed = args.slice(2).some(word => !/^\d+$/u.test(word)) ? [UNNAMED] : [];
+		return { kind: "merge", targets: [...numbers, ...wideningWords(words), ...unnamed] };
 	}
-	return { kind: "network", targets: [`${verb}-${sub}`.replace(/-$/u, "")] };
+	// `gh repo view` and `gh repo delete` are opposite requests, so the
+	// subcommand path is named to its second word.
+	const depth = SUBCOMMAND_WORD.test(args[1] ?? "") ? 2 : 1;
+	const path = [verb, ...args.slice(0, depth)].join("-");
+	return { kind: "network", targets: [path, ...wideningWords(words), ...unnamedTargets(["gh", ...args.slice(depth)])] };
 }
 
 /** `find` and `fd` run other commands when asked, and `find` deletes when
@@ -483,10 +527,15 @@ function deployTargets(words: readonly string[], verb: string): string[] {
  *  `--force-with-lease=main` and `--force` are one request, and recognizing
  *  only the bare long form made a force push and an ordinary push the same
  *  summary. */
-function wideningWords(words: readonly string[]): string[] {
-	return words
-		.filter(word => WIDENING_FLAG.test(word))
-		.map(word => (word === "-f" ? "force" : word.replace(/^--/u, "").replace(/=.*$/u, "").replace(/-with-lease$/u, "")));
+function wideningWords(words: readonly string[], short = true): string[] {
+	const found: string[] = [];
+	for (const word of words) {
+		const long = WIDENING_LONG.exec(word);
+		const shortName = short ? WIDENING_SHORT.find(([pattern]) => pattern.test(word))?.[1] : undefined;
+		const name = long !== null ? long[1].replace(/-with-lease$|-if-includes$/u, "") : shortName;
+		if (name !== undefined && !found.includes(name)) found.push(name);
+	}
+	return found;
 }
 
 /** Group the raw actions by kind, in ACTION_KINDS order so two commands with
@@ -498,6 +547,7 @@ function collect(raw: readonly RawAction[]): ActionSummaryEntry[] {
 		if (mine.length === 0) continue;
 		const targets: string[] = [];
 		let count = 0;
+		let overflow = 0;
 		for (const action of mine) {
 			const presented = action.targets.map(presentTarget).filter(target => target.length > 0);
 			// One classified action is one action, however many targets it
@@ -506,9 +556,15 @@ function collect(raw: readonly RawAction[]): ActionSummaryEntry[] {
 			// contradicts what `count` is documented to mean.
 			count += 1;
 			for (const target of presented) {
-				if (!targets.includes(target) && targets.length < TARGETS_PER_KIND) targets.push(target);
+				if (targets.includes(target)) continue;
+				if (targets.length < TARGETS_PER_KIND) targets.push(target);
+				else overflow += 1;
 			}
 		}
+		// A cut list says it was cut. Without the marker, `rm a b c d e f g h
+		// prod` and the same delete without `prod` read identically, and the
+		// model could judge every target covered.
+		if (overflow > 0) targets.push(`more:${overflow}`);
 		entries.push({ kind, count, targets });
 	}
 	return entries;
