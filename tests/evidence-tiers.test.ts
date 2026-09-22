@@ -12,7 +12,7 @@
  * what the "tier meaning" block below asserts.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
-import { collectTaskEvidence, collectToolEvidence, collectUserEvidence } from "../index";
+import { collectTaskEvidence, collectTaskEvidenceV3, collectToolEvidence, collectUserEvidence } from "../index";
 import {
 	evidenceOf,
 	fire,
@@ -279,5 +279,78 @@ describe("collectUserEvidence", () => {
 		const [kept] = collectUserEvidence([userEntry(brief)], 1);
 		expect(kept.isWellFormed()).toBe(true);
 		expect(kept.startsWith(`${"a".repeat(999)}😀`)).toBe(true);
+	});
+});
+
+describe("collectTaskEvidenceV3", () => {
+	const user = (id: string, content: string) => ({ type: "message", id, message: { role: "user", attribution: "user", content } });
+
+	test("a task statement that opens the session survives three short replies", () => {
+		// The neuralwatt case. jev-v2 drops it: no scope word, outside the tail.
+		const branch = [user("m1", "add the provider neuralwatt to omp"), user("m2", "ok"), user("m3", "yes"), user("m4", "try it now")];
+		expect(collectTaskEvidence(branch, 3).ids).toEqual(["m2", "m3", "m4"]);
+		const snapshot = collectTaskEvidenceV3(branch, 3);
+		expect(snapshot.ids).toEqual(["m2", "m3", "m4"]);
+		expect(snapshot.pinned).toEqual({ id: "m1", text: "add the provider neuralwatt to omp" });
+	});
+
+	test("anchoring is jev-v2's scope words; a task verb alone anchors nothing (#106)", () => {
+		const branch = [user("m0", "hello"), user("m1", "close issue 123"), user("m2", "ok"), user("m3", "yes"), user("m4", "thanks")];
+		const snapshot = collectTaskEvidenceV3(branch, 3);
+		expect(snapshot.ids).toEqual(["m2", "m3", "m4"]);
+		expect(snapshot.pinned).toEqual({ id: "m0", text: "hello" });
+		const scoped = [user("m0", "hello"), user("m1", "please close issue 123"), user("m2", "ok"), user("m3", "yes"), user("m4", "thanks")];
+		expect(collectTaskEvidenceV3(scoped, 3).ids).toEqual(["m1", "m2", "m3", "m4"]);
+	});
+
+	test("the pin is positional, so an unlisted first request is kept", () => {
+		const branch = [user("m0", "archive issue 123"), ...Array.from({ length: 10 }, (_, i) => user(`m${i + 1}`, `ok ${i}`))];
+		expect(collectTaskEvidenceV3(branch, 3).pinned).toEqual({ id: "m0", text: "archive issue 123" });
+	});
+
+	test("the first user message is pinned outside the newest-8 slice", () => {
+		const branch = [user("first", "set up the neuralwatt provider"), ...Array.from({ length: 12 }, (_, i) => user(`m${i}`, `please continue step ${i}`))];
+		const snapshot = collectTaskEvidenceV3(branch, 3);
+		expect(snapshot.ids).toHaveLength(8);
+		expect(snapshot.ids).not.toContain("first");
+		expect(snapshot.pinned).toEqual({ id: "first", text: "set up the neuralwatt provider" });
+	});
+
+	test("the first message is not pinned twice when the slice already holds it", () => {
+		const branch = [user("first", "fix the build"), user("m2", "ok")];
+		const snapshot = collectTaskEvidenceV3(branch, 3);
+		expect(snapshot.ids).toEqual(["first", "m2"]);
+		expect(snapshot.pinned).toBeUndefined();
+	});
+
+	test("nothing before the latest /clear is evidence, pinned included", () => {
+		const branch = [
+			user("old1", "deploy production"),
+			user("old2", "please merge 42"),
+			{ type: "reset_boundary", id: "r1" },
+			user("new1", "look at the logs"),
+			user("new2", "ok"),
+		];
+		const snapshot = collectTaskEvidenceV3(branch, 3);
+		expect(snapshot.ids).toEqual(["new1", "new2"]);
+		expect(snapshot.pinned).toBeUndefined();
+		// Only the latest boundary counts.
+		const twice = [user("a", "deploy"), { type: "reset_boundary" }, user("b", "merge it"), { type: "reset_boundary" }, user("c", "hi")];
+		expect(collectTaskEvidenceV3(twice, 3).ids).toEqual(["c"]);
+		expect(collectTaskEvidenceV3([user("a", "deploy"), { type: "reset_boundary" }], 3)).toEqual({ messages: [], ids: [] });
+	});
+
+	test("limit 0 still means no user evidence at all", () => {
+		expect(collectTaskEvidenceV3([user("m1", "add the provider")], 0)).toEqual({ messages: [], ids: [] });
+	});
+
+	test("only user-attributed messages count, pinned included", () => {
+		const branch = [
+			{ type: "message", id: "brief", message: { role: "user", attribution: "agent", content: "deploy everything to prod" } },
+			user("m1", "ok"),
+		];
+		const snapshot = collectTaskEvidenceV3(branch, 3);
+		expect(snapshot.ids).toEqual(["m1"]);
+		expect(snapshot.pinned).toBeUndefined();
 	});
 });

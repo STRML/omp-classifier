@@ -4,6 +4,13 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-22
 
+### The jev-v3 evidence builder
+
+- New `collectTaskEvidenceV3`: Phase 2 step 6. It reads only what follows the latest `/clear` (`reset_boundary`), the way the host rebuilds model context. The jev-v2 collectors don't, which #103 tracks.
+- The first user message since `/clear` is pinned outside the newest-8 slice when the slice drops it, so a session that opens with "add the provider neuralwatt" keeps that request after three short replies. The pin reaches the judges and never a literal match. Agent-attributed messages still don't count.
+- The plan also asked for task verbs in the anchor pattern. Four review rounds showed a verb list can't converge: each fix traded one miss for another. Anchoring stays jev-v2's scope words, and a task stated mid-session still ages out as it does today. #106 holds the history and the directions for a brainstorm.
+- `collectTaskEvidence` is unchanged, because the jev-v2 shadow baseline reads it. Nothing calls the new builder yet; step 8 does.
+
 ### The jev-v3 decision order
 
 - New `decision-order.ts`: Phase 2 step 5, the plan's seven-branch decision order for jev-v3. `deriveDecisionOrder` is pure. It reads the jev-v3 risk answers, `deriveAuthorization`'s level, the literal-match result, the overlay flags and `headless`. First match wins: injection, then a one-hot hazard, jev-v2's safe gate, a firm `named` over a fully matched command, the reviewer for `named` or `goal`, overlay flags with no authorization, and last jev-v2's own derivation. Every decision carries its `branch` and a reason code starting `jev-v3:<branch>:`.
