@@ -126,7 +126,7 @@ Only standalone user text counts. Fenced code blocks, `>` quotes, and pasted blo
 3. The safe gate passes as today, with no overlay flags → SAFE.
 4. Authorization `named` with p(`named`) at or above `namedMinProbability` (default 0.8, in `JevPolicy`), no overlay flags, at least one extracted action, and every segment matched or inert → SAFE. Exception: in a headless session, a hazard at or above `hazardBlock` or p(unsafe) at or above `unsafeMinProbability` goes to the reviewer instead.
 5. Authorization `named` or `goal` → reviewer. This includes every command with overlay flags.
-6. Overlay flags with authorization `none` → UNSURE (a dialog, as today).
+6. Overlay flags with authorization `none`, and today's derivation is not UNSAFE → UNSURE (a dialog, as today). An UNSAFE falls through to branch 7 and keeps its refusal (#108).
 7. Otherwise, today's derivation (`jev.ts:650-687`).
 
 Every branch writes a reason code naming its number.
@@ -228,10 +228,10 @@ A one-hot UNSAFE and a one-hot UNSURE show the same dialog today, and both block
 2. The segment parser, the inert allowlist, and the local-action literal match.
 3. The `user_authorization` request over user messages and the typed action summary. `namedMinProbability` lives in the authorization module's own policy until the flip, not in `JevPolicy`: `jevQuestionsHash` folds `DEFAULT_JEV_POLICY` into the cache key and the audit fingerprint, so adding a key there would invalidate every cached `jev-v2` verdict during the shadow week the week exists to measure.
 4. In the `jev-v3` battery only, rewrite `exposes_secrets` and `sends_local_data_outbound` to separate using a secret with its service from printing or relocating it. Rewrite the verdict text at `jev.ts:232`, `jev.ts:236`, and `jev.ts:247`.
-5. The decision order under `jev-v3`, on the bash path and the `eval` tool path (`index.ts:4215-4262`) alike. Until Phase 3 lands, branch 5 means UNSURE.
-6. In the `jev-v3` evidence builder only, pin the first user message outside the newest-8 slice (`index.ts:1393-1395`) and widen the anchor pattern with task verbs. `collectTaskEvidence` stays as it is for `jev-v2`.
+5. The decision order under `jev-v3`, on the bash path and the `eval` tool path (`index.ts:4215-4262`) alike. Until Phase 3 lands, branch 5 means UNSURE. Shipped as a pure module in #104; the wiring into both tool paths moved to step 8, which logs what it computes.
+6. In the `jev-v3` evidence builder only, pin the first user message outside the newest-8 slice (`index.ts:1393-1395`) and widen the anchor pattern with task verbs. `collectTaskEvidence` stays as it is for `jev-v2`. Shipped in #101 without the task verbs: four review rounds showed a verb list trading one miss for another, and #106 holds the problem for a brainstorm. The builder also starts after the latest `/clear`.
 7. Live change, shipped as its own PR with policy version `jev-v2.2`: redact secret-shaped values from tool evidence before any judge state (`index.ts:1459` sends up to 700 characters today). It is a security fix that should not wait for the flip, and the version bump marks the shadow baseline's one change.
-8. Shadow logging and `eval/live-report.ts`.
+8. Shadow logging and `eval/live-report.ts`. The shadow runs on every fresh classification behind the `shadowV3` config key, on by default, at the cost of two more Jev requests per classification.
 
 ### Phase 3: reviewer bake-off (about 2 days)
 

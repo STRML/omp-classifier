@@ -25,6 +25,7 @@ import { TYPESAFE_PROVIDER, tokenUsage, typesafeModel } from "@oh-my-pi/pi-ai";
 import type { Judge, JudgeOptions, JudgmentRequest, JudgmentResult, Questions } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { JudgeDeps } from "@oh-my-pi/pi-coding-agent/judgment";
+import { JEV_V3_POLICY_VERSION, jevQuestions } from "../jev";
 
 export type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "UNAVAILABLE";
 
@@ -216,6 +217,31 @@ export interface CapturedJevRequest {
 }
 
 export const modelCalls: CapturedJevRequest[] = [];
+
+/**
+ * Requests from the jev-v3 shadow (plan Phase 2 step 8), kept apart from
+ * `modelCalls`, which counts the live judgment only. A shadow request is
+ * answered here without touching the live script: it never uses up a scripted
+ * failure, a queued answer, or the delay, so every live assertion reads the
+ * same with the shadow on or off.
+ */
+export const shadowCalls: CapturedJevRequest[] = [];
+const V3_VERDICT_QUESTION = JSON.stringify(jevQuestions(JEV_V3_POLICY_VERSION).verdict);
+const isShadowRequest = (questions: Record<string, unknown>): boolean =>
+	"user_authorization" in questions || JSON.stringify(questions.verdict) === V3_VERDICT_QUESTION;
+const DEFAULT_SHADOW_AUTHORIZATION = { choice: "none", probabilities: { none: 0.9, goal: 0.05, named: 0.05 }, confidence: 0.9 };
+let shadowAuthorization: Record<string, unknown> = { ...DEFAULT_SHADOW_AUTHORIZATION };
+let shadowFails = false;
+
+/** Script the shadow's authorization answer. */
+export function setShadowAuthorization(choice: "none" | "goal" | "named", probabilities: Record<string, number>, confidence = 0.9): void {
+	shadowAuthorization = { choice, probabilities, confidence };
+}
+
+/** Make every shadow request fail, to prove the live path does not notice. */
+export function setShadowFailure(fail: boolean): void {
+	shadowFails = fail;
+}
 
 /**
  * The `JudgeDeps` every context-resolved judge was built from, in call order.
@@ -443,6 +469,18 @@ const scriptedJudge: Judge & { readonly kind: "typesafe" } = {
 		// one nothing was ever sent, and a capture here would claim otherwise.
 		if (!jevApiKeyPresent) throw new Error("no TypeSafe credential for provider typesafe");
 		const questions = request.questions as Record<string, unknown>;
+		if (isShadowRequest(questions)) {
+			shadowCalls.push({ state: request.state, questions, model: typesafeModel() });
+			if (shadowFails) throw new Error("shadow judge unavailable");
+			const answers = "user_authorization" in questions ? { user_authorization: { type: "choice", ...shadowAuthorization } } : jevDefaultAnswers;
+			return {
+				api: jevAnsweringApi,
+				provider: TYPESAFE_PROVIDER,
+				model: JEV_FIXTURE_MODEL,
+				answers: answers as unknown as JudgmentResult<Q>["answers"],
+				usage: tokenUsage(528, 126),
+			};
+		}
 		modelCalls.push({ state: request.state, questions, model: typesafeModel() });
 		const scripted = await scriptedJudgement(questions, options?.signal);
 		if (scripted.kind === "status") throw statusError(scripted.status, scripted.body);
@@ -559,6 +597,9 @@ export async function loadPlugin(settings: Record<string, unknown>): Promise<voi
 	handlers.clear();
 	registeredCommands.clear();
 	modelCalls.length = 0;
+	shadowCalls.length = 0;
+	shadowAuthorization = { ...DEFAULT_SHADOW_AUTHORIZATION };
+	shadowFails = false;
 	resolvedJudgeDeps.length = 0;
 	// Every stub knob resets here: each test file's beforeEach loadPlugin()
 	// then starts from the pristine default, so no file can inherit another's
