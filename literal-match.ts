@@ -24,8 +24,8 @@
  * extract it and a force push goes to the reviewer. Branch delete, which is
  * local, still matches. Filed to reconcile the plan text.
  */
-import { tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 import { isSecretPath } from "./floor";
+import { parseShell, type ShellCommand } from "./shell-ast";
 
 export type ActionKind = "delete" | "branch-delete" | "merge" | "deploy";
 
@@ -107,14 +107,18 @@ const CANCEL_WORDS = new Set([
 const WIDENING_FLAG = /^--(admin|force|force-with-lease|no-verify|hard|prod|production)$/u;
 
 export function literalMatch(input: LiteralMatchInput): LiteralMatchResult {
-	const segments = tokenizeShellSegments(input.command).filter(tokens => tokens.length > 0);
+	const parsed = parseShell(input.command);
+	if (!parsed.ok) {
+		return { matched: false, actions: [], incomplete: [input.command], reason: `the shell parser could not read the command: ${parsed.reason}` };
+	}
 	const actions: ExtractedAction[] = [];
 	const incomplete: string[] = [];
 
-	for (const tokens of segments) {
-		const extracted = extractActions(tokens, input);
+	for (const command of parsed.commands) {
+		const tokens = plainTokens(command);
+		const extracted = tokens === undefined ? undefined : extractActions(tokens, input);
 		if (extracted === undefined) {
-			incomplete.push(tokens.join(" "));
+			incomplete.push(command.unreadShape ?? command.words.map(word => word.source).join(" "));
 			continue;
 		}
 		actions.push(...extracted);
@@ -136,6 +140,20 @@ export function literalMatch(input: LiteralMatchInput): LiteralMatchResult {
 		}
 	}
 	return { matched: true, actions, incomplete, reason: `every segment matched: ${actions.map(a => `${a.kind} ${a.target}`).join(", ")}` };
+}
+
+/**
+ * A command's words as plain text, or undefined when the command does more
+ * than its words say. A redirect writes somewhere, an assignment sets state,
+ * an expansion is a value nobody here has read, and a command inside a
+ * substitution runs for a word of another command. Each of those makes the
+ * command incomplete. So does a shape the parser could not decompose.
+ */
+function plainTokens(command: ShellCommand): string[] | undefined {
+	if (command.nested || command.unreadShape !== undefined) return undefined;
+	if (command.redirects.length > 0 || command.assigns.length > 0) return undefined;
+	if (command.words.length === 0 || command.words.some(word => !word.literal)) return undefined;
+	return command.words.map(word => word.value);
 }
 
 /** Returns the actions in this segment, or undefined when the segment is
