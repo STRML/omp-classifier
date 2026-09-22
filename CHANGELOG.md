@@ -4,6 +4,13 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-22
 
+### The jev-v3 decision order
+
+- New `decision-order.ts`: Phase 2 step 5, the plan's seven-branch decision order for jev-v3. `deriveDecisionOrder` is pure. It reads the jev-v3 risk answers, `deriveAuthorization`'s level, the literal-match result, the overlay flags and `headless`. First match wins: injection, then a one-hot hazard, jev-v2's safe gate, a firm `named` over a fully matched command, the reviewer for `named` or `goal`, overlay flags with no authorization, and last jev-v2's own derivation. Every decision carries its `branch` and a reason code starting `jev-v3:<branch>:`.
+- Branch 5 is UNSURE until Phase 3 builds the reviewer, and it never records a refusal. A one-hot risk answer that flags anything is UNSAFE without a refusal. In a headless session, a block-band hazard or an unsafe-leaning verdict skips the fast allow and goes to branch 5. The eval tool has no literal match, so it never takes branch 4.
+- `judgeJevV3` in `jev-judge.ts` asks the jev-v3 battery and the authorization question in parallel, each over its own state. A failed risk request throws `JevUnavailableError`. A failed authorization request leaves the risk answer standing and reports `authorization: undefined`, which reads as `none`.
+- `deriveJevDecision` is unchanged, and with authorization `none` and no overlay flags the new order returns jev-v2's verdict. Nothing calls either function from `index.ts` yet. Step 8 wires both tool paths in shadow and logs the result.
+
 ### The jev-v3 battery
 
 - New battery version `jev-v3`, selected by `jevQuestions(version)` and `jevQuestionsHash(version)`. It's Phase 2 step 4 of the intent-aware judgment plan. Nothing live asks it yet; step 5 gives it a decision order and runs it in shadow.
