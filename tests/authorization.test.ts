@@ -193,8 +193,10 @@ describe("the summary names what the command does, from a fixed vocabulary", () 
 		// read as a flag. ssh's are not: the plan's row is that `-p 2222` must
 		// not come back as the host, so ssh names nothing at all.
 		expect(kinds("git -C /repo push origin main")).toEqual(["git-publish"]);
-		expect(entry("git -C /repo push origin main", "git-publish")?.targets).toEqual(["origin", "main"]);
-		expect(entry("git push -o ci.skip origin main", "git-publish")?.targets).toEqual(["origin", "main"]);
+		// `-C /repo` is accounted for by git's grammar but not named, so it is
+		// covered by the marker rather than dropped.
+		expect(entry("git -C /repo push origin main", "git-publish")?.targets).toEqual(["origin", "main", "unnamed-arguments"]);
+		expect(entry("git push -o ci.skip origin main", "git-publish")?.targets).toEqual(["origin", "main", "unnamed-arguments"]);
 		expect(entry("ssh -p 2222 host.example uptime", "network")?.targets).toEqual(["unnamed-arguments"]);
 		expect(entry("scp artifact.tar host.example:/srv", "network")?.targets).toEqual(["unnamed-arguments"]);
 		expect(entry("python3 -W ignore script.py", "run-code")?.targets).toEqual(["python3", "unnamed-arguments"]);
@@ -241,6 +243,37 @@ describe("the summary names what the command does, from a fixed vocabulary", () 
 		// `-f` is a file.
 		expect(entry("kubectl delete -f manifest.yaml", "network")?.targets).toEqual(["kubectl-delete", "unnamed-arguments"]);
 		expect(entry("docker rm --force web", "run-code")?.targets).toEqual(["docker-rm", "force", "unnamed-arguments"]);
+	});
+
+	test("every word is named or marked unnamed, never dropped (#94 review round 2)", () => {
+		const target = (command: string) => JSON.stringify(summarize(command).flatMap(action => action.targets));
+		for (const [a, b] of [
+			["npm --silent audit", "npm --silent publish"],
+			["docker --debug pull app:1", "docker --debug push app:1"],
+			["gh api https://api.github.com/repos/o/r", "gh api -X DELETE https://api.github.com/repos/o/r"],
+		]) {
+			expect({ a, b, same: target(a) === target(b) }).toEqual({ a, b, same: false });
+		}
+		expect(entry("npm --silent audit", "network")?.targets).toEqual(["npm-audit", "unnamed-arguments"]);
+		expect(entry("gh api -X DELETE https://api.github.com/repos/o/r", "network")?.targets).toEqual(["gh-api", "api.github.com", "unnamed-arguments"]);
+		// A flag this module cannot name is covered, not dropped. `--soft` and
+		// no flag at all both read as "arguments not named", which is true.
+		expect(entry("git reset --soft HEAD~1", "write")?.targets).toEqual(["git-reset", "unnamed-arguments"]);
+		// Flag position does not change the summary of one request.
+		expect(target("git push --force origin main")).toBe(target("git push origin main --force"));
+	});
+
+	test("a deploy-named script is named wherever it sits", () => {
+		expect(entry("bash deploy.sh --prod", "run-code")?.targets).toEqual(["bash", "deploy.sh", "unnamed-arguments"]);
+		expect(entry("bash scripts/rsync-to-prod.sh dist/", "run-code")?.targets).toEqual(["bash", "unnamed-arguments"]);
+	});
+
+	test("a short flag widens only where its tool's grammar says so (#94 review round 2)", () => {
+		for (const command of ["git config -f other.cfg --get x", "gh api -f name=v repos/o/r", "./deploy.sh -cf config.yml", "git commit -m fix"]) {
+			const targets = summarize(command).flatMap(action => action.targets);
+			expect({ command, force: targets.includes("force") }).toEqual({ command, force: false });
+		}
+		expect(entry("git push -uf origin main", "git-publish")?.targets).toContain("force");
 	});
 
 	test("a cut target list says it was cut (#94 review round 1)", () => {
