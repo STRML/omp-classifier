@@ -12,11 +12,14 @@
  * the answers, and their provenance.
  *
  * Invariants it keeps:
- *   - One judge call per classification, carrying the whole battery
- *     (jevQuestions(): one Choice, nine Nouls, one Score). Questions in a
- *     request are answered in parallel over the same state, so batching is the
- *     natural shape — and it is the only shape that cannot ask a question the
- *     policy then reads by a different name.
+ *   - One judge call per battery, carrying the whole battery (jevQuestions():
+ *     one Choice, nine Nouls, one Score). Questions in a request are answered
+ *     in parallel over the same state, so batching is the natural shape — and
+ *     it is the only shape that cannot ask a question the policy then reads by
+ *     a different name. The authorization question (judgeAuthorization) is a
+ *     second request rather than a tenth question for the same reason read the
+ *     other way: it is asked over a different state, one with no command text
+ *     in it, and one request carries one state.
  *   - The same strict validation the old HTTP transport performed, because the
  *     answer set now arrives from a text bridge as often as from a server. Every
  *     field the policy reads is checked, a missing hazard is a throw rather than
@@ -49,6 +52,11 @@ import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { type JudgeDeps, resolveJudge } from "@oh-my-pi/pi-coding-agent/judgment";
 import { ONLINE_MEMORY_MODEL_KEY } from "@oh-my-pi/pi-coding-agent/tiny/models";
+import {
+	jevAuthorizationQuestions,
+	type JevAuthorizationAnswer,
+	type JevAuthorizationLevel,
+} from "./authorization";
 import {
 	JEV_HAZARDS,
 	JevUnavailableError,
@@ -126,6 +134,82 @@ export async function judgeBattery(signal: AbortSignal | undefined, options: Jud
 	// Measured across the whole call, so latencyMs is what the classification
 	// waited for the judgment rather than the time to the first answer.
 	return toJevAnswers(result, battery, Math.round(performance.now() - startedAt));
+}
+
+/**
+ * The authorization battery as the native module types it: one choice question,
+ * whose option labels are the plan's three levels.
+ */
+type AuthorizationBattery = Questions & { user_authorization: ChoiceQuestion<JevAuthorizationLevel> };
+
+/**
+ * Ask the authorization question about one authorization state.
+ *
+ * A second request rather than a question added to the risk battery, because
+ * the two are asked over different states: this one never sees the command
+ * text, and the risk battery does. Questions in one request are answered over
+ * one state, so separating the states means separating the requests.
+ *
+ * Throws `JevUnavailableError` on every failure, exactly as `judgeBattery`
+ * does. The caller maps a throw to authorization `none`
+ * (`deriveAuthorization(undefined, …)`): a risk judgment that succeeded still
+ * decides, and the command loses only its fast path.
+ */
+export async function judgeAuthorization(signal: AbortSignal | undefined, options: JudgeBatteryOptions): Promise<JevAuthorizationAnswer> {
+	const judge = options.judge ?? judgeForClassification(options);
+	const battery = jevAuthorizationQuestions() as AuthorizationBattery;
+	const startedAt = performance.now();
+	let result: JudgmentResult<AuthorizationBattery>;
+	try {
+		result = await judge.judge({ state: options.state as JudgmentState, questions: battery }, { signal });
+	} catch (err) {
+		throw new JevUnavailableError(`authorization judgment failed: ${err instanceof Error ? err.message : String(err)}`);
+	}
+	return toAuthorizationAnswer(result, battery, Math.round(performance.now() - startedAt));
+}
+
+function toAuthorizationAnswer(
+	result: JudgmentResult<AuthorizationBattery>,
+	battery: AuthorizationBattery,
+	latencyMs: number,
+): JevAuthorizationAnswer {
+	const fieldError = (field: string, problem: string): JevUnavailableError =>
+		new JevUnavailableError(`authorization answer field ${field} ${problem}`);
+	const model = result.model;
+	if (typeof model !== "string" || model === "") throw fieldError("model", "is missing or not a non-empty string");
+	const answers = asRecord(result.answers);
+	if (answers === undefined) throw fieldError("answers", "is missing or not an object");
+	const answer = asRecord(answers.user_authorization);
+	if (answer === undefined) throw fieldError("answers.user_authorization", "is missing or not an object");
+	if (answer.type !== "choice") throw fieldError("answers.user_authorization.type", 'is missing or not "choice"');
+
+	// The labels come from the question that was asked, not from a constant
+	// here: every level the policy reads by name was in the battery.
+	const labels = Object.keys(battery.user_authorization.criteria) as JevAuthorizationLevel[];
+	const rawLevel = answer.choice;
+	const level = typeof rawLevel === "string" ? labels.find(label => label === rawLevel) : undefined;
+	if (level === undefined) throw fieldError("answers.user_authorization.choice", "is missing or not one of the question's options");
+	const rawProbabilities = asRecord(answer.probabilities);
+	if (rawProbabilities === undefined) throw fieldError("answers.user_authorization.probabilities", "is missing or not an object");
+	const probabilities: Record<string, number> = {};
+	for (const label of labels) {
+		const value = unitNumber(rawProbabilities[label]);
+		if (value === undefined) throw fieldError(`answers.user_authorization.probabilities.${label}`, "is missing or not a number in 0..1");
+		probabilities[label] = value;
+	}
+	const confidence = unitNumber(answer.confidence);
+	if (confidence === undefined) throw fieldError("answers.user_authorization.confidence", "is missing or not a number in 0..1");
+
+	const usage = usageFrom(result.usage);
+	return {
+		model,
+		level,
+		probabilities,
+		confidence,
+		...(usage === undefined ? {} : { usage }),
+		latencyMs,
+		oneHot: result.api !== TYPESAFE_PROVIDER,
+	};
 }
 
 /**
