@@ -271,10 +271,12 @@ const WIDENING_LONG = /^--(admin|force|force-with-lease|force-if-includes|no-ver
  */
 type ShortWidening = ReadonlyArray<readonly [RegExp, string]>;
 const NO_SHORT: ShortWidening = [];
-const FORCE_CLUSTER = /^-[a-zA-Z]*f[a-zA-Z]*$/u;
+/** Exact spellings only. A cluster such as `-fdx` could carry a flag that
+ *  takes a value (`git push -of` is `-o f`), and splitting one needs each
+ *  flag's arity, so a cluster is an unnamed argument. */
 const SHORT_WIDENING: Record<string, ShortWidening> = {
-	"git-push": [[FORCE_CLUSTER, "force"], [/^-d$/u, "delete"]],
-	"git-clean": [[FORCE_CLUSTER, "force"]],
+	"git-push": [[/^-f$/u, "force"], [/^-d$/u, "delete"]],
+	"git-clean": [[/^-f$/u, "force"]],
 	"gh-pr-merge": [[/^-d$/u, "delete"]],
 };
 
@@ -446,23 +448,16 @@ function takeWidening(words: readonly string[], short: ShortWidening, taken: Tak
 }
 
 /**
- * A subcommand CLI's path: the verb and its first two plain words,
- * `kubectl-delete-pod`, `npm-audit`. A leading flag is skipped rather than
- * ending the path, because `npm --silent audit` and `npm --silent publish`
- * are opposite requests. The skipped flag stays unnamed, and if it took a
- * value, that value can stand in the path, which is why the path carries the
- * marker whenever a flag came first.
+ * A subcommand CLI's path: the verb and the plain words that lead its
+ * arguments, up to two: `kubectl-delete-pod`, `npm-audit`. The first flag
+ * ends it. Past a flag, whether the next word is a subcommand or that flag's
+ * value is the CLI's own grammar (`npm --prefix foo audit`), which this
+ * module does not have. So `npm --silent audit` names only `npm`, and its
+ * arguments are marked unnamed (plan section 2, "Opposed requests").
  */
 function subcommandPath(words: readonly string[], taken: Taken): string[] {
 	const path: string[] = [];
 	for (let index = 1; index < words.length && path.length < SUBCOMMAND_DEPTH; index += 1) {
-		// Flags are skipped only on the way to the first word: after it, a flag
-		// ends the path, or `docker rm --force web` would read `web` as part of
-		// the subcommand.
-		if (words[index].startsWith("-")) {
-			if (path.length > 0) break;
-			continue;
-		}
 		if (!SUBCOMMAND_WORD.test(words[index])) break;
 		path.push(words[index]);
 		taken.set(index, undefined);
@@ -516,7 +511,9 @@ function pathDeleteTargets(words: readonly string[]): string[] {
 function subcommandAction(words: readonly string[], network: RegExp | undefined): RawAction {
 	const taken: Taken = new Map();
 	const path = subcommandPath(words, taken);
-	const kind: ActionKind = network === undefined || path.some(word => network.test(word)) ? "network" : "run-code";
+	// The first subcommand word decides: `npm run publish` runs a local script
+	// called publish, and `publish` in second place is its name.
+	const kind: ActionKind = network === undefined || network.test(path[0] ?? "") ? "network" : "run-code";
 	const widening = takeWidening(words, NO_SHORT, taken);
 	return { kind, targets: [[basename(words[0]), ...path].join("-"), ...claimTargets(words, taken, widening)] };
 }
