@@ -64,6 +64,13 @@ describe("redactSecrets", () => {
 		expect(redactSecrets(`OPENAI_API_KEY=${value}`)).toBe(`OPENAI_API_KEY=${REDACTED}`);
 	});
 
+	test("no header or quoting grammar is left to miss (Codex round 3)", () => {
+		const aws = "Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260922/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024";
+		expect(redactSecrets(aws)).toBe(`Authorization: ${REDACTED}`);
+		expect(redactSecrets('DB_PASSWORD="hunter2')).toBe(`DB_PASSWORD=${REDACTED}`);
+		expect(redactSecrets("export DB_PASSWORD=hunter2\nnext line")).toBe(`export DB_PASSWORD=${REDACTED}\nnext line`);
+	});
+
 	test("quoted, JSON-escaped and any-scheme credentials are redacted (Codex round 1)", () => {
 		const basic = "dXNlcjpwYXNzd29yZA==";
 		const opaque = fake("", 22);
@@ -82,12 +89,11 @@ describe("redactSecrets", () => {
 			expect(out).toContain(REDACTED);
 			expect(redactSecrets(out)).toBe(out);
 		}
-		// A URL query keeps its other parameters.
-		expect(redactSecrets(`https://x.test/cb?token=${opaque}&page=2`)).toBe(`https://x.test/cb?token=${REDACTED}&page=2`);
-		// Prose after the header name is a user's words, not a credential.
-		const prose = "Authorization: I approve the deploy to staging";
-		expect(redactSecrets(prose)).toBe(prose);
-		expect(redactSecrets(`Authorization: ApiKey ${opaque}`)).toBe(`Authorization: ApiKey ${REDACTED}`);
+		// Everything after the marker goes, by design: a URL query loses its
+		// later parameters, and a user's "Authorization:" line loses its words.
+		expect(redactSecrets(`https://x.test/cb?token=${opaque}&page=2`)).toBe(`https://x.test/cb?token=${REDACTED}`);
+		expect(redactSecrets("Authorization: I approve the deploy to staging")).toBe(`Authorization: ${REDACTED}`);
+		expect(redactSecrets(`Authorization: ApiKey ${opaque}`)).toBe(`Authorization: ${REDACTED}`);
 	});
 
 	test("an escaped quote can't end a quoted secret early, and Digest params go whole (Codex round 2)", () => {
@@ -95,9 +101,9 @@ describe("redactSecrets", () => {
 		expect(redactSecrets(escaped)).not.toContain("secondhalf123");
 		const digest = 'Authorization: Digest username="Mufasa", realm="testrealm@host.com", nonce="abcdef0123456789"';
 		const out = redactSecrets(digest);
-		expect(out).toBe(`Authorization: Digest ${REDACTED}`);
-		// The cost, stated: a quoted secret runs to the last quote on its line.
-		expect(redactSecrets('{"password":"x","user":"bob"}')).toBe(`{"password":"${REDACTED}"}`);
+		expect(out).toBe(`Authorization: ${REDACTED}`);
+		// The cost, stated: a secret-named value takes the rest of its line.
+		expect(redactSecrets('{"password":"x","user":"bob"}')).toBe(`{"password":${REDACTED}`);
 	});
 
 	test("structured values lose everything under a secret key, whatever its content", () => {
