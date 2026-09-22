@@ -31,12 +31,14 @@ import {
 	resultText,
 	setJevAnswer,
 	writeConfigFile,
+	removeConfigFile,
 } from "./fixtures";
 
 let dir = "";
 let seq = 0;
 
 beforeEach(async () => {
+	removeConfigFile();
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-session-off-"));
 	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));

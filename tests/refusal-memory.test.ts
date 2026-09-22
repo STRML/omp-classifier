@@ -38,6 +38,7 @@ import {
 	setJevAnswer,
 	setJevAnsweringApi,
 	stateOf,
+	removeConfigFile,
 } from "./fixtures";
 
 let dir = "";
@@ -53,6 +54,7 @@ const readDecisions = (): DecisionRecord[] =>
 		.map(line => JSON.parse(line) as DecisionRecord);
 
 beforeEach(async () => {
+	removeConfigFile();
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-refusal-"));
 	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));

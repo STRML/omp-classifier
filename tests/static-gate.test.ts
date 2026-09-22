@@ -24,6 +24,7 @@ import {
 } from "./fixtures";
 
 beforeEach(async () => {
+	removeConfigFile();
 	await loadPlugin(makeSettings([]));
 	setJevAnswer(jevSafeAnswer());
 });

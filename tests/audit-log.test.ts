@@ -34,6 +34,7 @@ import {
 	setJevAnswer,
 	setJevUnavailable,
 	useTempConfigFile,
+	removeConfigFile,
 } from "./fixtures";
 import { buildStatusReport, CLASSIFIER_POLICY_HASH, CLASSIFIER_POLICY_VERSION, type DecisionRecord } from "../index";
 
@@ -59,6 +60,7 @@ const readDecisions = (): DecisionRecord[] =>
 		.map(line => JSON.parse(line) as DecisionRecord);
 
 beforeEach(async () => {
+	removeConfigFile();
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-audit-"));
 	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));

@@ -33,9 +33,11 @@ import {
 	resultText,
 	selectCalls,
 	setJevAnswer,
+	removeConfigFile,
 } from "./fixtures";
 
 beforeEach(async () => {
+	removeConfigFile();
 	await loadPlugin(makeSettings([]));
 	setJevAnswer(jevSafeAnswer());
 });
