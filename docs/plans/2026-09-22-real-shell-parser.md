@@ -58,6 +58,19 @@ The floor's question is whether a secret reaches a sink. It does not need to kno
 
 Over-asking is the floor's correct failure direction, and this trades the whole attached-flag class for it.
 
+### 4. What a name check cannot see
+
+The floor decides whether a word names a secret file by reading the word's text. That check can see anything the text fixes: quotes, backslashes, `$'…'` escapes, brace expansion, and the default in `${SAFE:-key.pem}`. It cannot see a value decided at run time:
+
+| Runtime value | Example that passes the floor |
+| --- | --- |
+| A glob, which matches whatever is on disk | `cat .e*` |
+| An assignment inside one expansion that changes the next | `cat ${x:=key.txt} ${x/txt/pem}` |
+| A symlink, which renames any file | `ln -s ~/.aws/credentials notes.txt && cat notes.txt` |
+| Code in another language, whose strings the floor does not evaluate | `subprocess.run(["o" "p", "read", …])` |
+
+The floor reads each of these as the text it is written as, so `*.pem` still asks. Every one of them reaches the reviewer. Three Codex rounds on PR #96 found a new runtime spelling each time, and the symlink row shows why no number of spellings closes the class. This limit is a decision, recorded here the same way as the destination residual in the intent-aware plan. Treat it as settled, not as a gap to fill. #97 tracks the two changes that would close it: judging the file a command opens, and intercepting spawns in the eval kernel (#13).
+
 ## Failure matrix
 
 | State or input | What the code does | How it can fail | What the caller is told |
@@ -76,6 +89,8 @@ Over-asking is the floor's correct failure direction, and this trades the whole 
 | `printf … \| tee /tmp/leak \| docker login --password-stdin` | The pipe structure is the parser's, and `tee` still breaks the exemption | Pipeline position lost | Existing test, unchanged |
 | `2>&1`, `&>`, `>&2`, `>>` | Direction and target from the parser's redirect node | Opaque operator numbers renumbered by a library upgrade | A test parses each spelling and pins its number |
 | A command 100 KB long | Parsed; the existing caps still apply | The parser walked without bound in the classification path | Test asserting the parse stays under the budget |
+| `cat .e*`, `cat ${x:=a} ${x/a/.env}`, a symlink to a secret | The floor reads the text as written and does not ask; the reviewer judges it | Expected by section 4, not a failure | Test pins that a glob reads as its text and that no glob throws |
+| A malformed glob such as `.e[z-a]` | The floor decides without compiling it | A regex built from the glob throws, and the floor returns no decision | Test per malformed shape, asserting no throw |
 | `mvdan-sh` missing at runtime | The floor asks and the summary reports `unparsed-command` | An import error crashing the interceptor | Test with the parser stubbed to throw |
 
 ## Order of work
