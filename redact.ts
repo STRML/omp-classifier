@@ -44,7 +44,8 @@ const RULES: readonly Rule[] = [
 	// The same marker as a command-line flag with its value after a space:
 	// `mysql --password hunter2`, `--api-key $KEY`. `--password-stdin` is a
 	// different word and stays.
-	{ pattern: new RegExp(`(\\s--?${SECRET_MARKER}[ \\t]+)(?=\\S)[^\\r\\n]*`, "giu"), replace: (_m, keep) => `${keep}${REDACTED}` },
+	// It may open the text or a line.
+	{ pattern: new RegExp(`((?:^|\\s)--?${SECRET_MARKER}[ \\t]+)(?=\\S)[^\\r\\n]*`, "gimu"), replace: (_m, keep) => `${keep}${REDACTED}` },
 	{ pattern: /\b(bearer\s+)[^\s"'\\,;]{8,}/giu, replace: (_m, keep) => `${keep}${REDACTED}` },
 	// Token formats with a published prefix.
 	{ pattern: /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}/gu, replace: whole },
