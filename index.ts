@@ -1471,7 +1471,7 @@ export function collectTaskEvidenceV3(branch: ReadonlyArray<EvidenceBranchEntry>
 		const text = textOf(message.content);
 		if (text.trim() === "") continue;
 		const id = message.id ?? entry.id ?? `user-${index}`;
-		all.push({ text: headAndTail(text, EVIDENCE_MESSAGE_MAX_CHARS), id, index, anchored: TASK_SCOPE_RE.test(text) });
+		all.push({ text: headAndTail(redactSecrets(text), EVIDENCE_MESSAGE_MAX_CHARS), id, index, anchored: TASK_SCOPE_RE.test(text) });
 	}
 	if (all.length === 0) return { messages: [], ids: [] };
 	const tail = new Set(all.slice(-limit).map(item => item.id));

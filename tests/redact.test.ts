@@ -6,7 +6,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { buildAuthorizationState, summarizeActions } from "../authorization";
-import { collectTaskEvidence, collectToolEvidence, collectUserEvidence, operatorContextFromInput } from "../index";
+import { collectTaskEvidence, collectTaskEvidenceV3, collectToolEvidence, collectUserEvidence, operatorContextFromInput } from "../index";
 import { buildJevState, JEV_POLICY_VERSION } from "../jev";
 import { REDACTED, redactSecrets, redactValue } from "../redact";
 
@@ -206,12 +206,19 @@ describe("redaction reaches every judge state", () => {
 	test("user messages and operator context are redacted before they are cut", () => {
 		// A cut through `DB_PASSWORD=hunter2` leaves `DB_PASSWORD=hunte`, which
 		// no longer reads as a six-character value.
-		const long = `${"a".repeat(990)} DB_PASSWORD=hunter2 ${"b".repeat(2_000)}`;
+		// headAndTail keeps the first 1,000 characters: 982 + 1 + 17 puts the
+		// cut right after `DB_PASSWORD=hunte`, inside the value.
+		const long = `${"a".repeat(982)} DB_PASSWORD=hunter2 ${"b".repeat(2_000)}`;
+		expect(long.slice(0, 1_000).endsWith("DB_PASSWORD=hunte")).toBe(true);
 		const snapshot = collectTaskEvidence([{ type: "message", id: "m1", message: { role: "user", attribution: "user", content: long } }], 1);
 		expect(snapshot.messages[0]).not.toContain("hunte");
 		expect(collectUserEvidence([{ type: "message", message: { role: "user", attribution: "user", content: long } }], 1)[0]).not.toContain("hunte");
 		const context = operatorContextFromInput(`${"c".repeat(480)} DB_PASSWORD=hunter2 tail`);
 		expect(context).not.toContain("hunte");
+		// The jev-v3 builder (#101) cuts the same way, pinned message included.
+		const v3 = collectTaskEvidenceV3([{ type: "message", id: "m1", message: { role: "user", attribution: "user", content: long } }, ...Array.from({ length: 10 }, (_, i) => ({ type: "message", id: `r${i}`, message: { role: "user", attribution: "user", content: `ok ${i}` } }))], 1);
+		expect(v3.pinned?.text).not.toContain("hunte");
+		expect(v3.messages.join(" ")).not.toContain("hunte");
 	});
 
 	test("an evidence hash covers the redacted text, so it can't verify a guessed password", () => {
