@@ -24,7 +24,7 @@
  */
 import { createHash } from "node:crypto";
 import { tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
-import { isSecretPath, pathInToken, secretStoreRead, secretVariableNames } from "./floor";
+import { secretPathInToken, secretStoreRead, secretVariableNames } from "./floor";
 
 /**
  * The vocabulary. Every segment of every command lands on exactly one of these
@@ -145,7 +145,13 @@ function presentTarget(raw: string): string {
 		.replace(/([a-z0-9])([A-Z])/gu, "$1 $2")
 		.split(/[^A-Za-z0-9]+/u)
 		.filter(part => part.length > 0);
-	const isName = value.length <= TARGET_MAX_LENGTH && !parts.some(part => REVIEWER_WORD.test(part)) && !readsAsSentence(parts);
+	// Every label this module writes is one word. Whitespace, a substitution or
+	// a newline therefore means the text came out of the command, and a quoted
+	// word can carry a whole command: the tokenizer strips the quotes, so
+	// `echo "$(rm -rf build)"` handed `$(rm -rf build` straight to the model.
+	const carriesCommandText = /\s|\$|`|\n/u.test(value);
+	const isName =
+		value.length <= TARGET_MAX_LENGTH && !carriesCommandText && !parts.some(part => REVIEWER_WORD.test(part)) && !readsAsSentence(parts);
 	if (isName) return value;
 	return `hashed:${createHash("sha256").update(value).digest("hex").slice(0, 12)}`;
 }
@@ -226,17 +232,66 @@ const DEPLOY_SCRIPT = /(deploy|publish|release)[^/]*\.(sh|ts|js|mjs|py|rb)$/u;
 const WIDENING_FLAG = /^--(admin|force|force-with-lease|no-verify|hard|prod|production|yes|all)$/u;
 
 const URL = /^[a-z][a-z0-9+.-]*:\/\/([^/\s]+)/iu;
-/** A redirect that creates or truncates a file. `2>&1` and `>/dev/null` write
- *  nothing anyone can read back, so neither is a write. */
-const REDIRECT = /^(\d|&)?>>?(.*)$/u;
 /** Any redirect, including an input one: all of them are the segment's
  *  plumbing rather than the verb's arguments. */
 const ANY_REDIRECT = /^(\d|&)?(?:>>?|<<?)(.*)$/u;
 
+/**
+ * Shapes the tokenizer does not parse. It is a conservative splitter, not a
+ * shell: it says so in its own header, and its output was being accepted as a
+ * complete reading of the command. Two ways that showed:
+ * `echo "$(rm -rf build)"` kept the substitution inside one quoted word and the
+ * nested delete never appeared, and a heredoc's body was tokenized as if it
+ * were commands, inventing a delete out of inert text.
+ *
+ * Neither is fixable by reading harder. What is fixable is saying so: each
+ * shape found here becomes an `other` action naming the shape, so the model
+ * answers knowing part of the command was not read.
+ */
+const UNREAD_SHAPE: ReadonlyArray<readonly [RegExp, string]> = [
+	[/\$\(/u, "command-substitution"],
+	[/`[^`]*`/u, "backtick-substitution"],
+	[/<\(|>\(/u, "process-substitution"],
+	[/<<-?\s*['"]?[A-Za-z_]/u, "heredoc"],
+];
+
+const HEREDOC_OPENER = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/u;
+/** `2>&1` and `>&2` point one stream at another and name no file. The host
+ *  tokenizer breaks at `&`, so left in they arrive as a stray `1` segment that
+ *  reads as an unknown command. */
+const STREAM_DUPLICATION = /(\d?)>&(\d)/gu;
+
+/**
+ * The command with what the tokenizer would misread taken out: stream
+ * duplications, and heredoc bodies.
+ *
+ * A heredoc's body is data. Tokenized, `cat <<EOF\nrm -rf build\nEOF` invented
+ * a delete out of text that is never run. The `heredoc` marker from
+ * UNREAD_SHAPE still records that a body was there and was not read.
+ */
+function readable(command: string): string {
+	const withoutStreams = command.replace(STREAM_DUPLICATION, "");
+	const lines = withoutStreams.split("\n");
+	const kept: string[] = [];
+	for (let index = 0; index < lines.length; index += 1) {
+		const opener = HEREDOC_OPENER.exec(lines[index]);
+		kept.push(lines[index].replace(HEREDOC_OPENER, ""));
+		if (opener === null) continue;
+		// Everything up to and including the terminator line belongs to the
+		// body; an unterminated heredoc runs to the end.
+		const terminator = opener[2];
+		index += 1;
+		while (index < lines.length && lines[index].trim() !== terminator) index += 1;
+	}
+	return kept.join("\n");
+}
+
 export function summarizeActions(input: ActionSummaryInput): ActionSummaryEntry[] {
 	const raw: RawAction[] = [];
 	const tainted = input.taintedVars ?? [];
-	for (const tokens of tokenizeShellSegments(input.command)) {
+	const unread = UNREAD_SHAPE.filter(([pattern]) => pattern.test(input.command)).map(([, name]) => name);
+	if (unread.length > 0) raw.push({ kind: "other", targets: unread });
+	for (const tokens of tokenizeShellSegments(readable(input.command))) {
 		if (tokens.length === 0) continue;
 		raw.push(...classifySegment(tokens, tainted));
 	}
@@ -248,17 +303,20 @@ function classifySegment(tokens: readonly string[], tainted: readonly string[]):
 	// A redirect belongs to the segment, not to the verb's arguments. Left in,
 	// `rm -rf build > log` reports a delete of `log`, and `cat x > ~/.ssh/id_rsa`
 	// reports a secret READ of the file it is overwriting.
-	const rest = withoutRedirects(takePrivilege(tokens, actions));
-	if (rest.length === 0) return actions;
-	const secrets = secretReads(rest, tainted);
+	const { words, inputs, outputs } = splitRedirects(takePrivilege(tokens, actions));
+	if (words.length === 0) return actions;
+	// Direction decides which side of the secret question a redirect target is
+	// on. An input is read — `cat < ~/.ssh/id_rsa` reads the key as surely as
+	// `cat ~/.ssh/id_rsa` does — and an output is written.
+	const secrets = secretReads([...words, ...inputs], tainted);
 	actions.push(...secrets);
-	const main = classifyVerb(rest);
+	const main = classifyVerb(words);
 	// `other` is the fallback for a segment nothing else claimed, and a secret
 	// store read has already named the segment. Privilege does NOT stand in for
 	// it: `sudo frobnicate` must still report the verb nobody recognized.
 	if (!(main.kind === "other" && secrets.length > 0)) actions.push(main);
-	actions.push(...redirectWrites(tokens));
-	actions.push(...inPlaceWrites(rest));
+	if (outputs.length > 0) actions.push({ kind: "write", targets: outputs });
+	actions.push(...inPlaceWrites(words));
 	return actions;
 }
 
@@ -267,25 +325,47 @@ function classifySegment(tokens: readonly string[], tainted: readonly string[]):
 function inPlaceWrites(tokens: readonly string[]): RawAction[] {
 	const verb = basename(tokens[0] ?? "");
 	if (!PROGRAM_VERB.test(verb) || !tokens.some(token => IN_PLACE_FLAG.test(token))) return [];
-	// The first non-flag argument is the program text, not a file.
-	const files = tokens.slice(1).filter(token => !token.startsWith("-")).slice(1);
+	// The first operand is the program text, not a file.
+	const files = operands(tokens, verb).slice(1);
 	return [{ kind: "write", targets: files }];
 }
 
-/** The segment's words with its redirects removed: the operator, and the word
- *  after a bare `>` or `<`, which is the operator's target rather than the
- *  verb's argument. */
-function withoutRedirects(tokens: readonly string[]): string[] {
-	const kept: string[] = [];
+/**
+ * The segment split three ways: the verb's own words, the files it reads
+ * through an input redirect, and the files it writes through an output one.
+ *
+ * Direction is the whole point of the split. Treating every redirect as
+ * plumbing to be dropped erased `cat < ~/.ssh/id_rsa`, which reads the key;
+ * leaving every one in the argument list invented a delete of `log` in
+ * `rm -rf build > log`.
+ */
+function splitRedirects(tokens: readonly string[]): { words: string[]; inputs: string[]; outputs: string[] } {
+	const words: string[] = [];
+	const inputs: string[] = [];
+	const outputs: string[] = [];
 	for (let index = 0; index < tokens.length; index += 1) {
-		const match = ANY_REDIRECT.exec(tokens[index]);
+		const token = tokens[index];
+		const match = ANY_REDIRECT.exec(token);
 		if (match === null) {
-			kept.push(tokens[index]);
+			words.push(token);
 			continue;
 		}
-		if (match[2] === "") index += 1;
+		let target = match[2];
+		if (target === "") {
+			// A bare operator takes the next word as its target.
+			target = tokens[index + 1] ?? "";
+			index += 1;
+		}
+		// `2>&1` points a stream at another open stream and names no file.
+		if (target === "" || target.startsWith("&")) continue;
+		if (token.includes("<")) {
+			inputs.push(target);
+			continue;
+		}
+		// `/dev/null` is a write nobody can read back.
+		if (target !== "/dev/null") outputs.push(target);
 	}
-	return kept;
+	return { words, inputs, outputs };
 }
 
 /** Record a privilege action and return the command it wraps, or the segment
@@ -326,17 +406,80 @@ function secretReads(tokens: readonly string[], tainted: readonly string[]): Raw
 	const store = secretStoreRead(tokens.join(" "));
 	if (store !== undefined) add(store);
 	for (const token of tokens) {
-		for (const name of secretVariableNames(token, tainted)) add(`$${name}`);
-		const path = pathInToken(token);
-		if (path !== undefined && isSecretPath(path)) add(basename(path));
+		// The name without its sigil: a `$` in a target is command text and
+		// would be hashed, which would make every secret variable opaque.
+		const variables = secretVariableNames(token, tainted);
+		for (const name of variables) add(name);
+		// A word that expands a variable is not a path this code can resolve,
+		// and `$AWS_SECRET_ACCESS_KEY` reads as a secret FILE to the path rule
+		// (its name carries "secret"), which reported one secret twice.
+		if (variables.length > 0) continue;
+		const path = secretPathInToken(token);
+		if (path !== undefined) add(basename(path));
 	}
 	return targets.length === 0 ? [] : [{ kind: "secret-read", targets }];
+}
+
+/**
+ * Flags that take their value as the NEXT word, by verb. Dropping every word
+ * that starts with a dash and keeping the rest made each flag's value look
+ * like an operand: `git -C /repo push origin main` read `/repo` as the
+ * subcommand, `ssh -p 2222 host.example` reported the port as the host, and
+ * `python3 -W ignore script.py` reported `ignore` as the script.
+ *
+ * A verb absent from this table is read as taking no valued flags, which is
+ * the conservative direction: an operand too many, never one too few.
+ */
+const FLAG_TAKING_VALUE: Record<string, RegExp> = {
+	git: /^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix)$/u,
+	ssh: /^(-[bcDEeFIiJLlmOoPpQRSWw])$/u,
+	scp: /^(-[cFiJloPS])$/u,
+	sftp: /^(-[BbcDFiJloPRS])$/u,
+	rsync: /^(-e|--rsh|--exclude|--include|--files-from|--log-file|--out-format|--compare-dest)$/u,
+	rclone: /^(--config|--transfers)$/u,
+	python: /^(-[WXm]|--check-hash-based-pycs)$/u,
+	python3: /^(-[WXm]|--check-hash-based-pycs)$/u,
+	node: /^(-r|--require|--import|--loader|--experimental-loader|--conditions)$/u,
+	bun: /^(-r|--preload|--config|--cwd)$/u,
+	deno: /^(--allow-read|--allow-write|--config|--import-map)$/u,
+	perl: /^(-[IMm])$/u,
+	ruby: /^(-[IrE])$/u,
+	gh: /^(-R|--repo|-F|-f|-H|--field|--raw-field|--jq|--template)$/u,
+	glab: /^(-R|--repo)$/u,
+	docker: /^(-[evpuw]|--name|--network|--mount|--entrypoint)$/u,
+	podman: /^(-[evpuw]|--name|--network|--mount|--entrypoint)$/u,
+	xargs: /^(-[IPnds]|--replace|--max-procs|--max-args|--delimiter)$/u,
+	tar: /^(-[fC]|--file|--directory)$/u,
+	curl: /^(-[odDFTHubcAeXxKEJ]|--output|--data|--header|--user|--form|--upload-file|--request|--url)$/u,
+	wget: /^(-[OoPTt]|--output-document|--directory-prefix)$/u,
+	install: /^(-[mogt])$/u,
+	cp: /^(-t|--target-directory)$/u,
+	mv: /^(-t|--target-directory)$/u,
+	mkdir: /^(-m|--mode)$/u,
+};
+
+/** The segment's operands: its words with flags, and the values of flags that
+ *  take one, removed. */
+function operands(tokens: readonly string[], verb: string): string[] {
+	const valued = FLAG_TAKING_VALUE[verb];
+	const found: string[] = [];
+	for (let index = 1; index < tokens.length; index += 1) {
+		const token = tokens[index];
+		if (!token.startsWith("-")) {
+			found.push(token);
+			continue;
+		}
+		// `--flag=value` carries its own value; only the spaced form eats the
+		// next word.
+		if (valued !== undefined && valued.test(token) && !token.includes("=")) index += 1;
+	}
+	return found;
 }
 
 function classifyVerb(tokens: readonly string[]): RawAction {
 	const spelling = tokens[0];
 	const verb = basename(spelling);
-	const args = tokens.slice(1).filter(token => !token.startsWith("-"));
+	const args = operands(tokens, verb);
 	const sub = args[0] ?? "";
 
 	if (DEPLOY_NAME.test(verb) || DEPLOY_SCRIPT.test(verb)) return { kind: "deploy", targets: deployTargets(tokens, verb) };
@@ -367,16 +510,23 @@ function gitAction(tokens: readonly string[], args: readonly string[], sub: stri
 	// A bare `git push` names no ref: the remote and branch come from the
 	// repository's own configuration, and inventing `origin` here would put a
 	// name in the summary that the command never said.
-	if (sub === "push") return { kind: "git-publish", targets: [...rest] };
-	if (sub === "branch" && tokens.some(token => /^(-d|-D|--delete)$/u.test(token))) return { kind: "branch-delete", targets: [...rest] };
-	if (GIT_NETWORK_SUBCOMMAND.test(sub)) return { kind: "network", targets: [`git ${sub}`] };
+	// The widening flag rides along here as it does on a merge: `git push origin
+	// main` and `git push origin main --force` are different requests, and
+	// filtering flags out of the operand list had made them the same summary.
+	if (sub === "push") return { kind: "git-publish", targets: [...rest, ...wideningWords(tokens)] };
+	if (sub === "branch" && tokens.some(token => /^(-d|-D|--delete)$/u.test(token))) {
+		// `-D` deletes a branch that was never merged, which is the widening.
+		const forced = tokens.includes("-D") ? ["force"] : [];
+		return { kind: "branch-delete", targets: [...rest, ...forced] };
+	}
+	if (GIT_NETWORK_SUBCOMMAND.test(sub)) return { kind: "network", targets: [`git-${sub}`] };
 	if (GIT_AMBIGUOUS_SUBCOMMAND.test(sub)) {
 		const reading = tokens.some(token => GIT_READING_FLAG.test(token)) || rest.length === 0;
-		return { kind: reading ? "read" : "write", targets: [`git ${sub}`] };
+		return { kind: reading ? "read" : "write", targets: [`git-${sub}`] };
 	}
-	if (GIT_READ_SUBCOMMAND.test(sub)) return { kind: "read", targets: [`git ${sub}`] };
-	if (GIT_WRITE_SUBCOMMAND.test(sub)) return { kind: "write", targets: [`git ${sub}`] };
-	return { kind: "other", targets: [`git ${sub}`] };
+	if (GIT_READ_SUBCOMMAND.test(sub)) return { kind: "read", targets: [`git-${sub}`] };
+	if (GIT_WRITE_SUBCOMMAND.test(sub)) return { kind: "write", targets: [`git-${sub}`] };
+	return { kind: "other", targets: [`git-${sub}`] };
 }
 
 function ghAction(tokens: readonly string[], args: readonly string[], sub: string): RawAction {
@@ -384,7 +534,7 @@ function ghAction(tokens: readonly string[], args: readonly string[], sub: strin
 		const numbers = args.slice(2).filter(token => /^\d+$/u.test(token));
 		return { kind: "merge", targets: [...numbers, ...wideningWords(tokens)] };
 	}
-	return { kind: "network", targets: [`${basename(tokens[0])} ${sub}`.trim()] };
+	return { kind: "network", targets: [`${basename(tokens[0])}-${sub}`.replace(/-$/u, "")] };
 }
 
 /** `find` and `fd` run other commands when asked, and `find` deletes when
@@ -396,19 +546,34 @@ function findAction(tokens: readonly string[], args: readonly string[], verb: st
 	return { kind: "read", targets: [...args.slice(0, 1)] };
 }
 
-/** The host a network command names, or the command's own shape when it names
- *  no URL: a bare remote or a subcommand is still what the user has to have
- *  asked for. */
+/** `host:path` or `user@host:path`, the spelling scp, sftp and rsync use for
+ *  the far end. The negative lookahead keeps a URL's `//` out of it. */
+const REMOTE_OPERAND = /^([A-Za-z0-9._-]+@)?([A-Za-z0-9._-]+):(?!\/\/)/u;
+
+/**
+ * The remote endpoint a network command names.
+ *
+ * A URL wins. Failing that, the operand that names a host does: `scp
+ * artifact.tar host.example:/srv` and `rsync local/ host.example:/srv` put the
+ * local file first, so taking the first operand reported the file being sent
+ * and left out the machine it was going to, which is the one thing the
+ * authorization judgment needs to compare against the user's words.
+ */
 function networkTargets(tokens: readonly string[], verb: string): string[] {
 	const hosts = tokens.flatMap(token => {
 		const match = URL.exec(token);
 		return match === null ? [] : [match[1]];
 	});
 	if (hosts.length > 0) return hosts;
-	const first = tokens.slice(1).find(token => !token.startsWith("-"));
-	// `ssh host`, `rsync src host:/path`: the first plain argument is the host or
-	// the subcommand, and either one is the thing being named.
-	return first === undefined ? [verb] : [first.split(":")[0]];
+	const args = operands(tokens, verb);
+	const remotes = args.flatMap(arg => {
+		const match = REMOTE_OPERAND.exec(arg);
+		return match === null ? [] : [match[2]];
+	});
+	if (remotes.length > 0) return remotes;
+	// `ssh host`, `aws s3 ls`: the first operand is the host or the subcommand,
+	// and either one is what the user has to have named.
+	return args.length === 0 ? [verb] : [args[0].split("@").pop() ?? args[0]];
 }
 
 /** What an interpreter runs: the script it was handed, or its own name when the
@@ -418,13 +583,13 @@ function networkTargets(tokens: readonly string[], verb: string): string[] {
  *  which flag means "code follows" depends on which interpreter was asked. */
 function runTarget(tokens: readonly string[], verb: string): string {
 	const inlineFlag = SHELL.test(verb) ? /^-[a-zA-Z]*c$/u : /^-[a-zA-Z]*[ce]$/u;
-	if (tokens.some(token => inlineFlag.test(token))) return `${verb} -c`;
-	const script = tokens.slice(1).find(token => !token.startsWith("-"));
+	if (tokens.some(token => inlineFlag.test(token))) return `${verb}-inline`;
+	const script = operands(tokens, verb)[0];
 	return script === undefined ? verb : basename(script);
 }
 
 function deployTargets(tokens: readonly string[], verb: string): string[] {
-	const argument = tokens.slice(1).find(token => !token.startsWith("-"));
+	const argument = operands(tokens, verb)[0];
 	const widening = wideningWords(tokens);
 	const named = argument ?? widening[0] ?? verb.replace(/\.(sh|ts|js|mjs|py|rb)$/u, "");
 	return [named, ...widening.filter(word => word !== named)];
@@ -432,24 +597,6 @@ function deployTargets(tokens: readonly string[], verb: string): string[] {
 
 function wideningWords(tokens: readonly string[]): string[] {
 	return tokens.filter(token => WIDENING_FLAG.test(token)).map(token => token.replace(/^--/u, "").replace(/-with-lease$/u, ""));
-}
-
-/** A redirect is what a segment WRITES, whatever its verb reads. `echo hi >
- *  ~/.bashrc` is an inert-looking verb installing a shell alias. */
-function redirectWrites(tokens: readonly string[]): RawAction[] {
-	const targets: string[] = [];
-	tokens.forEach((token, index) => {
-		const match = REDIRECT.exec(token);
-		if (match === null) return;
-		// `2>` and `&>` redirect a stream, but the file they create is a file
-		// either way; only the duplication form `>&1` writes to an open stream.
-		const attached = match[2];
-		if (attached.startsWith("&")) return;
-		const target = attached === "" ? (tokens[index + 1] ?? "") : attached;
-		if (target === "" || target === "/dev/null" || target.startsWith("&")) return;
-		targets.push(target);
-	});
-	return targets.length === 0 ? [] : [{ kind: "write", targets }];
 }
 
 /** Group the raw actions by kind, in ACTION_KINDS order so two commands with
@@ -463,9 +610,11 @@ function collect(raw: readonly RawAction[]): ActionSummaryEntry[] {
 		let count = 0;
 		for (const action of mine) {
 			const presented = action.targets.map(presentTarget).filter(target => target.length > 0);
-			// An action with no target is still one action: `git status` names
-			// nothing and is still a read.
-			count += Math.max(presented.length, 1);
+			// One classified action is one action, however many targets it
+			// names. Counting targets turned `git push origin main` into two
+			// publishes and `gh pr merge 42 --admin` into two merges, which
+			// contradicts what `count` is documented to mean.
+			count += 1;
 			for (const target of presented) {
 				if (!targets.includes(target) && targets.length < TARGETS_PER_KIND) targets.push(target);
 			}
