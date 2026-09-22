@@ -50,6 +50,8 @@ function liveOutcome(line: DecisionRecord): LiveOutcome | undefined {
 	if (line.cached === 1) return undefined;
 	const terminal = line.approval !== undefined || (line.decision === "allow" && line.layer === "verdict");
 	if (!terminal) return undefined;
+	// A decision with no live verdict can't be told from an outage: not counted.
+	if (line.v3 !== undefined && !("error" in line.v3) && line.v3.live === undefined) return undefined;
 	if (line.v3?.live === "UNAVAILABLE" || line.approval === "unavailable") return "unavailable";
 	switch (line.approval) {
 		case "allow-once":
@@ -98,9 +100,46 @@ export function summarizeShadow(lines: readonly DecisionRecord[], sinceMs: numbe
 	return report;
 }
 
+const VERDICTS = new Set(["SAFE", "UNSAFE", "UNSURE", "UNAVAILABLE"]);
+
+/** A v3 record this report can read: an error, or a decision that names the
+ *  live verdict it ran beside. A v3 without `live` can't be told from an
+ *  outage, so it is unreadable rather than guessed. */
+function isShadowRecord(value: unknown): boolean {
+	if (typeof value !== "object" || value === null) return false;
+	const record = value as Record<string, unknown>;
+	if (typeof record.error === "string") return true;
+	return (
+		typeof record.live === "string" &&
+		VERDICTS.has(record.live) &&
+		typeof record.verdict === "string" &&
+		VERDICTS.has(record.verdict) &&
+		typeof record.branch === "number" &&
+		typeof record.reasonCode === "string"
+	);
+}
+
+/** The fields the counting reads, checked rather than cast: `{}` parses as
+ *  JSON and is still no decision. */
+function isDecisionLine(value: unknown): value is DecisionRecord {
+	if (typeof value !== "object" || value === null) return false;
+	const line = value as Record<string, unknown>;
+	return (
+		typeof line.ts === "string" &&
+		!Number.isNaN(Date.parse(line.ts)) &&
+		(line.tool === "bash" || line.tool === "eval") &&
+		(line.decision === "allow" || line.decision === "block") &&
+		typeof line.layer === "string" &&
+		typeof line.cmd === "string" &&
+		(line.cached === 0 || line.cached === 1) &&
+		(line.v3 === undefined || isShadowRecord(line.v3))
+	);
+}
+
 export interface DecisionLog {
 	lines: DecisionRecord[];
-	/** Line numbers (1-based) that did not parse. */
+	/** Line numbers (1-based) that did not parse, or parsed into something
+	 *  that is not a decision line this report can read. */
 	malformed: number[];
 }
 
@@ -113,11 +152,15 @@ export function readDecisionLog(file: string): DecisionLog {
 		.split("\n")
 		.forEach((raw, index) => {
 			if (raw.trim() === "") return;
+			let parsed: unknown;
 			try {
-				log.lines.push(JSON.parse(raw) as DecisionRecord);
+				parsed = JSON.parse(raw);
 			} catch {
 				log.malformed.push(index + 1);
+				return;
 			}
+			if (isDecisionLine(parsed)) log.lines.push(parsed);
+			else log.malformed.push(index + 1);
 		});
 	return log;
 }
