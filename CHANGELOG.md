@@ -4,6 +4,14 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-22
 
+### Evidence redaction (policy `jev-v2.2`)
+
+- Secret-shaped values are now redacted from every evidence field before it reaches TypeSafe: tool calls and results, bash commands and output from earlier in the session, the agent's `operatorContext`, and user messages. Before this, a tool result that printed a key went to the judge at up to 700 characters. It's Phase 2 step 7 of the intent-aware judgment plan, and the one live change in Phase 2.
+- New `redact.ts` matches known token formats (Anthropic, OpenAI, GitHub, Slack, AWS, Google, GitLab, npm, JWTs), authorization header values, private key blocks, the password in a URL, and any value of six or more characters assigned to a secret-sounding name (`API_KEY=`, `"password":`). The name, scheme or host around the value stays. Tool evidence is redacted before it's cut to length, so a key at the cut can't leak half.
+- The command being judged is sent unredacted. Hiding its key would hide the hazard.
+- A secret with no known shape and no secret-sounding name still gets through.
+- `JEV_POLICY_VERSION` is now `jev-v2.2`, which changes the policy hash and clears every cached verdict once.
+
 ### The jev-v3 evidence builder
 
 - New `collectTaskEvidenceV3`: Phase 2 step 6. It reads only what follows the latest `/clear` (`reset_boundary`), the way the host rebuilds model context. The jev-v2 collectors don't, which #103 tracks.

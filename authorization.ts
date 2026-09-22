@@ -24,6 +24,7 @@
  */
 import { createHash } from "node:crypto";
 import { secretPathIn, secretStoreRead, secretVariableNames } from "./floor";
+import { redactSecrets } from "./redact";
 import { parseShell, type ShellCommand, type ShellWord } from "./shell-ast";
 
 /**
@@ -712,7 +713,7 @@ export function buildAuthorizationState(input: AuthorizationStateInput): unknown
 	const evidence: Record<string, unknown> = {};
 	// Copied, not aliased: the caller passes live session state, and a mutation
 	// while the request is in flight must not change what was judged.
-	if (input.userMessages !== undefined && input.userMessages.length > 0) evidence.userMessages = [...input.userMessages];
+	if (input.userMessages !== undefined && input.userMessages.length > 0) evidence.userMessages = input.userMessages.map(redactSecrets);
 	if (input.userMessageIds !== undefined && input.userMessageIds.length > 0) evidence.userMessageIds = [...input.userMessageIds];
 	const state: Record<string, unknown> = {
 		notice: AUTHORIZATION_NOTICE,
