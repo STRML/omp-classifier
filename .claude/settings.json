@@ -1,0 +1,5 @@
+{
+  "env": {
+    "ENABLE_CODE_SECURITY_REVIEW": "1"
+  }
+}
