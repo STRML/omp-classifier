@@ -252,8 +252,14 @@ function deleteTargetName(target: string, input: LiteralMatchInput): string | un
 	if (homeOrAbove(input.cwd, input.homeDir)) return undefined;
 
 	if (input.resolveRealPath === undefined) return undefined;
-	const resolved = input.resolveRealPath(resolvePath(target, input.cwd));
-	const roots = [input.cwd, ...(input.sessionTempDir ? [input.sessionTempDir] : [])];
+	const real = input.resolveRealPath;
+	// The target is compared by its real path, so the roots are too: a
+	// symlinked working directory (macOS /var is /private/var) otherwise never
+	// contains its own files. The home rule is checked on both spellings.
+	const cwd = real(input.cwd);
+	if (homeOrAbove(cwd, real(input.homeDir))) return undefined;
+	const resolved = real(resolvePath(target, input.cwd));
+	const roots = [cwd, ...(input.sessionTempDir ? [real(input.sessionTempDir)] : [])];
 	if (!roots.some(root => isInside(resolved, root))) return undefined;
 
 	const name = resolved.split("/").filter(part => part.length > 0).pop();

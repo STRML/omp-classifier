@@ -147,6 +147,17 @@ describe("these never match literally, whatever the user's words say", () => {
 			}),
 		).toBe(false);
 	});
+
+	test("a symlinked working directory is compared by its real path too", () => {
+		// macOS /var is a symlink to /private/var: the target resolves under
+		// /private/var while ctx.cwd still says /var. Both sides resolve.
+		const real = (candidate: string) => candidate.replace(/^\/var\//u, "/private/var/");
+		const input = { cwd: "/var/folders/x/proj", homeDir: HOME, resolveRealPath: real };
+		expect(matched("rm -r scratch-build", ["delete scratch-build"], input)).toBe(true);
+		// Resolving never loosens the home rule: a cwd whose real path is the
+		// home directory still never matches.
+		expect(matched("rm -r scratch-build", ["delete scratch-build"], { cwd: "/var/home-link", homeDir: "/private/var/home-link", resolveRealPath: real })).toBe(false);
+	});
 });
 
 describe("segments come from the shell parser (plan 2026-09-22-real-shell-parser.md)", () => {
