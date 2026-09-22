@@ -1436,6 +1436,54 @@ export function collectTaskEvidence(branch: ReadonlyArray<EvidenceBranchEntry>, 
 	return { messages: selected.map(item => item.text), ids: selected.map(item => item.id) };
 }
 
+export interface UserEvidenceSnapshotV3 extends UserEvidenceSnapshot {
+	/** The first user message since the latest `/clear`, when the newest-8
+	 *  slice dropped it. It is positional: whatever the user said first, which
+	 *  is where a session usually states its task. It sits outside
+	 *  TASK_EVIDENCE_MAX, so later messages can't push it out. It reaches the judges but never a
+	 *  literal match: an old request cannot authorize a new command alone. */
+	pinned?: { id: string; text: string };
+}
+
+/**
+ * The jev-v3 evidence builder (plan Phase 2 step 6). It differs from
+ * collectTaskEvidence in two ways: it reads only what follows the latest
+ * `/clear` (`reset_boundary`), the way the host rebuilds model context, and it
+ * pins the first user message when the slice would drop it.
+ *
+ * The plan also asked for task verbs in the anchor pattern. Four review
+ * rounds showed a verb list can't converge on intent (every fix traded one
+ * miss for another), so anchoring stays jev-v2's scope words, and a task
+ * stated mid-session still ages out as it does today (#106).
+ * collectTaskEvidence stays as it is, because the jev-v2 shadow baseline
+ * reads it.
+ */
+export function collectTaskEvidenceV3(branch: ReadonlyArray<EvidenceBranchEntry>, limit: number): UserEvidenceSnapshotV3 {
+	if (limit <= 0) return { messages: [], ids: [] };
+	const all: Array<{ text: string; id: string; index: number; anchored: boolean }> = [];
+	const start = branch.findLastIndex(entry => entry.type === "reset_boundary") + 1;
+	for (let index = start; index < branch.length; index++) {
+		const entry = branch[index];
+		if (entry.type !== "message") continue;
+		const message = entry.message;
+		if (message?.role !== "user" || message.attribution !== "user") continue;
+		const text = textOf(message.content);
+		if (text.trim() === "") continue;
+		const id = message.id ?? entry.id ?? `user-${index}`;
+		all.push({ text: headAndTail(text, EVIDENCE_MESSAGE_MAX_CHARS), id, index, anchored: TASK_SCOPE_RE.test(text) });
+	}
+	if (all.length === 0) return { messages: [], ids: [] };
+	const tail = new Set(all.slice(-limit).map(item => item.id));
+	const anchors = all.filter(item => item.anchored).slice(-TASK_EVIDENCE_MAX);
+	const selected = [...all.filter(item => tail.has(item.id)), ...anchors.filter(item => !tail.has(item.id))]
+		.sort((a, b) => a.index - b.index)
+		.slice(-TASK_EVIDENCE_MAX);
+	const snapshot = { messages: selected.map(item => item.text), ids: selected.map(item => item.id) };
+	const first = all[0];
+	if (selected.some(item => item.id === first.id)) return snapshot;
+	return { ...snapshot, pinned: { id: first.id, text: first.text } };
+}
+
 function scopeFingerprint(messages: readonly string[] | undefined): string {
 	const durable = (messages ?? []).filter(message => TASK_SCOPE_FINGERPRINT_RE.test(message));
 	return evidenceFingerprint(durable.length > 0 ? durable : undefined);
