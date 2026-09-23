@@ -27,12 +27,18 @@ state="$("$gh" issue view "$issue" -R "$slug" --json state --jq .state 2>&1)" ||
 [ "$state" = "OPEN" ] || exit 0
 
 mkdir -p "$dir"
+# Both runs' statuses count: a full report that failed to write is a failed
+# week, even when the counts came out.
 "$bun" "$repo/eval/live-report.ts" --hours 168 >"$full" 2>&1
+full_status=$?
+[ -s "$full" ] || full_status=1
 counts="$("$bun" "$repo/eval/live-report.ts" --hours 168 --counts-only 2>&1)"
-status=$?
+counts_status=$?
 
 verdict="Report complete."
-[ "$status" -eq 0 ] || verdict="Report INCOMPLETE or failed (exit $status): fix the log before reading it."
+if [ "$full_status" -ne 0 ] || [ "$counts_status" -ne 0 ]; then
+	verdict="Report INCOMPLETE or failed (full report exit $full_status, counts exit $counts_status): fix it before reading this."
+fi
 
 body="Weekly jev-v3 shadow report, $(date +%F), last 7 days. $verdict
 
