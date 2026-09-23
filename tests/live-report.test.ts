@@ -159,6 +159,9 @@ describe("render", () => {
 			const file = path.join(dir, "decisions.jsonl");
 			fs.writeFileSync(file, `${JSON.stringify({ ...line({ layer: "verdict" }), verdict: "PARSE_ERROR" })}\n`);
 			expect(readDecisionLog(file).malformed).toEqual([]);
+			// ... but one that carries a v3 contradicts itself (#117 gate round 1).
+			fs.writeFileSync(file, `${JSON.stringify({ ...line({ approval: "deny", v3: v3("SAFE", 4) }), verdict: "PARSE_ERROR" })}\n`);
+			expect(readDecisionLog(file).malformed).toEqual([1]);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

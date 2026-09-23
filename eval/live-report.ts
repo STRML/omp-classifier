@@ -103,7 +103,8 @@ export function summarizeShadow(lines: readonly DecisionRecord[], sinceMs: numbe
 const VERDICTS = new Set(["SAFE", "UNSAFE", "UNSURE", "UNAVAILABLE"]);
 /** Line verdicts the log holds from before the Jev port: the prompt-era
  *  classifier wrote PARSE_ERROR when its reply had no verdict. Real history,
- *  not corruption; such lines carry no v3 and count for nothing. */
+ *  not corruption, and it predates the shadow: a PARSE_ERROR line that
+ *  carries v3 contradicts itself and is malformed. */
 const LEGACY_VERDICTS = new Set(["PARSE_ERROR"]);
 /** DecisionRecord["approval"], value for value: an unknown answer is no answer
  *  this report can count, so the line is unreadable rather than skipped. */
@@ -154,7 +155,7 @@ function isDecisionLine(value: unknown): value is DecisionRecord {
 		typeof line.cmd === "string" &&
 		(line.cached === 0 || line.cached === 1) &&
 		(line.approval === undefined || (typeof line.approval === "string" && APPROVALS.has(line.approval))) &&
-		(line.verdict === null || line.verdict === undefined || (typeof line.verdict === "string" && (VERDICTS.has(line.verdict) || LEGACY_VERDICTS.has(line.verdict)))) &&
+		(line.verdict === null || line.verdict === undefined || (typeof line.verdict === "string" && (VERDICTS.has(line.verdict) || (LEGACY_VERDICTS.has(line.verdict) && line.v3 === undefined)))) &&
 		(line.v3 === undefined || isShadowRecord(line.v3))
 	);
 }
