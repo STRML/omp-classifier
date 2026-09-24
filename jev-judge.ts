@@ -270,17 +270,22 @@ function toAuthorizationAnswer(
 /**
  * The judge for one classification, resolved from the extension context.
  *
- * TypeSafe in front and the online tiny/smol/default chain behind it
- * (`ONLINE_MEMORY_MODEL_KEY`), which is the native module's own precedence: a
- * TypeSafe failure degrades to a keyword judgment instead of to no judgment at
- * all, and that is the path whose answers come back flagged one-hot.
+ * TypeSafe in front with nothing behind it: the gate never degrades to a
+ * keyword judge. The host's judge-role chain (modelRoles.judge, primary
+ * `typesafe/jev-latest`; `retry.fallbackChains.judge: []` pins off the
+ * built-in tiny/smol chain) is the whole candidate list, and `sessionModel`
+ * is deliberately absent from the deps — the host's ChainJudge appends the
+ * session's chat model when given it, which would let a TypeSafe outage
+ * produce a chat-derived verdict. Every unavailability must surface as
+ * JevUnavailableError and a permission request instead (see
+ * tests/fallback.test.ts).
  *
  * `settings` must be the host instance, because a plugin-local
  * `import { settings }` is a second copy of the singleton with no instance
  * behind it and throws on the first read (see index.ts's header). Session
- * identity is only advisory to the judge — it scopes the session's credentials
- * and adds the session's model to the fallback chain — so a context that cannot
- * supply it must not cost the gate its judgment.
+ * identity is only advisory to the judge — it scopes the session's
+ * credentials — so a context that cannot supply it must not cost the gate
+ * its judgment.
  */
 function judgeForClassification(options: JudgeBatteryOptions): Judge {
 	const { context, settings } = options;
@@ -293,8 +298,12 @@ function judgeForClassification(options: JudgeBatteryOptions): Judge {
 		const deps: JudgeDeps = {
 			settings,
 			registry: context.modelRegistry,
+			// 18.2.4's JudgeDeps requires `backend`; the 18.3 ChainJudge ignores
+			// it. What matters for fail-closed is the absent `sessionModel`:
+			// without it the chain ends after the configured judge role, so an
+			// unreachable TypeSafe endpoint is an outage, not a weaker verdict
+			// from whatever model the session is using.
 			backend: ONLINE_MEMORY_MODEL_KEY,
-			sessionModel: safely(() => context.models.current()),
 			sessionId: safely(() => context.sessionManager.getSessionId()),
 		};
 		return resolveJudge(deps);

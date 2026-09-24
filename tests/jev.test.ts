@@ -766,7 +766,7 @@ describe("judgeBattery", () => {
 		await expectUnavailable(judgeBattery(undefined, { state: "state", context: { modelRegistry: {} } as unknown as JudgeContext }), /no judge to ask/u);
 	});
 
-	test("the ctx supplies the resolver's deps: registry, backend, session model and id", async () => {
+	test("the ctx supplies the resolver's deps: registry, backend and id, never a session model", async () => {
 		resolvedJudgeDeps.length = 0;
 		const context = {
 			modelRegistry: { authStorage: { hasAuth: () => false }, getAvailable: () => [] },
@@ -783,9 +783,12 @@ describe("judgeBattery", () => {
 		const deps = resolvedJudgeDeps[0] as unknown as Record<string, unknown>;
 		expect(deps.settings).toBe(settings);
 		expect(deps.registry).toBe((context as unknown as Record<string, unknown>).modelRegistry);
-		// The chat chain is the backend when a feature does not name a local model.
+		// The chat chain is the backend key (an 18.2.4 field the 18.3 chain ignores).
 		expect(deps.backend).toBe(ONLINE_MEMORY_MODEL_KEY);
-		expect(deps.sessionModel).toEqual({ provider: "test", id: "session-model" });
+		// A session model would give the host's judge chain a chat fallback after a
+		// TypeSafe outage — an unavailability must be an outage, never a weaker
+		// verdict — so the adapter must not pass one even when the ctx has one.
+		expect(deps.sessionModel).toBeUndefined();
 		expect(deps.sessionId).toBe("session-1");
 		expect(judgeAnswers.model).toBe("jev-1.13.0");
 	});
