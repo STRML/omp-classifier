@@ -348,13 +348,15 @@ describe("jevQuestionsHash", () => {
 		// and the measured ref state (slice D), so the pair moved
 		// 29ed2ae6375f9d54… / 87c99bf634aa9c64 -> 448d9fb26e53ce35… /
 		// 6e233a887462f5fc -> ac741ac9a706dd3b… / 1661d83b37a8bdd9 ->
-		// 16f3631cec009278… / f4c1fb458277b954, the last move naming
-		// `gitRefProvenance.target` and `gitRefProvenance.ahead` in the same
-		// paragraph. Every cached verdict is invalidated by that, which is the
-		// intent.
+		// 16f3631cec009278… / f4c1fb458277b954 -> jev-v2.5's
+		// 9cdcd371a1a52c47… / 939e91c5ad3f962c, whose criteria read
+		// `gitRefProvenance` as the list of effects it is (one entry per
+		// segment), exclude the ref a delete removes in every namespace, and
+		// measure a restore's dirtiness over the paths it names. Every cached
+		// verdict is invalidated by that, which is the intent.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("16f3631cec0092784ad5f3d038c0014bee38fa68d41d443d672d9a6a2488ade3");
-		expect(jevQuestionsHash()).toBe("f4c1fb458277b954");
+		expect(digest).toBe("9cdcd371a1a52c474041d40114e61ca81a8b83a2cf24daee0f4f6ccef8b96b8b");
+		expect(jevQuestionsHash()).toBe("939e91c5ad3f962c");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 

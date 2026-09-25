@@ -3778,7 +3778,7 @@ export default function (pi: ExtensionAPI) {
 			operatorContext?: string;
 			pushProvenance?: GitPushProvenance;
 			worktreeProvenance?: GitWorktreeProvenance;
-			refProvenance?: GitRefProvenance;
+			refProvenance?: GitRefProvenance[];
 			recordExtras: Record<string, unknown>;
 		},
 	): Promise<ShadowV3> => {
@@ -3922,7 +3922,7 @@ export default function (pi: ExtensionAPI) {
 		// discard, what a rebase would replay onto. Read-only plumbing; a command
 		// that is none of the three shapes leaves it undefined and the criteria
 		// read the syntax alone.
-		let refProvenance: GitRefProvenance | undefined;
+		let refProvenance: GitRefProvenance[] | undefined;
 		try {
 			refProvenance = measureGitRefProvenance(command, cwd);
 		} catch {

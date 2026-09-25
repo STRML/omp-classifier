@@ -8,6 +8,12 @@
  * The pairs that have to be measurably different are the point of the slice: a
  * delete of a merged branch versus one nothing else points at, and a path
  * restore on a clean tree versus a dirty one.
+ *
+ * The tier is a list, one entry per effect the command carries: a compound
+ * command measures EVERY segment rather than the first shape that matches, the
+ * ref a delete removes never counts as its own survivor (in any namespace), and
+ * a restore's dirtiness is measured over the paths it names rather than the
+ * whole tree.
  */
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
@@ -23,8 +29,8 @@ beforeEach(async () => {
 
 const measured = (command: string, cwd: string): GitRefProvenance => {
 	const value = measureGitRefProvenance(command, cwd);
-	if (value === undefined) throw new Error(`expected measured ref state for ${command}`);
-	return value;
+	if (value === undefined || value.length !== 1) throw new Error(`expected exactly one measured ref shape for ${command}`);
+	return value[0];
 };
 
 /** One fixture for the read-only tests; the mutating ones build their own, so a
@@ -128,49 +134,158 @@ describe("the measured ref state", () => {
 		expect(mystery.containedIn).toBeNull();
 		expect(mystery.mergedIntoHead).toBeNull();
 	});
+
+	test("a remote-tracking delete does not count the ref it removes as a survivor", () => {
+		const own = makeWorktreeFixture();
+		try {
+			// A commit held by nothing but the remote-tracking ref being deleted.
+			gitIn(
+				own.main,
+				"git checkout -q --detach HEAD && git commit -q --allow-empty -m orphan-only && git update-ref refs/remotes/origin/orphan HEAD && git checkout -q main",
+			);
+			const orphan = measured("git branch -r -D origin/orphan", own.main);
+			expect(orphan.kind).toBe("branch-delete");
+			expect(orphan.target).toBe("origin/orphan");
+			// The ref the delete removes does not survive its own deletion, in any
+			// namespace: an empty list, not one naming refs/remotes/origin/orphan.
+			expect(orphan.containedIn).toEqual([]);
+			expect(orphan.mergedIntoHead).toBe(false);
+			// The bundled and long-flag spellings are the same delete.
+			expect(measured("git branch -rD origin/orphan", own.main)).toEqual(orphan);
+			expect(measured("git branch --remotes -D origin/orphan", own.main)).toEqual(orphan);
+		} finally {
+			removeFixture(own.root);
+		}
+	});
+
+	test("a local delete keeps the remote-tracking ref that survives it", () => {
+		const own = makeWorktreeFixture();
+		try {
+			gitIn(own.main, "git branch pushy && git update-ref refs/remotes/origin/pushy refs/heads/pushy");
+			// Only refs/heads/pushy is removed; origin/pushy still holds the tip,
+			// so the delete is recoverable and the list has to say so.
+			const deleted = measured("git branch -D pushy", own.main);
+			expect(deleted.containedIn).toContain("refs/remotes/origin/pushy");
+			expect(deleted.containedIn).toContain("refs/heads/main");
+			expect(deleted.containedIn).not.toContain("refs/heads/pushy");
+		} finally {
+			removeFixture(own.root);
+		}
+	});
+
+	test("a compound command measures every shape it carries, not the first one matched", () => {
+		const own = makeWorktreeFixture();
+		try {
+			gitIn(own.main, "echo dirty >> notes.txt");
+			const shapes = measureGitRefProvenance("git checkout -- notes.txt && git branch -D old", own.main);
+			expect(shapes?.map(shape => shape.kind)).toEqual(["checkout-paths", "branch-delete"]);
+			// The restore's own measurement: a dirty copy of the path it names.
+			expect(shapes?.[0].target).toBe("notes.txt");
+			expect(shapes?.[0].unstagedChanges).toBe(true);
+			// The delete's own: every branch that came after `old` still holds it.
+			expect(shapes?.[1].target).toBe("old");
+			expect(shapes?.[1].containedIn).toContain("refs/heads/main");
+			// Repeating one effect is one reading; two effects are two.
+			expect(measureGitRefProvenance("git checkout -- notes.txt && git checkout -- notes.txt", own.main)).toHaveLength(1);
+			expect(measureGitRefProvenance("git checkout -- notes.txt; git checkout -- other.txt", own.main)?.map(shape => shape.target)).toEqual([
+				"notes.txt",
+				"other.txt",
+			]);
+			// Two deletes are two lists, not one answer standing in for both.
+			const deletes = measureGitRefProvenance("git branch -D old && git branch -D scratch", own.main);
+			expect(deletes?.map(shape => shape.containedIn)).toEqual([expect.arrayContaining(["refs/heads/main"]), []]);
+		} finally {
+			removeFixture(own.root);
+		}
+	});
+
+	test("a restore measures dirtiness in the paths it names, not the whole tree", () => {
+		const own = makeWorktreeFixture();
+		try {
+			gitIn(own.main, "echo second > other.txt && git add other.txt && git commit -q -m other");
+			// An unstaged edit elsewhere: the restore leaves it alone, so this
+			// restore has nothing of its own to discard and is no data loss.
+			gitIn(own.main, "echo dirty >> other.txt");
+			expect(measured("git checkout -- notes.txt", own.main).unstagedChanges).toBe(false);
+			// The same edit in a path the restore names is the copy it discards...
+			gitIn(own.main, "echo dirty >> notes.txt");
+			expect(measured("git checkout -- notes.txt", own.main).unstagedChanges).toBe(true);
+			// ...and any one of several named paths counts for all of them.
+			expect(measured("git checkout -- notes.txt other.txt", own.main).unstagedChanges).toBe(true);
+			expect(measured("git checkout -- other.txt", own.main).unstagedChanges).toBe(true);
+		} finally {
+			removeFixture(own.root);
+		}
+	});
 });
 
 describe("the ref state through the gate", () => {
 	let seq = 0;
 	const session = (): string => `ref-${(seq += 1)}`;
 
-	const stateFor = async (command: string, cwd: string): Promise<Record<string, unknown> | undefined> => {
+	const stateFor = async (command: string, cwd: string): Promise<Array<Record<string, unknown>> | undefined> => {
 		const before = modelCalls.length;
 		await fire("tool_call", makeEvent(command), makeCtx({ sessionId: session(), cwd }));
-		return stateOf(before).gitRefProvenance as Record<string, unknown> | undefined;
+		return stateOf(before).gitRefProvenance as Array<Record<string, unknown>> | undefined;
 	};
 
 	test("the deleted-branch row carries the measured refs with the authority note", async () => {
 		const measuredState = await stateFor("git branch -D old", fixture.main);
-		expect(measuredState?.kind).toBe("branch-delete");
-		expect(measuredState?.mergedIntoHead).toBe(true);
-		expect(measuredState?.containedIn).toContain("refs/remotes/origin/main");
-		expect(String(measuredState?.note)).toContain("measured by the gate");
+		expect(measuredState).toHaveLength(1);
+		expect(measuredState?.[0].kind).toBe("branch-delete");
+		expect(measuredState?.[0].mergedIntoHead).toBe(true);
+		expect(measuredState?.[0].containedIn).toContain("refs/remotes/origin/main");
+		expect(String(measuredState?.[0].note)).toContain("measured by the gate");
 	});
 
 	test("the restore row carries the clean-tree measurement", async () => {
 		const measuredState = await stateFor("git checkout -- .", fixture.main);
-		expect(measuredState?.kind).toBe("checkout-paths");
-		expect(measuredState?.unstagedChanges).toBe(false);
+		expect(measuredState?.[0].kind).toBe("checkout-paths");
+		expect(measuredState?.[0].unstagedChanges).toBe(false);
 	});
 
 	test("the rebase row carries the counts", async () => {
 		const measuredState = await stateFor("git rebase origin/main", fixture.main);
-		expect(measuredState?.behind).toBe(1);
-		expect(measuredState?.ahead).toBe(1);
+		expect(measuredState?.[0].behind).toBe(1);
+		expect(measuredState?.[0].ahead).toBe(1);
 	});
 
 	test("a command of another shape carries the field not at all", async () => {
 		expect(await stateFor("git status", fixture.main)).toBeUndefined();
 	});
 
+	test("a compound command carries every effect it read, each with its own note", async () => {
+		const own = makeWorktreeFixture();
+		try {
+			gitIn(own.main, "echo dirty >> notes.txt");
+			const measuredState = await stateFor("git checkout -- notes.txt && git branch -D old", own.main);
+			expect(measuredState?.map(entry => entry.kind)).toEqual(["checkout-paths", "branch-delete"]);
+			expect(measuredState?.[0].unstagedChanges).toBe(true);
+			expect(measuredState?.[1].mergedIntoHead).toBe(true);
+			for (const entry of measuredState ?? []) expect(String(entry.note)).toContain("measured by the gate");
+		} finally {
+			removeFixture(own.root);
+		}
+	});
+
+	test("an edit outside the restored paths is not this restore's data loss", async () => {
+		const own = makeWorktreeFixture();
+		try {
+			gitIn(own.main, "echo second > other.txt && git add other.txt && git commit -q -m other && echo dirty >> other.txt");
+			const measuredState = await stateFor("git checkout -- notes.txt", own.main);
+			expect(measuredState?.[0].unstagedChanges).toBe(false);
+		} finally {
+			removeFixture(own.root);
+		}
+	});
+
 	test("a recognized shape with no repository to measure carries null fields, not a guess", async () => {
 		const measuredState = await stateFor("git branch -D old", outside);
-		expect(measuredState?.kind).toBe("branch-delete");
-		expect(measuredState?.target).toBe("old");
-		expect(measuredState?.containedIn).toBeNull();
-		expect(measuredState?.mergedIntoHead).toBeNull();
-		expect(String(measuredState?.note)).toContain("measured by the gate");
+		expect(measuredState?.[0].kind).toBe("branch-delete");
+		expect(measuredState?.[0].target).toBe("old");
+		expect(measuredState?.[0].containedIn).toBeNull();
+		expect(measuredState?.[0].mergedIntoHead).toBeNull();
+		expect(String(measuredState?.[0].note)).toContain("measured by the gate");
 	});
 
 	test("a tree that becomes dirty between two identical calls publishes a new cache key", async () => {
@@ -185,7 +300,7 @@ describe("the ref state through the gate", () => {
 			gitIn(own.main, "echo dirty >> notes.txt");
 			await fire("tool_call", makeEvent(command), makeCtx({ sessionId: id, cwd: own.main }));
 			expect(modelCalls).toHaveLength(2);
-			expect((stateOf(1).gitRefProvenance as { unstagedChanges?: boolean }).unstagedChanges).toBe(true);
+			expect((stateOf(1).gitRefProvenance as Array<{ unstagedChanges?: boolean }>)[0].unstagedChanges).toBe(true);
 		} finally {
 			removeFixture(own.root);
 		}

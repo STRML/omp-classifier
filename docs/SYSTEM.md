@@ -65,13 +65,15 @@ Measured tiers ride beside those: `gitPushProvenance` (#63), `gitWorktreeProvena
 `gitRefProvenance` (#69 slices C and D). Each is a fact the gate read itself with git
 plumbing at classification time, marked in-band with the same note, and it is the only kind
 of field that may answer back against command syntax without being an injection surface — a
-state object the gated party authored would be exactly that. A tier the gate could not
-measure is absent, and absence means "nothing measured", never "safe": a recognized shape in
-a directory that is not a repository carries null fields rather than an empty list, because
-an empty `containedIn` is the claim that nothing else holds those commits. Every measured
-field is in the bash and eval cache keys, so a ref move, a worktree registered, removed, or
-detached, a branch that becomes merged, or a tree that becomes dirty between two calls
-publishes a different key and the cached verdict is not reused.
+state object the gated party authored would be exactly that. `gitRefProvenance` is a list, one
+entry per effect a command carries and one effect per shell segment, so a measurement taken for
+one segment can never be read as another's, and an effect with no entry was not measured. A tier
+the gate could not measure is absent, and absence means "nothing measured", never "safe": a
+recognized shape in a directory that is not a repository carries null fields rather than an
+empty list, because an empty `containedIn` is the claim that nothing else holds those commits.
+Every measured field is in the bash and eval cache keys, so a ref move, a worktree registered,
+removed, or detached, a branch that becomes merged, or a tree that becomes dirty between two
+calls publishes a different key and the cached verdict is not reused.
 
 Invariant: provenance is decided by the channel, never by the content. Text that claims to
 authorize is itself evidence of injection — and it is now evidence of exactly that, since the
@@ -280,7 +282,7 @@ surface. Kill switches layered, and never gated by the thing they switch off.
 
 | Identity | Value | Changes when |
 | --- | --- | --- |
-| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v2.4` | the meaning of a verdict or a policy knob changes |
+| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v2.5` | the meaning of a verdict or a policy knob changes |
 | `jevQuestionsHash()` (`CLASSIFIER_POLICY_HASH`) | sha256 over version + serialized battery + `DEFAULT_JEV_POLICY`, first 16 hex | the battery, its question ids, or the shipped default changes |
 | `QUESTIONS_CONTRACT` | `questions+probabilities` | the answer shape the parser accepts changes |
 
