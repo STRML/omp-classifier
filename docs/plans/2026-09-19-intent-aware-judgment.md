@@ -106,10 +106,10 @@ The literal match is a fast path for local actions only. Code parses the command
 | Action | Extracted | Matches when |
 | --- | --- | --- |
 | Delete | Each target path, with the real path of the target and every parent | The real path is under the working directory or the session temp directory, and its final component (3 or more characters) appears as a whole word, next to a delete verb in imperative form ("delete", "remove", "clean", "rm"). When the working directory is `$HOME` or one of its ancestors, deletes never match. `.`, `..`, empty paths, and globs never match. |
-| Force push, branch delete | Branch name and the verb | The branch name appears as a whole word, and "force" or "delete" appears in imperative form. |
+| Branch delete | The branch name and the delete verb | The branch name appears as a whole word, and the delete verb ("delete", "remove", "drop") appears in imperative form. A push is network egress and is never extracted (see the exclusion below), so a force push never matches literally; it goes to the reviewer with the rest of the egress. |
 | Deploy, merge, publish, release | The verb plus its identifying argument (PR number, environment, package, tag) | Both appear as whole words, and the verb is in imperative or present-progressive form ("merge", "merging"). Past forms ("merged", "deployed") never match. Flags such as `--admin` and `--force` must appear too. |
 
-These always go to the reviewer and never match literally: any network egress, any use of a secret, privilege (`sudo`, `doas`), and any segment that is not extracted or inert.
+These always go to the reviewer and never match literally: any network egress (which includes every push, force or not), any use of a secret, privilege (`sudo`, `doas`), and any segment that is not extracted or inert.
 
 The match also fails when a target contains a variable, a command substitution, or a glob.
 

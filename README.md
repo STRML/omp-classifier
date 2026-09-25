@@ -72,7 +72,7 @@ Uninstall: `omp plugin uninstall omp-classifier`. Coming from the parent? Uninst
 
 Your existing `bash.patterns` and `tools.approval` keep working. A narrow `allow` rule doubles as the opt-out from classification for a trusted shape; blanket patterns never qualify.
 
-Plugin settings live in `~/.omp/omp-classifier.json`. View or change them with `/classifier`:
+Plugin settings live in `omp-classifier.json` at the config root the host resolves — `~/.omp/omp-classifier.json` by default, and otherwise where that session's files go: the profile root under `--profile work` (`~/.omp/profiles/work/omp-classifier.json`), `PI_CONFIG_DIR` in place of the `.omp` segment, or `$XDG_DATA_HOME/omp` once `omp config init-xdg` has created it (darwin/linux). So a profile (or an XDG-migrated root) has its own classifier config instead of sharing the default one. `OMP_JEV_CONFIG` overrides the path outright. View or change them with `/classifier`:
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -214,5 +214,17 @@ bun eval/live-report.ts --hours 168 --counts-only # the same with no command tex
 `eval/weekly-report.sh` runs it every Monday through a launchd agent
 (`eval/launchd/`, install steps in the plist) and posts the counts to the
 shadow-week issue. The full report stays in `~/.omp/omp-classifier/`.
+
+The routine recognizer from #34 is measurement-only, and its measurement is a
+report of its own: the share of a corpus it can prove inert, where the rest of
+the volume goes, and what the decision log says happened to every row it would
+have cleared. It clears 1.2% of the mined history's volume against the issue's
+>30% gate, so nothing calls it from the gate.
+
+```bash
+bun eval/mine-history.ts                                      # rebuild the gate corpus
+bun eval/recognizer-measure.ts                                # measure it, both variants
+bun eval/recognizer-measure.ts --corpus eval/corpus/adversarial.jsonl --rows
+```
 
 MIT licensed.

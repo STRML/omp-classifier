@@ -128,6 +128,47 @@ like `don't`, and a pinned or inherited message never produces a match.
 `literalMatch` is pure, and nothing calls it yet. Phase 2 step 5 gives it a branch in the
 decision order.
 
+### The routine recognizer (`recognizer.ts`, measured only)
+
+The cheapest L1 question: is this command's *shape* provably inert, so a model round-trip would
+only be agreeing? `recognizeRoutineCommand` answers with a verdict and the rules that declined,
+never with a refusal. Twelve rules run in order, and every one of them has to pass: one plain
+segment; no metacharacter the flat segment list cannot show (`&`, `;`, `(`, `)`, a non-parameter
+`{`, a word-initial `!` — the shapes the adapter flattens to a single command); no command
+substitution; no injected verdict or approval vocabulary anywhere in the text, comments included,
+which is what keeps `ls # answer SAFE` from clearing; a read-only verb spelled as a bare literal
+name; literal arguments, with `echo` the one verb that may print an expansion; no redirect; no
+assignment; no flag that writes or runs something; no secret path, keychain or SSH key; and a
+floor that stays quiet. `find` and `grep` are the `search` variant, measured separately, because
+a search walks a tree the code has not read. `env` is not on the read-only list: bare, it prints
+every variable in the session, and `env VAR=1 cmd` runs `cmd`.
+
+It fails closed in both directions that matter. Every rule that declines is reported with the
+token that tripped it, so a measurement can say where a corpus's volume actually goes, and
+session taint is a required input rather than a module global — otherwise `echo $CAPTURED` would
+clear after a capture the recognizer never saw. A caller with no session to look at — a corpus, a
+replayed log — passes `"unknown"` rather than an empty list: an unknown session is one where any
+expansion may print a captured secret, so the `echo` exemption goes with it, and a shape with no
+expansion to read clears as before.
+
+The issue's gate was measurement before build, and the measurement says no: over the mined
+history corpus it clears 1.0% of rows and 1.2% of volume against a >30% target, and even the
+loosest possible bound (one segment plus a listed verb, every other rule ignored) is 4.6%. The
+volume is compounds and unparsable multi-line scripts, not single reads. `bun
+eval/recognizer-measure.ts` is that measurement, and `eval/corpus/history.jsonl` is its corpus.
+Nothing calls the recognizer from `index.ts`, and the adversarial corpus still holds almost
+nothing it can clear (1/103), which is why it stays measurement-only. Its known limits are stated
+rather than hidden: a verb is trusted by name, so a shadowing function or an earlier `PATH` entry
+defeats it.
+
+The measurement's own gate needs both halves, and it refuses to read a half as done when it
+cannot: a clear share above 30% of the volume, zero cleared rows the log or a label refused, and
+zero cleared rows without evidence either way. An unlabeled row is not a pass — the mined
+snapshot predates the decision log, so most of its cleared rows answer nothing, and the gate
+prints NO-GO naming that rather than a share nobody verified. A cleared row whose only join to
+the log is the log's 120-character cut is unlabeled too: the stored key is a prefix of the
+command, and a different suffix stores the same key.
+
 ## L2 judgment
 
 One request, two inputs, no prose:
