@@ -338,6 +338,83 @@ describe("the interpreter's own options, not the gate's guess at them", () => {
 		expect(read.refusal?.why).toContain("$PAYLOAD");
 	});
 
+	// Round 3 review: the round-2 fix closed the separated spelling and not its
+	// class. A value attached to its flag is the SAME value, and reading the
+	// flag word alone loses it: `bun --preload=./payload.ts run safe.ts` matched
+	// only the separate `--preload`, so the preload was never read while the
+	// program slot moved on to safe.ts.
+	test("the attached spelling of a loader flag names the same file", () => {
+		writeScript(root, "payload.ts", HARMFUL_CODE);
+		writeScript(root, "safe.ts", BENIGN);
+		const read = readInterpretedScriptBodies("bun --preload=./payload.ts run safe.ts", root, 8000);
+		expect(read.bodies.map(b => b.operand)).toEqual(["./payload.ts", "safe.ts"]);
+		expect(read.text).toContain("subprocess");
+	});
+
+	test("the getopt short spelling is the same flag, and the `=` after it is a separator", () => {
+		// `bun --help`: `-r, --preload=<val>`. `bun -r./payload.ts run safe.ts`
+		// loads that file on this machine, and `php -f=eq-marker.php` runs
+		// `eq-marker.php` (measured) — the `=` is dropped, not part of the name.
+		writeScript(root, "payload.ts", HARMFUL_CODE);
+		writeScript(root, "safe.ts", BENIGN);
+		writeScript(root, "payload.php", HARMFUL_CODE);
+		for (const command of ["bun -r./payload.ts run safe.ts", "bun -r=./payload.ts run safe.ts"]) {
+			const read = readInterpretedScriptBodies(command, root, 8000);
+			expect({ command, operands: read.bodies.map(b => b.operand) }).toEqual({ command, operands: ["./payload.ts", "safe.ts"] });
+		}
+		for (const command of ["php -f=./payload.php", "php -f./payload.php"]) {
+			const read = readInterpretedScriptBodies(command, root, 8000);
+			expect({ command, operands: read.bodies.map(b => b.operand) }).toEqual({ command, operands: ["./payload.php"] });
+		}
+	});
+
+	test("node's and php's script flags carry their file in the flag too", () => {
+		// `node --require=./pre.cjs` loads that file (measured), and the operand
+		// scan left the attached spelling unread: node's `-r`/`--require`/
+		// `--import` belong to the file class, as php's `-f` does.
+		writeScript(root, "pre.cjs", HARMFUL_CODE);
+		writeScript(root, "main.cjs", BENIGN);
+		const node = readInterpretedScriptBodies("node --require=./pre.cjs main.cjs", root, 8000);
+		expect(node.bodies.map(b => b.operand)).toEqual(["./pre.cjs", "main.cjs"]);
+		// The separated spelling keeps reading the same file it always did.
+		expect(readInterpretedScriptBodies("node --require ./pre.cjs main.cjs", root, 8000).bodies.map(b => b.operand)).toEqual(["./pre.cjs", "main.cjs"]);
+	});
+
+	test("an attached value of a setting flag consumes no program word", () => {
+		// `python3 -Wignore payload` and `python3 -Xutf8 payload` are one word
+		// for the flag and one for the program: nothing is consumed here; the
+		// program slot still holds the next word.
+		writeScript(root, "payload", BENIGN);
+		for (const command of ["python3 -Wignore payload", "python3 -Xutf8 payload", "php -dmemory_limit=64M payload"]) {
+			const read = readInterpretedScriptBodies(command, root, 8000);
+			expect({ command, operands: read.bodies.map(b => b.operand) }).toEqual({ command, operands: ["payload"] });
+		}
+	});
+
+	test("a short word that is a flag cluster keeps its program slot", () => {
+		// `bash -cx ./probe.sh` runs probe.sh: `-cx` is `-c -x`, and the shell
+		// takes the NEXT word as the code. A short word is therefore never read
+		// as its first letter's attached value — that would end the scan and
+		// drop a file the shell runs (measured: `bash -cx ./x.sh` executes x.sh,
+		// while `bash -cecho hi` is an invalid option cluster).
+		writeScript(root, "probe.sh", HARMFUL_SHELL);
+		const read = readInterpretedScriptBodies("bash -cx ./probe.sh", root, 8000);
+		expect(read.bodies.map(b => b.operand)).toEqual(["./probe.sh"]);
+		expect(read.text).toContain("rm -rf ./out");
+	});
+
+	test("an expanded attached value is a refusal, not a word to pass over", () => {
+		const read = readInterpretedScriptBodies("bun --preload=$PAYLOAD run safe.ts", root, 8000);
+		expect(read.refusal?.why).toContain("$PAYLOAD");
+	});
+
+	test("the gate refuses a harmful preload behind the attached spelling", async () => {
+		writeScript(root, "payload.ts", HARMFUL_CODE);
+		writeScript(root, "safe.ts", BENIGN);
+		const result = await gate("bun --preload=./payload.ts run safe.ts");
+		expect(refusalOf(result).why).toContain("flags: bun runs ./payload.ts");
+	});
+
 	test("an end-of-options marker does not eat the program (lua --)", () => {
 		writeScript(root, "payload.lua", 'print("lua payload")\n');
 		const read = readInterpretedScriptBodies("lua -- ./payload.lua", root, 8000);
@@ -461,6 +538,61 @@ describe("the directory the shell will be in", () => {
 		writeScript(root, "payload.py", BENIGN);
 		const read = readInterpretedScriptBodies(`cd ${outside} || python3 payload.py`, root, 8000);
 		expect(read.bodies.map(b => b.operand)).toEqual(["payload.py"]);
+	});
+
+	// Round 3 review: the round-2 fix closed the spelling it was shown (`cd
+	// /tmp || true; …`) and not its class. The `||` BRANCH can move the shell
+	// itself, and the `&&` after it gates the whole `||` chain rather than the
+	// last `cd` in it: in `cd A || cd B && python3 payload.py` the second `cd`
+	// runs only when the first FAILED, so the program runs in A when A exists
+	// and in B when it does not. Reading B's payload.py was the wrong file
+	// whenever A exists — and the walk had no way to know it was wrong.
+	test("a cd on the '||' branch leaves the directory after the chain unknown too", () => {
+		// The same name in three directories, so any single answer is a guess.
+		const branch = path.join(outside, "branch");
+		fs.mkdirSync(branch);
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(outside, "payload.py", BENIGN);
+		writeScript(branch, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies(`cd ${outside} || cd ${branch} && python3 payload.py`, root, 8000);
+		expect(read.bodies).toEqual([]);
+		expect(read.refusal?.why).toContain("payload.py");
+		expect(read.refusal?.why).toContain("cannot be resolved from the command text");
+	});
+
+	test("a chained '||' with a plain separator after it is the same doubt", () => {
+		// `cd A || cd B; …`: the branch may or may not have run, so the shell
+		// after the chain is in A or in B.
+		const branch = path.join(outside, "branch");
+		fs.mkdirSync(branch);
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(outside, "payload.py", BENIGN);
+		writeScript(branch, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies(`cd ${outside} || cd ${branch}; python3 payload.py`, root, 8000);
+		expect(read.bodies).toEqual([]);
+		expect(read.refusal?.why).toContain("cannot be resolved from the command text");
+	});
+
+	test("the gate asks rather than judging text whose directory it cannot pin", async () => {
+		const branch = path.join(outside, "branch");
+		fs.mkdirSync(branch);
+		writeScript(outside, "payload.py", HARMFUL_CODE);
+		writeScript(branch, "payload.py", BENIGN);
+		const result = await gate(`cd ${outside} || cd ${branch} && python3 payload.py`);
+		expect(refusalOf(result).layer).toBe("script-body");
+		expect(refusalOf(result).why).toContain("working directory");
+	});
+
+	test("a cd chain continued by '&&' still names its last directory", () => {
+		// The precise half the doubt must not swallow: after `cd A && cd B &&`
+		// the next segment runs only if B ran and moved, so B's directory is a
+		// fact in the text.
+		const nested = path.join(outside, "nested");
+		fs.mkdirSync(nested);
+		writeScript(nested, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies(`cd ${outside} && cd nested && python3 payload.py`, root, 8000);
+		expect(read.bodies.map(b => b.operand)).toEqual(["payload.py"]);
+		expect(read.text).toContain('print("scratch probe ok")');
 	});
 });
 

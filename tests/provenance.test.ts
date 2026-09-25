@@ -82,4 +82,33 @@ describe("gate-measured git push provenance (#63)", () => {
 			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
 		}
 	});
+
+	// Round 3 review, as the neighbouring spelling of the compose `--config`
+	// class: `git` runs in the command's OWN segment directory, so a `cd`
+	// before the push decides which repository is measured. Reading the
+	// session's own repository reported another repo's tips — and its
+	// `forwardOnly` — for a push that discards work.
+	test("the push is measured in the repository the command's own segment runs in", () => {
+		const session = mkdtempSync(join(tmpdir(), "jev63-session-"));
+		const target = mkdtempSync(join(tmpdir(), "jev63-target-"));
+		try {
+			// The session's own repo is a clean fast-forward (ahead 1, behind 0).
+			git("git init -q -b main && git commit -q --allow-empty -m base && git update-ref refs/remotes/origin/main HEAD && git commit -q --allow-empty -m local", session);
+			// The repo the command cd's into has DIVERGED: the same push there
+			// discards a remote commit, which the session's numbers deny.
+			git("git init -q -b main && git commit -q --allow-empty -m base && git checkout -q --detach HEAD && git commit -q --allow-empty -m remote-only && git update-ref refs/remotes/origin/main HEAD && git checkout -q main && git commit -q --allow-empty -m local-only", target);
+			expect(measureGitPushProvenance("git push origin main", session)?.forwardOnly).toBe(true);
+			expect(measureGitPushProvenance(`cd ${target} && git push origin main`, session)).toEqual({
+				remoteTip: measureGitPushProvenance("git push origin main", target)?.remoteTip,
+				localTip: measureGitPushProvenance("git push origin main", target)?.localTip,
+				ahead: 1,
+				behind: 1,
+				forwardOnly: false,
+			});
+			// A directory the command's text does not pin measures nothing.
+			expect(measureGitPushProvenance('cd "$REPO" && git push origin main', session)).toBeUndefined();
+		} finally {
+			for (const dir of [session, target]) execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
+		}
+	});
 });

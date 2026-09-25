@@ -378,6 +378,123 @@ describe("the daemon decides the local claim, not the local file (#121 review)",
 			remove();
 		}
 	});
+
+	// Round 3 review: a relative path the docker CLI resolves itself is
+	// relative to the directory THAT segment runs in, not to the directory the
+	// command started in. `cd /tmp; docker --config ./.docker compose exec web
+	// sh` has docker read /tmp/.docker: resolving `./.docker` from the starting
+	// directory read this session's config instead and called a remote context
+	// local. `-f` and the default compose file names are the same class of path
+	// — the CLI resolves them in its own directory too.
+	test("a relative --config is resolved in the directory the invocation runs in", () => {
+		const { sources, home, project, remove } = fixture();
+		const target = mkdtempSync(join(tmpdir(), "jev65-cwd-"));
+		try {
+			// The session's own config says this machine; the directory the
+			// command cd's into carries a context naming another machine.
+			dockerContext(join(target, ".docker"), "prod", "tcp://prod.example:2376");
+			writeFileSync(join(target, "compose.yaml"), "services:\n  web:\n    image: wordpress\n");
+			expect(measureNetworkProvenance(`cd ${target}; docker --config ./.docker compose exec web sh`, project, sources)?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+			]);
+			// The context name is read out of that same directory.
+			expect(measureNetworkProvenance(`cd ${target}; docker --config ./.docker --context prod compose exec web sh`, project, sources)?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+			]);
+			// The same command with the directory the command STARTED in: the
+			// session's own config decides, and it is this machine's.
+			expect(measureNetworkProvenance(`docker --config ${join(home, ".docker")} compose exec web sh`, project, sources)?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: true },
+			]);
+		} finally {
+			remove();
+			cleanup(target);
+		}
+	});
+
+	test("a relative -f and the default compose file are read where the invocation runs", () => {
+		const { sources, project, remove } = fixture();
+		const target = mkdtempSync(join(tmpdir(), "jev65-cwd-f-"));
+		try {
+			// The session's own compose file declares `web`; the directory the
+			// command cd's into declares `db` only, so `web` is not this stack's
+			// service once the file is read where docker reads it.
+			writeFileSync(join(target, "compose.yaml"), "services:\n  db:\n    image: mysql:8\n");
+			expect(measureNetworkProvenance(`cd ${target}; docker compose -f ./compose.yaml exec web sh`, project, sources)?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+			]);
+			// No compose file at all in that directory: docker has none to read,
+			// so nothing about the service is measured.
+			const empty = mkdtempSync(join(tmpdir(), "jev65-cwd-empty-"));
+			try {
+				expect(measureNetworkProvenance(`cd ${empty}; docker compose exec web sh`, project, sources)).toBeUndefined();
+			} finally {
+				cleanup(empty);
+			}
+		} finally {
+			remove();
+			cleanup(target);
+		}
+	});
+
+	test("a directory the command's own text cannot pin measures nothing, never a guess", () => {
+		const { sources, home, project, remove } = fixture();
+		try {
+			// `$DIR` is not in the text, so the compose file this invocation would
+			// read is not in the text either: no service is claimed, not even the
+			// one the starting directory's file declares.
+			expect(measureNetworkProvenance('cd "$DIR"; docker compose exec web sh', project, sources)).toBeUndefined();
+			// An absolute path needs no directory: the config and the compose file
+			// the command names are read as the CLI reads them.
+			const remoteConfig = dockerContext(join(home, "remote-docker"), "prod", "tcp://prod.example:2376");
+			expect(
+				measureNetworkProvenance(`cd "$DIR"; docker --config ${remoteConfig} compose -f ${join(project, "compose.yaml")} exec web sh`, project, sources)?.dockerNetworks,
+			).toEqual([{ target: "web", kind: "compose-service", resolvesLocally: false }]);
+		} finally {
+			remove();
+		}
+	});
+
+	test("a cd inside a heredoc body is not a command the shell runs", () => {
+		const { sources, project, remove } = fixture();
+		const elsewhere = mkdtempSync(join(tmpdir(), "jev65-body-"));
+		try {
+			// The body names another directory, and that directory's config says
+			// this machine. The shell never runs that `cd`: the docker invocation
+			// is still in the project directory, whose `--config ./.docker` names
+			// a remote context, so the service is NOT this machine's. A walk that
+			// read the body as commands would answer the body's directory instead
+			// and claim the service local.
+			dockerContext(join(project, ".docker"), "prod", "tcp://prod.example:2376");
+			dockerContext(join(elsewhere, ".docker"), "local", "unix:///var/run/docker.sock");
+			const command = `cat > /dev/null <<'EOF'\ncd ${elsewhere}\nEOF\ndocker --config ./.docker compose exec web sh`;
+			expect(measureNetworkProvenance(command, project, sources)?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+			]);
+		} finally {
+			remove();
+			cleanup(elsewhere);
+		}
+	});
+
+	test("a relative DOCKER_CONFIG is resolved in the directory the invocation runs in", () => {
+		const { sources, project, remove } = fixture();
+		const target = mkdtempSync(join(tmpdir(), "jev65-env-"));
+		try {
+			// `DOCKER_CONFIG=.docker` is a path the CLI resolves against its own
+			// directory. The machine config dir is left to the environment here
+			// (`dockerConfigDir: undefined`), so the env value is the one read.
+			dockerContext(join(target, ".docker"), "prod", "tcp://prod.example:2376");
+			writeFileSync(join(target, "compose.yaml"), "services:\n  web:\n    image: wordpress\n");
+			const env = { DOCKER_CONFIG: ".docker" };
+			expect(measureNetworkProvenance(`cd ${target}; docker compose exec web sh`, project, { ...sources, dockerConfigDir: undefined, env })?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+			]);
+		} finally {
+			remove();
+			cleanup(target);
+		}
+	});
 });
 
 describe("the state carries the measured tier, and absence means nothing measured (#65)", () => {

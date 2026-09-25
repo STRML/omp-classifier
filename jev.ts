@@ -56,8 +56,9 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { redactSecrets } from "./redact";
+import { maskHeredocBodiesAndAnsiSpans, segmentCwdAt, SHELL_WORD_EXPANSION } from "./shell-cwd";
 
 /**
  * Identity of the decision policy. Bump it when the battery or the meaning of a
@@ -510,15 +511,19 @@ function gitPlumbing(args: string[], cwd: string): string | null {
 
 /** Parse the push shape `git ... push [flags] <remote> [<lref>[:<rref>]]`.
  *  The `+` is stripped everywhere: provenance is measured from the ACTUAL
- *  refs, and the criteria decide the +/force semantics from the numbers. */
-function parsePushRefs(command: string): { remote: string; lref: string; rref: string } | null {
-	const tokens = command.split(/\s+/u);
-	const idx = tokens.indexOf("push");
-	if (idx === -1 || idx === 0 || tokens.slice(0, idx).filter(t => !t.startsWith("-")).at(-1) !== "git") return null;
+ *  refs, and the criteria decide the +/force semantics from the numbers.
+ *
+ *  `at` is the offset the `push` token starts at, which is how the caller
+ *  resolves the directory the git command runs in (a `cd` earlier in the same
+ *  segment decides which repository is pushed). */
+function parsePushRefs(command: string): { remote: string; lref: string; rref: string; at: number } | null {
+	const tokens = [...command.matchAll(/\S+/gu)].map(m => ({ text: m[0], at: m.index }));
+	const idx = tokens.findIndex(token => token.text === "push");
+	if (idx === -1 || idx === 0 || tokens.slice(0, idx).filter(token => !token.text.startsWith("-")).at(-1)?.text !== "git") return null;
 	let remote: string | null = null;
 	let spec: string | null = null;
 	for (let i = idx + 1; i < tokens.length; i++) {
-		const t = tokens[i];
+		const t = tokens[i].text;
 		// `--force-with-lease[=...]` and friends are flags; a nonflag is the
 		// remote then the refspec.
 		if (t.startsWith("-")) continue;
@@ -535,29 +540,37 @@ function parsePushRefs(command: string): { remote: string; lref: string; rref: s
 	const lref = colon === -1 ? plus : plus.slice(0, colon);
 	const rref = colon === -1 ? plus : plus.slice(colon + 1);
 	if (lref === "" || rref === "" || lref.includes("*") || rref.includes("*")) return null;
-	return { remote, lref, rref };
+	return { remote, lref, rref, at: tokens[idx].at };
 }
 
 export function measureGitPushProvenance(command: string, cwd: string): GitPushProvenance | undefined {
 	const refs = parsePushRefs(command);
 	if (refs === null) return undefined;
-	const { remote, lref, rref } = refs;
+	const { remote, lref, rref, at } = refs;
+	// The repository measured is the one the git command itself runs in: `cd
+	// /repo && git push origin main` pushes THAT repository, and reading the
+	// session's own repository instead would report another repo's tips and
+	// `forwardOnly` for a push that discards work (#63 tier, round 3 review —
+	// the same class as the compose config path). A directory the command's
+	// text does not pin measures nothing, never a guess.
+	const repo = segmentCwdAt(maskHeredocBodiesAndAnsiSpans(command).masked, at, cwd);
+	if (repo === null) return undefined;
 	// The remote tip comes from remote-tracking state when it exists; a
 	// fresh `git fetch` is out of scope here (classification must stay
 	// fast and side-effect-free).
-	const remoteRefOid = gitPlumbing(["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${rref}`], cwd);
+	const remoteRefOid = gitPlumbing(["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${rref}`], repo);
 	// A push to a remote path the repo does not track under that name (an
 	// explicit URL, or a differently-shaped ref namespace) yields null and
 	// the state carries no provenance.
-	const localRefOid = gitPlumbing(["rev-parse", "--verify", "--quiet", `${lref}^{commit}`], cwd);
+	const localRefOid = gitPlumbing(["rev-parse", "--verify", "--quiet", `${lref}^{commit}`], repo);
 	if (remoteRefOid === null || localRefOid === null) {
 		return { remoteTip: remoteRefOid, localTip: localRefOid, ahead: null, behind: null, forwardOnly: undefined };
 	}
-	const cacheKey = `${cwd}\u0000${remoteRefOid}\u0000${localRefOid}`;
+	const cacheKey = `${repo}\u0000${remoteRefOid}\u0000${localRefOid}`;
 	let counts = revCountCache.get(cacheKey);
 	if (counts === undefined) {
 		counts = null;
-		const raw = gitPlumbing(["rev-list", "--left-right", "--count", `${remoteRefOid}...${localRefOid}`], cwd);
+		const raw = gitPlumbing(["rev-list", "--left-right", "--count", `${remoteRefOid}...${localRefOid}`], repo);
 		const m = raw?.match(/^(\d+)\t(\d+)$/u);
 		if (m) counts = { behind: Number(m[1]), ahead: Number(m[2]) };
 		if (revCountCache.size > 64) revCountCache.clear();
@@ -915,19 +928,40 @@ function dockerDaemonFlags(words: readonly string[]): { daemon?: string; context
 	return named;
 }
 
-/** Shell spellings that make a word name something only the shell knows: the
- *  change happens before the CLI sees the word, so a path carrying one is not a
- *  path this gate read. A `~` at the front is the one such spelling the gate
- *  can measure for itself. */
-const SHELL_WORD_EXPANSION = /[$`*?[\]{}]/u;
-
-/** The config directory a `--config` value names, or undefined when this gate
- *  cannot turn the text into one (an expansion, an empty value). */
-function dockerConfigPath(raw: string, cwd: string): string | undefined {
+/**
+ * One path a docker CLI would resolve itself, or undefined when the gate cannot
+ * turn the command's text into one: an expansion, an empty value, or a RELATIVE
+ * path whose directory the command text does not pin.
+ *
+ * `cwd` is the directory the invocation's own segment runs in, not the
+ * directory the command starts in: `cd /tmp; docker --config ./.docker compose
+ * exec web sh` has docker read `/tmp/.docker`, and resolving `./.docker` from
+ * the starting directory read this session's config instead and called a remote
+ * context local (#121 round 3 review). A directory this walk cannot pin (a `cd
+ * $DIR` earlier in the command) leaves the path unmeasured rather than
+ * substituting a file the command never reads. An absolute path needs no
+ * directory and is measured either way, and `~` is the one shell spelling the
+ * gate can expand for itself.
+ */
+function dockerCliPath(raw: string, cwd: string | null): string | undefined {
 	const value = raw.trim();
 	if (value === "" || SHELL_WORD_EXPANSION.test(value)) return undefined;
 	const expanded = value === "~" || value.startsWith("~/") ? join(homedir(), value.slice(1)) : value;
-	return resolve(cwd, expanded);
+	if (isAbsolute(expanded)) return expanded;
+	return cwd === null ? undefined : resolve(cwd, expanded);
+}
+
+/**
+ * The config directory a machine-config source names (the `DOCKER_CONFIG`
+ * environment variable, or the injected seam), resolved the way the docker CLI
+ * resolves it: an absolute path stands on its own, and a relative one is
+ * relative to the directory the CLI runs in — the invocation's own segment.
+ * A path the gate cannot turn into one measures nothing.
+ */
+function dockerConfigDirFor(raw: string | undefined, fallback: string, cwd: string | null): string | undefined {
+	const value = (raw ?? "").trim();
+	if (value === "") return fallback;
+	return dockerCliPath(value, cwd);
 }
 
 /** The locality of the daemon one compose invocation reaches: the daemon or the
@@ -937,14 +971,19 @@ function dockerConfigPath(raw: string, cwd: string): string | undefined {
  *  the file the command's daemon is recorded in is the one the command points
  *  at, and a value this gate cannot turn into a path leaves the invocation's
  *  daemon unmeasured rather than substituting a file the command never reads
- *  (#121 round 2 review). */
+ *  (#121 round 2 review).
+ *
+ *  `cwd` is the directory this invocation's segment runs in, so every relative
+ *  path the CLI would resolve — its `--config`, and a relative `DOCKER_CONFIG`
+ *  — is resolved the way the CLI resolves it (#121 round 3 review). */
 function composeDaemonResolvesLocally(
 	invocation: ComposeInvocation,
-	cwd: string,
 	env: Record<string, string | undefined>,
-	configDir: string,
+	configDir: string | undefined,
 ): boolean | undefined {
-	const commandConfig = invocation.config === undefined ? configDir : dockerConfigPath(invocation.config, cwd);
+	if (configDir === undefined) return undefined;
+	const segmentCwd = invocation.cwd;
+	const commandConfig = invocation.config === undefined ? configDir : dockerCliPath(invocation.config, segmentCwd);
 	if (commandConfig === undefined) return undefined;
 	const selectors: Array<boolean | undefined> = [];
 	if (invocation.daemon !== undefined) selectors.push(dockerDaemonResolvesLocally(invocation.daemon));
@@ -1121,6 +1160,12 @@ interface ComposeInvocation {
 	subcommand: string | null;
 	operands: string[];
 	files: string[];
+	/** The directory this invocation's own segment runs in, or null when the
+	 *  command's text does not pin it (a `cd $DIR` earlier in the command).
+	 *  Every relative path the CLI resolves — `-f`, the default compose file
+	 *  names, `--config`, a relative `DOCKER_CONFIG` — is resolved against this
+	 *  one, because it is the directory the CLI itself runs in. */
+	cwd: string | null;
 	/** The daemon the docker CLI level names with `-H`/`--host`, if any. */
 	daemon?: string;
 	/** The context it names with `-c`/`--context`, if any. */
@@ -1136,9 +1181,17 @@ interface ComposeInvocation {
  *  before it (`docker -H tcp://… compose exec db`) do not shift the
  *  subcommand, and a `docker` command with no `compose` word is not one. A
  *  `docker-compose` CLI carries its globals before its subcommand, so those are
- *  read there, `-f`/`-H` values consumed. */
-function composeInvocations(command: string): ComposeInvocation[] {
+ *  read there, `-f`/`-H` values consumed.
+ *
+ *  Each invocation carries the directory its own segment runs in (`cwd`), read
+ *  from the command's own mask-and-walk: `cd /tmp; docker --config ./.docker
+ *  compose exec web sh` has docker read `/tmp/.docker`, not the config beside
+ *  the session's own directory (#121 round 3 review). The walk reads the MASKED
+ *  command — a heredoc body is not commands the shell runs — which keeps the
+ *  offsets aligned with this scan, because masking is length-preserving. */
+function composeInvocations(command: string, base: string): ComposeInvocation[] {
 	const invocations: ComposeInvocation[] = [];
+	const masked = maskHeredocBodiesAndAnsiSpans(command).masked;
 	for (const m of command.matchAll(COMPOSE_VERB_RE)) {
 		const tokens = segmentWords(command.slice(m.index + m[0].length));
 		let cliWords: readonly string[];
@@ -1174,7 +1227,12 @@ function composeInvocations(command: string): ComposeInvocation[] {
 			if (COMPOSE_NO_SERVICE_SUBCOMMANDS[subcommand] !== true) operands.push(word);
 		}
 		const named = dockerDaemonFlags(cliWords);
-		invocations.push({ subcommand, operands, files, daemon: named.daemon, context: named.context, config: named.config });
+		// The offset of the VERB, not of the match: `SEGMENT_START` makes the
+		// match begin at the separator that ended the previous segment (`; ` in
+		// `cd /tmp; docker …`), and an offset on the separator belongs to the
+		// segment before it — the directory the shell was in BEFORE the `cd`.
+		const verbAt = m.index + m[0].indexOf(m[1]);
+		invocations.push({ subcommand, operands, files, cwd: segmentCwdAt(masked, verbAt, base), daemon: named.daemon, context: named.context, config: named.config });
 	}
 	return invocations;
 }
@@ -1182,8 +1240,11 @@ function composeInvocations(command: string): ComposeInvocation[] {
 /**
  * Measure the network tier for one command, or undefined when nothing about its
  * destinations could be measured — an absent field means "nothing measured",
- * never "trusted". `cwd` is where the compose file is looked for; the rest of
- * the machine state is read from the paths in `sources`.
+ * never "trusted". `cwd` is the directory the command STARTS in: the compose
+ * file and the docker config are looked for in the directory each of the
+ * command's own segments runs in, as far as the command's `cd` chain can be read
+ * (that walk is `segmentCwdAt` in `shell-cwd.ts`, shared with the script-body
+ * reader). The rest of the machine state is read from the paths in `sources`.
  *
  * The compose file and the docker port table are configuration on this disk:
  * they name services and ports, never the machine a container runs on. That is
@@ -1194,11 +1255,15 @@ function composeInvocations(command: string): ComposeInvocation[] {
  */
 export function measureNetworkProvenance(command: string, cwd: string, sources: NetworkSources = {}): NetworkProvenance | undefined {
 	const endpoints = namedEndpoints(command);
-	const compose = composeInvocations(command);
+	const compose = composeInvocations(command, cwd);
 	if (endpoints.length === 0 && compose.length === 0) return undefined;
 
 	const env = sources.env ?? process.env;
-	const configDir = sources.dockerConfigDir ?? (env.DOCKER_CONFIG?.trim() || DEFAULT_DOCKER_CONFIG_DIR);
+	// The config directory this machine's own chain is read from, resolved the
+	// way the CLI would resolve a relative `DOCKER_CONFIG`: against the
+	// directory the command starts in. Each compose invocation resolves its own
+	// through the same rule below, against the directory its segment runs in.
+	const configDir = dockerConfigDirFor(sources.dockerConfigDir ?? env.DOCKER_CONFIG, DEFAULT_DOCKER_CONFIG_DIR, cwd);
 	const sshNames = sshConfigHostNames(sources.sshConfigPaths ?? DEFAULT_SSH_CONFIG_PATHS);
 	const hostsNames = hostsFileNames(sources.hostsFile ?? DEFAULT_HOSTS_FILE);
 	const localPorts = new Set<number>();
@@ -1217,8 +1282,10 @@ export function measureNetworkProvenance(command: string, cwd: string, sources: 
 
 	// The port table is read from this machine's own daemon. When this machine's
 	// own environment points that daemon at another host, the table lists that
-	// host's containers: nothing in it is a measurement about this one.
-	const daemon = machineDaemonResolvesLocally(env, configDir);
+	// host's containers: nothing in it is a measurement about this one. A config
+	// directory the gate cannot turn into a path measures nothing at all — never
+	// the process's own config, which the command may not read.
+	const daemon = configDir === undefined ? undefined : machineDaemonResolvesLocally(env, configDir);
 	const wantsDocker = unresolved.length > 0 || localPorts.size > 0 || compose.length > 0;
 	const docker = wantsDocker && daemon === true ? (sources.dockerState ?? readDockerPortState)() : undefined;
 	const dockerNetworks: DockerTarget[] = [];
@@ -1234,10 +1301,22 @@ export function measureNetworkProvenance(command: string, cwd: string, sources: 
 	}
 
 	for (const invocation of compose) {
-		const files = invocation.files.length > 0 ? invocation.files.map(file => resolve(cwd, file)) : DEFAULT_COMPOSE_FILES.map(name => join(cwd, name));
+		// Which files the CLI reads is decided by ITS directory, not by the one
+		// the command started in: a relative `-f` and the default compose file
+		// names are resolved against the segment's own directory, and a segment
+		// whose directory the command text does not pin leaves the invocation
+		// unmeasured rather than reading a file docker never opens.
+		const requested = invocation.files.length > 0 ? invocation.files : DEFAULT_COMPOSE_FILES;
+		const files: string[] = [];
+		for (const file of requested) {
+			const path = dockerCliPath(file, invocation.cwd);
+			if (path === undefined) break;
+			files.push(path);
+		}
+		if (files.length !== requested.length) continue;
 		const declared = composeServiceNames(files);
 		if (declared === undefined) continue;
-		const local = composeDaemonResolvesLocally(invocation, cwd, env, configDir);
+		const local = composeDaemonResolvesLocally(invocation, env, dockerConfigDirFor(sources.dockerConfigDir ?? env.DOCKER_CONFIG, DEFAULT_DOCKER_CONFIG_DIR, invocation.cwd));
 		const first = invocation.operands[0];
 		if (first !== undefined && !declared.has(first)) dockerNetworks.push({ target: first, kind: "compose-service", resolvesLocally: false });
 		for (const operand of invocation.operands) {
