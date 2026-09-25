@@ -16,7 +16,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 - The 24 rows cover the captures quoted, unquoted and backticked, the redirect spellings (`&>`, `&>>`, `>&`, `2>`, `2>/dev/null`, `1>&2`, a quoted `">/dev/null"`), the wrapper prefixes (`nohup`, `command`, `builtin`, `env`), the quoted read commands, and the historical mistakes from the four review rounds on #85.
 - One row is a file sink the file channel cannot walk, and it asserts the policy instead of the oracle: a file sink asks by `routeStdout` whether or not the oracle can see the write. The fixture keeps that distinction explicit rather than flattening it into the equality.
 - It runs in the default `bun test`, since the CI image has bash 5. A row the local `bash` cannot parse is named in the fixture's report rather than silently skipped, and `JEV_ORACLE_BASH` picks the interpreter.
->>>>>>> fix/91
+
+### The plugin's own files follow the host's directory resolver (#9)
+
+- `omp-classifier.json`, `decisions.jsonl`, `status.json` and `omp-classifier-grants.json` now resolve through the host's resolver instead of a hand-built `~/.omp` segment: the profile root under `--profile work` (`~/.omp/profiles/work/`), `PI_CONFIG_DIR` in place of `.omp`, and `$XDG_DATA_HOME/omp` once `omp config init-xdg` has created it (darwin/linux). Before this, `/classifier enabled false` in a work profile turned the classifier off in every profile, because all of them read one file. `OMP_JEV_CONFIG` still overrides the path, and with none of those inputs set the default `~/.omp/omp-classifier.json` is unchanged, so no existing install moves.
 
 ## 2026-09-22
 

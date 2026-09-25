@@ -41,10 +41,14 @@
  *     is never classified — its values can hold secrets — it goes straight to a
  *     permission request.
  *   - Every gate decision appends one JSON line to
- *     <agentDir>/omp-classifier/decisions.jsonl (issue #33): tool,
+ *     <config root>/omp-classifier/decisions.jsonl (issue #33): tool,
  *     decision, layer, why, command, verdict, cache provenance, timing. The
  *     write is fire-and-forget: a failure drops the log line, never the
  *     command.
+ *   - The plugin's own files — config, decisions.jsonl, status.json — resolve
+ *     through the host's directory resolver, so a named profile,
+ *     `PI_CONFIG_DIR` and an XDG-migrated config root each get their own file
+ *     instead of every profile sharing `~/.omp/omp-classifier.json` (issue #9).
  *   - Settings are read through `pi.pi.settings` (the HOST module instance); a
  *     plugin-local `import { settings }` is a second, uninitialized copy that
  *     throws. An SDK/isolated session may have no global settings at all, so an
@@ -80,7 +84,7 @@ import type { ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
-import { getConfigRootDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
+import { getPluginsDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
 import { substitutionSpans } from "./shell-ast";
 import { judgeBattery, judgeJevV3 } from "./jev-judge";
@@ -662,8 +666,28 @@ export function jevPolicyFor(config: ClassifierConfig): JevPolicy {
 	return { ...DEFAULT_JEV_POLICY, ...config.jevPolicy };
 }
 
-function classifierConfigPath(): string {
-	return process.env.OMP_JEV_CONFIG ?? path.join(getConfigRootDir(), "omp-classifier.json");
+/**
+ * The config root the host places a plugin's own file in (issue #9).
+ *
+ * `getConfigRootDir()` answers the profile and `PI_CONFIG_DIR` halves of the
+ * question but not the XDG half: the host resolves a top-level file at the
+ * config root through its `data` category (`getMarketplacesRegistryPath()`,
+ * `getAutoQaDbPath()`), which redirects to `$XDG_DATA_HOME/omp` on darwin/linux
+ * once the user has migrated. `dirname(getPluginsDir())` is the exported handle
+ * on that same base — `getPluginsDir()` is `rootSubdir("plugins", "data")` — so
+ * every directory input (profile, `PI_CONFIG_DIR`, XDG) is answered by the
+ * host's resolver instead of being re-derived from `process.env` here. With no
+ * XDG migration the two bases are identical, so no existing file moves.
+ */
+function pluginRootDir(): string {
+	return path.dirname(getPluginsDir());
+}
+
+/** Exported as a test seam (issue #9): the resolution is only observable in a
+ *  process that started with the environment under test, so the regression
+ *  test spawns one and asks for this path. */
+export function classifierConfigPath(): string {
+	return process.env.OMP_JEV_CONFIG ?? path.join(pluginRootDir(), "omp-classifier.json");
 }
 
 interface ClassifierConfigCache {
@@ -756,18 +780,21 @@ function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig
 // ---------------------------------------------------------------------------
 // Decision audit log (issue #33)
 //
-// One JSON line per gate decision at <agentDir>/omp-classifier/
+// One JSON line per gate decision at <config root>/omp-classifier/
 // decisions.jsonl. The directory mirrors classifierConfigPath()'s resolution —
 // dirname(OMP_JEV_CONFIG) when the test override is set,
-// <agentDir>/omp-classifier otherwise — so tests point one env var at a
+// <config root>/omp-classifier otherwise — so tests point one env var at a
 // temp dir and find every artifact there. Append-only; the writer is
 // fire-and-forget (see logDecision inside the plugin factory).
 // ---------------------------------------------------------------------------
 
-/** Directory holding every plugin artifact: config, decisions.jsonl, status.json. */
-function classifierDataDir(): string {
+/** Directory holding every plugin artifact: config, decisions.jsonl, status.json.
+ *  Resolved from the same host root as the config file, so a profile or an XDG
+ *  migration never splits the config from its audit log. Exported alongside
+ *  classifierConfigPath() as the same test seam. */
+export function classifierDataDir(): string {
 	const override = process.env.OMP_JEV_CONFIG;
-	return override ? path.dirname(override) : path.join(getConfigRootDir(), PLUGIN_NAME);
+	return override ? path.dirname(override) : path.join(pluginRootDir(), PLUGIN_NAME);
 }
 
 export function decisionsLogPath(): string {
