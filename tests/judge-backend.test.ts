@@ -337,3 +337,38 @@ function countRejections(shapes: unknown[]): void {
 	const accepted = shapes.filter(shape => parseJudgeBackend(shape) !== undefined);
 	expect(accepted).toEqual([]);
 }
+
+/**
+ * The transport's trust boundary (review gate on #84, P0). The request carries
+ * the judged state and the bearer key, so what the endpoint is allowed to be is
+ * a security decision, not a convenience one.
+ */
+describe("the endpoint transport refuses cleartext and redirects", () => {
+	test("a plaintext endpoint on another host keeps the default backend", () => {
+		countRejections([
+			{ kind: "endpoint", baseUrl: "http://judge.example", model: "m", apiKeyEnv: "K" },
+			{ kind: "endpoint", baseUrl: "http://10.0.0.5:9000", model: "m", apiKeyEnv: "K" },
+			{ kind: "endpoint", baseUrl: "http://judge.example:8765/v1", model: "m", apiKeyEnv: "K" },
+		]);
+	});
+
+	test("a loopback http endpoint is accepted: that is a judge on this machine", () => {
+		for (const baseUrl of ["http://127.0.0.1:8765", "http://localhost:8765", "http://[::1]:8765"]) {
+			expect(parseJudgeBackend({ kind: "endpoint", baseUrl, model: "m", apiKeyEnv: "K" })).toEqual({
+				kind: "endpoint",
+				baseUrl,
+				model: "m",
+				apiKeyEnv: "K",
+			});
+		}
+	});
+
+	test("a credential inside the URL is refused", () => {
+		// The id is built from this URL and the id is printed by `/classifier`
+		// and written into the status report, so a secret in it would be shown.
+		countRejections([
+			{ kind: "endpoint", baseUrl: "https://user:secret@judge.example", model: "m", apiKeyEnv: "K" },
+			{ kind: "endpoint", baseUrl: "https://:secret@judge.example", model: "m", apiKeyEnv: "K" },
+		]);
+	});
+});

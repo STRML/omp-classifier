@@ -174,17 +174,36 @@ export interface JudgeBackend {
  *  and never written to the config, the audit line, or the status report. */
 const ENV_VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 
+/** Hosts a plaintext judge endpoint may name: this machine. The set is the
+ *  spellings `URL.hostname` returns for loopback, including the bracketed IPv6
+ *  form. When the network-provenance tier lands (#65, PR #121) this can defer
+ *  to that shared predicate instead of listing them again. */
+const LOOPBACK_ENDPOINT_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
 /** An http(s) endpoint, canonicalized: trailing slashes stripped, so `http://h/`
  *  and `http://h` are one judge with one identity and an edit between them
  *  flushes no cache. A bare hostname, another scheme, or a non-URL is a shape
- *  this loader does not understand. */
+ *  this loader does not understand.
+ *
+ *  Two shapes are refused because the request carries the whole state and the
+ *  credential (found by the review gate on #84):
+ *  - plaintext to anything but this machine. The bearer key and the judged
+ *    command would both be readable by any observer on the path, so `http:` is
+ *    accepted only for a loopback host, which is what a local judge uses.
+ *  - a URL carrying its own credentials (`https://user:secret@host`). The
+ *    backend id is built from this URL and the id is printed by `/classifier`
+ *    and written into the status report, so a secret inside it would be
+ *    displayed. A judge credential belongs in the environment variable that
+ *    `apiKeyEnv` names, never in the URL. */
 function endpointBaseUrl(value: unknown): string | undefined {
 	if (typeof value !== "string") return undefined;
 	const text = value.trim();
 	if (text === "") return undefined;
 	try {
-		const protocol = new URL(text).protocol;
-		if (protocol !== "http:" && protocol !== "https:") return undefined;
+		const url = new URL(text);
+		if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+		if (url.username !== "" || url.password !== "") return undefined;
+		if (url.protocol === "http:" && !LOOPBACK_ENDPOINT_HOSTS.has(url.hostname)) return undefined;
 	} catch {
 		return undefined;
 	}
@@ -243,6 +262,16 @@ const TYPESAFE_BACKEND: JudgeBackend = {
  * second implementation to keep in step. Its caller's `AbortSignal` still
  * bounds the whole call, and `api: "typesafe"` still marks the answers as
  * measured probabilities rather than a one-hot keyword bridge.
+ *
+ * The URL is checked at the config: https anywhere, http only to this machine,
+ * and never a URL carrying its own credentials (review gate on #84). A redirect
+ * is NOT covered yet: this runtime's `fetch` follows a redirect even when the
+ * init asks it not to, and a 307/308 replays the body, so a hostile or
+ * misconfigured judge could forward the state and the key one hop. Measured in
+ * tests/judge-backend.test.ts; tracked in #125, which is the transport-level
+ * fix (a client that cannot follow a redirect) and is a maintainer call because
+ * it moves the endpoint path off the host's own fetch, and therefore off its
+ * proxy and TLS handling.
  */
 function endpointBackend(config: Extract<JudgeBackendConfig, { kind: "endpoint" }>): JudgeBackend {
 	return {
@@ -255,7 +284,7 @@ function endpointBackend(config: Extract<JudgeBackendConfig, { kind: "endpoint" 
 			if (!apiKey) {
 				throw new JevUnavailableError(`judge endpoint credential ${config.apiKeyEnv} is not set`);
 			}
-			return new TypeSafeJudge({ baseUrl: config.baseUrl, model: config.model, apiKey });
+			return new TypeSafeJudge({ baseUrl: config.baseUrl, model: config.model, apiKey, });
 		},
 	};
 }
