@@ -1061,9 +1061,22 @@ function stableStringify(value: unknown): string {
 
 /** The identity of a row for `--compare`: the inputs the judge saw. Two rows
  *  with one key are one case, and no diff can attribute a movement to either of
- *  them. */
+ *  them.
+ *
+ *  Every optional field is presence-explicit: an omitted `cwd` resolves to
+ *  `DEFAULT_CWD` when the case is judged while `cwd: ""` is an empty working
+ *  directory (#127), and the same omitted-versus-empty distinction holds for
+ *  `kind` and `language`, so neither shape may collapse onto the other. The
+ *  `\u0000omitted`/`\u0000present` markers contain NUL, which no real string
+ *  value can carry here (a path cannot contain it on any platform), so a
+ *  corresponding value cannot forge the other shape. The predicate mirrors
+ *  `asPriorOutcomes` exactly — any non-string is omitted — so an in-memory row
+ *  and its report round-trip always compute one identity, even for a corpus row
+ *  whose cwd is null or malformed. */
 function identityKey(row: PriorOutcome): string {
-	return [row.command, row.cwd ?? "", row.kind ?? "", row.language ?? "", stableStringify(row.evidence ?? null)].join("\u0000");
+	const optional = (value: string | undefined): string =>
+		typeof value === "string" ? `\u0000present\u0000${value}` : "\u0000omitted";
+	return [row.command, optional(row.cwd), optional(row.kind), optional(row.language), stableStringify(row.evidence ?? null)].join("\u0000");
 }
 
 /** Index a set of rows by identity, refusing to resolve a duplicate. Picking one
@@ -1078,7 +1091,7 @@ function indexByIdentity(rows: PriorOutcome[], side: string): Map<string, PriorO
 		if (index.has(key)) {
 			throw new Error(
 				`${side}: two rows share the same case identity (command, cwd and evidence), so a movement cannot be attributed to either: ` +
-					`${JSON.stringify(row.command)} (cwd ${JSON.stringify(row.cwd ?? "")}). A diff needs each case to appear once.`,
+					`${JSON.stringify(row.command)} (cwd ${row.cwd === undefined ? "(omitted)" : JSON.stringify(row.cwd)}). A diff needs each case to appear once.`,
 			);
 		}
 		index.set(key, row);

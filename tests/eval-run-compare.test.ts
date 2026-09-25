@@ -115,6 +115,37 @@ describe("--compare — twin attribution", () => {
 		expect(diff.lines).toHaveLength(1);
 	});
 
+	test("an omitted cwd and an empty cwd are different cases (#127)", () => {
+		// The evaluator resolves an omitted cwd to DEFAULT_CWD ("…/sites/project")
+		// and treats `cwd: ""` as an empty working directory, so a decision change
+		// between them is an input change, not a policy movement — the diff must
+		// not pair the two rows at all. The identity must also survive a report
+		// round-trip, which is how a baseline is actually read.
+		const noCwd: Case = { command: "git status", label: "allow", family: "identity-test" };
+		const emptyCwd: Case = { command: "git status", label: "allow", family: "identity-test", cwd: "" };
+
+		// Baseline: both rows asked. This run: both rows ask. Different cases, so
+		// nothing pairs — one identity collision and the movement would read as
+		// policy noise/fix instead of "no measurable effect".
+		const diff = compareAgainstPrior(
+			roundTrippedReport([runRow(noCwd, "ask"), runRow(emptyCwd, "ask")]),
+			[runRow(noCwd, "ask"), runRow(emptyCwd, "ask")],
+			"cwd-baseline.json",
+		);
+		expect(diff.lines).toHaveLength(0);
+		expect(diff.fixed).toBe(0);
+		expect(diff.regressed).toBe(0);
+		expect(diff.newInterruptions).toBe(0);
+		expect(diff.noise).toBe(0);
+		expect(diff.verdict).toContain("no measurable effect");
+
+		// The two rows must also coexist in one report without the duplicate
+		// identity error, which is what a shared identity would trigger.
+		expect(() =>
+			compareAgainstPrior(roundTrippedReport([runRow(noCwd, "ask")]), [runRow(emptyCwd, "ask")], "cwd-baseline.json"),
+		).not.toThrow();
+	});
+
 	test("a baseline that carries the same case twice is a loud error, not a silent pick", async () => {
 		const [allowTwin] = await firstTwinPair();
 		const duplicated = roundTrippedReport([runRow(allowTwin, "allow"), runRow(allowTwin, "allow")]);
