@@ -268,7 +268,7 @@ const TYPESAFE_BACKEND: JudgeBackend = {
  * is NOT covered yet: this runtime's `fetch` follows a redirect even when the
  * init asks it not to, and a 307/308 replays the body, so a hostile or
  * misconfigured judge could forward the state and the key one hop. Measured in
- * tests/judge-backend.test.ts; tracked in #125, which is the transport-level
+ * tests/judge-backend.test.ts; tracked in #124, which is the transport-level
  * fix (a client that cannot follow a redirect) and is a maintainer call because
  * it moves the endpoint path off the host's own fetch, and therefore off its
  * proxy and TLS handling.
