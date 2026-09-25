@@ -362,12 +362,21 @@ function userWords(messages: readonly string[]): string[] {
 			// A phone and a Mac type `don’t`, not `don't`. The split keeps the
 			// ASCII apostrophe and drops everything else, so without this the
 			// negation arrives as `don` and `t` and cancels nothing.
+			//
+			// Order matters (issue #88): NFKC must run AFTER the fence
+			// strippers. It maps the fullwidth grave U+FF40 and the Greek
+			// varia U+1FEF to a backtick, so normalizing first could turn a
+			// user's own punctuation into an inline-code fence and delete the
+			// negation inside it. The explicit apostrophe/quote mappings stay
+			// first so the careful characters are folded in one pass; the
+			// blanket NFKC pass then only handles word-shape classes (fullwidth
+			// letters and digits, superscripts, ligatures, ellipsis, ...).
 			message
-				.normalize("NFKC")
 				.replace(/[‘’ʼ՚＇]/gu, "'")
-				.replace(/[“”]/gu, '"')
+				.replace(/[“＂]/gu, '"')
 				.replace(/```[\s\S]*?```/gu, " ")
 				.replace(/`[^`]*`/gu, " ")
+				.normalize("NFKC")
 				.split("\n")
 				.filter(line => !line.trimStart().startsWith(">"))
 				.join(" "),
