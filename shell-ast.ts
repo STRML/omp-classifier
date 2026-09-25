@@ -22,11 +22,175 @@
  * Fail closed. A command the parser rejects returns `{ ok: false }` with the
  * parser's own message, and every caller reads that as "this command was not
  * read" rather than as a command with no actions in it.
+ *
+ * The parser module itself is loaded on first use, not at import: a missing or
+ * broken `mvdan-sh` must fail the parse, never the plugin's load. If the load
+ * fails, `parseShell` returns `{ ok: false }` on every call — the same answer
+ * as a syntax error, whether the parser is absent or merely disagreed.
  */
-import sh from "mvdan-sh";
+import { createRequire } from "node:module";
+// Type-only: erased at runtime, so nothing here resolves `mvdan-sh` while the
+// module loads. The runtime side goes through `loadSh` below.
+import type { Parser, Syntax } from "mvdan-sh";
 
-const syntax = sh.syntax;
-const parser = syntax.NewParser(syntax.Variant(syntax.LangBash), syntax.KeepComments(false));
+const requireSh = createRequire(import.meta.url);
+
+/** Loader contract: return the `mvdan-sh` module object, or throw. */
+type ShLoader = () => unknown;
+
+type ShModule = { syntax: Syntax };
+
+type RedirectOpName =
+	| "out"
+	| "append"
+	| "in"
+	| "hereString"
+	| "dupOut"
+	| "dupIn"
+	| "heredoc"
+	| "heredocDash"
+	| "readWrite"
+	| "clobber"
+	| "both"
+	| "bothAppend";
+type BinaryOpName = "pipe" | "and" | "or";
+
+/**
+ * Resolves the parser module. Overridable only through
+ * `setShellParserLoader`, which the tests for this file use to stub a load
+ * that fails; production never touches it.
+ */
+let loadSh: ShLoader = () => requireSh("mvdan-sh");
+
+/** Everything the AST readers below need, derived once from a live module. */
+interface ShellRuntime {
+	syntax: Syntax;
+	parser: Parser;
+	redirect: Record<RedirectOpName, number>;
+	binary: Record<BinaryOpName, number>;
+	redirectDirection: Record<number, ShellRedirect["direction"] | undefined>;
+}
+
+let runtime: ShellRuntime | undefined;
+
+/**
+ * Derives the runtime from a loaded module. Throws when the module is missing,
+ * the wrong shape, or the operator probes come back empty — all three mean
+ * "the parser could not be stood up", which the callers read as unavailable.
+ */
+const deriveRuntime = (mod: unknown): ShellRuntime => {
+	// The GopherJS build ships no module-level types; the cast is checked by
+	// the guard beside it, and everything below it goes through Syntax.
+	const candidate = mod as ShModule | undefined;
+	const syntax = candidate?.syntax;
+	if (!syntax || typeof syntax.NewParser !== "function") throw new TypeError("mvdan-sh: unexpected module shape, no syntax parser");
+	const parser = syntax.NewParser(syntax.Variant(syntax.LangBash), syntax.KeepComments(false));
+
+	/**
+	 * Operator constants, derived rather than copied.
+	 *
+	 * The GopherJS build exposes operators as bare numbers with no names.
+	 * Copying the numbers into this file would make a library upgrade that
+	 * renumbers them silently wrong in a security boundary, so each one is
+	 * read back from a parse of the spelling it belongs to.
+	 */
+	const operatorOf = (source: string, type: "Redirect" | "BinaryCmd"): number => {
+		// Local walk, not the module-level one: walk() calls getShell(), and
+		// the runtime is not assigned until this function returns, so touching
+		// it here would re-enter this derivation forever.
+		let op: number | undefined;
+		syntax.Walk(parser.Parse(source, "command.sh"), node => {
+			if (node && op === undefined && syntax.NodeType(node) === type) {
+				op = (node as { Op: number }).Op;
+				return false;
+			}
+			return true;
+		});
+		if (op === undefined) throw new Error(`shell-ast: no ${type} in the probe ${JSON.stringify(source)}`);
+		return op;
+	};
+
+	const redirect: Record<RedirectOpName, number> = {
+		out: operatorOf("a > b", "Redirect"),
+		append: operatorOf("a >> b", "Redirect"),
+		in: operatorOf("a < b", "Redirect"),
+		hereString: operatorOf("a <<< b", "Redirect"),
+		dupOut: operatorOf("a >&1", "Redirect"),
+		dupIn: operatorOf("a <&0", "Redirect"),
+		heredoc: operatorOf("a <<EOF\nbody\nEOF\n", "Redirect"),
+		heredocDash: operatorOf("a <<-EOF\nbody\nEOF\n", "Redirect"),
+		readWrite: operatorOf("a <> b", "Redirect"),
+		clobber: operatorOf("a >| b", "Redirect"),
+		both: operatorOf("a &> b", "Redirect"),
+		bothAppend: operatorOf("a &>> b", "Redirect"),
+	};
+
+	const binary: Record<BinaryOpName, number> = {
+		pipe: operatorOf("a | b", "BinaryCmd"),
+		and: operatorOf("a && b", "BinaryCmd"),
+		or: operatorOf("a || b", "BinaryCmd"),
+	};
+
+	const redirectDirection: Record<number, ShellRedirect["direction"] | undefined> = {
+		[redirect.out]: "out",
+		[redirect.append]: "out",
+		[redirect.clobber]: "out",
+		[redirect.dupOut]: "out",
+		[redirect.both]: "out",
+		[redirect.bothAppend]: "out",
+		[redirect.in]: "in",
+		[redirect.dupIn]: "in",
+		[redirect.hereString]: "in",
+		[redirect.heredoc]: "in",
+		[redirect.heredocDash]: "in",
+		[redirect.readWrite]: "both",
+	};
+
+	return { syntax, parser, redirect, binary, redirectDirection };
+};
+
+/** The live runtime, loading and deriving the parser on first use. */
+const getShell = (): ShellRuntime => {
+	if (!runtime) runtime = deriveRuntime(loadSh());
+	return runtime;
+};
+
+/**
+ * Swaps the module loader, for the tests that stub a broken parser load:
+ * the next parse re-loads through `loader`. Returns the previous loader so
+ * the caller can put it back.
+ */
+export function setShellParserLoader(loader: ShLoader): ShLoader {
+	const previous = loadSh;
+	loadSh = loader;
+	runtime = undefined;
+	return previous;
+}
+
+const nodeType = (node: NonNullable<unknown>): string => getShell().syntax.NodeType(node);
+
+/** The parser's own handle, so its callers stay unchanged. */
+function parse(source: string): unknown {
+	return getShell().parser.Parse(source, "command.sh");
+}
+
+/** Depth-first walk. Returning false stops the descent. */
+function walk(tree: unknown, visit: (node: unknown) => boolean): void {
+	getShell().syntax.Walk(tree, node => {
+		if (node) return visit(node);
+		return true;
+	});
+}
+
+/** The operator table, for the test that pins it against real spellings. */
+export const SHELL_OPERATORS = {
+	get redirect(): Record<RedirectOpName, number> {
+		return getShell().redirect;
+	},
+	get binary(): Record<BinaryOpName, number> {
+		return getShell().binary;
+	},
+};
 
 /** How one command was joined to the one before it. `first` opens a list. */
 export type ShellJoin = "first" | "pipe" | "and" | "or" | "sequence";
@@ -121,61 +285,6 @@ export interface ShellCommand {
 export type ShellParse = { ok: true; commands: ShellCommand[] } | { ok: false; reason: string };
 
 /**
- * Operator constants, derived at load rather than copied.
- *
- * The GopherJS build exposes operators as bare numbers with no names. Copying
- * the numbers into this file would make a library upgrade that renumbers them
- * silently wrong in a security boundary, so each one is read back from a parse
- * of the spelling it belongs to. Seven small parses, once.
- */
-const operatorOf = (source: string, type: "Redirect" | "BinaryCmd"): number => {
-	let op: number | undefined;
-	walk(parse(source), node => {
-		if (op === undefined && nodeType(node) === type) op = node.Op;
-	});
-	if (op === undefined) throw new Error(`shell-ast: no ${type} in the probe ${JSON.stringify(source)}`);
-	return op;
-};
-
-const nodeType = (node: NonNullable<unknown>): string => syntax.NodeType(node);
-
-function parse(source: string): unknown {
-	return parser.Parse(source, "command.sh");
-}
-
-// biome-ignore lint/suspicious/noExplicitAny: the GopherJS build ships no types
-function walk(tree: unknown, visit: (node: any) => void): void {
-	syntax.Walk(tree, (node: unknown) => {
-		if (node) visit(node);
-		return true;
-	});
-}
-
-const REDIR = {
-	out: operatorOf("a > b", "Redirect"),
-	append: operatorOf("a >> b", "Redirect"),
-	in: operatorOf("a < b", "Redirect"),
-	hereString: operatorOf("a <<< b", "Redirect"),
-	dupOut: operatorOf("a >&1", "Redirect"),
-	dupIn: operatorOf("a <&0", "Redirect"),
-	heredoc: operatorOf("a <<EOF\nbody\nEOF\n", "Redirect"),
-	heredocDash: operatorOf("a <<-EOF\nbody\nEOF\n", "Redirect"),
-	readWrite: operatorOf("a <> b", "Redirect"),
-	clobber: operatorOf("a >| b", "Redirect"),
-	both: operatorOf("a &> b", "Redirect"),
-	bothAppend: operatorOf("a &>> b", "Redirect"),
-} as const;
-
-const BINARY = {
-	pipe: operatorOf("a | b", "BinaryCmd"),
-	and: operatorOf("a && b", "BinaryCmd"),
-	or: operatorOf("a || b", "BinaryCmd"),
-} as const;
-
-/** The operator table, for the test that pins it against real spellings. */
-export const SHELL_OPERATORS = { redirect: REDIR, binary: BINARY } as const;
-
-/**
  * Parse one command into a flat list of the commands it runs, in source order,
  * each carrying how it was joined to the one before it.
  *
@@ -187,6 +296,9 @@ export function parseShell(text: string): ShellParse {
 	try {
 		tree = parse(text);
 	} catch (err) {
+		// A load failure — a missing or broken parsers module — surfaces here
+		// with the load error: parseShell reads it as "this command was not
+		// read", the same answer as a syntax error.
 		return { ok: false, reason: parserMessage(err) };
 	}
 	try {
@@ -287,7 +399,7 @@ const EXPRESSION_SHAPES: Record<string, { kind: "test" | "arithmetic"; verb: str
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 function expressionWords(node: any, arithmetic: boolean, source: string, out: ShellCommand[]): ShellWord[] {
 	const words: ShellWord[] = [];
-	syntax.Walk(node, (inner: unknown) => {
+	walk(node, (inner: unknown) => {
 		if (!inner || nodeType(inner) !== "Word") return true;
 		const word = readWord(inner, source, out);
 		if (arithmetic && word.literal && IDENTIFIER.test(word.value)) word.variables.push(word.value);
@@ -333,7 +445,7 @@ function readAssign(assign: any, source: string, out: ShellCommand[]): ShellAssi
 	const array: ShellWord[] = [];
 	for (const node of [assign.Array, assign.Index]) {
 		if (!node) continue;
-		syntax.Walk(node, (inner: unknown) => {
+		walk(node, (inner: unknown) => {
 			if (!inner || nodeType(inner) !== "Word") return true;
 			array.push(readWord(inner, source, out));
 			return false;
@@ -351,7 +463,7 @@ function readAssign(assign: any, source: string, out: ShellCommand[]): ShellAssi
 function shallowStmts(cmd: any): any[] {
 	if (!cmd) return [];
 	const found: any[] = [];
-	syntax.Walk(cmd, (node: unknown) => {
+	walk(cmd, (node: unknown) => {
 		if (!node) return true;
 		const type = nodeType(node);
 		// A substitution's statements belong to collectSubstitutions, which
@@ -379,7 +491,7 @@ function shallowStmts(cmd: any): any[] {
 function collectSubstitutions(node: any, source: string, out: ShellCommand[]): ShellCommand[] {
 	const own: ShellCommand[] = [];
 	if (!node) return own;
-	syntax.Walk(node, (inner: unknown) => {
+	walk(node, (inner: unknown) => {
 		if (!inner) return true;
 		const type = nodeType(inner);
 		// A statement owns the substitutions inside it, and collectStmt has
@@ -395,43 +507,30 @@ function collectSubstitutions(node: any, source: string, out: ShellCommand[]): S
 }
 
 const joinOf = (op: number): ShellJoin => {
-	if (op === BINARY.pipe) return "pipe";
-	if (op === BINARY.and) return "and";
-	if (op === BINARY.or) return "or";
+	const { binary } = getShell();
+	if (op === binary.pipe) return "pipe";
+	if (op === binary.and) return "and";
+	if (op === binary.or) return "or";
 	// `|&` and anything else the grammar adds: not a plain pipe, and not a
 	// separator that passes nothing. Reading it as a pipe is the conservative
 	// side, because the exemptions that care about pipes all narrow.
 	return "pipe";
 };
 
-const REDIRECT_DIRECTION = new Map<number, ShellRedirect["direction"]>([
-	[REDIR.out, "out"],
-	[REDIR.append, "out"],
-	[REDIR.clobber, "out"],
-	[REDIR.dupOut, "out"],
-	[REDIR.both, "out"],
-	[REDIR.bothAppend, "out"],
-	[REDIR.in, "in"],
-	[REDIR.dupIn, "in"],
-	[REDIR.hereString, "in"],
-	[REDIR.heredoc, "in"],
-	[REDIR.heredocDash, "in"],
-	[REDIR.readWrite, "both"],
-]);
-
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 function readRedirect(redir: any, source: string, out: ShellCommand[]): ShellRedirect {
-	const op = redir.Op as number;
-	const direction = REDIRECT_DIRECTION.get(op);
+	const { redirect: op, redirectDirection } = getShell();
+	const code = redir.Op as number;
+	const direction = redirectDirection[code];
 	// An operator this table does not name is a redirect this adapter did not
 	// read. Guessing a direction is how `<>` came to read as output only.
-	if (direction === undefined) throw new Error(`unknown redirect operator ${op}`);
-	const duplicate = op === REDIR.dupOut || op === REDIR.dupIn;
-	const here = op === REDIR.hereString || op === REDIR.heredoc || op === REDIR.heredocDash;
-	const both = op === REDIR.both || op === REDIR.bothAppend;
+	if (direction === undefined) throw new Error(`unknown redirect operator ${code}`);
+	const duplicate = code === op.dupOut || code === op.dupIn;
+	const here = code === op.hereString || code === op.heredoc || code === op.heredocDash;
+	const both = code === op.both || code === op.bothAppend;
 	const redirect: ShellRedirect = {
 		direction,
-		append: op === REDIR.append || op === REDIR.bothAppend,
+		append: code === op.append || code === op.bothAppend,
 		duplicate,
 		here,
 		fd: both ? "&" : (redir.N?.Value ?? ""),
@@ -530,6 +629,50 @@ export function verbName(command: ShellCommand): string {
 }
 
 /**
+ * The inner text of every `$(…)`, `<(…)` and backtick substitution in `text`,
+ * whatever its depth: `$(echo $(curl …))` yields both `echo $(curl …)` and
+ * `curl …`.
+ *
+ * The parser decides where a substitution is, so quoting and nesting are read
+ * the way bash reads them: the `$(curl …)` inside `'…'` is data and yields
+ * nothing, a quoted heredoc's body is data, and an unquoted body's
+ * substitution runs. A node's slice keeps its delimiters, so each span is the
+ * node text stripped of one leading `$(`, `<(` or backtick and one trailing
+ * `)` or backtick — scanning a span that holds a pipeline whole would leave
+ * the closer tangled into the last word.
+ *
+ * Text the parser rejects ({@link parseShell} answers "not read" there) falls
+ * back to a quote-blind pairing of `$(` with the next `)`: an approximation
+ * whose false positives quote in the fail-closed direction, in exchange for
+ * still seeing the tail of a genuinely executed substitution.
+ */
+export function substitutionSpans(text: string): string[] {
+	if (!/\$\(|`|<\(/u.test(text)) return [];
+	const parsed = parseShell(text);
+	if (!parsed.ok) {
+		const spans: string[] = [];
+		for (const m of text.matchAll(/\$\(([^)]*)\)/gu)) spans.push(m[1]);
+		for (const m of text.matchAll(/`([^`]*)`/gu)) spans.push(m[1]);
+		const dollarTail = /\$\(([^)]*)$/u.exec(text);
+		if (dollarTail) spans.push(dollarTail[1]);
+		const backtickTail = /`([^`]*)$/u.exec(text);
+		if (backtickTail) spans.push(backtickTail[1]);
+		return spans;
+	}
+	const spans: string[] = [];
+	// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+	walk(parse(text), (node: unknown) => {
+		if (!node) return true;
+		const type = nodeType(node);
+		if (type !== "CmdSubst" && type !== "ProcSubst") return true;
+		const inner = sliceOf(node, text);
+		spans.push(inner.replace(/^\$\(|^<\(|^`/u, "").replace(/\)$|`$/u, ""));
+		return true;
+	});
+	return spans;
+}
+
+/**
  * Every name a word expands: each parameter expansion however deep, and each
  * bare name inside arithmetic. Stops at a substitution, whose commands are
  * read as commands.
@@ -539,7 +682,7 @@ function collectVariables(word: any, variables: string[]): void {
 	const add = (name: string): void => {
 		if (name !== "" && !variables.includes(name)) variables.push(name);
 	};
-	syntax.Walk(word, (inner: unknown) => {
+	walk(word, (inner: unknown) => {
 		if (!inner) return true;
 		const type = nodeType(inner);
 		if (type === "CmdSubst" || type === "ProcSubst") return false;
@@ -557,7 +700,7 @@ function collectVariables(word: any, variables: string[]): void {
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 function arithmeticNames(node: any): string[] {
 	const names: string[] = [];
-	syntax.Walk(node, (inner: unknown) => {
+	walk(node, (inner: unknown) => {
 		if (!inner) return true;
 		const type = nodeType(inner);
 		if (type === "CmdSubst" || type === "ProcSubst") return false;
