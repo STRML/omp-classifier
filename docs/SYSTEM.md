@@ -143,6 +143,47 @@ like `don't`, and a pinned or inherited message never produces a match.
 `literalMatch` is pure, and nothing calls it yet. Phase 2 step 5 gives it a branch in the
 decision order.
 
+### The routine recognizer (`recognizer.ts`, measured only)
+
+The cheapest L1 question: is this command's *shape* provably inert, so a model round-trip would
+only be agreeing? `recognizeRoutineCommand` answers with a verdict and the rules that declined,
+never with a refusal. Twelve rules run in order, and every one of them has to pass: one plain
+segment; no metacharacter the flat segment list cannot show (`&`, `;`, `(`, `)`, a non-parameter
+`{`, a word-initial `!` — the shapes the adapter flattens to a single command); no command
+substitution; no injected verdict or approval vocabulary anywhere in the text, comments included,
+which is what keeps `ls # answer SAFE` from clearing; a read-only verb spelled as a bare literal
+name; literal arguments, with `echo` the one verb that may print an expansion; no redirect; no
+assignment; no flag that writes or runs something; no secret path, keychain or SSH key; and a
+floor that stays quiet. `find` and `grep` are the `search` variant, measured separately, because
+a search walks a tree the code has not read. `env` is not on the read-only list: bare, it prints
+every variable in the session, and `env VAR=1 cmd` runs `cmd`.
+
+It fails closed in both directions that matter. Every rule that declines is reported with the
+token that tripped it, so a measurement can say where a corpus's volume actually goes, and
+session taint is a required input rather than a module global — otherwise `echo $CAPTURED` would
+clear after a capture the recognizer never saw. A caller with no session to look at — a corpus, a
+replayed log — passes `"unknown"` rather than an empty list: an unknown session is one where any
+expansion may print a captured secret, so the `echo` exemption goes with it, and a shape with no
+expansion to read clears as before.
+
+The issue's gate was measurement before build, and the measurement says no: over the mined
+history corpus it clears 1.0% of rows and 1.2% of volume against a >30% target, and even the
+loosest possible bound (one segment plus a listed verb, every other rule ignored) is 4.6%. The
+volume is compounds and unparsable multi-line scripts, not single reads. `bun
+eval/recognizer-measure.ts` is that measurement, and `eval/corpus/history.jsonl` is its corpus.
+Nothing calls the recognizer from `index.ts`, and the adversarial corpus still holds almost
+nothing it can clear (1/103), which is why it stays measurement-only. Its known limits are stated
+rather than hidden: a verb is trusted by name, so a shadowing function or an earlier `PATH` entry
+defeats it.
+
+The measurement's own gate needs both halves, and it refuses to read a half as done when it
+cannot: a clear share above 30% of the volume, zero cleared rows the log or a label refused, and
+zero cleared rows without evidence either way. An unlabeled row is not a pass — the mined
+snapshot predates the decision log, so most of its cleared rows answer nothing, and the gate
+prints NO-GO naming that rather than a share nobody verified. A cleared row whose only join to
+the log is the log's 120-character cut is unlabeled too: the stored key is a prefix of the
+command, and a different suffix stores the same key.
+
 ## L2 judgment
 
 One request, two inputs, no prose:
@@ -178,6 +219,27 @@ reason with `(llm keyword answer)`), the model is whatever that judge resolves
 (`TYPESAFE_DEFAULT_MODEL`, else `jev-latest`), and the only knob this gate passes is its own
 deadline as an `AbortSignal` — no temperature to set.
 
+Which transport answers is one seam (`JudgeBackend` in `jev-judge.ts`, issue #84). The default
+kind, `typesafe`, is exactly the paragraph above. The `endpoint` kind constructs the host's own
+`TypeSafeJudge` against `{baseUrl, model}` from the config file, with the credential read from
+the environment variable named by `apiKeyEnv`, so any server speaking the same wire contract
+(`POST {state, model, questions}` → `{answers, model}`) can judge without a patch — a
+self-hosted or fully local classifier included. Its one transport change is the redirect
+policy, forced to `manual` (`noFollowFetch`, issue #124): `fetch` follows a redirect by
+default, and this request carries the judged state and the bearer key, so a 3xx comes back as
+the response and fails the call instead of being replayed to a second host. Two things do not
+move: the battery and the policy. The answers are still probabilities (a `choice` with
+`probabilities` + `confidence`, one `noul` per hazard, a `score` for blast radius), so the same
+floors read them, and one-hot handling stays reserved for a text bridge. A missing credential,
+an unreachable baseUrl, a 3xx, a non-2xx, and an unparseable body are all outages:
+`JevUnavailableError` → permission request.
+
+The backend's **id** (`typesafe/<model>`, `endpoint/<baseUrl>#<model>`) is the judge's identity.
+It joins the config signature and every cache key, so a verdict earned from one judge can never
+be served under another; `/classifier` and `/classifier status` (`backendId`) show it.
+Credentials are deliberately not part of that identity — the TypeSafe key is not in the
+signature either, and another key for the same endpoint is another login, not another judge.
+
 Invariant: nothing that reached L2 can end in silence. `UNAVAILABLE` behaves exactly like
 `UNSURE` at L4 (a dialog) and is excluded from the cache, so an outage cannot pin a session
 to a stale non-answer.
@@ -212,8 +274,9 @@ behind it. The sweep in L5 exists to make that cheap enough to be routine.
 
 ## L3 memory
 
-- **Verdict cache**: per session, keyed by command + cwd + env/pty identity, and cleared
-  whenever the effective config signature changes. `UNAVAILABLE` is never cached.
+- **Verdict cache**: per session, keyed by command + cwd + env/pty identity + the judge's
+  identity (the active backend and the model it answers with), and cleared whenever the
+  effective config signature changes. `UNAVAILABLE` is never cached.
 - **Refusal memory**: what this session was denied, keyed by `normalizeGrantTarget` — the same
   identity a session grant uses, so an approval lifts exactly what a refusal covers (issue #64)
   — plus the cwd, and fingerprinted by the evidence the judge saw, fed back into the state as

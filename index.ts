@@ -41,10 +41,14 @@
  *     is never classified — its values can hold secrets — it goes straight to a
  *     permission request.
  *   - Every gate decision appends one JSON line to
- *     <agentDir>/omp-classifier/decisions.jsonl (issue #33): tool,
+ *     <config root>/omp-classifier/decisions.jsonl (issue #33): tool,
  *     decision, layer, why, command, verdict, cache provenance, timing. The
  *     write is fire-and-forget: a failure drops the log line, never the
  *     command.
+ *   - The plugin's own files — config, decisions.jsonl, status.json — resolve
+ *     through the host's directory resolver, so a named profile,
+ *     `PI_CONFIG_DIR` and an XDG-migrated config root each get their own file
+ *     instead of every profile sharing `~/.omp/omp-classifier.json` (issue #9).
  *   - Settings are read through `pi.pi.settings` (the HOST module instance); a
  *     plugin-local `import { settings }` is a second, uninitialized copy that
  *     throws. An SDK/isolated session may have no global settings at all, so an
@@ -60,7 +64,13 @@
  *     the plugin passes a deadline and receives a probability vector, and
  *     every deterministic check that surrounded the old judge (static rules,
  *     moderate-risk tokens, the eval spawn scan, forced dialogs, grants,
- *     refusal memory) is unchanged.
+ *     refusal memory) is unchanged. Which transport answers is one seam
+ *     (`JudgeBackend`, issue #84): the default is that host path, and the
+ *     `judgeBackend` config key can point the gate at any server speaking the
+ *     same System One contract (`POST {state, model, questions}`) with its
+ *     credential in a named environment variable. The backend's id joins the
+ *     config signature and the cache key, so a verdict is only ever served
+ *     under the judge that produced it.
  *
  * Fail-closed points: a command too long to display is blocked outright; an
  * `env` override and a judgment that fails, times out, or answers with a
@@ -80,10 +90,17 @@ import type { ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
-import { getConfigRootDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
+import { getPluginsDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
 import { substitutionSpans } from "./shell-ast";
-import { judgeBatteryUnderDeadline, judgeJevV3 } from "./jev-judge";
+import {
+	DEFAULT_JUDGE_BACKEND,
+	judgeBackendFor,
+	judgeBatteryUnderDeadline,
+	judgeJevV3,
+	parseJudgeBackend,
+	type JudgeBackendConfig,
+} from "./jev-judge";
 import { buildAuthorizationState, DEFAULT_AUTHORIZATION_POLICY, deriveAuthorization, summarizeActions, type ActionSummaryEntry, type JevAuthorizationLevel } from "./authorization";
 import { deriveDecisionOrder, type DecisionBranch } from "./decision-order";
 import { literalMatch } from "./literal-match";
@@ -635,6 +652,21 @@ interface ClassifierConfig {
 	 * key in a pre-existing config file is tolerated and ignored.
 	 */
 	typesafeModel: string;
+	/**
+	 * Which transport answers the battery (issue #84). `{kind: "typesafe"}` —
+	 * the default — is the host's judge resolution, unchanged; `{kind:
+	 * "endpoint", baseUrl, model, apiKeyEnv}` points the gate at any server
+	 * speaking the System One wire contract, with the credential read from the
+	 * named environment variable (a name, never the key itself: a key pasted
+	 * here is looked up as a variable and fails closed).
+	 *
+	 * Part of the config signature and of every cache key, as `typesafeModel` is:
+	 * a verdict earned from one judge must never be served under another. It is
+	 * file-only — no `/classifier` setter — because a nested object has no
+	 * round-trip through one command argument; `/classifier reset` returns it to
+	 * the default.
+	 */
+	judgeBackend: JudgeBackendConfig;
 	/** Threshold overrides over DEFAULT_JEV_POLICY; absent keys keep the
 	 *  shipped default. These are policy, not facts from vendor docs: measured
 	 *  Jev probabilities move with the question set and the state shape (the
@@ -694,6 +726,7 @@ const JEV_POLICY_RANGES: Record<keyof JevPolicy, { min: number; max: number }> =
  *  snapshot can go stale when `TYPESAFE_DEFAULT_MODEL` changes. */
 const CLASSIFIER_CONFIG_DEFAULTS: Omit<ClassifierConfig, "typesafeModel"> = {
 	enabled: true,
+	judgeBackend: DEFAULT_JUDGE_BACKEND,
 	jevPolicy: {},
 	timeoutMs: DEFAULT_TIMEOUT_MS,
 	maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH,
@@ -709,8 +742,28 @@ export function jevPolicyFor(config: ClassifierConfig): JevPolicy {
 	return { ...DEFAULT_JEV_POLICY, ...config.jevPolicy };
 }
 
-function classifierConfigPath(): string {
-	return process.env.OMP_JEV_CONFIG ?? path.join(getConfigRootDir(), "omp-classifier.json");
+/**
+ * The config root the host places a plugin's own file in (issue #9).
+ *
+ * `getConfigRootDir()` answers the profile and `PI_CONFIG_DIR` halves of the
+ * question but not the XDG half: the host resolves a top-level file at the
+ * config root through its `data` category (`getMarketplacesRegistryPath()`,
+ * `getAutoQaDbPath()`), which redirects to `$XDG_DATA_HOME/omp` on darwin/linux
+ * once the user has migrated. `dirname(getPluginsDir())` is the exported handle
+ * on that same base — `getPluginsDir()` is `rootSubdir("plugins", "data")` — so
+ * every directory input (profile, `PI_CONFIG_DIR`, XDG) is answered by the
+ * host's resolver instead of being re-derived from `process.env` here. With no
+ * XDG migration the two bases are identical, so no existing file moves.
+ */
+function pluginRootDir(): string {
+	return path.dirname(getPluginsDir());
+}
+
+/** Exported as a test seam (issue #9): the resolution is only observable in a
+ *  process that started with the environment under test, so the regression
+ *  test spawns one and asks for this path. */
+export function classifierConfigPath(): string {
+	return process.env.OMP_JEV_CONFIG ?? path.join(pluginRootDir(), "omp-classifier.json");
 }
 
 interface ClassifierConfigCache {
@@ -734,6 +787,13 @@ function normalizeClassifierConfig(raw: Record<string, unknown>): ClassifierConf
 	if (typeof raw.enabled === "boolean") config.enabled = raw.enabled;
 	if (typeof raw.persistentGrants === "boolean") config.persistentGrants = raw.persistentGrants;
 	if (typeof raw.shadowV3 === "boolean") config.shadowV3 = raw.shadowV3;
+	// `judgeBackend` follows the same rule as every other key: a shape the
+	// loader does not understand (a string, an unknown kind, an endpoint with no
+	// model or a non-URL baseUrl) keeps the default rather than half-applying an
+	// override that would fail closed on every command. The parse also
+	// canonicalizes the base URL, so one endpoint has exactly one identity.
+	const backend = parseJudgeBackend(raw.judgeBackend);
+	if (backend !== undefined) config.judgeBackend = backend;
 	if (typeof raw.timeoutMs === "number" && Number.isFinite(raw.timeoutMs) && raw.timeoutMs > 0) {
 		config.timeoutMs = raw.timeoutMs;
 	}
@@ -790,7 +850,7 @@ export function readClassifierConfig(): ClassifierConfig {
 function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig {
 	const before = readClassifierConfig();
 	const raw: Record<string, unknown> = {};
-	for (const key of ["enabled", "jevPolicy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "persistentGrants", "shadowV3"] as const) {
+	for (const key of ["enabled", "judgeBackend", "jevPolicy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "persistentGrants", "shadowV3"] as const) {
 		if (key in patch) raw[key] = patch[key];
 	}
 	const next = normalizeClassifierConfig({ ...before, ...raw });
@@ -803,18 +863,21 @@ function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig
 // ---------------------------------------------------------------------------
 // Decision audit log (issue #33)
 //
-// One JSON line per gate decision at <agentDir>/omp-classifier/
+// One JSON line per gate decision at <config root>/omp-classifier/
 // decisions.jsonl. The directory mirrors classifierConfigPath()'s resolution —
 // dirname(OMP_JEV_CONFIG) when the test override is set,
-// <agentDir>/omp-classifier otherwise — so tests point one env var at a
+// <config root>/omp-classifier otherwise — so tests point one env var at a
 // temp dir and find every artifact there. Append-only; the writer is
 // fire-and-forget (see logDecision inside the plugin factory).
 // ---------------------------------------------------------------------------
 
-/** Directory holding every plugin artifact: config, decisions.jsonl, status.json. */
-function classifierDataDir(): string {
+/** Directory holding every plugin artifact: config, decisions.jsonl, status.json.
+ *  Resolved from the same host root as the config file, so a profile or an XDG
+ *  migration never splits the config from its audit log. Exported alongside
+ *  classifierConfigPath() as the same test seam. */
+export function classifierDataDir(): string {
 	const override = process.env.OMP_JEV_CONFIG;
-	return override ? path.dirname(override) : path.join(getConfigRootDir(), PLUGIN_NAME);
+	return override ? path.dirname(override) : path.join(pluginRootDir(), PLUGIN_NAME);
 }
 
 export function decisionsLogPath(): string {
@@ -912,6 +975,9 @@ export interface StatusReport {
 	config: ClassifierConfig;
 	policyVersion: string;
 	policyHash: string;
+	/** The judge identity a verdict is cached under: which backend, and the
+	 *  model or endpoint that answers it. The id the cache key trusts. */
+	backendId: string;
 	/** Which output contract the live battery + derivation implement. */
 	contract: string;
 	cacheSizes: Record<string, number>;
@@ -947,10 +1013,12 @@ export function buildStatusReport(): StatusReport {
 		// No audit log yet: zero counts.
 	}
 	const allow = recent.filter(record => record.decision === "allow").length;
+	const config = readClassifierConfig();
 	return {
-		config: readClassifierConfig(),
+		config,
 		policyVersion: CLASSIFIER_POLICY_VERSION,
 		policyHash: CLASSIFIER_POLICY_HASH,
+		backendId: judgeBackendFor(config.judgeBackend).id,
 		contract: QUESTIONS_CONTRACT,
 		cacheSizes,
 		pausedSessions: [...sessionOff].sort(),
@@ -1113,6 +1181,7 @@ export function formatClassifierConfig(config: ClassifierConfig): string {
 	return [
 		`enabled: ${config.enabled}`,
 		`typesafeModel: ${config.typesafeModel}`,
+		`judgeBackend: ${judgeBackendFor(config.judgeBackend).id}`,
 		`timeoutMs: ${config.timeoutMs}`,
 		`maxCommandLength: ${config.maxCommandLength}`,
 		`evidenceUserMessages: ${config.evidenceUserMessages}`,
@@ -4382,7 +4451,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (key === "reset") {
-				writeClassifierConfig({ enabled: true, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, persistentGrants: true, shadowV3: true });
+				writeClassifierConfig({ enabled: true, judgeBackend: DEFAULT_JUDGE_BACKEND, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, persistentGrants: true, shadowV3: true });
 				notify(`omp-classifier reset to defaults (${classifierConfigPath()})`);
 				return;
 			}
@@ -4591,6 +4660,10 @@ export default function (pi: ExtensionAPI) {
 				authorizationState: buildAuthorizationState({ actions, ...userEvidence }),
 				context: ctx,
 				settings,
+				// The shadow measures the judge that actually decides: same backend,
+				// same credential path. Anything else would report a disagreement
+				// between two judges as a policy disagreement.
+				backend: config.judgeBackend,
 			});
 			const authorization = deriveAuthorization(judgment.authorization, DEFAULT_AUTHORIZATION_POLICY);
 			const literal = shell
@@ -4752,6 +4825,9 @@ export default function (pi: ExtensionAPI) {
 			// credential store through it (see the header note on settings).
 			context: ctx,
 			settings,
+			// Which transport answers (issue #84). Omitted, it is the host
+			// path; an endpoint backend ignores `settings`/`context` entirely.
+			backend: config.judgeBackend,
 		});
 		if (outcome.kind === "answered") return await judgementFrom(outcome.answers);
 		if (outcome.kind === "failed") {
@@ -5449,10 +5525,13 @@ export default function (pi: ExtensionAPI) {
 		// The merged policy is in the signature, not just the override set: two
 		// different overrides that merge to the same effective thresholds are
 		// the same trust state, and any policy change must invalidate every
-		// cached verdict.
+		// cached verdict. The judge's own identity (the backend plus the model
+		// that answers it) is in there for the same reason: a verdict about one
+		// judge is not a verdict about another.
 		const configSignature = [
 			config.enabled,
 			config.typesafeModel,
+			judgeBackendFor(config.judgeBackend).id,
 			JSON.stringify(jevPolicyFor(config)),
 			config.timeoutMs,
 			config.maxCommandLength,
@@ -5610,7 +5689,7 @@ export default function (pi: ExtensionAPI) {
 			// the session's, which is where the payload's own process still runs
 			// and reads and writes. Dropping either would let a verdict cross a
 			// directory change it never saw.
-			const cacheKey = JSON.stringify(["eval", config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, ctx.cwd, language, evalCode, reviewEvidenceFingerprint]);
+			const cacheKey = JSON.stringify(["eval", config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, ctx.cwd, language, evalCode, reviewEvidenceFingerprint]);
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
 			// session off, so it must hold here too, not only for bash. The
@@ -5905,7 +5984,7 @@ export default function (pi: ExtensionAPI) {
 			// a ref move between calls must invalidate the cached verdict.
 			const pushProvenanceForCache = measureGitPushProvenance(command, cwd);
 			const cacheKey = JSON.stringify([
-				config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, command,
+				config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, command,
 				reviewEvidenceFingerprint,
 				pushProvenanceForCache ?? null,
 			]);
