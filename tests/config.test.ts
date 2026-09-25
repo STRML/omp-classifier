@@ -34,6 +34,9 @@ beforeEach(async () => {
 afterEach(() => {
 	delete process.env.TYPESAFE_DEFAULT_MODEL;
 });
+// Producer-side cleanup (issue #107): this file writes the config file, so it
+// removes it after itself instead of relying on the next consumer's reset.
+afterEach(removeConfigFile);
 
 const gate = async (
 	command: string,

@@ -700,6 +700,21 @@ export const ALLOW_SESSION = "Allow for session";
 export const ALWAYS_ALLOW = "Always allow";
 export const DENY = "Deny";
 
+let sessionSeq = 0;
+
+/**
+ * A session id unique across the whole test process — including across
+ * `--rerun-each` file reruns (issue #107). The plugin's module-level verdict
+ * cache outlives a rerun pass, while a test file's local `seq` counter resets
+ * on re-evaluation, so a rerun would serve the previous pass's cached verdicts
+ * under the reused session id and skip the model entirely. A per-process
+ * counter makes every rerun pass look like fresh sessions, which is what the
+ * per-test-file `beforeEach` reset assumes.
+ */
+export function makeSessionId(prefix: string): string {
+	return `${prefix}-${(sessionSeq += 1)}`;
+}
+
 export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 	const selectCalls: Array<[string, Array<{ label: string; description?: string }>]> = [];
 	const notifyCalls: string[][] = [];

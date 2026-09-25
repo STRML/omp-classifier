@@ -10,7 +10,7 @@
  * answers are keyed by exactly these ids, so a battery change must show up as
  * an edited expectation rather than a silently mismatched stub.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	dialogText,
 	fire,
@@ -39,6 +39,9 @@ beforeEach(async () => {
 	await loadPlugin(makeSettings([]));
 	setJevAnswer(jevSafeAnswer());
 });
+// Producer-side cleanup (issue #107): this file writes the config file, so it
+// removes it after itself instead of relying on the next consumer's reset.
+afterEach(removeConfigFile);
 
 let seq = 0;
 /** Fresh session per test; the gate's cache is module-level and per-session. */
