@@ -5,7 +5,7 @@
  * check), deny stays with the host, narrow allow is honored without a model
  * call, blanket allow gets classified, and env overrides prompt.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	fire,
 	jevSafeAnswer,
@@ -21,6 +21,7 @@ import {
 	ALLOW_ONCE,
 	setJevAnswer,
 	writeConfigFile,
+	makeSessionId,
 } from "./fixtures";
 
 beforeEach(async () => {
@@ -28,19 +29,18 @@ beforeEach(async () => {
 	await loadPlugin(makeSettings([]));
 	setJevAnswer(jevSafeAnswer());
 });
-
-let seq = 0;
+// Producer-side cleanup (issue #107): this file writes the config file, so it
+// removes it after itself instead of relying on the next consumer's reset.
+afterEach(removeConfigFile);
 
 const gate = async (
 	command: string,
 	input: Record<string, unknown> = {},
 	ctxOptions: Parameters<typeof makeCtx>[0] = {},
-) => {
-	seq += 1;
-	return resultText(
-		await fire("tool_call", makeEvent(command, input), makeCtx({ sessionId: `sg-${seq}`, ...ctxOptions })),
+) =>
+	resultText(
+		await fire("tool_call", makeEvent(command, input), makeCtx({ sessionId: makeSessionId("sg"), ...ctxOptions })),
 	);
-};
 
 describe("host-owned decisions pass through untouched", () => {
 	test("deny rule is left to the host", async () => {

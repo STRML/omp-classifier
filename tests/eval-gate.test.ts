@@ -6,7 +6,7 @@
  * Every test runs in a FRESH session (the module-level cache is per-session),
  * and unique payloads where the test asserts a fresh classification.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { evalSubprocessMarkers } from "../index";
 import {
 	fire,
@@ -31,6 +31,9 @@ beforeEach(async () => {
 	await loadPlugin(makeSettings([]));
 	setJevAnswer(jevSafeAnswer());
 });
+// Producer-side cleanup (issue #107): this file writes the config file, so it
+// removes it after itself instead of relying on the next consumer's reset.
+afterEach(removeConfigFile);
 
 const fresh = (opts: Parameters<typeof makeCtx>[0] = {}) => {
 	seq += 1;

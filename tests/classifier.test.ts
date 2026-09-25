@@ -28,9 +28,9 @@ import {
 	setJevAnswer,
 	ALLOW_ONCE,
 	removeConfigFile,
+	makeSessionId,
 } from "./fixtures";
 
-let seq = 0;
 
 beforeEach(async () => {
 	removeConfigFile();
@@ -38,10 +38,7 @@ beforeEach(async () => {
 	setJevAnswer(jevSafeAnswer());
 });
 
-const fresh = (opts: Parameters<typeof makeCtx>[0] = {}) => {
-	seq += 1;
-	return makeCtx({ sessionId: `classify-${seq}`, ...opts });
-};
+const fresh = (opts: Parameters<typeof makeCtx>[0] = {}) => makeCtx({ sessionId: makeSessionId("classify"), ...opts });
 
 const gate = async (command: string, ctxOptions: Parameters<typeof makeCtx>[0] = {}, input: Record<string, unknown> = {}) =>
 	resultText(await fire("tool_call", makeEvent(command, input), fresh(ctxOptions)));

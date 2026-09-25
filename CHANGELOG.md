@@ -2,6 +2,13 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-09-25
+
+### Test-hygiene fixes (#107)
+
+- Every test file that writes the plugin config file now removes it after itself via `afterEach(removeConfigFile)`: `config`, `eval-gate`, `evidence-tiers`, `fallback`, `policy-gates`, `session-grants`, `session-off`, `stale-disable`, and `static-gate`. The existing `beforeEach` resets stay; the reset just no longer depends on the next consumer's hook running. The scope call settled in favor of producer files only: a cleanup hook registered from `tests/fixtures.ts` would fire for every file that imports it (bun registers module-level hooks globally), including files that never write the config, and the only files that can leak a config file are the ones that write one.
+- The gate's module-level per-session verdict cache survives bun's `--rerun-each` file reruns, while a test file's local session-id counter resets — so a rerun pass reuses the previous pass's session buckets and serves cached verdicts with zero model calls. New `makeSessionId(prefix)` in `tests/fixtures.ts` mints process-unique session ids; `classifier.test.ts` and `static-gate.test.ts` now use it, so every rerun pass looks like fresh sessions.
+
 ## 2026-09-22
 
 ### The jev-v3 shadow
