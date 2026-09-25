@@ -333,6 +333,21 @@ describe("eval spawn cwd (issue #14)", () => {
 		// is not code), while a block the payload has moved past does not.
 		expect(evalSpawnCwd("Dir.chdir(\"/tmp/rbwrap\") do\n  `ls`\nend\n", SESSION)).toEqual({ kind: "literal", cwd: "/tmp/rbwrap" });
 		expect(evalSpawnCwd("Dir.chdir(\"/tmp/rbempty\") { }\n`ls`", SESSION)).toEqual({ kind: "session" });
+		// A Ruby 3 endless method (`def helper = 1`) opens no block and closes
+		// none: counting it as a `def`-opener would run the block past its real
+		// `end` and judge a spawn written after it against the block's
+		// directory, which Ruby has already restored.
+		expect(evalSpawnCwd(`Dir.chdir("/tmp/rbendless") do\n  def helper = 1\nend\nsystem("echo outside")`, SESSION)).toEqual({
+			kind: "session",
+		});
+		// The same endless def written on one line, and one written after the
+		// block: neither may throw the balance off in either direction.
+		expect(
+			evalSpawnCwd(`Dir.chdir("/tmp/rbendless2") do; def helper = 1; end; system("echo outside")`, SESSION)
+		).toEqual({ kind: "session" });
+		expect(evalSpawnCwd(`Dir.chdir("/tmp/rbel3") do\n  1\nend\ndef helper = 1\nsystem("ls")`, SESSION)).toEqual({
+			kind: "session",
+		});
 	});
 
 	test("a spawn directory the scan cannot read is opaque, never guessed", () => {

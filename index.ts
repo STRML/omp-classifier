@@ -2359,6 +2359,27 @@ const RUBY_BLOCK_KEYWORD = /^(?:do|if|unless|while|until|case|begin|def|class|mo
  * keyword that never closes before the payload ends — reports -1, and the
  * caller asks rather than guess a directory.
  */
+/** True when the `def` at `defAt` is Ruby 3's endless method definition —
+ *  `def helper = 1`, `def helper() = 1`, `def self.helper = 1` — which is a
+ *  complete statement on its own line: it opens no block and its `end`-less
+ *  body is the expression after the `=`. Counting it as an opener would run
+ *  the enclosing block past its real `end` (a spawn written after it would be
+ *  judged against a directory Ruby has already restored) or leave the balance
+ *  unable to close at all. The `=` that marks this form sits at paren depth 0
+ *  on the statement's line; a normal method's default-value `=`, as in
+ *  `def helper(x = 1)`, sits inside its parentheses and stays a plain opener. */
+function isRubyEndlessDef(masked: string, defAt: number): boolean {
+	let depth = 0;
+	for (let i = defAt + 3; i < masked.length; i += 1) {
+		const char = masked[i];
+		if (char === "\n" || char === ";") return false;
+		if (char === "(") depth += 1;
+		else if (char === ")") depth -= 1;
+		else if (char === "=" && depth === 0) return true;
+	}
+	return false;
+}
+
 function scanRubyBlockEnd(masked: string, at: number): number {
 	if (masked[at] === "{") {
 		const close = scanGroupEnd(masked, at);
@@ -2378,6 +2399,7 @@ function scanRubyBlockEnd(masked: string, at: number): number {
 		// `do` of such a line is that statement's own opener, not a second one.
 		const before = masked.slice(masked.lastIndexOf("\n", position - 1) + 1, position).trimEnd();
 		if (word === "do" && /^(?:while|until|for)\b/u.test(before)) continue;
+		if (word === "def" && isRubyEndlessDef(masked, position)) continue;
 		// Every other `do` opens a block wherever it is written — `items.each do
 		// |item|`, and a block-taking call's own `do` after its `)`. The other
 		// keywords open one only where a statement can start: a mid-expression
