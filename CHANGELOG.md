@@ -17,6 +17,13 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 - The harness stays machine-independent: `eval/run.ts` passes no measured tier, because the corpus cases name hosts that exist on no particular machine, and a score that depended on this laptop's docker table would not be reproducible. The battery hash moved, so cached answers are re-drawn anyway.
 - Known residual, pinned by a test: a URL is read as a destination wherever it is written, including inside a quoted message (`echo 'see http://host/'`); a *bare* host named inside a quoted message is not, because a remote verb is only read at the start of a segment. A compose file that declares its services through `include:`/`extends` measures as declaring none, which fails closed (no carve-out claimed).
 
+### Live evidence respects `/clear` (#103)
+
+- All three live evidence collectors — `collectUserEvidence`, `collectTaskEvidence`, `collectToolEvidence` — now read only what follows the latest `/clear` (`reset_boundary`), the way the host rebuilds model context (`session-context.ts:404` uses the same boundary for emission). Before this, a request the user cleared away came back as user evidence and could weigh as authorization for a later command. They previously started at branch index 0; `collectTaskEvidenceV3` already read from the boundary (#101).
+- One shared boundary helper, `branchStartAfterLatestResetBoundary`, serves all four collectors, so there is a single implementation of "start after the latest boundary".
+- A branch with no `reset_boundary` is unchanged, and the jev-v3 collector's behavior is unchanged — it used the same index before and after.
+- This change shares the `jev-v2.3` bump with the network-provenance change above: both land in the same release, and the bump is safe now because the jev-v3 shadow week has recorded zero calls (`shadow-report-2026-09-22.txt`: "jev-v3 shadow since 2026-09-16T00:19:00.712Z: 0 calls, 0 shadow errors"), so there is no v2 shadow baseline to disturb. Holding the bump would have left a live authorization leak open to protect a baseline that does not exist.
+
 ## 2026-09-22
 
 ### The jev-v3 shadow

@@ -1467,6 +1467,16 @@ function textOf(content: unknown): string {
 }
 
 /**
+ * Index of the first entry after the latest `/clear` boundary, 0 when none.
+ * The host rebuilds model context only from after the latest
+ * `reset_boundary` (session-context.ts:404), so no live evidence collector
+ * may read past it — a cleared request cannot weigh as authorization. One
+ * implementation, shared by every collector (#103).
+ */
+const branchStartAfterLatestResetBoundary = (branch: ReadonlyArray<{ type: string }>): number =>
+	branch.findLastIndex(entry => entry.type === "reset_boundary") + 1;
+
+/**
  * The last `limit` user messages on a session branch, oldest first (issue
  * #31): the user-tier evidence a classify record may carry. Pure over the
  * branch entry array so tests pass a fixture instead of a live session. Only
@@ -1476,13 +1486,16 @@ function textOf(content: unknown): string {
  * out too (fail closed). Each is textOf-flattened and capped per
  * EVIDENCE_MESSAGE_MAX_CHARS by keeping its head and tail. The window is the
  * tail: when the branch holds more user messages than `limit`, the newest win.
+ * Like collectTaskEvidenceV3 (#101), it reads only what follows the latest
+ * `/clear` boundary (#103).
  */
 export function collectUserEvidence(
 	branch: ReadonlyArray<{ type: string; message?: { role?: string; attribution?: string; content?: unknown } }>,
 	limit: number,
 ): string[] {
 	const messages: string[] = [];
-	for (const entry of branch) {
+	for (let index = branchStartAfterLatestResetBoundary(branch); index < branch.length; index++) {
+		const entry = branch[index];
 		if (entry.type !== "message") continue;
 		const message = entry.message;
 		if (message?.role !== "user" || message.attribution !== "user") continue;
@@ -1524,7 +1537,7 @@ type EvidenceBranchEntry = {
 export function collectTaskEvidence(branch: ReadonlyArray<EvidenceBranchEntry>, limit: number): UserEvidenceSnapshot {
 	if (limit <= 0) return { messages: [], ids: [] };
 	const all: Array<{ text: string; id: string; index: number; anchored: boolean }> = [];
-	for (let index = 0; index < branch.length; index++) {
+	for (let index = branchStartAfterLatestResetBoundary(branch); index < branch.length; index++) {
 		const entry = branch[index];
 		if (entry.type !== "message") continue;
 		const message = entry.message;
@@ -1554,9 +1567,11 @@ export interface UserEvidenceSnapshotV3 extends UserEvidenceSnapshot {
 
 /**
  * The jev-v3 evidence builder (plan Phase 2 step 6). It differs from
- * collectTaskEvidence in two ways: it reads only what follows the latest
- * `/clear` (`reset_boundary`), the way the host rebuilds model context, and it
- * pins the first user message when the slice would drop it.
+ * collectTaskEvidence in two ways: it pins the first user message when the
+ * slice would drop it, and its collector name records that it feeds the
+ * jev-v3 battery. Both builders now read only what follows the latest
+ * `/clear` (`reset_boundary`), the way the host rebuilds model context
+ * (#103).
  *
  * The plan also asked for task verbs in the anchor pattern. Four review
  * rounds showed a verb list can't converge on intent (every fix traded one
@@ -1568,7 +1583,7 @@ export interface UserEvidenceSnapshotV3 extends UserEvidenceSnapshot {
 export function collectTaskEvidenceV3(branch: ReadonlyArray<EvidenceBranchEntry>, limit: number): UserEvidenceSnapshotV3 {
 	if (limit <= 0) return { messages: [], ids: [] };
 	const all: Array<{ text: string; id: string; index: number; anchored: boolean }> = [];
-	const start = branch.findLastIndex(entry => entry.type === "reset_boundary") + 1;
+	const start = branchStartAfterLatestResetBoundary(branch);
 	for (let index = start; index < branch.length; index++) {
 		const entry = branch[index];
 		if (entry.type !== "message") continue;
@@ -1633,7 +1648,7 @@ export function collectToolEvidence(
 	// Every digest covers redacted text. A hash of the raw text would let
 	// anyone holding the evidence test password guesses against it offline.
 	const digest = (value: string): string => createHash("sha256").update(value).digest("hex").slice(0, 16);
-	for (const entry of branch) {
+	for (const entry of branch.slice(branchStartAfterLatestResetBoundary(branch))) {
 		if (entry.type !== "message") continue;
 		if (typeof entry.message !== "object" || entry.message === null) continue;
 		const message = entry.message as Record<string, unknown>;
