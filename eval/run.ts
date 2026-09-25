@@ -471,13 +471,35 @@ function policyIdOf(policy: JevPolicy, batteryHash: string): string {
 		.slice(0, 12);
 }
 
+/**
+ * Read a JSONL corpus and parse one record per line. Blank and whitespace-only
+ * lines are skipped, and a trailing newline is therefore harmless — the exact
+ * tolerance the four loaders below always had, kept so a corpus that loads
+ * today still loads. A malformed line is a corpus bug and fails the run naming
+ * the file and the real 1-based line in that file (not the index among parsed
+ * rows): a bare `JSON.parse` named neither, so a one-character typo in a
+ * thousand-line corpus was a hunt through a raw `SyntaxError`.
+ */
+export async function parseJsonl<T>(path: string): Promise<T[]> {
+	const rows: T[] = [];
+	const lines = (await Bun.file(path).text()).split("\n");
+	for (let index = 0; index < lines.length; index++) {
+		const line = lines[index];
+		if (line.trim() === "") continue;
+		try {
+			rows.push(JSON.parse(line) as T);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(`${path}:${index + 1}: malformed JSONL line — ${message}`);
+		}
+	}
+	return rows;
+}
+
 async function loadCorpus(name: string): Promise<Case[]> {
 	const cases: Case[] = [];
 	if (name === "all" || name === "adversarial" || name === "gitflow") {
-		const text = await Bun.file(join(EVAL_DIR, "corpus", "adversarial.jsonl")).text();
-		for (const line of text.split("\n")) {
-			if (line.trim() === "") continue;
-			const parsed: Record<string, unknown> = JSON.parse(line);
+		for (const parsed of await parseJsonl<Record<string, unknown>>(join(EVAL_DIR, "corpus", "adversarial.jsonl"))) {
 			// The leading metadata line documents the schema; it is not a case.
 			if (typeof parsed._comment === "string") continue;
 			cases.push(parsed as unknown as Case);
@@ -488,21 +510,14 @@ async function loadCorpus(name: string): Promise<Case[]> {
 		// everyday work, measured separately because every case names a checkout
 		// and the friction cluster lives in work provenance the state cannot yet
 		// carry. Scored with `--corpus gitflow`, and inside `all`.
-		const text = await Bun.file(join(EVAL_DIR, "corpus", "gitflow.jsonl")).text();
-		for (const line of text.split("\n")) {
-			if (line.trim() === "") continue;
-			cases.push(JSON.parse(line) as Case);
-		}
+		cases.push(...(await parseJsonl<Case>(join(EVAL_DIR, "corpus", "gitflow.jsonl"))));
 	}
 	if (name === "all" || name === "history") {
 		// Labels live beside the mined history because the history file itself is
 		// rebuilt per machine and carries no judgements.
-		const labelsFile = Bun.file(join(EVAL_DIR, "corpus", "labels.jsonl"));
-		if (await labelsFile.exists()) {
-			for (const line of (await labelsFile.text()).split("\n")) {
-				if (line.trim() === "") continue;
-				cases.push(JSON.parse(line) as Case);
-			}
+		const labelsPath = join(EVAL_DIR, "corpus", "labels.jsonl");
+		if (await Bun.file(labelsPath).exists()) {
+			cases.push(...(await parseJsonl<Case>(labelsPath)));
 		} else {
 			// `all` must be loud too: silently scoring authored-only while
 			// claiming "all" misrepresents the measurement.
@@ -519,11 +534,9 @@ async function loadCorpus(name: string): Promise<Case[]> {
 		// Phase 0): the seed rows plus hand-labelled twins and injection-shaped
 		// rows, scored with `--corpus intent` and inside `all`, same pattern as
 		// gitflow above.
-		const file = Bun.file(join(EVAL_DIR, "corpus", "intent.jsonl"));
-		if (await file.exists()) {
-			for (const line of (await file.text()).split("\n")) {
-				if (line.trim() === "") continue;
-				const parsed: Record<string, unknown> = JSON.parse(line);
+		const intentPath = join(EVAL_DIR, "corpus", "intent.jsonl");
+		if (await Bun.file(intentPath).exists()) {
+			for (const parsed of await parseJsonl<Record<string, unknown>>(intentPath)) {
 				// The leading metadata line documents the schema; it is not a case.
 				if (typeof parsed._comment === "string") continue;
 				cases.push(parsed as unknown as Case);
