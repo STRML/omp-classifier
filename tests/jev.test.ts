@@ -355,11 +355,16 @@ describe("jevQuestionsHash", () => {
 		// measure a restore's dirtiness over the paths it names -> jev-v2.6's
 		// 608c617f11cbc174… / 03b6c52b62745145, whose paragraph excludes the
 		// refs the command's other deletes remove too, so a delete whose only
-		// companions are dropped by the same command reads unrecoverable. Every
-		// cached verdict is invalidated by that, which is the intent.
+		// companions are dropped by the same command reads unrecoverable ->
+		// jev-v2.7's d7860a1730364502… / 6bdde1f421b4e52c, whose paragraph keeps
+		// that exclusion but conditions it on the join: only deletes on
+		// unconditional joins (`&&`, `;`, a pipeline stage) drop each other's
+		// refs from the list, while an `||` delete may be skipped, so its refs
+		// stay in the list and read as survivors. Every cached verdict is
+		// invalidated by that, which is the intent.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("608c617f11cbc174eeb76d62a4836a597549de2b936354a8caba9497b5d6159d");
-		expect(jevQuestionsHash()).toBe("03b6c52b62745145");
+		expect(digest).toBe("d7860a1730364502ba4017d0187c5ed3834cae90582ea31eb36aad63451c1682");
+		expect(jevQuestionsHash()).toBe("6bdde1f421b4e52c");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 

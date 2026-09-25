@@ -309,6 +309,6 @@ describe("redaction reaches every judge state", () => {
 		// later changes to what a state means (the measured git tiers), which is
 		// the point of pinning it: a state read under one version means
 		// something else under the next.
-		expect(JEV_POLICY_VERSION).toBe("jev-v2.6");
+		expect(JEV_POLICY_VERSION).toBe("jev-v2.7");
 	});
 });

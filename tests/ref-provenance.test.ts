@@ -244,6 +244,35 @@ describe("the measured ref state", () => {
 		}
 	});
 
+	test("a delete behind `||` does not exclude the refs a reached delete removes", () => {
+		const own = makeWorktreeFixture();
+		try {
+			// Same twin tip as the `&&` case: a and b are the only pointers to this
+			// commit. But `git branch -D a || git branch -D b` may never run its
+			// right side — a successful first delete short-circuits it — so the
+			// command may leave refs/heads/b behind. The `&&` union would call that
+			// pointer-deletion certain; this reading keeps it measured.
+			gitIn(own.main, "git checkout -q --detach HEAD && git commit -q --allow-empty -m twin-only && git branch a && git branch b && git checkout -q main");
+			const pair = measureGitRefProvenance("git branch -D a || git branch -D b", own.main);
+			expect(pair?.map(shape => shape.target)).toEqual(["a", "b"]);
+			// The reached delete of `a` removes refs/heads/a, and the or-joined
+			// delete of `b` may be skipped by the shell — so `b` still holds the
+			// tip and the delete reads recoverable, which is what the list says.
+			expect(pair?.map(shape => shape.containedIn)).toEqual([["refs/heads/b"], []]);
+			// The second entry reads a tip orphaned here — in the world where the
+			// right arm runs, `a` was already removed and `b` removes itself —
+			// which errs toward alarm on a command that may delete less than it
+			// reads, never toward calling unreachable work recoverable.
+			// The mirror: `&&` and `;` are unconditional joins, and their deletes
+			// still exclude each other's refs exactly as before.
+			const andPair = measureGitRefProvenance("git branch -D a && git branch -D b", own.main);
+			expect(andPair?.map(shape => shape.containedIn)).toEqual([[], []]);
+			expect(measureGitRefProvenance("git branch -D a; git branch -D b", own.main)?.map(shape => shape.containedIn)).toEqual([[], []]);
+		} finally {
+			removeFixture(own.root);
+		}
+	});
+
 	test("a restore measures dirtiness in the paths it names, not the whole tree", () => {
 		const own = makeWorktreeFixture();
 		try {
@@ -347,6 +376,19 @@ describe("the ref state through the gate", () => {
 			const measuredState = await stateFor("git branch -D a && git branch -D b", own.main);
 			expect(measuredState?.map(entry => entry.target)).toEqual(["a", "b"]);
 			expect(measuredState?.map(entry => entry.containedIn)).toEqual([[], []]);
+			// The `||` reading differs through the gate too: the right arm may be
+			// skipped, so refs/heads/b is a survivor of the first delete's deletion
+			// and the judge receives it as the work's remaining pointer.
+			await removeFixture(own.root);
+			const orOwn = makeWorktreeFixture();
+			try {
+				gitIn(orOwn.main, "git checkout -q --detach HEAD && git commit -q --allow-empty -m twin-only && git branch a && git branch b && git checkout -q main");
+				const orState = await stateFor("git branch -D a || git branch -D b", orOwn.main);
+				expect(orState?.map(entry => entry.target)).toEqual(["a", "b"]);
+				expect(orState?.map(entry => entry.containedIn)).toEqual([["refs/heads/b"], []]);
+			} finally {
+				removeFixture(orOwn.root);
+			}
 		} finally {
 			removeFixture(own.root);
 		}
