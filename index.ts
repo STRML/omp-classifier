@@ -1727,6 +1727,43 @@ const MODERATE_RISK_TOKENS = new Set([
 // `bash script.sh` is an ordinary invocation.
 const INLINE_CODE_INTERPRETERS = new Set(["python", "python2", "python3", "bash", "sh", "perl"]);
 
+// Flags whose VALUE is the program (or stdin), for the script-file scan (issue
+// #67). `python3 -c '…'`, `node -e '…'`, `perl -e '…'`, `bash -s`, a bare `-`:
+// the text travels with the command, so these spellings keep their existing
+// treatment and the file scan leaves them alone. The set mirrors
+// `interpretersInSegment`'s inline-code test; where a spelling would otherwise
+// be read as a program word it gets its own table below (php's `-r`, the
+// bun/deno subcommands). The direction is fail-closed either way: a gap here
+// costs one file body its read, while an invented entry costs a prompt on a
+// flag value.
+const INTERPRETER_PROGRAM_FLAG = /^-{1,2}(c|e|E|eval|command|p|print)$/u;
+
+// php spells inline code `-r`/`-R` and its interactive shell `-a`; for ruby `-r`
+// loads a library and for node it preloads one, so these letters are php's own.
+// `php -f x.php` names the script in the flag's VALUE, which is left to the
+// ordinary operand scan: the word after `-f` is read like any other program.
+const PHP_PROGRAM_FLAG = /^-{1,2}(r|R|run|a)$/u;
+
+// The interpreters that put a subcommand between the verb and the program, and
+// the words that are one: `bun run x.ts` (the program is the NEXT word) and
+// `deno run x.ts`. `bun run build` resolves a package.json script instead of a
+// file, so a word in this position is read only when it IS a readable file.
+const INTERPRETER_SUBCOMMANDS: Record<string, Set<string>> = {
+	bun: new Set(["run", "x", "exec", "eval", "test", "build", "repl"]),
+	deno: new Set(["run", "eval", "test", "bench", "check", "serve", "task", "compile", "bundle", "doc", "fmt", "lint", "repl", "jupyter"]),
+};
+
+// A word carrying one of these is expanded by the shell before the interpreter
+// ever sees it, so the program it names is not readable text. `{` and `[` are
+// brace expansion and globs; a `$` or a backtick is a substitution.
+const SHELL_WORD_EXPANSION = /[$`*?[\]{}]/u;
+
+// Extensions that make a bare word a script even without a path separator: the
+// shape `node -r ./pre.js main.js` hides its program behind a flag, and the
+// program it loads is the second one. A word that only has the extension is
+// read best-effort — the same shape is also an ordinary data argument.
+const SCRIPT_FILE_EXTENSION = /\.(?:py|pyw|rb|js|mjs|cjs|ts|mts|cts|tsx|jsx|sh|bash|zsh|fish|dash|ksh|pl|pm|php|lua|tcl|r|jl|ps1|bat|cmd|awk)$/iu;
+
 // Obfuscation and second-execution markers inside inline interpreter code.
 // Inline code is fully visible to the classifier — `python3 -c 'print(1)'`
 // shows every character it will run — so a SAFE verdict on plain code may
@@ -2067,8 +2104,17 @@ function stdinExecutingInterpreters(stage: string): Array<{ verb: string; codeTe
 	return found;
 }
 
-function interpretersInSegment(segment: string[], rawStage: string): Array<{ verb: string; codeText: string | null }> {
-
+/**
+ * The interpreter a segment's own verb names, with the words after it.
+ *
+ * Both interpreter scans start here: the pipe scan asks what that interpreter
+ * will read from stdin, the script-file scan (issue #67) which file it will run.
+ *
+ * Wrappers are stepped through by position rather than by breaking at the first
+ * non-flag word: `env`, `nice`, `timeout` and `stdbuf` take options or durations
+ * first, so breaking early read `timeout 5 sh` as the verb `5`.
+ */
+function interpreterInvocation(segment: string[]): { verb: string; rest: string[] } | null {
 	let i = 0;
 	let sawWrapper = false;
 	while (i < segment.length) {
@@ -2093,11 +2139,17 @@ function interpretersInSegment(segment: string[], rawStage: string): Array<{ ver
 		}
 		break;
 	}
-	if (i >= segment.length) return [];
-
+	if (i >= segment.length) return null;
 	const verb = interpreterName(segment[i]);
-	if (!verb) return [];
-	const rest = segment.slice(i + 1);
+	if (!verb) return null;
+	return { verb, rest: segment.slice(i + 1) };
+}
+
+function interpretersInSegment(segment: string[], rawStage: string): Array<{ verb: string; codeText: string | null }> {
+
+	const invocation = interpreterInvocation(segment);
+	if (!invocation) return [];
+	const { verb, rest } = invocation;
 	// Inline code executes regardless of what else is on the line. The builtin
 	// INLINE_CODE_INTERPRETERS covers -c/-e for python/bash/sh/perl only, which
 	// left node, deno, bun, ruby, php and the rest with no inline-code path.
@@ -2564,6 +2616,212 @@ function heredocBody(text: string): string | null {
 	// may hide its second act behind an `EOF ` line.
 	const closer = new RegExp(`^${opener[1] === "-" ? "\\t*" : ""}${opener[3]}$`, "mu").exec(tail);
 	return closer ? tail.slice(0, closer.index) : tail;
+}
+
+/**
+ * A file the command hands to an interpreter as its program (issue #67).
+ *
+ * `operand` says the word the command spelled; `arm` says how sure the scan is
+ * that it IS the program:
+ *   - "program": the interpreter's own operand (`python3 x.py`, `bash x.sh`).
+ *     Strict — the interpreter will run this file and nothing else, so a word
+ *     that is not a readable regular file (a directory python would open as
+ *     `__main__.py`, an unreadable file, a glob the shell expands first) is a
+ *     refusal, not a shrug.
+ *   - "load": a word reached past a subcommand or behind a loader flag
+ *     (`bun run x.ts`, `node -r ./pre.js main.js`). Best-effort — the same
+ *     spelling can be a package.json script or a data argument, so only a
+ *     readable file is read and anything else is passed over.
+ */
+interface InterpreterProgramRef {
+	verb: string;
+	/** The word as the command spelled it, for the flag text and the refusal. */
+	operand: string;
+	arm: "program" | "load";
+}
+
+/** The interpreter-program words one segment names, in command order. */
+function interpreterProgramRefs(segment: string[]): InterpreterProgramRef[] {
+	const invocation = interpreterInvocation(segment);
+	if (!invocation) return [];
+	const { verb, rest } = invocation;
+	const subcommands = INTERPRETER_SUBCOMMANDS[verb];
+	const refs: InterpreterProgramRef[] = [];
+	let arm: "program" | "load" = "program";
+	for (let i = 0; i < rest.length; i++) {
+		const word = rest[i];
+		if (word === "") continue;
+		if (word.startsWith("-")) {
+			// The program travels in a flag's value, or on stdin: those spellings
+			// keep their existing treatment (inline-code and pipe scans).
+			if (
+				INTERPRETER_PROGRAM_FLAG.test(word) ||
+				word === "-" ||
+				word === "-s" ||
+				word === "--stdin" ||
+				(verb === "php" && PHP_PROGRAM_FLAG.test(word))
+			) {
+				return refs;
+			}
+			// `python3 -m pkg` runs a module the interpreter resolves through its
+			// own import path. That is a lookup this scan does not model, and the
+			// module is not a file the command named, so the rest of the line is
+			// the module's ARGUMENTS, not a program.
+			if (verb.startsWith("python") && (word === "-m" || word === "--module")) return refs;
+			continue;
+		}
+		if (arm === "program" && subcommands?.has(word)) {
+			arm = "load";
+			continue;
+		}
+		if (arm === "load" && !SCRIPT_FILE_EXTENSION.test(word) && !word.includes("/")) continue;
+		refs.push({ verb, operand: word, arm });
+		// The program slot is filled: everything after it is an argument, and only
+		// a script-shaped word is read past it (a loader's second file).
+		arm = "load";
+	}
+	return refs;
+}
+
+export interface InterpretedScriptBody {
+	/** The interpreter that will run it. */
+	verb: string;
+	/** The program word, as the command spelled it. */
+	operand: string;
+	/** The file's contents, verbatim. */
+	body: string;
+}
+
+export interface ReadScriptBodiesResult {
+	/** The text the gate judges: `command`, plus one fenced section per body. */
+	text: string;
+	/** The bodies that were read, in command order. */
+	bodies: InterpretedScriptBody[];
+	/** Fail-closed stop: a program the classifier could not read in full. */
+	refusal: { why: string } | null;
+}
+
+/** One program word resolved against the disk: what to read, or why not. */
+type ScriptFileRead = { kind: "body"; body: string } | { kind: "skip" } | { kind: "refuse"; why: string };
+
+/** Resolve and read one program word. `budget` is what the review limit has
+ *  left for this body once the command and the section's labels are counted. */
+function readScriptFile(ref: InterpreterProgramRef, cwd: string, budget: number): ScriptFileRead {
+	if (SHELL_WORD_EXPANSION.test(ref.operand)) {
+		return {
+			kind: "refuse",
+			why:
+				`script body blocked: the shell expands ${ref.operand} before ${ref.verb} sees it, ` +
+				`so the program is not readable text`,
+		};
+	}
+	let file: string;
+	let stat: fs.Stats;
+	try {
+		file = resolveToCwd(ref.operand, cwd);
+		stat = fs.statSync(file);
+	} catch (err) {
+		// A program that is not there runs nothing: the interpreter fails on it,
+		// or a sibling command of the same line writes it with a heredoc whose
+		// body already rides the command text. The other stat failures (EACCES on
+		// the directory, ELOOP, ENAMETOOLONG, an internal URL) mean the gate
+		// cannot see the program at all.
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "skip" };
+		return {
+			kind: "refuse",
+			why: `script body blocked: ${ref.operand} could not be read (${err instanceof Error ? err.message : String(err)})`,
+		};
+	}
+	if (!stat.isFile()) {
+		return {
+			kind: "refuse",
+			why:
+				`script body blocked: ${ref.operand} is a ${stat.isDirectory() ? "directory" : "non-regular file"}, ` +
+				`and the classifier cannot read the program it runs`,
+		};
+	}
+	if (stat.size > budget) {
+		return {
+			kind: "refuse",
+			why:
+				`script body blocked: ${ref.operand} is ${stat.size} bytes and the review limit ` +
+				`leaves ${Math.max(budget, 0)} for it`,
+		};
+	}
+	let read: Buffer;
+	try {
+		read = fs.readFileSync(file);
+	} catch (err) {
+		return {
+			kind: "refuse",
+			why: `script body blocked: ${ref.operand} could not be read (${err instanceof Error ? err.message : String(err)})`,
+		};
+	}
+	// A short read is a file that changed under the gate: the text in hand is not
+	// the program the interpreter will run.
+	if (read.byteLength !== stat.size) {
+		return {
+			kind: "refuse",
+			why: `script body blocked: ${ref.operand} changed while it was read (${read.byteLength} of ${stat.size} bytes)`,
+		};
+	}
+	return { kind: "body", body: read.toString("utf8") };
+}
+
+/**
+ * Read the program text of every script the command hands to an interpreter
+ * (issue #67).
+ *
+ * Where a script lives decided whether it ran: `python3 .scratch/x.py` was
+ * judged as command TEXT, so a byte-identical script refused in /tmp ran from
+ * the worktree, and renaming a refused script flipped the verdict. The body is
+ * read here and joins the judged text, exactly as a heredoc body already does,
+ * which makes path and filename stop mattering in both directions.
+ *
+ * The bound is the review limit: the body is text the gate now reviews, and
+ * text past the limit is text neither the classifier nor a permission dialog
+ * may approve. A body that cannot fit, a file that cannot be read, a truncated
+ * read, and a program word the shell would expand all fail closed, because a
+ * program the classifier cannot read is a program it must not release.
+ *
+ * Deliberately NOT modeled: what the entry file pulls in. A `import`/`require`/
+ * `source` target is resolved by the interpreter's own rules (sys.path,
+ * NODE_PATH, extension lookup, dynamic specifiers), so a half-resolver here
+ * would read the wrong file and say nothing about the right one. `python3 -m
+ * pkg` is the same kind of lookup and is left to the interpreter.
+ */
+export function readInterpretedScriptBodies(command: string, cwd: string, limit: number): ReadScriptBodiesResult {
+	const bodies: InterpretedScriptBody[] = [];
+	let text = command;
+
+	// Discovery reads the MASKED text: a heredoc body is data to the shell (and a
+	// document written with one must not turn `python3 pkg` inside it into a
+	// program this scan insists on reading), while an ANSI-C or crossed quote
+	// span is text the shell never parses as a command either. The judged text
+	// below stays the whole command: masking is for the scan, not for the judge.
+	for (const segment of tokenizeShellSegments(maskHeredocBodiesAndAnsiSpans(command).masked)) {
+		if (segment.length === 0) continue;
+		for (const ref of interpreterProgramRefs(segment)) {
+			// Label lines the section adds: shell comments, so a body's first line
+			// is never read as a command of this line's, and the judge can see that
+			// the text below is a FILE the interpreter will run.
+			const label = `\n# --- ${ref.verb} runs ${ref.operand}; body read from disk ---\n`;
+			const endLabel = `\n# --- end of ${ref.operand} ---`;
+			const result = readScriptFile(ref, cwd, limit - text.length - label.length - endLabel.length);
+			if (result.kind === "skip") continue;
+			// Only the interpreter's own operand is promised to be the program, so
+			// only there is "cannot read it" a refusal; a word reached past a
+			// subcommand or a loader flag may be a package.json script or an
+			// argument, and is passed over when it is not readable.
+			if (result.kind === "refuse") {
+				if (ref.arm === "load") continue;
+				return { text, bodies, refusal: { why: result.why } };
+			}
+			bodies.push({ verb: ref.verb, operand: ref.operand, body: result.body });
+			text += `${label}${result.body}${endLabel}`;
+		}
+	}
+	return { text, bodies, refusal: null };
 }
 
 /**
@@ -4862,12 +5120,38 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			const cwd = cwdInput ? resolveToCwd(cwdInput, ctx.cwd) : ctx.cwd;
+			// Issue #67: a command that runs a script file is judged by what the
+			// file HOLDS, not by its path. The body joins the text every layer
+			// below reads — critical patterns, the forced-dialog token scan, the
+			// verdict cache, the grants, the judge — so `python3 x.py` and
+			// `python3 /tmp/x.py` reach the same verdict, and a rename changes
+			// nothing. A body the classifier cannot read in full (over the review
+			// limit, unreadable, truncated, expanded by the shell before the
+			// interpreter sees it) fails closed here, before any static rule,
+			// grant, or dialog could approve text nobody read.
+			const script = readInterpretedScriptBodies(command, cwd, config.maxCommandLength);
+			if (script.refusal) {
+				const why = script.refusal.why;
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "script-body", why, cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+				addRefusal(ctx, command, why, { source: "cap", cwd });
+				return {
+					block: true,
+					reason: refusalPayload(
+						"bash",
+						"script-body",
+						why,
+						"Run the script's steps as individual commands, or keep the file inside the review limit and readable.",
+						"Do not rename, move or shrink the script to dodge the read.",
+					),
+				};
+			}
+			const judgedCommand = script.text;
 			const env = canonicalEnv(event.input.env);
 			const pty = event.input.pty === true;
 			const timeout = typeof event.input.timeout === "number" ? event.input.timeout : undefined;
 			const async = event.input.async === true;
 			const target = {
-				command,
+				command: judgedCommand,
 				cwd,
 				envKeys: env.keys,
 				pty,
@@ -4880,15 +5164,18 @@ export default function (pi: ExtensionAPI) {
 			// Judge identity is the model selector plus the question battery: a
 			// verdict earned under one policy must not be reused under another.
 			// (The config signature clears the whole cache when either changes;
-			// this keeps the key honest on its own.) The measured push
-			// provenance (issue #63) and network provenance (issue #65) are what
-			// the judge read about the refs and the destinations, so a ref move
-			// or a destination that stops being this machine's own between calls
+			// this keeps the key honest on its own.) The judged text is the
+			// command with its script bodies spliced in (#67), so a rewrite of
+			// the file is a different question and can never ride the previous
+			// body's verdict. The measured push provenance (issue #63) and
+			// network provenance (issue #65) are what the judge read about the
+			// refs and the destinations, so a ref move, a body rewrite, or a
+			// destination that stops being this machine's own between calls
 			// must invalidate the cached verdict.
-			const pushProvenanceForCache = measureGitPushProvenance(command, cwd);
-			const networkProvenanceForCache = measureNetworkProvenance(command, cwd);
+			const pushProvenanceForCache = measureGitPushProvenance(judgedCommand, cwd);
+			const networkProvenanceForCache = measureNetworkProvenance(judgedCommand, cwd);
 			const cacheKey = JSON.stringify([
-				config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, command,
+				config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, judgedCommand,
 				reviewEvidenceFingerprint,
 				pushProvenanceForCache ?? null,
 				networkProvenanceForCache ?? null,
@@ -4897,7 +5184,7 @@ export default function (pi: ExtensionAPI) {
 			// prior refusal. The record tells the model; the SAFE branch below
 			// stops trusting a bare SAFE for a refused target. Computed before
 			// the cache lookup so a cached SAFE cannot outvote a newer refusal.
-			const prior = priorRefusalFor(ctx, command, cwd, reviewEvidenceFingerprint);
+			const prior = priorRefusalFor(ctx, judgedCommand, cwd, reviewEvidenceFingerprint);
 			const recordExtras: Record<string, unknown> = prior
 				? { priorRefusal: { target: prior.normalizedTarget, why: prior.why, when: new Date(prior.ts).toISOString() } }
 				: {};
@@ -4912,13 +5199,13 @@ export default function (pi: ExtensionAPI) {
 			// approval mode: the mode cannot be trusted to imply a human, because
 			// a per-session `autoApprove` (wrapper.ts:189-192) forces `yolo`
 			// without appearing in settings at all.
-			if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command))) {
-				const replay = replayDecision({ tool: "bash", command, cwd, riskFlags: ["critical"], headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "critical pattern: matches a built-in dangerous-command pattern", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+			if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(judgedCommand))) {
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, riskFlags: ["critical"], headless: !ctx.hasUI });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "critical pattern: matches a built-in dangerous-command pattern", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				// A critical hit is a refusal (issue #30) however the dialog below
 				// ends: the pattern itself is the memory. An approval lifts it via
 				// requestPermission.
-				addRefusal(ctx, command, "matches a built-in dangerous-command pattern", { source: "critical", cwd });
+				addRefusal(ctx, judgedCommand, "matches a built-in dangerous-command pattern", { source: "critical", cwd });
 				return await requestPermission(
 					ctx,
 					target,
@@ -4936,8 +5223,8 @@ export default function (pi: ExtensionAPI) {
 			// prompt/narrow-allow rule that only judged the command string. Env
 			// values are not shown to the classifier — they can hold secrets.
 			if (env.key !== "") {
-				const replay = replayDecision({ tool: "bash", command, cwd, envKeys: env.keys, headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "environment override: command runs with caller-supplied env; not classified", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, envKeys: env.keys, headless: !ctx.hasUI });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "environment override: command runs with caller-supplied env; not classified", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				return await requestPermission(
 					ctx,
 					target,
@@ -4955,7 +5242,7 @@ export default function (pi: ExtensionAPI) {
 			// `tools.approval.bash` policy in native resolveApproval, so apply the
 			// user prompt only when no pattern rule decided the call.
 			if (rule?.approval === "prompt") {
-				const replay = replayDecision({ tool: "bash", command, cwd: ctx.cwd, staticRule: "prompt", headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd: ctx.cwd, staticRule: "prompt", headless: !ctx.hasUI });
 				if (dryRun) {
 					return dryRunStop({
 						would: "allow",
@@ -4966,13 +5253,18 @@ export default function (pi: ExtensionAPI) {
 				}
 				return;
 			}
-			if (rule?.approval === "allow" && !isBlanketPattern(rule.match)) {
-				const replay = replayDecision({ tool: "bash", command, cwd, staticRule: "allow", headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: `rule: ${rule.match}`, cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+			// A host allow rule matched the command TEXT the user wrote it for.
+			// When a script body was read (#67) that text is not the text the gate
+			// is judging: the file decides what runs, and its contents change per
+			// call. The rule can say nothing about the file, so the call classifies
+			// as if no rule had matched.
+			if (rule?.approval === "allow" && !isBlanketPattern(rule.match) && script.bodies.length === 0) {
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, staticRule: "allow", headless: !ctx.hasUI });
+				logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: `rule: ${rule.match}`, cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				return;
 			}
 			if (!rule && policy.bashPolicy === "prompt") {
-				const replay = replayDecision({ tool: "bash", command, cwd: ctx.cwd, staticRule: "prompt", headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd: ctx.cwd, staticRule: "prompt", headless: !ctx.hasUI });
 				if (dryRun) {
 					return dryRunStop({
 						would: "allow",
@@ -5025,10 +5317,14 @@ export default function (pi: ExtensionAPI) {
 			// critical-pattern and env-override checks above, which rank the
 			// command itself, and below host static rules, which were configured
 			// explicitly.
-			if (matchingGrant(ctx, grantKeyForCommand(command), cwd, userScopeFingerprint)) {
-				const replay = replayDecision({ tool: "bash", command, cwd, grant: "session" });
+			// A grant is authorization for the text the human approved. The judged
+			// text carries the script bodies (#67), so a grant recorded for one
+			// body never covers a rewrite of that file: grantKeyForCommand sees the
+			// spliced newlines and falls back to its exact-text key.
+			if (matchingGrant(ctx, grantKeyForCommand(judgedCommand), cwd, userScopeFingerprint)) {
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, grant: "session" });
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "session grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "session grant", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 					return;
 				}
 			}
@@ -5044,10 +5340,10 @@ export default function (pi: ExtensionAPI) {
 			// multi-segment command, so `cd X && script` could otherwise never be
 			// remembered), which also means an env-prefixed spelling, a different
 			// cwd, or any edit to the text intentionally does NOT match.
-			if (matchingPersistentGrant(command, cwd)) {
-				const replay = replayDecision({ tool: "bash", command, cwd, grant: "persistent" });
+			if (matchingPersistentGrant(judgedCommand, cwd)) {
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, grant: "persistent" });
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "persistent grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "persistent grant", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 					return;
 				}
 			}
@@ -5059,7 +5355,7 @@ export default function (pi: ExtensionAPI) {
 			// Dry-run probe (issue #32): with nothing cached, the classifier model
 			// would run — report that instead of paying the call.
 			if (dryRun && !cached) {
-				const replay = replayDecision({ tool: "bash", command, cwd, judgement: undefined, priorRefusal: Boolean(prior), headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, judgement: undefined, priorRefusal: Boolean(prior), headless: !ctx.hasUI });
 				return dryRunStop({
 					would: "classify",
 					layer: "classifier",
@@ -5068,7 +5364,7 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			let classifyError = "";
-			const judgement = cached ? withoutShadow(cached) : (await classify(ctx, command, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot).catch((err: unknown) => {
+			const judgement = cached ? withoutShadow(cached) : (await classify(ctx, judgedCommand, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot).catch((err: unknown) => {
 				// Provider errors (quota exhausted, auth, HTTP failures) previously
 				// vanished into an opaque "unavailable". Keep the message so the
 				// permission dialog says WHY.
@@ -5107,7 +5403,7 @@ export default function (pi: ExtensionAPI) {
 			// line: a `--password` value on the continued line is otherwise on a
 			// marker-less line of its own, and flattening it back onto the flag
 			// would strand the real value after the REDACTED marker.
-			const logCommand = truncated(redactSecrets(command.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120);
+			const logCommand = truncated(redactSecrets(judgedCommand.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120);
 			if (!dryRun) pi.logger.info(
 				`classifier: verdict=${judgement.verdict}` +
 					` cached=${cached ? 1 : 0} reason="${judgement.reason}" cmd="${logCommand}"`,
@@ -5120,10 +5416,18 @@ export default function (pi: ExtensionAPI) {
 				// and a judge that answers SAFE on a payload carrying an injected
 				// instruction must not auto-run rm/dd/mkfs-class commands the
 				// builtin critical list does not cover.
-				const flags = matchModerateRiskTokens(command, cwd);
+				const flags = matchModerateRiskTokens(judgedCommand, cwd);
+				// Issue #67: a script body is code the classifier read verbatim —
+				// the same class of payload as an inline `-c` argument — so the
+				// same second-execution markers apply. A SAFE cannot vouch for a
+				// script that re-execs or decodes its real work, and that must not
+				// depend on the judge noticing which file it is reading.
+				for (const body of script.bodies) {
+					if (INTERPRETER_CODE_RISK.test(body.body)) flags.push(`${body.verb} runs ${body.operand}`);
+				}
 				const replay = replayDecision({
 					tool: "bash",
-					command,
+					command: judgedCommand,
 					cwd,
 					judgement,
 					priorRefusal: Boolean(prior),
@@ -5131,7 +5435,7 @@ export default function (pi: ExtensionAPI) {
 					headless: !ctx.hasUI,
 				});
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: command, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
 					return;
 				}
 				// A SAFE on a target this session already refused is not a clean
@@ -5146,7 +5450,7 @@ export default function (pi: ExtensionAPI) {
 						: `classifier-safe despite prior refusal of "${priorTarget}"`;
 				const foot = trashFootnote(flags);
 				const dialogWhy = foot === "" ? why : `${why}\n${foot}`;
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", why, cmd: command, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", why, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
 				return await requestPermission(
 					ctx,
 					target,
@@ -5170,7 +5474,7 @@ export default function (pi: ExtensionAPI) {
 				decision: "block",
 				layer: "verdict",
 				why: `${detail}: ${judgement.reason}`,
-				cmd: command,
+				cmd: judgedCommand,
 				cwd,
 				verdict,
 				cached: cached ? 1 : 0,
@@ -5188,7 +5492,7 @@ export default function (pi: ExtensionAPI) {
 			// makes an undecided command a refusal — requestPermission records
 			// that itself.
 			if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
-				addRefusal(ctx, command, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
+				addRefusal(ctx, judgedCommand, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
 			}
 			return await requestPermission(ctx, target, detail, judgement.reason, "bash", "follows verdict", userScopeFingerprint, { ...auditFields(), ...judgementAudit(judgement) });
 		} catch (err) {
