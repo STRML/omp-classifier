@@ -1010,17 +1010,65 @@ function reportSweep(input: {
 
 /**
  * The fields a baseline report must carry for `--compare`. Deliberately not
- * `Outcome`: a baseline may come from an older harness, and the diff needs four
+ * `Outcome`: a baseline may come from an older harness, and the diff needs these
  * fields from each row. Rows that do not carry them are dropped; a file with no
  * readable rows is not a report at all, so the caller falls through to reading
  * it as a policy instead of diffing against an empty baseline.
+ *
+ * `cwd`, `kind`, `language` and `evidence` are the identity fields — the same
+ * inputs the answer cache above keys on, because a case IS its inputs to the
+ * judge. A command alone is not a case: `eval/corpus/intent.jsonl` lists 14
+ * commands twice (13 of them with opposite labels) whose rows differ only in the
+ * evidence that authorizes them, and `--corpus heldout` repeats every command 25
+ * times differing only in `cwd`. Keying on the command made the last twin in the
+ * baseline stand in for all of them (issue #80).
  */
 export interface PriorOutcome {
 	command: string;
+	cwd?: string;
+	kind?: "eval-code";
+	language?: string;
+	evidence?: Case["evidence"];
 	label: Decision;
 	decision: Decision;
 	stable?: boolean;
 	verdicts?: string[];
+}
+
+/** JSON with object keys in sorted order, so an identity built from a row in
+ *  memory and one read back from a report file are the same string even if the
+ *  writer reordered keys. Key order carries no meaning on a `Case`, and the diff
+ *  must not lose a row because a report was pretty-printed by another tool. */
+function stableStringify(value: unknown): string {
+	if (value === null || value === undefined || typeof value !== "object") return JSON.stringify(value) ?? "null";
+	if (Array.isArray(value)) return `[${value.map(item => stableStringify(item)).join(",")}]`;
+	const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+	return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`).join(",")}}`;
+}
+
+/** The identity of a row for `--compare`: the inputs the judge saw. Two rows
+ *  with one key are one case, and no diff can attribute a movement to either of
+ *  them. */
+function identityKey(row: PriorOutcome): string {
+	return [row.command, row.cwd ?? "", row.kind ?? "", row.language ?? "", stableStringify(row.evidence ?? null)].join("\u0000");
+}
+
+/** Index a set of rows by identity, refusing to resolve a duplicate. Picking one
+ *  silently is the defect this exists to prevent: the movement then reads as if
+ *  it belonged to whichever row happened to be last. */
+function indexByIdentity(rows: PriorOutcome[], source: string): Map<string, PriorOutcome> {
+	const index = new Map<string, PriorOutcome>();
+	for (const row of rows) {
+		const key = identityKey(row);
+		if (index.has(key)) {
+			throw new Error(
+				`--compare ${source}: two rows share the same case identity (command, cwd and evidence), so a movement cannot be attributed to either: ` +
+					`${JSON.stringify(row.command)} (cwd ${JSON.stringify(row.cwd ?? "")}). A diff needs each case to appear once.`,
+			);
+		}
+		index.set(key, row);
+	}
+	return index;
 }
 
 export interface CompareSummary {
@@ -1035,16 +1083,20 @@ export interface CompareSummary {
 /** The `--compare` diff, lifted out of `runScored` so a test can drive it
  *  without a live corpus. Both sides are `PriorOutcome`s because `Outcome`
  *  satisfies it: the diff reads identity, label, decision, stability and
- *  verdicts, and nothing else. */
-export function compareAgainstPrior(previous: PriorOutcome[], outcomes: PriorOutcome[]): CompareSummary {
-	const before = new Map(previous.map(o => [o.command, o]));
+ *  verdicts, and nothing else. `source` names the baseline in a duplicate-key
+ *  error. */
+export function compareAgainstPrior(previous: PriorOutcome[], outcomes: PriorOutcome[], source: string): CompareSummary {
+	const before = indexByIdentity(previous, `baseline ${source}`);
+	// The run's own rows are checked too: a corpus that lists one case twice makes
+	// both of its rows diff against a single baseline entry.
+	indexByIdentity(outcomes, `this run (--compare ${source})`);
 	let fixed = 0;
 	let regressed = 0;
 	let noise = 0;
 	let newInterruptions = 0;
 	const lines: string[] = [];
 	for (const o of outcomes) {
-		const prior = before.get(o.command);
+		const prior = before.get(identityKey(o));
 		if (!prior || prior.decision === o.decision) continue;
 		// A case that flips on repeated draws of the SAME policy cannot
 		// evidence anything about a policy change. `prior.stable` may be
@@ -1092,6 +1144,13 @@ export function asPriorOutcomes(value: unknown): PriorOutcome[] | undefined {
 		if (!("command" in entry) || typeof entry.command !== "string") continue;
 		if (!("label" in entry) || (entry.label !== "allow" && entry.label !== "ask")) continue;
 		if (!("decision" in entry) || (entry.decision !== "allow" && entry.decision !== "ask")) continue;
+		const cwd = "cwd" in entry && typeof entry.cwd === "string" ? entry.cwd : undefined;
+		const kind: "eval-code" | undefined = "kind" in entry && entry.kind === "eval-code" ? "eval-code" : undefined;
+		const language = "language" in entry && typeof entry.language === "string" ? entry.language : undefined;
+		// Passed through unfiltered: it is only ever canonicalized into an identity
+		// key, and a report whose evidence cannot be read back simply fails to match
+		// this run's row rather than matching the wrong one.
+		const evidence = "evidence" in entry ? (entry.evidence as Case["evidence"]) : undefined;
 		const stable = "stable" in entry && typeof entry.stable === "boolean" ? entry.stable : undefined;
 		const verdicts =
 			"verdicts" in entry && Array.isArray(entry.verdicts)
@@ -1099,6 +1158,10 @@ export function asPriorOutcomes(value: unknown): PriorOutcome[] | undefined {
 				: undefined;
 		rows.push({
 			command: entry.command,
+			...(cwd === undefined ? {} : { cwd }),
+			...(kind === undefined ? {} : { kind }),
+			...(language === undefined ? {} : { language }),
+			...(evidence === undefined ? {} : { evidence }),
 			label: entry.label,
 			decision: entry.decision,
 			...(stable === undefined ? {} : { stable }),
@@ -1592,7 +1655,7 @@ async function runScored(args: Args, credentials: AuthStorage): Promise<void> {
 			else console.log(`\n(no report at ${other} — run that policy first to diff)`);
 		}
 		if (previous) {
-			const diff = compareAgainstPrior(previous, outcomes);
+			const diff = compareAgainstPrior(previous, outcomes, args.compare);
 			console.log(
 				`\n=== vs ${args.compare}: ${diff.fixed} fixed, ${diff.regressed} regressed, ${diff.newInterruptions} new interruption(s), ${diff.noise} noise ===`,
 			);
