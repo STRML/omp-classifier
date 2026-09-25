@@ -199,6 +199,51 @@ describe("the measured ref state", () => {
 		}
 	});
 
+	test("two restores whose paths join to the same text are two effects", () => {
+		const own = makeWorktreeFixture();
+		try {
+			// `alpha beta` is one tracked path with a space in it, so two different
+			// path lists join to the same text: one names the clean file alone, the
+			// other names a dirty `beta` beside a nonexistent `alpha`. An effect's
+			// identity is its members, never the flattened text.
+			gitIn(own.main, "echo one > 'alpha beta' && echo one > beta && git add -- 'alpha beta' beta && git commit -q -m paths");
+			gitIn(own.main, "echo dirty >> beta");
+			const spaced = measured("git checkout -- 'alpha beta'", own.main);
+			expect(spaced.target).toBe("alpha beta");
+			expect(spaced.unstagedChanges).toBe(false);
+			const both = measureGitRefProvenance("git checkout -- 'alpha beta' && git checkout -- alpha beta", own.main);
+			expect(both?.map(shape => shape.target)).toEqual(["alpha beta", "alpha beta"]);
+			// The second restore discards the only copy of the `beta` edit, and its
+			// measurement is not the first one's.
+			expect(both?.map(shape => shape.unstagedChanges)).toEqual([false, true]);
+			// Either order: the dirty list is measured wherever it appears.
+			const reversed = measureGitRefProvenance("git checkout -- alpha beta && git checkout -- 'alpha beta'", own.main);
+			expect(reversed?.map(shape => shape.unstagedChanges)).toEqual([true, false]);
+		} finally {
+			removeFixture(own.root);
+		}
+	});
+
+	test("a compound delete excludes the refs the command removes, and only those", () => {
+		const own = makeWorktreeFixture();
+		try {
+			// a and b are the only refs to this tip, and the command deletes both: a
+			// pointer the same command removes is not a copy it leaves behind, so
+			// neither delete may count the other as a survivor.
+			gitIn(own.main, "git checkout -q --detach HEAD && git commit -q --allow-empty -m twin-only && git branch a && git branch b && git checkout -q main");
+			const pair = measureGitRefProvenance("git branch -D a && git branch -D b", own.main);
+			expect(pair?.map(shape => shape.target)).toEqual(["a", "b"]);
+			expect(pair?.map(shape => shape.containedIn)).toEqual([[], []]);
+			// The mirror: a ref the companion delete does not remove still counts, so
+			// the exclusion cannot over-reach into a false unrecoverable.
+			const mixed = measureGitRefProvenance("git branch -D old && git branch -D scratch", own.main);
+			expect(mixed?.[0].containedIn).toContain("refs/heads/main");
+			expect(mixed?.[1].containedIn).toEqual([]);
+		} finally {
+			removeFixture(own.root);
+		}
+	});
+
 	test("a restore measures dirtiness in the paths it names, not the whole tree", () => {
 		const own = makeWorktreeFixture();
 		try {
@@ -274,6 +319,34 @@ describe("the ref state through the gate", () => {
 			gitIn(own.main, "echo second > other.txt && git add other.txt && git commit -q -m other && echo dirty >> other.txt");
 			const measuredState = await stateFor("git checkout -- notes.txt", own.main);
 			expect(measuredState?.[0].unstagedChanges).toBe(false);
+		} finally {
+			removeFixture(own.root);
+		}
+	});
+
+	test("a compound command's restores are measured one by one, even when their text is identical", async () => {
+		const own = makeWorktreeFixture();
+		try {
+			gitIn(own.main, "echo one > 'alpha beta' && echo one > beta && git add -- 'alpha beta' beta && git commit -q -m paths && echo dirty >> beta");
+			// The joined text of both shapes is `alpha beta`; the second names the
+			// dirty path, and the judge has to receive that reading, not the first's.
+			const measuredState = await stateFor("git checkout -- 'alpha beta' && git checkout -- alpha beta", own.main);
+			expect(measuredState).toHaveLength(2);
+			expect(measuredState?.map(entry => entry.unstagedChanges)).toEqual([false, true]);
+		} finally {
+			removeFixture(own.root);
+		}
+	});
+
+	test("a compound delete hands the judge no survivor for the pointers the command removes", async () => {
+		const own = makeWorktreeFixture();
+		try {
+			gitIn(own.main, "git checkout -q --detach HEAD && git commit -q --allow-empty -m twin-only && git branch a && git branch b && git checkout -q main");
+			// Each delete alone would leave the other ref as a copy; the command
+			// removes both, so an empty `containedIn` is the reading the judge gets.
+			const measuredState = await stateFor("git branch -D a && git branch -D b", own.main);
+			expect(measuredState?.map(entry => entry.target)).toEqual(["a", "b"]);
+			expect(measuredState?.map(entry => entry.containedIn)).toEqual([[], []]);
 		} finally {
 			removeFixture(own.root);
 		}

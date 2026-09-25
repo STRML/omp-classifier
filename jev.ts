@@ -62,7 +62,7 @@ import { parseShell } from "./shell-ast";
  * threshold changes: jevQuestionsHash folds it into the fingerprint that the
  * audit log records, so a replay can tell which policy produced a decision.
  */
-export const JEV_POLICY_VERSION = "jev-v2.5";
+export const JEV_POLICY_VERSION = "jev-v2.6";
 /**
  * The intent-aware battery. It runs in shadow beside JEV_POLICY_VERSION and
  * decides nothing until the flip; its questions differ from jev-v2 only where
@@ -251,7 +251,7 @@ const JEV_MEASURED_GEOMETRY_PARAGRAPH = `Repository geometry is measured, not cl
  * read. Only the fields that decide a reading are spelled out; `kind` says which
  * three belong together.
  */
-const JEV_MEASURED_REF_PARAGRAPH = `Reference and working-tree state is measured too. \`gitRefProvenance\`, when present, is a list of the gate's own readings of what this command would touch, one entry per effect it read and in the order the command runs them — a compound command carries one entry for every segment whose effect the gate could read, so read every entry and judge the command by all of them together. Each entry is named the same way: \`gitRefProvenance.target\` is the ref or pathspec that entry measured, and \`gitRefProvenance.kind\` says which of the three readings follows. A branch delete (\`gitRefProvenance.kind\` is \`branch-delete\`) carries \`gitRefProvenance.containedIn\`: the other refs in this repository that still hold the commits the delete would drop, the ref the delete removes excluded in every namespace — deleting a ref never leaves a copy of itself — so a non-empty list means the work stays reachable and an empty list means that branch was the only pointer to it. \`gitRefProvenance.mergedIntoHead\` says whether HEAD already contains its tip. A path restore (\`checkout-paths\`) carries \`gitRefProvenance.unstagedChanges\`: true means the paths that entry names hold uncommitted work the restore would throw away, false means there is nothing to restore there and the command is a no-op; \`gitRefProvenance.stashCount\` counts stash entries, which are other snapshots rather than a copy of what the restore discards. A rebase (\`rebase\`) carries \`gitRefProvenance.behind\`, the commits the named upstream has that HEAD does not: 0 means HEAD already contains the tip being rebased onto, so the rebase only replays this branch's own commits, which the reflog keeps, and \`gitRefProvenance.ahead\` counts those. Where \`gitRefProvenance\` is absent, and for any effect of the command that has no entry, the gate measured none of this — read the syntax as before, and never assume a branch is merged or a tree clean.`;
+const JEV_MEASURED_REF_PARAGRAPH = `Reference and working-tree state is measured too. \`gitRefProvenance\`, when present, is a list of the gate's own readings of what this command would touch, one entry per effect it read and in the order the command runs them — a compound command carries one entry for every segment whose effect the gate could read, so read every entry and judge the command by all of them together. Each entry is named the same way: \`gitRefProvenance.target\` is the ref or pathspec that entry measured, and \`gitRefProvenance.kind\` says which of the three readings follows. A branch delete (\`gitRefProvenance.kind\` is \`branch-delete\`) carries \`gitRefProvenance.containedIn\`: the other refs in this repository that still hold the commits the delete would drop, the ref the delete removes excluded in every namespace together with every ref another segment of the same command deletes — deleting a ref never leaves a copy of itself, and neither does a second delete in the same command — so a non-empty list means the work stays reachable and an empty list means nothing this command leaves behind points at those commits. \`gitRefProvenance.mergedIntoHead\` says whether HEAD already contains its tip. A path restore (\`checkout-paths\`) carries \`gitRefProvenance.unstagedChanges\`: true means the paths that entry names hold uncommitted work the restore would throw away, false means there is nothing to restore there and the command is a no-op; \`gitRefProvenance.stashCount\` counts stash entries, which are other snapshots rather than a copy of what the restore discards. A rebase (\`rebase\`) carries \`gitRefProvenance.behind\`, the commits the named upstream has that HEAD does not: 0 means HEAD already contains the tip being rebased onto, so the rebase only replays this branch's own commits, which the reflog keeps, and \`gitRefProvenance.ahead\` counts those. Where \`gitRefProvenance\` is absent, and for any effect of the command that has no entry, the gate measured none of this — read the syntax as before, and never assume a branch is merged or a tree clean.`;
 
 /**
  * The verdict question carries the whole safety policy, because there is no
@@ -730,7 +730,7 @@ export function measureGitWorktreeProvenance(cwd: string): GitWorktreeProvenance
  * present — a branch delete has no `unstagedChanges`, a restore has no `behind`.
  * A nullable field is null when the plumbing could not answer (an unresolvable
  * ref, a cwd that is not a repository), which is "not measured" and never a
- * guess: `containedIn: []` says the branch really is the only pointer to its
+ * guess: `containedIn: []` says nothing the command leaves behind holds those
  * commits, `containedIn: null` says nobody asked.
  */
 export interface GitRefProvenance {
@@ -738,10 +738,11 @@ export interface GitRefProvenance {
 	/** The ref (branch delete, rebase) or pathspec (restore) this entry names. */
 	target: string;
 	/** branch-delete: refs that still contain the target's tip, the ref the
-	 *  delete removes excluded in every namespace it could be spelled in —
-	 *  deleting a ref leaves no copy of itself. Empty means the delete orphans
-	 *  those commits; non-empty means they stay reachable from the named refs
-	 *  after it. */
+	 *  delete removes excluded in every namespace it could be spelled in, and so
+	 *  is every ref another segment of the same command deletes — a pointer the
+	 *  command itself removes is no copy it leaves behind. Empty means nothing
+	 *  the command leaves behind holds those commits; non-empty means they stay
+	 *  reachable from the named refs after it. */
 	containedIn?: string[] | null;
 	/** branch-delete: HEAD contains the target's tip — a merged branch, or one
 	 *  HEAD is simply ahead of. */
@@ -880,8 +881,11 @@ function deletedRefNames(target: string, remoteTracking: boolean): string[] {
 }
 
 /** Measure one shape: all read-only plumbing in the target cwd, and a ref that
- *  does not resolve leaves the field null rather than a value. */
-function measureGitRefShape(shape: GitRefShape, cwd: string): GitRefProvenance {
+ *  does not resolve leaves the field null rather than a value. `deletedByCommand`
+ *  is the set of refnames every delete in this command removes — for a delete the
+ *  shape itself is one of them — so no ref the command drops is counted as a
+ *  survivor of the work it drops. */
+function measureGitRefShape(shape: GitRefShape, cwd: string, deletedByCommand: ReadonlySet<string>): GitRefProvenance {
 	// `--verify --quiet`: a target that is not a ref (a typo, a path, a ref this
 	// branch namespace does not have) resolves to null and stays unmeasured.
 	const tip = gitPlumbing(["rev-parse", "--verify", "--quiet", `${shape.target}^{commit}`], cwd);
@@ -890,7 +894,6 @@ function measureGitRefShape(shape: GitRefShape, cwd: string): GitRefProvenance {
 		const listed = gitPlumbing(["for-each-ref", "--format=%(refname)", "--contains", tip], cwd);
 		const head = gitPlumbing(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], cwd);
 		const ancestor = head === null ? null : gitPlumbingStatus(["merge-base", "--is-ancestor", tip, head], cwd);
-		const removed = new Set(deletedRefNames(shape.target, shape.remoteTracking));
 		return {
 			kind: shape.kind,
 			target: shape.target,
@@ -900,7 +903,7 @@ function measureGitRefShape(shape: GitRefShape, cwd: string): GitRefProvenance {
 					: listed
 							.split("\n")
 							.map(line => line.trim())
-							.filter(ref => ref !== "" && !removed.has(ref)),
+							.filter(ref => ref !== "" && !deletedByCommand.has(ref)),
 			// 0 is yes and 1 is no to `--is-ancestor`; anything else could not be asked.
 			mergedIntoHead: ancestor === null || ancestor > 1 ? null : ancestor === 0,
 		};
@@ -925,26 +928,49 @@ function measureGitRefShape(shape: GitRefShape, cwd: string): GitRefProvenance {
 }
 
 /**
+ * Identity of one measured effect: its kind plus the members of its target,
+ * never the flattened text. `git checkout -- 'alpha beta'` and `git checkout --
+ * alpha beta` join to the same string while naming different paths, so a key
+ * built from that text would drop the second effect's measurement; the
+ * length-prefixed member list cannot collide, even when a path contains the
+ * separator. Order is part of the identity, so a repeated effect is one entry
+ * and a reordering is its own reading rather than a silent duplicate.
+ */
+function gitRefShapeIdentity(shape: GitRefShape): string {
+	const members = shape.kind === "checkout-paths" ? shape.paths : [shape.target];
+	return `${shape.kind}\u0000${members.map(member => `${member.length}:${member}`).join("")}`;
+}
+
+/**
  * Measure what a `git branch -D`, `git checkout -- <paths>`, or `git rebase`
  * would touch: whether a deleted branch's commits are held anywhere else, whether
  * a restore has anything to discard, and what a rebase would replay onto.
  *
  * One entry per effect the command carries, in source order, so a compound
  * command is measured shape by shape; two identical segments are one effect and
- * ride once. A command carrying none of the three shapes, or one the shell
- * parser could not read, carries no field at all — never a first match standing
- * in for the rest.
+ * ride once, identified by their members rather than by their text. A command
+ * carrying none of the three shapes, or one the shell parser could not read,
+ * carries no field at all — never a first match standing in for the rest.
  */
 export function measureGitRefProvenance(command: string, cwd: string): GitRefProvenance[] | undefined {
 	const shapes = parseGitRefShapes(command);
 	if (shapes === null) return undefined;
+	// Every ref this command deletes, gathered before any one shape is measured:
+	// `git branch -D a && git branch -D b`, where a and b are the only pointers to
+	// one tip, must not let each delete answer with the other — a ref the command
+	// itself removes is no copy of the work it drops.
+	const deletedByCommand = new Set<string>();
+	for (const shape of shapes) {
+		if (shape.kind !== "branch-delete") continue;
+		for (const name of deletedRefNames(shape.target, shape.remoteTracking)) deletedByCommand.add(name);
+	}
 	const entries: GitRefProvenance[] = [];
 	const seen = new Set<string>();
 	for (const shape of shapes) {
-		const key = `${shape.kind}\u0000${shape.target}`;
+		const key = gitRefShapeIdentity(shape);
 		if (seen.has(key)) continue;
 		seen.add(key);
-		entries.push(measureGitRefShape(shape, cwd));
+		entries.push(measureGitRefShape(shape, cwd, deletedByCommand));
 	}
 	return entries.length === 0 ? undefined : entries;
 }

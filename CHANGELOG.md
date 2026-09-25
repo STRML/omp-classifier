@@ -4,6 +4,12 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-25
 
+### Gate round-2 fixes on the measured ref tier (#126)
+
+- An effect's identity is its own members, never the text they join to. `git checkout -- 'alpha beta' && git checkout -- alpha beta` joined both shapes to one target, so the deduplication dropped the second shape's reading and a restore that discards an uncommitted `beta` reached the judge as a clean no-op — a wrong value reading as reassurance, which is the failure mode this tier exists to avoid. The key is the effect's kind plus its length-prefixed member list now, so two path lists that flatten alike are two measurements, while a repeated effect still rides once.
+- A compound delete no longer answers with the refs the same command deletes. With unmerged `a` and `b` as the only pointers to one tip, `git branch -D a && git branch -D b` measured each deletion against the ref set as it stood, so each saw the other as a surviving copy and the pair read recoverable — the command removes both. The exclusion set is every refname the command's own deletes remove, so the last pointer to a tip is never counted as surviving, and a ref a companion delete leaves alone (a merged branch beside an unmerged one) still counts, so the rule cannot over-exclude its way into a false unrecoverable.
+- The measured-ref paragraph and the `containedIn` documentation name the command-wide exclusion, so the model reading an empty list by the paragraph's own rule reaches the reading the measurement supports. `JEV_POLICY_VERSION` is `jev-v2.6`, and the pinned digest/hash pair moved to `608c617f11cbc174…` / `03b6c52b62745145`, clearing every cached verdict once by design. (#126)
+
 ### Gate round-1 fixes on the measured ref tier (#126)
 
 - `gitRefProvenance` is a list, one entry per effect a command carries, and the shapes are read per shell segment: `git checkout -- dirty.txt && git branch -D merged` used to report the delete alone — the first shape that matched won — so the restore's discarded work went unmeasured. Segments are read through the shell parser (`parseShell`), so a separator is a separator (`git push origin main; git status` no longer reads `main;` as a ref name), a bundled spelling is read (`git branch -rD origin/f`), and a command the parser rejects, or one carrying a shape it could not decompose, still carries no tier at all. An effect with no entry means nothing was measured for it — never that it does not happen.

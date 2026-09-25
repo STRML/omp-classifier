@@ -352,11 +352,14 @@ describe("jevQuestionsHash", () => {
 		// 9cdcd371a1a52c47… / 939e91c5ad3f962c, whose criteria read
 		// `gitRefProvenance` as the list of effects it is (one entry per
 		// segment), exclude the ref a delete removes in every namespace, and
-		// measure a restore's dirtiness over the paths it names. Every cached
-		// verdict is invalidated by that, which is the intent.
+		// measure a restore's dirtiness over the paths it names -> jev-v2.6's
+		// 608c617f11cbc174… / 03b6c52b62745145, whose paragraph excludes the
+		// refs the command's other deletes remove too, so a delete whose only
+		// companions are dropped by the same command reads unrecoverable. Every
+		// cached verdict is invalidated by that, which is the intent.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("9cdcd371a1a52c474041d40114e61ca81a8b83a2cf24daee0f4f6ccef8b96b8b");
-		expect(jevQuestionsHash()).toBe("939e91c5ad3f962c");
+		expect(digest).toBe("608c617f11cbc174eeb76d62a4836a597549de2b936354a8caba9497b5d6159d");
+		expect(jevQuestionsHash()).toBe("03b6c52b62745145");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 
