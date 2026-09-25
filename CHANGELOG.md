@@ -2,6 +2,15 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-09-25
+
+### The floor against a real shell (#91)
+
+- New fixture `tests/shell-oracle.test.ts`: instead of a hand-written rule, the shell answers. Each of 24 command shapes runs in a real `bash` with stub `security`, `op`, `pass` and `pbcopy` on `PATH`, and the secret is looked for in all four channels — stdout, stderr, a file the command wrote in its working directory, and the sink process piped into. `evaluateFloor({ command }).asks` must equal what the shell did. A draft oracle that watched stdout alone reported four false mismatches.
+- The 24 rows cover the captures quoted, unquoted and backticked, the redirect spellings (`&>`, `&>>`, `>&`, `2>`, `2>/dev/null`, `1>&2`, a quoted `">/dev/null"`), the wrapper prefixes (`nohup`, `command`, `builtin`, `env`), the quoted read commands, and the historical mistakes from the four review rounds on #85.
+- One row is a file sink the file channel cannot walk, and it asserts the policy instead of the oracle: a file sink asks by `routeStdout` whether or not the oracle can see the write. The fixture keeps that distinction explicit rather than flattening it into the equality.
+- It runs in the default `bun test`, since the CI image has bash 5. A row the local `bash` cannot parse is named in the fixture's report rather than silently skipped, and `JEV_ORACLE_BASH` picks the interpreter.
+
 ## 2026-09-22
 
 ### The jev-v3 shadow
