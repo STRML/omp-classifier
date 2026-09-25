@@ -132,7 +132,12 @@ decision order.
 
 One request, two inputs, no prose:
 
-- **State** — `buildJevState(...)`: the command or payload, cwd, and the evidence tiers.
+- **State** — `buildJevState(...)`: the command or payload, cwd, the evidence tiers, and the
+  tiers the gate measured itself (`gitPushProvenance` for the refs a push names,
+  `networkProvenance` for the destinations a command names — the loopback ports it uses, the
+  hosts this machine's own SSH config, hosts file, or docker state also names, and the
+  compose services it reaches). A measured tier carries a `note` saying so, is absent when
+  nothing could be measured, and is never written by the command's author.
 - **Battery** — `jevQuestions()`: one `choice` question for the verdict, one `noul` per
   hazard in `JEV_HAZARDS`, one `score` question for blast radius. The battery is a pure
   function of the module, not of config, so its hash is a stable identity (below).
@@ -268,7 +273,7 @@ surface. Kill switches layered, and never gated by the thing they switch off.
 
 | Identity | Value | Changes when |
 | --- | --- | --- |
-| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v2.2` | the meaning of a verdict or a policy knob changes |
+| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v2.3` | the meaning of a verdict or a policy knob changes |
 | `jevQuestionsHash()` (`CLASSIFIER_POLICY_HASH`) | sha256 over version + serialized battery + `DEFAULT_JEV_POLICY`, first 16 hex | the battery, its question ids, or the shipped default changes |
 | `QUESTIONS_CONTRACT` | `questions+probabilities` | the answer shape the parser accepts changes |
 

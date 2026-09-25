@@ -341,12 +341,18 @@ describe("jevQuestionsHash", () => {
 		expect(hash).toBe(expected);
 	});
 
-	test("the jev-v2 battery is pinned byte for byte until the flip", () => {
-		// The jev-v3 shadow week measures against this baseline. If this fails,
-		// a jev-v2 question moved: put the change in the jev-v3 battery instead.
+	test("the jev-v2 battery is pinned byte for byte, and the one deliberate move is recorded", () => {
+		// The pin is a detector, not a promise that the text never moves: the
+		// jev-v3 shadow week measures against this baseline, so an accidental
+		// move has to show up here. It has moved once, deliberately, for #65:
+		// the egress and remote-endpoint criteria now name the gate-measured
+		// `networkProvenance` field, and the pinned values were updated with the
+		// policy-version bump to `jev-v2.3`. The previous pair was
+		// 29ed2ae6375f9d549d7c7631589406764759f7c2a2e68e5f039be815e232d680 /
+		// 87c99bf634aa9c64 under `jev-v2.2`.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("29ed2ae6375f9d549d7c7631589406764759f7c2a2e68e5f039be815e232d680");
-		expect(jevQuestionsHash()).toBe("87c99bf634aa9c64");
+		expect(digest).toBe("40377ca248dffb53114b8269d7bdd7f8899ca38c54510fba100859231282cbac");
+		expect(jevQuestionsHash()).toBe("ab5086da2469c722");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 

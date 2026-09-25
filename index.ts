@@ -98,7 +98,9 @@ import {
 	type JevHazard,
 	type JevPolicy,
 	type JevVerdict,
+	type NetworkProvenance,
 	measureGitPushProvenance,
+	measureNetworkProvenance,
 } from "./jev";
 
 type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "UNAVAILABLE";
@@ -3777,6 +3779,7 @@ export default function (pi: ExtensionAPI) {
 			timeoutMs: number;
 			operatorContext?: string;
 			pushProvenance?: GitPushProvenance;
+			networkProvenance?: NetworkProvenance;
 			recordExtras: Record<string, unknown>;
 		},
 	): Promise<ShadowV3> => {
@@ -3819,6 +3822,7 @@ export default function (pi: ExtensionAPI) {
 					...userEvidence,
 					...(input.operatorContext ? { operatorContext: input.operatorContext } : {}),
 					...(input.pushProvenance !== undefined ? { gitPushProvenance: input.pushProvenance } : {}),
+					...(input.networkProvenance !== undefined ? { networkProvenance: input.networkProvenance } : {}),
 					...(Object.keys(input.recordExtras).length > 0 ? { extra: input.recordExtras } : {}),
 				}),
 				authorizationState: buildAuthorizationState({ actions, ...userEvidence }),
@@ -3903,10 +3907,31 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			pushProvenance = undefined;
 		}
+		// Gate-measured network provenance (issue #65), measured the same way
+		// and in the same tier: the command's own URLs and remote-verb
+		// destinations looked up in THIS machine's own naming (SSH config,
+		// hosts file, compose file, docker port table). A command that names
+		// no destination this machine knows yields undefined and the state
+		// carries no field — absent is "nothing measured", never "trusted".
+		let networkProvenance: NetworkProvenance | undefined;
+		try {
+			networkProvenance = measureNetworkProvenance(command, cwd);
+		} catch {
+			networkProvenance = undefined;
+		}
 		// Started before the live request so the two run in parallel; awaited
 		// on both return paths below, and it never throws.
 		const shadow = config.shadowV3
-			? shadowJevV3(ctx, { command, language, cwd, timeoutMs, recordExtras, ...(operatorContext ? { operatorContext } : {}), ...(pushProvenance !== undefined ? { pushProvenance } : {}) })
+			? shadowJevV3(ctx, {
+					command,
+					language,
+					cwd,
+					timeoutMs,
+					recordExtras,
+					...(operatorContext ? { operatorContext } : {}),
+					...(pushProvenance !== undefined ? { pushProvenance } : {}),
+					...(networkProvenance !== undefined ? { networkProvenance } : {}),
+				})
 			: undefined;
 		try {
 			const answers = await judgeBattery(AbortSignal.timeout(timeoutMs), {
@@ -3917,6 +3942,7 @@ export default function (pi: ExtensionAPI) {
 					...(taskEvidence?.ids.length ? { userMessageIds: taskEvidence.ids } : {}),
 					...(operatorContext ? { operatorContext } : {}),
 					...(pushProvenance !== undefined ? { gitPushProvenance: pushProvenance } : {}),
+					...(networkProvenance !== undefined ? { networkProvenance } : {}),
 					...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
 				}),
 				// The host settings instance, not a plugin-local singleton copy:
@@ -4565,8 +4591,15 @@ export default function (pi: ExtensionAPI) {
 			// Judge identity is the model selector plus the question battery: a
 			// verdict earned under one policy must not be reused under another.
 			// (The config signature clears the whole cache when either changes;
-			// this keeps the key honest on its own.)
-			const cacheKey = JSON.stringify(["eval", config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, language, evalCode, reviewEvidenceFingerprint]);
+			// this keeps the key honest on its own.) The measured network tier
+			// (issue #65) is part of the input the judge read here too, so a
+			// destination that stops being this machine's own invalidates the
+			// cached verdict. (Push provenance is a bash-path measurement: this
+			// payload is not a shell command.)
+			const cacheKey = JSON.stringify([
+				"eval", config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, language, evalCode, reviewEvidenceFingerprint,
+				measureNetworkProvenance(evalCode, cwd) ?? null,
+			]);
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
 			// session off, so it must hold here too, not only for bash.
@@ -4833,13 +4866,17 @@ export default function (pi: ExtensionAPI) {
 			// verdict earned under one policy must not be reused under another.
 			// (The config signature clears the whole cache when either changes;
 			// this keeps the key honest on its own.) The measured push
-			// provenance (issue #63) is what the judge read about the refs, so
-			// a ref move between calls must invalidate the cached verdict.
+			// provenance (issue #63) and network provenance (issue #65) are what
+			// the judge read about the refs and the destinations, so a ref move
+			// or a destination that stops being this machine's own between calls
+			// must invalidate the cached verdict.
 			const pushProvenanceForCache = measureGitPushProvenance(command, cwd);
+			const networkProvenanceForCache = measureNetworkProvenance(command, cwd);
 			const cacheKey = JSON.stringify([
 				config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, command,
 				reviewEvidenceFingerprint,
 				pushProvenanceForCache ?? null,
+				networkProvenanceForCache ?? null,
 			]);
 			// Refusal memory (issue #30): a reworded command meets its session's
 			// prior refusal. The record tells the model; the SAFE branch below

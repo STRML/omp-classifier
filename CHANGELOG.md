@@ -2,6 +2,21 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-09-25
+
+### Measured network provenance (policy `jev-v2.3`)
+
+- `curl http://localhost:8000/…` and `ssh raw-ovh …` were the two most common network false-asks in the measured decision log (`declared scope contradicts command (network)`, ~6% of blocks in the 09-09 to 09-17 window): the state carried no provenance for the called host, so every command that happened to use a remote-looking URL was judged on the shape of its text alone. New `measureNetworkProvenance` in `jev.ts` (issue #65, the tier rule of #63) runs before the battery is asked and measures the command's own destinations against this machine's own naming:
+  - `localPorts` — the ports the command names on a loopback address (`localhost`, `127.0.0.0/8`, `::1`, `*.localhost`), read from its URLs, an `ssh -p` destination, or `nc host port`.
+  - `knownHosts` — the hosts the command names that this machine's own SSH config, hosts file, or running docker container names also name, each with the source it was measured in. This is what catches `raw-ovh`, which lives in the user's `~/.ssh/config`.
+  - `dockerNetworks` — a compose service the local compose file declares (read from the `-f` file the command names, else the default compose file names in the working directory), or a loopback port a running container publishes. `docker ps` runs once per burst, cached 3s and aborted at 2.5s; a daemon that is not running yields no measurement, not an error.
+- The field rides the state beside `gitPushProvenance` with the same authority note, and the criteria for `sends_local_data_outbound` and `contacts_remote_endpoint` name it by backticked path in both batteries — the lesson from the force-push landing is that an unnamed field does not get used. Loopback traffic is this machine reading itself; an SSH alias that resolves in this machine's own config is the user's own host, still judged on what the command does to it. The non-goal stands: `ssh <alias> <destructive command>` is destructive on its command body, not on its hostname.
+- Trust constraint: every name is measured by the gate from this machine's own files and process state, never reported by the command's author, and nothing in the measurement opens a socket. A destination the gate could not measure produces no field at all — absence means "nothing measured", never "trusted" — and a command that names no network destination carries no provenance key.
+- The measured tier rides the bash cache key beside the push provenance, and the eval-tool cache key too: a destination that stops being this machine's own invalidates the cached verdict. (Push provenance stays a bash-path measurement; an eval payload is not a shell command.)
+- `JEV_POLICY_VERSION` is now `jev-v2.3`, and the jev-v2 battery moved for the first time: the egress and remote-endpoint criteria text changed. The pinned question digest moves from `29ed2ae6375f9d549d7c7631589406764759f7c2a2e68e5f039be815e232d680` to `40377ca248dffb53114b8269d7bdd7f8899ca38c54510fba100859231282cbac` and the policy hash from `87c99bf634aa9c64` to `ab5086da2469c722`, so every cached verdict clears once and the v3 shadow week's baseline moves with it. The pin in `tests/jev.test.ts` is a detector; it fired here on purpose and records the previous pair.
+- The harness stays machine-independent: `eval/run.ts` passes no measured tier, because the corpus cases name hosts that exist on no particular machine, and a score that depended on this laptop's docker table would not be reproducible. The battery hash moved, so cached answers are re-drawn anyway.
+- Known residual, pinned by a test: a URL is read as a destination wherever it is written, including inside a quoted message (`echo 'see http://host/'`); a *bare* host named inside a quoted message is not, because a remote verb is only read at the start of a segment. A compose file that declares its services through `include:`/`extends` measures as declaring none, which fails closed (no carve-out claimed).
+
 ## 2026-09-22
 
 ### The jev-v3 shadow

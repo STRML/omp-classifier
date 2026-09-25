@@ -220,7 +220,10 @@ describe("computeIntentMetrics — driven by a fake judge (no network)", () => {
 describe("parseArgs", () => {
 	test("--battery selects the battery and rejects an unknown one", () => {
 		expect(parseArgs(["--battery", "jev-v3"]).battery).toBe("jev-v3");
-		expect(parseArgs([]).battery).toBe("jev-v2.2");
+		// The default is the live battery, so this pin moves with its version:
+		// `jev-v2.2` for the redaction landing, `jev-v2.3` for network
+		// provenance (#65).
+		expect(parseArgs([]).battery).toBe("jev-v2.3");
 		expect(() => parseArgs(["--battery", "jev-v9"])).toThrow(/--battery must be one of/u);
 	});
 
@@ -233,7 +236,7 @@ describe("parseArgs", () => {
 	});
 
 	test("a flag given twice is an error, whichever copy is empty", () => {
-		expect(() => parseArgs(["--battery", "jev-v2.2", "--battery", ""])).toThrow("--battery is given more than once");
+		expect(() => parseArgs(["--battery", "jev-v2.3", "--battery", ""])).toThrow("--battery is given more than once");
 		expect(() => parseArgs(["--only", "a", "--only", "b"])).toThrow("--only is given more than once");
 	});
 
