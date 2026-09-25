@@ -2213,6 +2213,11 @@ function evalCwdSites(masked: string): Array<{ name: string; kind: "spawn" | "ch
 	return [...sites.values()].sort((a, b) => a.argStart - b.argStart);
 }
 
+/** The headline the eval gate asks under when a spawn's own directory cannot be
+ *  read (issue #14). Named once because two things key on it: the dialog title,
+ *  and the rule that this layer offers no grant (see requestPermission). */
+const EVAL_SPAWN_CWD_HEADLINE = "unreadable spawn cwd";
+
 /** The directory an eval payload's spawns run in (issue #14), or why the scan
  *  cannot tell. Exported for the test seam: the gate asks once per payload. */
 export type EvalSpawnCwd = { kind: "session" } | { kind: "literal"; cwd: string } | { kind: "opaque"; why: string };
@@ -4780,7 +4785,15 @@ export default function (pi: ExtensionAPI) {
 		// Compounds/substitutions have an exact-text key; changed payloads still
 		// miss it.
 		const grantKey = tool === "eval" ? normalizeEvalGrantTarget(target.command) : grantKeyForCommand(target.command);
-		const grantsHonoredAtLayer = headline !== "critical pattern" && headline !== "environment override";
+		// A grant is only OFFERED when the resolver below can honor it. Critical
+		// patterns and env overrides outrank grants, so showing a grant choice
+		// there would promise an authorization that the next call can never use.
+		// `unreadable spawn cwd` is on that list for its own reason: the eval path
+		// asks before the grant check, because a grant for this payload was scoped
+		// to a directory the payload never named — offering one would promise a
+		// scope the gate cannot honestly write down.
+		const grantsHonoredAtLayer =
+			headline !== "critical pattern" && headline !== "environment override" && headline !== EVAL_SPAWN_CWD_HEADLINE;
 		const sessionGrantAvailable = grantKey !== "" && grantsHonoredAtLayer;
 		const persistentGrantAvailable = tool === "bash" && readClassifierConfig().persistentGrants && grantsHonoredAtLayer;
 		const choice = await ctx.ui.select(
@@ -5047,7 +5060,7 @@ export default function (pi: ExtensionAPI) {
 			// way is worth less than a human's answer. Ask, and say what could
 			// not be read — the code text on the dialog carries the rest.
 			if (spawn.kind === "opaque") {
-				const headline = "unreadable spawn cwd";
+				const headline = EVAL_SPAWN_CWD_HEADLINE;
 				// No `spawnCwd` on these lines: the whole reason this path exists
 				// is that no directory could be read from the payload.
 				logDecisionFor(ctx, {

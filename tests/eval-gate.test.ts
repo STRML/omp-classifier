@@ -25,6 +25,7 @@ import {
 	removeConfigFile,
 	refusalOf,
 	resultText,
+	selectCalls,
 	setJevAnswer,
 	stateOf,
 	writeConfigFile,
@@ -393,5 +394,19 @@ describe("eval spawn cwd (issue #14)", () => {
 		const lines = decisionsFor(sessionId);
 		expect(lines[0]).toMatchObject({ decision: "block", layer: "cwd" });
 		expect(lines[1]).toMatchObject({ decision: "block", layer: "headless" });
+	});
+
+	test("the ask for an unreadable spawn cwd offers no grant", async () => {
+		setJevAnswer(jevSafeAnswer());
+		const ctx = fresh({ hasUI: true, selectResult: DENY });
+		const code = `const cp = require("child_process");\ncp.exec("echo hi", { cwd: process.env.TARGET });`;
+		await fire("tool_call", evalEvent(code, "js"), ctx);
+		const labels = selectCalls(ctx)[0][1].map(item => item.label);
+		expect(labels).toContain("Allow once");
+		expect(labels).toContain("Deny");
+		// A grant names a directory, and this payload's directory was never
+		// readable, so the dialog offers no scope the gate could not honor.
+		expect(labels).not.toContain("Allow for session");
+		expect(labels).not.toContain("Always allow");
 	});
 });
