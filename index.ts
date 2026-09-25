@@ -83,7 +83,7 @@ import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-codi
 import { getConfigRootDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
 import { substitutionSpans } from "./shell-ast";
-import { judgeBattery, judgeJevV3 } from "./jev-judge";
+import { judgeBatteryUnderDeadline, judgeJevV3 } from "./jev-judge";
 import { buildAuthorizationState, DEFAULT_AUTHORIZATION_POLICY, deriveAuthorization, summarizeActions, type ActionSummaryEntry, type JevAuthorizationLevel } from "./authorization";
 import { deriveDecisionOrder, type DecisionBranch } from "./decision-order";
 import { literalMatch } from "./literal-match";
@@ -97,6 +97,7 @@ import {
 	type GitPushProvenance,
 	type JevHazard,
 	type JevPolicy,
+	type JevAnswers,
 	type JevVerdict,
 	measureGitPushProvenance,
 } from "./jev";
@@ -129,6 +130,37 @@ export type ShadowV3 = (
 	 *  that followed a real verdict from one that followed an outage. */
 	live?: JevVerdict;
 };
+
+/** A judgment whose deadline fired while its request was still running (issue
+ *  #62). The verdict the request eventually produces can refine the dialog the
+ *  deadline opened — and only that: it cannot bypass a dialog, and a late
+ *  UNSAFE never re-blocks a command a human already allowed. `cancel` is what
+ *  the human's own answer calls: nobody is listening any more. */
+interface LateJudgement {
+	/** The late verdict, or undefined when the request was cancelled or the
+	 *  listen window closed. Never rejects. */
+	answer: Promise<Judgement | undefined>;
+	cancel(): void;
+}
+
+/** The timed-out judgment offered to a dialog, WITH the guards a late SAFE
+ *  still has to answer for (issue #62). One object on purpose: the guards are
+ *  not optional context, and a caller that handed the dialog a bare handle
+ *  would be letting a late SAFE auto-run a command the verdict path would have
+ *  asked about. The late path recovers the answer the deadline took away; it
+ *  never skips a guard the on-time path applies. */
+interface GuardedLateJudgement {
+	/** The still-running judgment. */
+	handle: LateJudgement;
+	/** The refusal this session already holds for this exact target, which rode
+	 *  into the judge state as `priorRefusal`. A SAFE on a refused target still
+	 *  asks, because a refusal is a human's (or a critical pattern's) stop. */
+	priorRefusal: Refusal | undefined;
+	/** The deterministic risk overlay for this command
+	 *  (`matchModerateRiskTokens`, `evalRiskFlags`): a SAFE on a command
+	 *  carrying a destructive token still asks. */
+	riskFlags: readonly string[];
+}
 
 interface Judgement {
 	verdict: Verdict;
@@ -171,6 +203,11 @@ interface Judgement {
 	persistRefusal?: boolean;
 	/** The jev-v3 shadow for this classification, when it ran. */
 	v3?: ShadowV3;
+	/** Present only when the deadline fired and the request is still running
+	 *  (issue #62): the timed-out judgment, whose late answer may dismiss or
+	 *  refine the dialog the deadline opened. Never cached — UNAVAILABLE sets
+	 *  `noCache` — so a handle with live promises never outlives its call. */
+	late?: LateJudgement;
 }
 
 /** A cached judgement minus its shadow. The shadow ran for the call that
@@ -788,8 +825,11 @@ function statusReportPath(): string {
  *  rebuilding the session transcript. There is no `branch`/decision-path
  *  field: `layer` already names the path that decided (critical,
  *  environment, rule, granted, verdict, cached, unclassified, dialog,
- *  headless, cap, cwd, internal-error), so a second field would only
- *  duplicate it under different spelling. */
+ *  headless, cap, cwd, internal-error, late-verdict), so a second field would
+ *  only duplicate it under different spelling. `late-verdict` is the one that
+ *  arrived after its deadline had already opened a dialog (issue #62): it
+ *  says which of the three late outcomes happened, in `why`, and carries the
+ *  answer's own `verdict`/`jev` the way an on-time verdict line would. */
 export interface DecisionRecord {
 	ts: string;
 	/** Unique line/action id for joining verdict and interaction entries. */
@@ -3864,10 +3904,15 @@ export default function (pi: ExtensionAPI) {
 	 * and becomes an UNAVAILABLE verdict, which the caller turns into a
 	 * permission request — never a silent allow.
 	 *
-	 * `timeoutMs` is the caller's deadline, passed as an AbortSignal so a slow
-	 * judge cannot exceed the plugin's own budget: the old path needed deadline
-	 * arithmetic of its own because it could make two sequential provider
-	 * calls inside one handler budget, while one signal covers this one.
+	 * `timeoutMs` is the deadline, and since #62 it is a race the plugin owns
+	 * rather than an abort on the request (judgeBatteryUnderDeadline): the
+	 * deadline still yields UNAVAILABLE and still opens the dialog right away,
+	 * but the request keeps running, so the verdict that lands a beat late
+	 * rides back on `Judgement.late` and can dismiss or refine that dialog
+	 * instead of being discarded. Only the deadline gets that treatment: a real
+	 * failure (HTTP error, missing key, unreadable body) has no late answer to
+	 * offer and returns without a `late` handle, so its dialog is exactly what
+	 * it was before.
 	 */
 	const classify = async (
 		ctx: ExtensionContext,
@@ -3904,23 +3949,11 @@ export default function (pi: ExtensionAPI) {
 		const shadow = config.shadowV3
 			? shadowJevV3(ctx, { command, language, cwd, timeoutMs, recordExtras, ...(operatorContext ? { operatorContext } : {}), ...(pushProvenance !== undefined ? { pushProvenance } : {}) })
 			: undefined;
-		try {
-			const answers = await judgeBattery(AbortSignal.timeout(timeoutMs), {
-				state: buildJevState({
-					command,
-					workingDirectory: cwd,
-					...(userMessages ? { userMessages } : {}),
-					...(taskEvidence?.ids.length ? { userMessageIds: taskEvidence.ids } : {}),
-					...(operatorContext ? { operatorContext } : {}),
-					...(pushProvenance !== undefined ? { gitPushProvenance: pushProvenance } : {}),
-					...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
-				}),
-				// The host settings instance, not a plugin-local singleton copy:
-				// the native resolver reads providers.judgmentProvider and the
-				// credential store through it (see the header note on settings).
-				context: ctx,
-				settings,
-			});
+		// Answers -> verdict, shared by the on-time and the late path: a late
+		// SAFE is the same battery with the same evidence weight as an on-time
+		// one, so it must be read by the same code, never by a shortcut written
+		// for the late case (issue #62).
+		const judgementFrom = async (answers: JevAnswers): Promise<Judgement> => {
 			const decision = deriveJevDecision(answers, policy);
 			// `decision.hazards` carries only the hazards that reached
 			// hazardReview, so "fired" is presence, not a threshold re-check.
@@ -3971,19 +4004,66 @@ export default function (pi: ExtensionAPI) {
 					latencyMs: answers.latencyMs,
 				},
 			});
-		} catch (err) {
-			// Fail closed, name the failure, and never cache it: a timeout, a
-			// missing key, a non-2xx, or a body whose answers do not match the
-			// battery says nothing about the command, and a cached non-answer
-			// would keep the session from re-asking once the endpoint recovers.
+		};
+		const outcome = await judgeBatteryUnderDeadline({
+			timeoutMs,
+			state: buildJevState({
+				command,
+				workingDirectory: cwd,
+				...(userMessages ? { userMessages } : {}),
+				...(taskEvidence?.ids.length ? { userMessageIds: taskEvidence.ids } : {}),
+				...(operatorContext ? { operatorContext } : {}),
+				...(pushProvenance !== undefined ? { gitPushProvenance: pushProvenance } : {}),
+				...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
+			}),
+			// The host settings instance, not a plugin-local singleton copy:
+			// the native resolver reads providers.judgmentProvider and the
+			// credential store through it (see the header note on settings).
+			context: ctx,
+			settings,
+		});
+		if (outcome.kind === "answered") return await judgementFrom(outcome.answers);
+		if (outcome.kind === "failed") {
+			// Fail closed, name the failure, and never cache it: a missing key,
+			// a non-2xx, or a body whose answers do not match the battery says
+			// nothing about the command, and a cached non-answer would keep the
+			// session from re-asking once the endpoint recovers.
 			const v3 = shadow ? { ...(await shadow), live: "UNAVAILABLE" as const } : undefined;
 			return annotateJudgement({
 				verdict: "UNAVAILABLE",
-				reason: `Jev unavailable: ${truncated(err instanceof Error ? err.message : String(err), 160)}`,
+				reason: `Jev unavailable: ${truncated(outcome.error instanceof Error ? outcome.error.message : String(outcome.error), 160)}`,
 				noCache: true,
 				...(v3 ? { v3 } : {}),
 			});
 		}
+		// The deadline fired. UNAVAILABLE and the dialog are what they always
+		// were, but the request is still running: the reason names the deadline
+		// instead of implying the gate broke, and requestPermission adds the
+		// dialog's own line about the answer that may still arrive.
+		const v3 = shadow ? { ...(await shadow), live: "UNAVAILABLE" as const } : undefined;
+		const late = outcome.late;
+		return annotateJudgement({
+			verdict: "UNAVAILABLE",
+			reason: `Jev unavailable: judgment timed out after ${timeoutMs}ms`,
+			noCache: true,
+			...(v3 ? { v3 } : {}),
+			late: {
+				answer: (async (): Promise<Judgement | undefined> => {
+					const answers = await late.answers;
+					if (answers === undefined) return undefined;
+					try {
+						return await judgementFrom(answers);
+					} catch (err) {
+						// A late answer this process cannot read is no answer: the
+						// dialog stays exactly as the deadline left it. Warned, never
+						// thrown — this runs after the tool call was decided.
+						pi.logger.warn(`classifier: late judgment unreadable: ${err instanceof Error ? err.message : String(err)}`);
+						return undefined;
+					}
+				})(),
+				cancel: late.cancel,
+			},
+		});
 	};
 
 	/**
@@ -4239,6 +4319,12 @@ export default function (pi: ExtensionAPI) {
 		 *  per field: this list grew a field per phase, and each time a caller
 		 *  was missed the log came out half-filled. */
 		auditExtras: Pick<DecisionRecord, "userMessageIds" | "authorization" | "v3" | "floor"> = {},
+		/** The still-running judgment behind a timed-out classification (issue
+		 *  #62), with the guards a late SAFE must still clear. Present only
+		 *  where classify hit its deadline: the dialog then races the late
+		 *  verdict, which may dismiss it or refine its reason — never bypass it,
+		 *  and never re-block what a human allowed. */
+		late?: GuardedLateJudgement,
 	): Promise<{ block: true; reason: string } | undefined> => {
 		const subject = tool === "eval" ? "eval code" : "bash command";
 		const detail = reason ? `${headline}: ${reason}` : headline;
@@ -4286,6 +4372,35 @@ export default function (pi: ExtensionAPI) {
 				reason: refusalPayload(tool, layer, detail, guidance[layer].next, guidance[layer].notThis),
 			};
 		};
+		/**
+		 * One line per late verdict (issue #62), on a layer of its own so the
+		 * three cases are separable in the log by machine: `late-verdict` says a
+		 * judgment arrived after its deadline, `why` opens with the decision
+		 * pair (`unavailable → late SAFE`), and `verdict`/`jev`/`reasonCode`
+		 * describe the answer itself, exactly as they would have on a verdict
+		 * line. No approval field: nobody answered this dialog, the verdict did.
+		 */
+		const auditLate = (judgement: Judgement, why: string, decision: "allow" | "block"): void =>
+			logDecisionFor(ctx, {
+				tool,
+				decision,
+				layer: "late-verdict",
+				why,
+				cmd: target.command,
+				cwd: target.cwd,
+				verdict: judgement.verdict,
+				cached: 0,
+				ms: Date.now() - began,
+				...(judgement.modelId ? { modelId: judgement.modelId } : {}),
+				...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}),
+				...(judgement.jev ? { jev: judgement.jev } : {}),
+				...(judgement.authorization ? { authorization: judgement.authorization } : {}),
+				...(judgement.v3 ? { v3: judgement.v3 } : {}),
+				...(stale === "" ? {} : { staleCode: 1 as const }),
+				...(auditExtras.userMessageIds && auditExtras.userMessageIds.length > 0 ? { userMessageIds: auditExtras.userMessageIds } : {}),
+				...(auditExtras.floor ? { floor: auditExtras.floor } : {}),
+			});
+
 		// Dry-run probe (issue #32): never open a dialog, never audit. When a
 		// decision was logged before reaching here (critical, env, a verdict),
 		// that record already won; the unclassified path arrives with none, so
@@ -4299,7 +4414,13 @@ export default function (pi: ExtensionAPI) {
 			});
 			return { block: true, reason: "dry-run probe: decision captured, nothing executed" };
 		}
-		if (!ctx.hasUI) return block();
+		if (!ctx.hasUI) {
+			// Headless: nobody can be asked and nobody can be refined. The
+			// deadline's dialog does not exist here, so end the listening the
+			// deadline started rather than leak a request nobody will read.
+			late?.handle.cancel();
+			return block();
+		}
 		// A grant is only OFFERED when the resolver below can honor it. Critical
 		// patterns and env overrides outrank grants, so showing a grant choice
 		// there would promise an authorization that the next call can never use.
@@ -4309,8 +4430,33 @@ export default function (pi: ExtensionAPI) {
 		const grantsHonoredAtLayer = headline !== "critical pattern" && headline !== "environment override";
 		const sessionGrantAvailable = grantKey !== "" && grantsHonoredAtLayer;
 		const persistentGrantAvailable = tool === "bash" && readClassifierConfig().persistentGrants && grantsHonoredAtLayer;
-		const choice = await ctx.ui.select(
-			`Run ${subject}? (${headline}${stale})\n${buildPermissionBody(target, reason, ctx.cwd)}`,
+		// The late-answer race (issue #62). The dialog the deadline opened keeps
+		// the judgment request alive, so a verdict that lands while the human is
+		// reading can still improve the answer in front of them:
+		//   SAFE   -> dismiss the dialog and let the command run. That is the
+		//             answer the deadline had no right to take away, and a late
+		//             SAFE carries the same evidence (same battery, same state)
+		//             as an on-time one.
+		//   UNSAFE -> the dialog is now backed by a real reason: keep it open,
+		//             say what arrived, and let the human decide with it in hand.
+		//   UNSURE -> leave the dialog exactly as it is; the answer goes on the
+		//             record so calibration sees it whatever the human answers.
+		// Fail-closed is untouched by all three. A late verdict can only refine a
+		// dialog that is already open (the dismissal is an abort of OUR dialog,
+		// and the signal is only passed when there is a late handle at all); a
+		// late UNSAFE never re-blocks a command a human allowed, it is logged
+		// beside that allow; and a dismissal is honored only when the dialog
+		// settled with no answer of the human's (see `dismissedForLateSafe`).
+		const dismissal = new AbortController();
+		let lateRefinement: Judgement | undefined;
+		let dismissedForLateSafe = false;
+		let dialogSettled = false;
+		// The dialog says what is actually happening: the judgment is still
+		// running, and the dialog may resolve itself before the human answers.
+		const shownReason =
+			late === undefined ? reason : `${reason}\nThe judgment is still running: it may dismiss this dialog before you answer it.`;
+		const dialog = ctx.ui.select(
+			`Run ${subject}? (${headline}${stale})\n${buildPermissionBody(target, shownReason, ctx.cwd)}`,
 			[
 				{ label: "Allow once", description: "This call only" },
 				...(sessionGrantAvailable
@@ -4321,9 +4467,82 @@ export default function (pi: ExtensionAPI) {
 					: []),
 				{ label: "Deny" },
 			],
-			// The old confirm default was approve; keep the cursor on it.
-			{ initialIndex: 0 },
+			// The old confirm default was approve; keep the cursor on it. The
+			// signal is what dismisses the dialog on a late SAFE: the host hides
+			// it and resolves `undefined` (extension-ui-controller.ts:1290).
+			{ initialIndex: 0, ...(late ? { signal: dismissal.signal } : {}) },
 		);
+		// Recorded so a late verdict that runs after the human answered can see
+		// that the race is already over and do nothing at all.
+		void dialog.then(() => {
+			dialogSettled = true;
+		});
+		if (late) {
+			const lateHandle = late.handle;
+			void lateHandle.answer.then(judgement => {
+				if (judgement === undefined || dialogSettled) return;
+				lateRefinement = judgement;
+				// The pair calibration reads: the dialog was opened by an
+				// UNAVAILABLE, and this is what the answer turned out to be.
+				const pair = `unavailable → late ${judgement.verdict}`;
+				if (judgement.verdict === "SAFE") {
+					// A late SAFE may dismiss the dialog only where an on-time SAFE
+					// would have auto-run. This dialog exists because of the deadline,
+					// not because the verdict asked to be here, so the guards the
+					// verdict path applies still apply: the destructive-token
+					// overlay, and a refusal this session already holds for the
+					// target. Anything else keeps the dialog open with the answer
+					// recorded beside it.
+					const lateReplay = replayDecision({
+						tool,
+						command: target.command,
+						cwd: target.cwd,
+						judgement,
+						priorRefusal: late.priorRefusal !== undefined,
+						riskFlags: late.riskFlags,
+						headless: false,
+					});
+					if (lateReplay.decision !== "allow") {
+						const guardWhy =
+							late.riskFlags.length > 0
+								? `classifier-safe but flags: ${late.riskFlags.join(", ")}`
+								: `classifier-safe despite prior refusal of "${late.priorRefusal?.normalizedTarget ?? ""}"`;
+						auditLate(judgement, `${pair}: dialog kept open — ${guardWhy}`, "block");
+						ctx.ui.notify(`classifier: judgment answered late (${guardWhy})\nThe dialog still needs your answer.`, "warning");
+						return;
+					}
+					dismissedForLateSafe = true;
+					auditLate(judgement, `${pair}: dialog dismissed, command allowed`, "allow");
+					dismissal.abort();
+					return;
+				}
+				if (judgement.verdict === "UNSAFE") {
+					// The dialog cannot be re-titled once it is on screen, so the
+					// real reason reaches the human as a warning beside it, and the
+					// dialog's own outcome line carries the pair afterwards.
+					auditLate(judgement, `${pair}: dialog kept open with the judgment's reason`, "block");
+					ctx.ui.notify(
+						`classifier: judgment answered late: ${truncated(judgement.reason, 160)}\n` +
+							"The dialog is still open and now backed by that reason.",
+						"warning",
+					);
+					return;
+				}
+				// UNSURE, and any other non-answer the battery could produce: the
+				// dialog stays exactly as it is and the answer only goes on the
+				// record.
+				auditLate(judgement, `${pair}: answer attached to this dialog's record`, "block");
+			});
+		}
+		const choice = await dialog;
+		// The human answered, so nothing is left to refine: stop the request
+		// rather than let it run for the rest of the window. A verdict that was
+		// already in hand is kept — it refines the outcome line below — and one
+		// that lands after this point finds `dialogSettled` and does nothing.
+		late?.handle.cancel();
+		// The race, on the human's own line: calibration has to read the late
+		// answer next to the human's, and that means the same line.
+		const lateSuffix = lateRefinement === undefined ? "" : ` (unavailable → late ${lateRefinement.verdict})`;
 		if (choice === "Allow once" || choice === "Allow for session" || choice === "Always allow") {
 			// The user said yes to this action (issue #30): erase the memory
 			// that its target was refused, so rewordings run clean again. A
@@ -4335,13 +4554,20 @@ export default function (pi: ExtensionAPI) {
 			if (choice === "Always allow") addPersistentGrant(target.command, target.cwd);
 			audit(
 				"allow",
-				choice === "Allow for session"
+				(choice === "Allow for session"
 					? "approved by user (session grant)"
 					: choice === "Always allow"
 						? "approved by user (persistent grant)"
-						: "approved by user",
+						: "approved by user") + lateSuffix,
 				choice === "Allow for session" ? "allow-session" : choice === "Always allow" ? "always-allow" : "allow-once",
 			);
+			return undefined;
+		}
+		if (dismissedForLateSafe) {
+			// The dialog resolved with no answer because the late SAFE dismissed
+			// it, which is an allow, not a canceled prompt. Registered after the
+			// human's own answer above so a denial or an allow that the host
+			// managed to deliver anyway still wins.
 			return undefined;
 		}
 		// A human denial is the one decision a rewording cannot launder:
@@ -4353,7 +4579,13 @@ export default function (pi: ExtensionAPI) {
 			source: "human",
 			cwd: target.cwd,
 		});
-		return block(choice === undefined ? `prompt canceled: ${detail}` : undefined);
+		return block(
+			choice === undefined
+				? `prompt canceled: ${detail}${lateSuffix}`
+				: lateSuffix === ""
+					? undefined
+					: `${logWhyPrefix === "" ? detail : `${logWhyPrefix}: ${detail}`}${lateSuffix}`,
+		);
 	};
 
 	/** End a dry-run probe at a decision point the gate itself passes through
@@ -4676,7 +4908,22 @@ export default function (pi: ExtensionAPI) {
 				if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
 					addRefusal(ctx, evalCode, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
 				}
-				return await requestPermission(ctx, target, detail, judgement.reason, "eval", "follows verdict", userScopeFingerprint, { ...auditFields(), ...judgementAudit(judgement) });
+				// The dialog is offered the still-running judgment, with the guards
+				// a late SAFE would still have to clear (see GuardedLateJudgement): the
+				// same `prior` and spawn-scan flags the SAFE branch above judges with.
+				return await requestPermission(
+					ctx,
+					target,
+					detail,
+					judgement.reason,
+					"eval",
+					"follows verdict",
+					userScopeFingerprint,
+					{ ...auditFields(), ...judgementAudit(judgement) },
+					judgement.late === undefined
+						? undefined
+						: { handle: judgement.late, priorRefusal: prior, riskFlags: evalRiskFlags(evalCode) },
+				);
 			} catch (err) {
 				pi.logger.error(`classifier: ${err instanceof Error ? err.message : String(err)}`);
 				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "internal-error", why: "classifier failed; eval code not run", cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
@@ -5134,7 +5381,22 @@ export default function (pi: ExtensionAPI) {
 			if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
 				addRefusal(ctx, command, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
 			}
-			return await requestPermission(ctx, target, detail, judgement.reason, "bash", "follows verdict", userScopeFingerprint, { ...auditFields(), ...judgementAudit(judgement) });
+			// The dialog is offered the still-running judgment, with the guards a
+			// late SAFE would still have to clear (see GuardedLateJudgement): the
+			// same `prior` and overlay the SAFE branch above judges with.
+			return await requestPermission(
+				ctx,
+				target,
+				detail,
+				judgement.reason,
+				"bash",
+				"follows verdict",
+				userScopeFingerprint,
+				{ ...auditFields(), ...judgementAudit(judgement) },
+				judgement.late === undefined
+					? undefined
+					: { handle: judgement.late, priorRefusal: prior, riskFlags: matchModerateRiskTokens(command, cwd) },
+			);
 		} catch (err) {
 			// Unexpected plugin error: fail closed rather than wave the command
 			// through on a path we cannot vouch for.

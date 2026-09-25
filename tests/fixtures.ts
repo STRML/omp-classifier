@@ -214,6 +214,11 @@ export interface CapturedJevRequest {
 	/** HTTP headers, lower-cased. Present only when the firewall below carried
 	 *  the judgement; the judge seam has no headers to show. */
 	headers?: Record<string, string>;
+	/** The signal the gate handed the request (issue #62). Its abort state is
+	 *  how a test observes that the gate STOPPED listening — a cancelled
+	 *  judgment, or one whose late window closed — because a request that is
+	 *  no longer wanted leaves no other trace. */
+	signal?: AbortSignal;
 }
 
 export const modelCalls: CapturedJevRequest[] = [];
@@ -481,7 +486,7 @@ const scriptedJudge: Judge & { readonly kind: "typesafe" } = {
 				usage: tokenUsage(528, 126),
 			};
 		}
-		modelCalls.push({ state: request.state, questions, model: typesafeModel() });
+		modelCalls.push({ state: request.state, questions, model: typesafeModel(), signal: options?.signal });
 		const scripted = await scriptedJudgement(questions, options?.signal);
 		if (scripted.kind === "status") throw statusError(scripted.status, scripted.body);
 		return {
@@ -527,6 +532,7 @@ async function fakeJevFetch(
 		questions: (body?.questions ?? {}) as Record<string, unknown>,
 		model: body?.model,
 		headers: headerRecord(init?.headers),
+		signal: init?.signal,
 	});
 	const scripted = await scriptedJudgement((body?.questions ?? {}) as Record<string, unknown>, init?.signal);
 	if (scripted.kind === "status") return new Response(scripted.body, { status: scripted.status });
@@ -552,6 +558,14 @@ export function questionsOf(index = 0): Record<string, unknown> {
 	const call = modelCalls[index];
 	if (!call) throw new Error(`no captured Jev judgement at index ${index}`);
 	return call.questions;
+}
+
+/** The signal one captured judgement was made under (issue #62). Aborted means
+ *  the gate stopped listening — the human answered, or the late window closed. */
+export function signalOf(index = 0): AbortSignal | undefined {
+	const call = modelCalls[index];
+	if (!call) throw new Error(`no captured Jev judgement at index ${index}`);
+	return call.signal;
 }
 
 export interface EvidenceTierView {

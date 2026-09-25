@@ -28,6 +28,19 @@ thresholds. Four consequences shape every layer below:
 - **Fail-closed is a code path, not a promise.** A missing key, a non-2xx, a timeout, or an
   answer that does not match the battery yields `UNAVAILABLE`, which raises a dialog and is
   never cached. Nothing admits a guess in place of an answer.
+- **A missed deadline keeps listening, and that can only help the dialog.** The deadline is a
+  race the gate owns, not an abort on the request, so the judgment that lands a beat late can
+  still act on the dialog the deadline opened: a late `SAFE` dismisses it and the command runs,
+  a late `UNSAFE` leaves it open with the real reason beside it, a late `UNSURE` goes on the
+  record. A human who answers first cancels the request and the late answer does nothing.
+  Listening stops at `min(2 x timeoutMs, 30s)` past the deadline. The three cases are written
+  as they happen, on a `late-verdict` layer, with the pair (`unavailable → late UNSAFE`) in
+  `why` so calibration can read the late answer next to the human's own line. A late verdict
+  can never bypass a dialog, and a late `UNSAFE` never re-blocks what a human allowed: the
+  dialog is the only thing it can refine. A late `SAFE` dismisses only where an on-time `SAFE`
+  would have auto-run — the destructive-token overlay and a refusal this session already holds
+  for the target keep the dialog open, because the late path recovers the deadline's answer,
+  never a guard the verdict path applies.
 
 ## The tower
 

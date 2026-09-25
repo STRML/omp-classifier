@@ -4,6 +4,18 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-25
 
+### A judgment that answers after its deadline now reaches the dialog (#62)
+
+- The deadline is a race the gate owns, not an abort on the request. `jev-judge.ts` splits in two: `judgeBattery` is the request half (it takes the request's own signal — the shadow and the eval harness still hand it `AbortSignal.timeout`), and the new `judgeBatteryUnderDeadline` is the judge half. On a miss it returns `{ kind: "deadline", late }` with the request still running.
+- `classify` maps both paths through one `judgementFrom(answers)`, so a late answer is read by the same code, with the same evidence weight, as an on-time one. A missed deadline yields `UNAVAILABLE` and reports the timeout (`Jev unavailable: judgment timed out after 8000ms`) instead of an opaque abort, and rides back on `Judgement.late`.
+- `requestPermission` races the dialog against that handle, and only in that case: a late `SAFE` aborts the dialog and the command runs (the answer the deadline had no right to take away), a late `UNSAFE` keeps it open and adds the real reason as a warning beside it, a late `UNSURE` only goes on the record. The dialog's reason says so up front: the judgment is still running and may dismiss the dialog before the human answers.
+- Fail-closed is untouched: a late verdict can only refine a dialog that is already open, a dismissal is honored only when the dialog settled with no answer of the human's (so a real Deny always wins), and a late `UNSAFE` never re-blocks a command a human allowed — it is logged next to their choice as `approved by user (unavailable → late UNSAFE)`.
+- A human who answers first cancels the request, and the late answer does nothing. Listening stops at `min(2 x timeoutMs, 30s)` past the deadline (`stopListening` aborts the request when the window closes), so a wedged provider cannot hold a socket for the session.
+- The three cases are one line each on a new `late-verdict` layer, with the decision pair (`unavailable → late SAFE`, `late UNSAFE`, `late UNSURE`) in `why` and the answer's own `verdict`/`reasonCode`/`jev` the way a verdict line carries them. No `approval`: nobody answered that dialog, the verdict did.
+- A late SAFE dismisses only where an on-time SAFE would have auto-run. The dialog is offered the handle together with the guards the verdict path applies — the destructive/irreversible overlay and this session's refusal for the target — and a guarded command keeps its dialog (logged as `dialog kept open — classifier-safe but flags: rm`, or `… despite prior refusal of "…"`). The late path recovers the answer the deadline took away; it never skips a guard.
+- `eval/live-report.ts` counts a late SAFE's dismissal as an auto-allow, since the human was never asked; the late block lines stay unterminal so the human's own answer is the outcome that counts.
+- Real failures (HTTP error, missing key, unreadable body) are unchanged: no background race, the dialog opens immediately, because retrying them has meaningfully lower EV and the error text is the point.
+
 ### Triage queue: three parser and loader defects
 
 - Risk verbs inside a substitution are now read from the parsed AST (`substitutionSpans`), the same source `commandHasOutboundNetwork` uses. `addSubstitutionFlags` collected `$(…)` and backtick spans with a quote-blind regex, so `echo '$(rm -rf /tmp/x)'` raised a risk flag for a substitution that never runs. Quoted spans are data now, nested spans are seen at every depth, and the removed local guard lets process substitution through, so `cat <(rm -rf /tmp/x)` asks. (#119)
