@@ -2,6 +2,12 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-09-25
+
+### The plugin's own files follow the host's directory resolver (#9)
+
+- `omp-classifier.json`, `decisions.jsonl`, `status.json` and `omp-classifier-grants.json` now resolve through the host's resolver instead of a hand-built `~/.omp` segment: the profile root under `--profile work` (`~/.omp/profiles/work/`), `PI_CONFIG_DIR` in place of `.omp`, and `$XDG_DATA_HOME/omp` once `omp config init-xdg` has created it (darwin/linux). Before this, `/classifier enabled false` in a work profile turned the classifier off in every profile, because all of them read one file. `OMP_JEV_CONFIG` still overrides the path, and with none of those inputs set the default `~/.omp/omp-classifier.json` is unchanged, so no existing install moves.
+
 ## 2026-09-22
 
 ### The jev-v3 shadow

@@ -72,7 +72,7 @@ Uninstall: `omp plugin uninstall omp-classifier`. Coming from the parent? Uninst
 
 Your existing `bash.patterns` and `tools.approval` keep working. A narrow `allow` rule doubles as the opt-out from classification for a trusted shape; blanket patterns never qualify.
 
-Plugin settings live in `~/.omp/omp-classifier.json`. View or change them with `/classifier`:
+Plugin settings live in `omp-classifier.json` at the config root the host resolves — `~/.omp/omp-classifier.json` by default, and otherwise where that session's files go: the profile root under `--profile work` (`~/.omp/profiles/work/omp-classifier.json`), `PI_CONFIG_DIR` in place of the `.omp` segment, or `$XDG_DATA_HOME/omp` once `omp config init-xdg` has created it (darwin/linux). So a profile (or an XDG-migrated root) has its own classifier config instead of sharing the default one. `OMP_JEV_CONFIG` overrides the path outright. View or change them with `/classifier`:
 
 | Key | Default | Meaning |
 |---|---|---|
