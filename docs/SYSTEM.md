@@ -168,11 +168,15 @@ kind, `typesafe`, is exactly the paragraph above. The `endpoint` kind constructs
 `TypeSafeJudge` against `{baseUrl, model}` from the config file, with the credential read from
 the environment variable named by `apiKeyEnv`, so any server speaking the same wire contract
 (`POST {state, model, questions}` → `{answers, model}`) can judge without a patch — a
-self-hosted or fully local classifier included. Two things do not move: the battery and the
-policy. The answers are still probabilities (a `choice` with `probabilities` + `confidence`,
-one `noul` per hazard, a `score` for blast radius), so the same floors read them, and one-hot
-handling stays reserved for a text bridge. A missing credential, an unreachable baseUrl, a
-non-2xx, and an unparseable body are all outages: `JevUnavailableError` → permission request.
+self-hosted or fully local classifier included. Its one transport change is the redirect
+policy, forced to `manual` (`noFollowFetch`, issue #124): `fetch` follows a redirect by
+default, and this request carries the judged state and the bearer key, so a 3xx comes back as
+the response and fails the call instead of being replayed to a second host. Two things do not
+move: the battery and the policy. The answers are still probabilities (a `choice` with
+`probabilities` + `confidence`, one `noul` per hazard, a `score` for blast radius), so the same
+floors read them, and one-hot handling stays reserved for a text bridge. A missing credential,
+an unreachable baseUrl, a 3xx, a non-2xx, and an unparseable body are all outages:
+`JevUnavailableError` → permission request.
 
 The backend's **id** (`typesafe/<model>`, `endpoint/<baseUrl>#<model>`) is the judge's identity.
 It joins the config signature and every cache key, so a verdict earned from one judge can never

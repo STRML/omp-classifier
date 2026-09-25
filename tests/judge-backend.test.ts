@@ -23,6 +23,12 @@
  *     config signature is deliberately left stale, so only the KEY can tell the
  *     two backends apart (the same shape as the evidence-off/on test in
  *     session-grants.test.ts).
+ *   - The redirect is a closed door (review gate P0 on #84, issue #124): the
+ *     endpoint transport forces the runtime fetch's redirect policy to
+ *     `"manual"`, so a 3xx comes back as the response and the host client fails
+ *     on it. Measured against two real local servers: the second one receives
+ *     zero requests for a 302 and for the 307 (the status that replays the
+ *     body), and the gate reports an outage rather than judging the target.
  *   - The credential value never reaches the audit log, the config banner, or
  *     the status report.
  */
@@ -30,11 +36,12 @@ import * as fs from "node:fs";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { TypeSafeJudge } from "@oh-my-pi/pi-ai";
 import { buildStatusReport, decisionsLogPath, formatClassifierConfig, readClassifierConfig } from "../index";
-import { DEFAULT_JUDGE_BACKEND, judgeBackendFor, parseJudgeBackend } from "../jev-judge";
+import { DEFAULT_JUDGE_BACKEND, judgeBackendFor, noFollowFetch, parseJudgeBackend } from "../jev-judge";
 import {
 	fire,
 	fireCommand,
 	JEV_FIXTURE_HAZARDS,
+	JEV_FIXTURE_MODEL,
 	jevSafeAnswer,
 	loadPlugin,
 	loggerInfos,
@@ -370,5 +377,172 @@ describe("the endpoint transport refuses cleartext and redirects", () => {
 			{ kind: "endpoint", baseUrl: "https://user:secret@judge.example", model: "m", apiKeyEnv: "K" },
 			{ kind: "endpoint", baseUrl: "https://:secret@judge.example", model: "m", apiKeyEnv: "K" },
 		]);
+	});
+});
+
+/** What one wire reply carries: a status, and optionally a body and headers. */
+interface WireReply {
+	status: number;
+	body?: string;
+	headers?: Record<string, string>;
+}
+
+/** One request a wire server received, in the contract's own shape. */
+interface WireRequest {
+	url: string;
+	method: string;
+	headers: Record<string, string>;
+	state: unknown;
+	model: unknown;
+	questions: Record<string, unknown>;
+}
+
+interface WireServer {
+	readonly baseUrl: string;
+	readonly calls: WireRequest[];
+	stop(): Promise<void>;
+}
+
+/** The envelope the redirect target answers with: the fixture's safe answers, so
+ *  a transport that DID follow would hand the gate a verdict instead of an
+ *  outage and the failure would be loud (528/126 are the fixture's usage). */
+function safeEnvelope(): string {
+	return JSON.stringify({
+		model: JEV_FIXTURE_MODEL,
+		answers: jevSafeAnswer(),
+		usage: { input_tokens: 528, output_tokens: 126 },
+	});
+}
+
+/**
+ * A real System One endpoint on 127.0.0.1. The redirect tests need the wire
+ * itself: a stub cannot show whether a request ARRIVED at a second server, and
+ * that arrival is the property under test.
+ */
+function startWireServer(respond: () => WireReply = () => ({ status: 200, body: safeEnvelope() })): WireServer {
+	const calls: WireRequest[] = [];
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch(request): Promise<Response> {
+			const raw = await request.text();
+			const body = raw === "" ? {} : (JSON.parse(raw) as Record<string, unknown>);
+			const url = new URL(request.url);
+			calls.push({
+				url: `${url.origin}${url.pathname}`,
+				method: request.method,
+				headers: Object.fromEntries(request.headers.entries()),
+				state: body.state,
+				model: body.model,
+				questions: (body.questions ?? {}) as Record<string, unknown>,
+			});
+			const reply = respond();
+			return new Response(reply.body ?? "", {
+				status: reply.status,
+				headers: { "content-type": "application/json", ...reply.headers },
+			});
+		},
+	});
+	return {
+		baseUrl: `http://127.0.0.1:${server.port}`,
+		calls,
+		stop: async () => {
+			await server.stop();
+		},
+	};
+}
+
+/**
+ * A redirect answered by the endpoint itself (review gate P0 on #84, issue
+ * #124). The suite's firewall answers every `fetch` without opening a socket, so
+ * these tests install the RUNTIME's fetch for the length of one call and run two
+ * real servers: the endpoint that answers 3xx, and the server it points at. The
+ * second must receive nothing, and the call must fail closed instead of judging
+ * whatever the target answers — the two are asserted together, because zero hits
+ * alone would also pass if the endpoint had never been asked, and an outage
+ * alone would also pass if the transport had followed and the target had
+ * answered nothing.
+ *
+ * The transport-level tests call `noFollowFetch` with `redirect: "follow"` in
+ * the init on purpose: the policy belongs to the boundary, so a caller cannot
+ * opt back into following.
+ */
+describe("the endpoint transport cannot follow a redirect", () => {
+	const runtimeFetch = Bun.fetch;
+	const started: WireServer[] = [];
+	const start = (respond?: () => WireReply): WireServer => {
+		const server = startWireServer(respond);
+		started.push(server);
+		return server;
+	};
+
+	afterEach(async () => {
+		globalThis.fetch = firewallFetch;
+		while (started.length > 0) await started.pop()?.stop();
+	});
+
+	for (const status of [302, 307]) {
+		test(`a ${status} comes back as the ${status} and never reaches the target`, async () => {
+			// 307 is the one that would replay the POST body — the judged state.
+			// 302 rewrites the method and drops it; neither may reach the target.
+			const target = start();
+			const endpoint = start(() => ({ status, headers: { location: `${target.baseUrl}/v1/systemone` } }));
+			globalThis.fetch = runtimeFetch;
+			const response = await noFollowFetch(`${endpoint.baseUrl}/v1/systemone`, {
+				method: "POST",
+				headers: { authorization: `Bearer ${KEY_VALUE}`, "content-type": "application/json" },
+				body: JSON.stringify({ state: { command: "git status" }, model: ENDPOINT.model, questions: {} }),
+				redirect: "follow",
+			});
+			expect(response.status).toBe(status);
+			expect(response.redirected).toBe(false);
+			expect(endpoint.calls.length).toBe(1);
+			expect(endpoint.calls[0].method).toBe("POST");
+			expect(endpoint.calls[0].headers.authorization).toBe(`Bearer ${KEY_VALUE}`);
+			expect(target.calls).toEqual([]);
+		});
+
+		test(`a ${status} fails the gate closed instead of judging the target`, async () => {
+			const target = start();
+			const endpoint = start(() => ({ status, headers: { location: `${target.baseUrl}/v1/systemone` } }));
+			process.env.LOCAL_JUDGE_KEY = KEY_VALUE;
+			writeConfigFile({ shadowV3: false, judgeBackend: { ...ENDPOINT, baseUrl: endpoint.baseUrl } });
+			const blocked = await (async () => {
+				globalThis.fetch = runtimeFetch;
+				try {
+					return await fire("tool_call", makeEvent("git status"), makeCtx({ sessionId: nextSession() }));
+				} finally {
+					globalThis.fetch = firewallFetch;
+				}
+			})();
+			// The target answers the fixture's safe set, so a transport that
+			// followed would arrive here as ALLOWED; `refusalOf` throws on that.
+			const payload = refusalOf(blocked);
+			expect(payload.layer).toBe("headless");
+			expect(payload.why).toContain("classifier unavailable");
+			// And the status the endpoint answered is what failed the call.
+			expect(payload.why).toContain(`TypeSafe API error (${status})`);
+			expect(endpoint.calls.length).toBe(1);
+			expect(target.calls).toEqual([]);
+		});
+	}
+
+	test("a reply the runtime reports as redirected is refused rather than judged", async () => {
+		// The backstop for a runtime that ignored the policy: `redirected` is the
+		// platform's own report that it followed, so that body came from somewhere
+		// else. Stubbed because this runtime honors `manual` and the branch cannot
+		// otherwise be reached here.
+		const following = globalThis.fetch;
+		let sawRedirect: unknown;
+		globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+			sawRedirect = init?.redirect;
+			return { redirected: true, status: 200 } as unknown as Response;
+		}) as unknown as typeof fetch;
+		try {
+			await expect(noFollowFetch(`${ENDPOINT.baseUrl}/v1/systemone`)).rejects.toThrow(/followed a redirect/u);
+			expect(sawRedirect).toBe("manual");
+		} finally {
+			globalThis.fetch = following;
+		}
 	});
 });

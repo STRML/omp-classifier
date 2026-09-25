@@ -41,10 +41,13 @@
  *     produces the `Judge` for a classification: `typesafe` is the host
  *     resolution described above and the default, `endpoint` is any server
  *     speaking the same System One contract with its credential in a named
- *     environment variable. Its `id` is the judge's identity and joins the
- *     config signature and the cache key, so a verdict is only ever served
- *     under the backend that produced it. A missing credential is an outage,
- *     never a request sent with nothing.
+ *     environment variable. The endpoint kind forces the redirect policy off
+ *     (`noFollowFetch`, issue #124), because the request carries the judged
+ *     state and the key and a 3xx must not replay them to a second host.
+ *     Its `id` is the judge's identity and joins the config signature and the
+ *     cache key, so a verdict is only ever served under the backend that
+ *     produced it. A missing credential is an outage, never a request sent
+ *     with nothing.
  */
 import {
 	type ChoiceQuestion,
@@ -256,22 +259,60 @@ const TYPESAFE_BACKEND: JudgeBackend = {
 };
 
 /**
- * An endpoint speaking the System One contract. The transport itself is the
- * host's `TypeSafeJudge` — the same client the default path uses, so retries,
- * timeouts, the error taxonomy and the wire shape are the host's and not a
- * second implementation to keep in step. Its caller's `AbortSignal` still
- * bounds the whole call, and `api: "typesafe"` still marks the answers as
- * measured probabilities rather than a one-hot keyword bridge.
+ * The endpoint kind's transport: the runtime's `fetch` with its redirect policy
+ * forced, so a 3xx can never be followed.
+ *
+ * `fetch` follows a redirect by default, and that default is the whole hazard
+ * here: this request carries the judged state and `Authorization: Bearer <key>`,
+ * so a hostile or misconfigured judge could answer 307/308 and have the state
+ * replayed to another host. Measured on this runtime, two local servers, a POST
+ * with a JSON body and a bearer header: with the default policy the 307 body
+ * arrives at the second hop verbatim, and when the redirect stays on the same
+ * origin so does the bearer header; with `redirect: "manual"` the 3xx comes
+ * back as the response, `response.redirected` is false, and the second hop is
+ * never contacted ("manual" is honored by this runtime; `redirect: "error"`
+ * refuses too, by throwing). This is the property the gate depends on (review
+ * gate P0 on #84, issue #124).
+ *
+ * Forcing it also means no caller can ask for a follow: a `redirect` in the
+ * init is overwritten here, so the policy belongs to this boundary rather than
+ * to whichever code builds the request. Everything else about the transport is
+ * unchanged — proxy handling, TLS trust, and the abort signal stay the
+ * runtime's, and retries stay the host client's.
+ *
+ * A 3xx is left for the client to fail on rather than raised here: it is not one
+ * of the statuses `TypeSafeJudge` retries (408/429/5xx), so a redirect costs one
+ * request and surfaces as `JevUnavailableError` → a permission request, never a
+ * verdict from the redirect target. Exported because it is the transport
+ * `endpointBackend` injects, and the no-follow property is asserted against it
+ * directly in tests/judge-backend.test.ts.
+ */
+export async function noFollowFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+	const response = await fetch(input, { ...init, redirect: "manual" });
+	// Backstop for a runtime that ignores the policy: `redirected` is the
+	// platform's own report that it followed, so a body fetched from the
+	// redirect target is refused rather than judged. It never fires where
+	// `manual` is honored (measured: the 3xx comes back with `redirected`
+	// false), and it costs one property read.
+	if (response.redirected) throw new TypeError("judge endpoint transport followed a redirect");
+	return response;
+}
+
+/**
+ * An endpoint speaking the System One contract. The client is the host's
+ * `TypeSafeJudge` — the same one the default path uses, so retries, timeouts,
+ * the error taxonomy and the wire shape are the host's and not a second
+ * implementation to keep in step — over the runtime's own `fetch` with one
+ * change: `noFollowFetch` forces the redirect policy to `"manual"`, because the
+ * default policy follows and this request carries the judged state and the key.
+ * Its caller's `AbortSignal` still bounds the whole call, and `api: "typesafe"`
+ * still marks the answers as measured probabilities rather than a one-hot
+ * keyword bridge.
  *
  * The URL is checked at the config: https anywhere, http only to this machine,
- * and never a URL carrying its own credentials (review gate on #84). A redirect
- * is NOT covered yet: this runtime's `fetch` follows a redirect even when the
- * init asks it not to, and a 307/308 replays the body, so a hostile or
- * misconfigured judge could forward the state and the key one hop. Measured in
- * tests/judge-backend.test.ts; tracked in #124, which is the transport-level
- * fix (a client that cannot follow a redirect) and is a maintainer call because
- * it moves the endpoint path off the host's own fetch, and therefore off its
- * proxy and TLS handling.
+ * and never a URL carrying its own credentials (review gate on #84). A 3xx from
+ * the endpoint is neither followed nor retried: it arrives as the response and
+ * fails the call like any other non-2xx.
  */
 function endpointBackend(config: Extract<JudgeBackendConfig, { kind: "endpoint" }>): JudgeBackend {
 	return {
@@ -284,7 +325,7 @@ function endpointBackend(config: Extract<JudgeBackendConfig, { kind: "endpoint" 
 			if (!apiKey) {
 				throw new JevUnavailableError(`judge endpoint credential ${config.apiKeyEnv} is not set`);
 			}
-			return new TypeSafeJudge({ baseUrl: config.baseUrl, model: config.model, apiKey, });
+			return new TypeSafeJudge({ baseUrl: config.baseUrl, model: config.model, apiKey, fetch: noFollowFetch });
 		},
 	};
 }
