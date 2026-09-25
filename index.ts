@@ -3228,29 +3228,6 @@ function remember(scoped: Map<string, Judgement>, key: string, judgement: Judgem
 	scoped.set(key, judgement);
 }
 
-/**
- * Normalized refusal target (issue #30): the stable identity of a command
- * across rewording. Lowercase, whitespace-collapsed, leading `cd <path> &&`
- * stripped, `./` argument spellings canonicalized to bare paths ("./x" and
- * "x" are the same file), flag tokens dropped, then the verb and its first
- * argument word are kept ("rm -rf ./x" -> "rm x"; git's verb is two words, so
- * "git push --force origin main" -> "git push origin"). Imperfect by design
- * and biased to OVER-match: two different commands sharing a target cost one
- * extra prompt-line, never a silent run. Force flags leave the KEY but stay
- * in the command text the model and the dialog see — force-ness is judged
- * there, not here.
- */
-export function normalizeRefusalTarget(command: string): string {
-	const collapsed = command.replace(/\s+/gu, " ").trim().toLowerCase();
-	const stripped = extractLeadingCdTarget(collapsed)?.rest || collapsed;
-	const words = stripped
-		.split(" ")
-		.map(word => word.replace(/^\.\//u, ""))
-		.filter(word => word !== "" && !word.startsWith("-"));
-	if (words.length === 0) return "";
-	return words.slice(0, words[0] === "git" ? 3 : 2).join(" ");
-}
-
 function sessionRefusals(sessionId: string): Refusal[] {
 	let list = refusals.get(sessionId);
 	if (!list) {
@@ -3275,7 +3252,7 @@ function addRefusal(
 	// Dry-run probe (issue #32): records nothing.
 	if (dryRun) return;
 	try {
-		const target = normalizeRefusalTarget(command);
+		const target = normalizeGrantTarget(command);
 		if (target === "") return;
 		const list = sessionRefusals(ctx.sessionManager.getSessionId());
 		const refusalCwd = meta.cwd ?? "";
@@ -3298,11 +3275,13 @@ function addRefusal(
 	}
 }
 
-/** A user approval of a target erases the memory that it was refused. */
+/** A user approval of a target erases the memory that it was refused. Approving
+ *  and refusing use one identity, so the lift covers exactly what the refusal
+ *  remembered (issue #64). */
 function liftRefusals(ctx: ExtensionContext, command: string, cwd = ""): void {
 	try {
 		const sessionId = ctx.sessionManager.getSessionId();
-		const target = normalizeRefusalTarget(command);
+		const target = normalizeGrantTarget(command);
 		if (target === "") return;
 		const list = refusals.get(sessionId);
 		if (!list) return;
@@ -3313,15 +3292,24 @@ function liftRefusals(ctx: ExtensionContext, command: string, cwd = ""): void {
 }
 
 /**
- * Strict authorization key for a session grant (issue #32). Grants are
- * authorization, so unlike normalizeRefusalTarget — whose over-match is the
- * SAFE direction for refusal memory — this key must NOT collapse distinct
- * actions: flag tokens are KEPT (combined short flags split, then sorted and
- * deduped, so "-rf" and "-r -f" produce the same key) and only the first
- * non-flag argument survives. Lowercased, whitespace-collapsed, leading
- * `cd <path> &&` stripped, `./` argument spellings canonicalized.
+ * The strict identity of one action, shared by session grants (issue #32) and
+ * refusal memory (issue #64). Authorization and memory must agree on what
+ * "this action" is: flag tokens are KEPT (combined short flags split, then
+ * sorted and deduped, so "-rf" and "-r -f" produce the same key) and only the
+ * first non-flag argument survives. Lowercased, whitespace-collapsed, leading
+ * `cd <path> &&` stripped, `./` argument spellings canonicalized. Force flags
+ * leave the KEY but stay in the command text the model and the dialog see —
+ * force-ness is judged there, not here.
+ *
+ * Grants are authorization, so this key must NOT collapse distinct actions:
  * "git push origin main" and "git push --force origin main" differ here;
  * refusing to notice that difference turned a grant into an overgrant.
+ *
+ * Refusal memory keys the same way. Its own old two-word key ("ssh raw-ovh",
+ * "docker exec") made one refused remote cleanup a session-length trip wire
+ * for every later read from that host: 152 of the blocks in the 2026-09-12
+ * log window carried `prior refusal` as a reason. A refusal now covers the
+ * action it names and nothing wider, and an approval lifts exactly that.
  */
 export function normalizeGrantTarget(command: string): string {
 	const collapsed = command.replace(/\s+/gu, " ").trim().toLowerCase();
@@ -3329,8 +3317,8 @@ export function normalizeGrantTarget(command: string): string {
 	const words = stripped.split(" ").filter(word => word !== "");
 	if (words.length === 0) return "";
 	const lead = [words[0]];
-	// git is the one two-word verb (mirrors normalizeRefusalTarget); the
-	// subverb must be a word, not a flag.
+	// git is the one two-word verb: the subverb is part of the identity. It
+	// must be a word, not a flag.
 	if (words[0] === "git" && words[1] !== undefined && !words[1].startsWith("-")) lead.push(words[1]);
 	const flags = new Set<string>();
 	let firstArg = "";
@@ -3558,7 +3546,7 @@ function priorRefusalFor(
 	evidenceFingerprint?: string,
 ): Refusal | undefined {
 	try {
-		const target = normalizeRefusalTarget(command);
+		const target = normalizeGrantTarget(command);
 		if (target === "") return undefined;
 		return refusals.get(ctx.sessionManager.getSessionId())?.find(refusal => {
 			if (refusal.normalizedTarget !== target || refusal.cwd !== cwd) return false;
