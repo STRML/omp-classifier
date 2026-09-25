@@ -334,6 +334,17 @@ describe("matcher unit spec", () => {
 		// Process substitution is a substitution too, and it runs.
 		expect(matchModerateRiskTokens("cat <(rm -rf /tmp/x)")).toEqual(["rm"]);
 	});
+
+	// The gate on #119 found the span text itself arriving truncated once
+	// non-ASCII text preceded the substitution: the parser's byte offsets were
+	// being used as string indexes, so `echo 漢字 $(rm important)` read as
+	// `[" important"]` and flagged nothing. Same class as the quote-blindness
+	// above, one layer down, so it is pinned here too.
+	test("a flag survives non-ASCII text before the substitution", () => {
+		expect(matchModerateRiskTokens("echo 漢字 $(rm important)")).toEqual(["rm"]);
+		expect(matchModerateRiskTokens("echo 🚗💨 $(dd if=/dev/zero of=/dev/disk2)")).toEqual(["dd"]);
+		expect(matchModerateRiskTokens("echo 漢字 '$(rm -rf /tmp/x)'")).toEqual([]);
+	});
 });
 describe("rm/unlink shape scoping", () => {
 	test("systemic shapes keep the forced dialog; plain named targets drop out", () => {
