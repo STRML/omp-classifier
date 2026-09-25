@@ -82,6 +82,7 @@ import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 import { getConfigRootDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
+import { substitutionSpans } from "./shell-ast";
 import { judgeBattery, judgeJevV3 } from "./jev-judge";
 import { buildAuthorizationState, DEFAULT_AUTHORIZATION_POLICY, deriveAuthorization, summarizeActions, type ActionSummaryEntry, type JevAuthorizationLevel } from "./authorization";
 import { deriveDecisionOrder, type DecisionBranch } from "./decision-order";
@@ -1235,27 +1236,21 @@ const SEND_DATA_FLAGS: Record<string, true> = {
 	"--method": true, "--body-data": true, "--post-file": true,
 };
 
-/** `$(…)` and backtick SPANS of `text`, mirroring the span collection in
- *  addSubstitutionFlags: substitution is outside the tokenizer's scope, so a
- *  span is unusable as a lead word and must be scanned as its own command. */
-function substitutionSpans(text: string): string[] {
-	if (!/\$\(|`/u.test(text)) return [];
-	const spans: string[] = [];
-	for (const m of text.matchAll(/\$\(([^)]*)\)/gu)) spans.push(m[1]);
-	const dollarTail = /\$\(([^)]*)$/u.exec(text);
-	if (dollarTail) spans.push(dollarTail[1]);
-	for (const m of text.matchAll(/`([^`]*)`/gu)) spans.push(m[1]);
-	const backtickTail = /`([^`]*)$/u.exec(text);
-	if (backtickTail) spans.push(backtickTail[1]);
-	return spans;
-}
+/** `$(…)`, `<(…)` and backtick SPANS of `text`: substitution is outside the
+ *  tokenizer's scope, so a span is unusable as a lead word and must be
+ *  scanned as its own command. Shells parse the spans (quoting and nesting
+ *  included) in shell-ast, which owns the parser; this keeps one collector in
+ *  the repository. */
 
 /** Does one command segment hold a network verb within reach? Its own lead
  *  word and every later pipe stage's lead run the same clearing rules: a
  *  read-shaped fetch clears (whole segment — isPlainReadOnlyFetch judges the
  *  pipeline too), the `gh` carveout decides on its tokens, and every other
  *  NETWORK_VERBS lead fails closed. Shared by the owner scan and the
- *  substitution-span scan below, which must never disagree. */
+ *  substitution-span scan below, which must never disagree. Later stages skip
+ *  leading `VAR=` assignments first, as the stage-0 lead does: the stage's
+ *  first token is the assignment, not the verb (`printf hi | FOO=bar ssh
+ *  host cat`). */
 function segmentLeadsOutbound(segment: string): boolean {
 	const stages = splitPipeStages(segment);
 	const leadWords = tokenizeShellSegments(stages[0] ?? "")[0] ?? [];
@@ -1267,7 +1262,9 @@ function segmentLeadsOutbound(segment: string): boolean {
 	if (NETWORK_VERBS[lead]) return true;
 	for (let i = 1; i < stages.length; i++) {
 		const stageTokens = tokenizeShellSegments(stages[i])[0] ?? [];
-		const stageLead = commandBasename((stageTokens[0] ?? "").toLowerCase());
+		let stageSkipped = 0;
+		while (stageSkipped < stageTokens.length && /^[a-z_][a-z0-9_]*=/iu.test(stageTokens[stageSkipped])) stageSkipped++;
+		const stageLead = commandBasename((stageTokens[stageSkipped] ?? "").toLowerCase());
 		if (stageLead === "gh" && !ghApiWrites(stageTokens)) continue;
 		if (NETWORK_VERBS[stageLead]) return true;
 	}

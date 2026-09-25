@@ -530,6 +530,48 @@ export function verbName(command: ShellCommand): string {
 }
 
 /**
+ * The inner text of every `$(…)`, `<(…)` and backtick substitution in `text`,
+ * whatever its depth: `$(echo $(curl …))` yields both `echo $(curl …)` and
+ * `curl …`.
+ *
+ * The parser decides where a substitution is, so quoting and nesting are read
+ * the way bash reads them: the `$(curl …)` inside `'…'` is data and yields
+ * nothing, a quoted heredoc's body is data, and an unquoted body's
+ * substitution runs. A node's slice keeps its delimiters, so each span is the
+ * node text stripped of one leading `$(`, `<(` or backtick and one trailing
+ * `)` or backtick — scanning a span that holds a pipeline whole would leave
+ * the closer tangled into the last word.
+ *
+ * Text the parser rejects ({@link parseShell} answers "not read" there) falls
+ * back to a quote-blind pairing of `$(` with the next `)`: an approximation
+ * whose false positives quote in the fail-closed direction, in exchange for
+ * still seeing the tail of a genuinely executed substitution.
+ */
+export function substitutionSpans(text: string): string[] {
+	if (!/\$\(|`|<\(/u.test(text)) return [];
+	const parsed = parseShell(text);
+	if (!parsed.ok) {
+		const spans: string[] = [];
+		for (const m of text.matchAll(/\$\(([^)]*)\)/gu)) spans.push(m[1]);
+		for (const m of text.matchAll(/`([^`]*)`/gu)) spans.push(m[1]);
+		const dollarTail = /\$\(([^)]*)$/u.exec(text);
+		if (dollarTail) spans.push(dollarTail[1]);
+		const backtickTail = /`([^`]*)$/u.exec(text);
+		if (backtickTail) spans.push(backtickTail[1]);
+		return spans;
+	}
+	const spans: string[] = [];
+	// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+	walk(parse(text), node => {
+		const type = nodeType(node);
+		if (type !== "CmdSubst" && type !== "ProcSubst") return;
+		const inner = sliceOf(node, text);
+		spans.push(inner.replace(/^\$\(|^<\(|^`/u, "").replace(/\)$|`$/u, ""));
+	});
+	return spans;
+}
+
+/**
  * Every name a word expands: each parameter expansion however deep, and each
  * bare name inside arithmetic. Stops at a substitution, whose commands are
  * read as commands.
