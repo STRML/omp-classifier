@@ -4,7 +4,18 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-25
 
+### Eval `--compare` keys on a case's identity (#80)
+
 - `--compare` keys a baseline row on the case's whole identity — command, cwd, kind, language and evidence, the same inputs the answer cache keys on — instead of the command alone. `eval/corpus/intent.jsonl` lists 14 commands twice (13 of them with opposite labels) differing only in the evidence that authorizes them, and `--corpus heldout` repeats all 20 commands 25 times differing only in cwd, so the last twin in the baseline stood in for every row sharing its command: the diff mis-attributed FIXED/REGRESSION lines and dropped the movements of the twin that came first (#80). Two rows that still share an identity, in the baseline or in the run under test, now throw with the command and cwd named instead of one of them being picked silently. The evidence identity is canonicalized before it is compared, so a report written with differently ordered object keys still matches.
+
+### A pluggable judge backend (#84)
+
+- The transport is one seam now: `JudgeBackend` in `jev-judge.ts` produces the `Judge` that answers `judgeBattery`/`judgeAuthorization`, and `judgeBackend` in the config file selects it. The default kind, `{kind: "typesafe"}`, is the host path byte for byte — the same `resolveJudge` deps, the same pinned judge role, the same one-hot fallback semantics, and no new socket opened anywhere.
+- `{"kind": "endpoint", "baseUrl", "model", "apiKeyEnv"}` points the gate at any server speaking System One's wire contract (`POST {baseUrl}/v1/systemone` with `{state, model, questions}` → `{model, answers}`). The transport is the host's own `TypeSafeJudge`, so retries, timeouts, and the error taxonomy are the ones the default path already had. `apiKeyEnv` is an environment variable NAME: the key is read per call, never written to the config file, the audit log, or `/classifier status`, and a missing one fails closed with no request sent.
+- Nothing about the battery or the policy moves: the endpoint answers probabilities, so the same `jevPolicy` floors read them, and one-hot handling stays reserved for a text bridge. A missing credential, an unreachable endpoint, a non-2xx, a malformed body, and a timeout are all `JevUnavailableError` → permission request.
+- Backend identity joins the config signature and both cache keys (`config.typesafeModel`, `judgeBackendFor(config.judgeBackend).id`), so a backend swap cannot serve a verdict the other judge produced — proven through the dry-run probe, the one cache read the signature deliberately leaves stale. A verdict cached under the host judge is no longer reported as an endpoint's.
+- `/classifier` shows the active backend as `judgeBackend: <id>` and `/classifier status` carries `backendId` (`typesafe/jev-latest`, `endpoint/http://127.0.0.1:8765#local-decide`). The shadow judgment asks the same backend as the live one. `/classifier reset` returns the key to the default; bad shapes (unknown kind, a non-URL baseUrl, a missing model, an env var name with a space) keep the default rather than half-applying an override.
+>>>>>>> fix/84
 
 ## 2026-09-22
 

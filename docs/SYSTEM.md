@@ -163,6 +163,23 @@ reason with `(llm keyword answer)`), the model is whatever that judge resolves
 (`TYPESAFE_DEFAULT_MODEL`, else `jev-latest`), and the only knob this gate passes is its own
 deadline as an `AbortSignal` — no temperature to set.
 
+Which transport answers is one seam (`JudgeBackend` in `jev-judge.ts`, issue #84). The default
+kind, `typesafe`, is exactly the paragraph above. The `endpoint` kind constructs the host's own
+`TypeSafeJudge` against `{baseUrl, model}` from the config file, with the credential read from
+the environment variable named by `apiKeyEnv`, so any server speaking the same wire contract
+(`POST {state, model, questions}` → `{answers, model}`) can judge without a patch — a
+self-hosted or fully local classifier included. Two things do not move: the battery and the
+policy. The answers are still probabilities (a `choice` with `probabilities` + `confidence`,
+one `noul` per hazard, a `score` for blast radius), so the same floors read them, and one-hot
+handling stays reserved for a text bridge. A missing credential, an unreachable baseUrl, a
+non-2xx, and an unparseable body are all outages: `JevUnavailableError` → permission request.
+
+The backend's **id** (`typesafe/<model>`, `endpoint/<baseUrl>#<model>`) is the judge's identity.
+It joins the config signature and every cache key, so a verdict earned from one judge can never
+be served under another; `/classifier` and `/classifier status` (`backendId`) show it.
+Credentials are deliberately not part of that identity — the TypeSafe key is not in the
+signature either, and another key for the same endpoint is another login, not another judge.
+
 Invariant: nothing that reached L2 can end in silence. `UNAVAILABLE` behaves exactly like
 `UNSURE` at L4 (a dialog) and is excluded from the cache, so an outage cannot pin a session
 to a stale non-answer.
@@ -197,8 +214,9 @@ behind it. The sweep in L5 exists to make that cheap enough to be routine.
 
 ## L3 memory
 
-- **Verdict cache**: per session, keyed by command + cwd + env/pty identity, and cleared
-  whenever the effective config signature changes. `UNAVAILABLE` is never cached.
+- **Verdict cache**: per session, keyed by command + cwd + env/pty identity + the judge's
+  identity (the active backend and the model it answers with), and cleared whenever the
+  effective config signature changes. `UNAVAILABLE` is never cached.
 - **Refusal memory**: what this session was denied, keyed by normalized target and cwd and
   fingerprinted by the evidence the judge saw, fed back into the state as `priorRefusal` so
   rewording cannot launder a refusal into a fresh judgment. A SAFE under a prior refusal is
