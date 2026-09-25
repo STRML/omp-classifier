@@ -1743,8 +1743,16 @@ interface InterpreterFlagGrammar {
 	inline: RegExp;
 	/** Flags that take a SEPARATE value word which is not a program (a warning
 	 *  filter, an include directory, a shopt name, an output style). The value
-	 *  word is consumed so it cannot be mistaken for the program. */
-	value: RegExp;
+	 *  word is consumed so it cannot be mistaken for the program. A verb whose
+	 *  flags all take their value attached carries no entry. */
+	value?: RegExp;
+	/** Flags that take a SEPARATE value word which IS a file the interpreter
+	 *  runs, not a setting (`bun --preload ./pre.ts`). The value word is read
+	 *  like the interpreter's own operand — the interpreter opens that file
+	 *  whatever the operand's grammatical role — and the program slot is still
+	 *  open for the word after it, so `bun --preload ./pre.ts run main.ts`
+	 *  reads both files (round 2 review). */
+	file?: RegExp;
 	/** True when `-s` means "the program comes from stdin" for this
 	 *  interpreter. Only the shells spell it that way: python's `-s`, perl's
 	 *  `-s`, ruby's `-s`, and php's `-s` are all something else. */
@@ -1791,15 +1799,24 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	// the operand scan, which reads it.
 	node: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--input-type$|^-C$|^--conditions$|^--title$/u, stdinFlag: false },
 	deno: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--ext$|^--config$|^--import-map$|^--v8-flags$/u, stdinFlag: false },
-	bun: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--cwd$|^--preload$|^--loader$/u, stdinFlag: false },
+	// `bun --help` here: `-r, --preload=<val>` ("import a module before other
+	// modules are loaded") and its Node-compatibility aliases `--require` and
+	// `--import` name FILES bun runs, so they are read; `--loader` takes an
+	// `.ext:loader` spec (a setting, never a path) and `--cwd` a directory.
+	bun: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--cwd$|^--loader$/u, file: /^--preload$|^-r$|^--require$|^--import$/u, stdinFlag: false },
 	php: { inline: PHP_INLINE_FLAG, value: /^-c$|^-d$|^-z$|^--php-ini$|^--define$/u, stdinFlag: false },
-	// `lua -l mod`/`io`? the module name is a load, left to the operand scan:
-	// `lua -e 'code'` is the only inline spelling.
-	lua: { inline: /^-e$/u, value: /^--$/u, stdinFlag: false },
+	// `lua -l mod` loads a module through the interpreter's own path and `-i`
+	// is interactive: neither takes a separate value word here, and `--` only
+	// ends the options — so no flag of lua's may consume the script operand
+	// (`lua -- payload.lua` runs payload.lua; round 2 review).
+	lua: { inline: /^-e$/u, stdinFlag: false },
 	// `tclsh -encoding utf-8 script.tcl` names the codec in a value.
 	tclsh: { inline: /^-e$/u, value: /^-encoding$|^--encoding$/u, stdinFlag: false },
-	// `osascript -e 'code'`, `-l language` and `-s style` are values.
-	osascript: { inline: /^-e$|^-eosascript$/u, value: /^-l$|^-s$|^-i$|^-o$/u, stdinFlag: false },
+	// `osascript -e 'code'`, `-l language` and `-s style` take values. The
+	// synopsis on this machine — `osascript [-l language] [-i] [-s flags] [-e
+	// statement | programfile] [argument ...]` — has `-i` as a bare flag
+	// (interactive mode), so it must not eat the program file (round 2 review).
+	osascript: { inline: /^-e$|^-eosascript$/u, value: /^-l$|^-s$/u, stdinFlag: false },
 	// `Rscript -e 'code'`; `--encoding` names a codec.
 	rscript: { inline: /^-e$|^--expression$/u, value: /^--encoding$|^--default-packages$/u, stdinFlag: false },
 	// `julia -e 'code'`; `-p n`/`-t n` are worker and thread counts.
@@ -2729,13 +2746,26 @@ function interpreterProgramRefs(segment: string[]): InterpreterProgramRef[] {
 			) {
 				return refs;
 			}
+			// A flag whose value word is a FILE the interpreter runs, not a
+			// setting: the interpreter opens that file whatever the operand's
+			// grammatical role, so the value is read like its own operand — and
+			// the program slot stays open for the word after it, which is what
+			// makes `bun --preload ./pre.ts run main.ts` read both files. A
+			// value the shell expands is read as the operand it cannot be, so it
+			// refuses rather than passing over (round 2 review).
+			if (grammar?.file?.test(word) === true) {
+				const value = rest[i + 1];
+				i++;
+				if (value !== undefined && value !== "") refs.push({ verb, operand: value, arm: "program" });
+				continue;
+			}
 			// A flag whose separate value word is NOT a program: consume that
 			// word here, so `python3 -W ignore payload` reads `payload` instead
 			// of treating the warning filter as the program and pushing the real
 			// one into the load arm, where an extensionless word is passed over.
 			// An attached value needs no entry: `-Wextra` is not a program word
 			// either way, and leaving it alone means the next word is read.
-			if (grammar?.value.test(word)) {
+			if (grammar?.value?.test(word) === true) {
 				i++;
 				continue;
 			}
@@ -3078,6 +3108,16 @@ function segmentWorkingDirectories(text: string, base: string, segments: string[
 	}
 	const opened: Array<string | null> = [];
 	let current: string | null = base;
+	// The directory of the next segment when that segment is the `||` branch of
+	// a `cd` that moved the shell. The branch runs only if the `cd` failed, so
+	// it runs in the directory that `cd` found — while the shell AFTER the
+	// branch is in the moved-to directory if the `cd` took effect and in the old
+	// one if it did not, which is not a fact in the text. The old walk read the
+	// `||` terminator as "that cd failed" and kept the starting directory, so
+	// `cd /tmp || true; python3 payload.py` judged the payload beside the
+	// session's own directory while the shell ran the one in /tmp (round 2
+	// review).
+	let branchOfMove: string | null | undefined;
 	let index = 0;
 	for (const event of events) {
 		if (event.kind === "group-open") {
@@ -3090,16 +3130,29 @@ function segmentWorkingDirectories(text: string, base: string, segments: string[
 			continue;
 		}
 		const at = index++;
-		dirs[at] = current;
-		const change = segmentDirectoryChange(event.words, current);
+		// The branch runs where the `cd` it hangs off found the shell; every
+		// other segment runs where the shell is now.
+		const from = branchOfMove !== undefined ? branchOfMove : current;
+		dirs[at] = from;
+		branchOfMove = undefined;
+		const change = segmentDirectoryChange(event.words, from);
 		if (!change.moves) continue;
 		const inSubshell = event.join === "new-shell" || event.terminator === "new-shell" || event.terminator === "group-end";
-		const conditional = event.join === "on-success" || event.join === "on-failure";
-		if (event.terminator === "on-failure" || inSubshell) {
-			// It failed, or ran in its own stage or background job: the shell is
-			// where this segment found it.
+		if (inSubshell) {
+			// It ran in its own stage or background job: the shell is where this
+			// segment found it.
 			continue;
 		}
+		if (event.terminator === "on-failure") {
+			// `cd X || …`: whether the `cd` took effect is not in the text, so
+			// the shell after the branch is in X or where it started. The branch
+			// gets the old directory and the chain leaves the rest unknown, which
+			// the reader refuses on rather than reading a guess.
+			branchOfMove = from;
+			current = null;
+			continue;
+		}
+		const conditional = event.join === "on-success" || event.join === "on-failure";
 		if (conditional && event.terminator !== "on-success") {
 			// It may not have run at all (an `&&`/`||` chain that ended in a
 			// plain `;`), so where the shell is now is not a fact in the text.

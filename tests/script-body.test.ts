@@ -309,6 +309,51 @@ describe("the interpreter's own options, not the gate's guess at them", () => {
 		expect(readInterpretedScriptBodies("perl -s probe.pl", root, 8000).bodies.map(b => b.operand)).toEqual(["probe.pl"]);
 		expect(readInterpretedScriptBodies("bash -s", root, 8000).bodies).toEqual([]);
 	});
+
+	// Round 2 review: a flag whose value is a FILE the interpreter runs was
+	// consumed as if it were a setting, so `bun --preload ./payload.ts run
+	// safe.ts` read only safe.ts while the preload ran unjudged. The value of
+	// such a flag is the interpreter's own operand, and the program slot stays
+	// open for the word after it.
+	test("a flag whose value is a file the interpreter runs is read (bun --preload)", () => {
+		writeScript(root, "payload.ts", HARMFUL_CODE);
+		writeScript(root, "safe.ts", BENIGN);
+		const read = readInterpretedScriptBodies("bun --preload ./payload.ts run safe.ts", root, 8000);
+		expect(read.bodies.map(b => b.operand)).toEqual(["./payload.ts", "safe.ts"]);
+		expect(read.text).toContain("subprocess");
+	});
+
+	test("the preload aliases this machine's bun ships are read the same way", () => {
+		// `bun --help` here: `-r, --preload=<val>`, `--require` and `--import`
+		// are aliases of it.
+		writeScript(root, "payload.ts", HARMFUL_CODE);
+		for (const flag of ["-r", "--require", "--import"]) {
+			const read = readInterpretedScriptBodies(`bun ${flag} ./payload.ts run safe.ts`, root, 8000);
+			expect({ flag, operands: read.bodies.map(b => b.operand) }).toEqual({ flag, operands: ["./payload.ts"] });
+		}
+	});
+
+	test("an expanded preload value is a refusal, not a word to pass over", () => {
+		const read = readInterpretedScriptBodies("bun --preload $PAYLOAD run safe.ts", root, 8000);
+		expect(read.refusal?.why).toContain("$PAYLOAD");
+	});
+
+	test("an end-of-options marker does not eat the program (lua --)", () => {
+		writeScript(root, "payload.lua", 'print("lua payload")\n');
+		const read = readInterpretedScriptBodies("lua -- ./payload.lua", root, 8000);
+		expect(read.bodies.map(b => b.operand)).toEqual(["./payload.lua"]);
+		expect(read.text).toContain("lua payload");
+	});
+
+	test("an osascript option with no value does not eat the program file (-i)", () => {
+		// The synopsis on this machine: `osascript [-l language] [-i] [-s
+		// flags] [-e statement | programfile] [argument ...]` — `-i` is
+		// interactive mode and takes no value word.
+		writeScript(root, "payload.applescript", 'do shell script "rm -rf ./out"\n');
+		const read = readInterpretedScriptBodies("osascript -i ./payload.applescript", root, 8000);
+		expect(read.bodies.map(b => b.operand)).toEqual(["./payload.applescript"]);
+		expect(read.text).toContain("do shell script");
+	});
 });
 
 describe("a loader operand the gate could not read is a refusal", () => {
@@ -384,6 +429,38 @@ describe("the directory the shell will be in", () => {
 		writeScript(outside, "payload.py", HARMFUL_CODE);
 		const result = await gate(`cd ${outside}; python3 payload.py`);
 		expect(refusalOf(result).why).toContain("flags: python3 runs payload.py");
+	});
+
+	// Round 2 review: the walk read a `||` terminator as "that cd failed", so
+	// `cd /tmp || true; python3 payload.py` kept the starting directory and the
+	// lookup read the wrong file — or, when the payload lived only in /tmp,
+	// skipped it entirely and judged the command text. Whether a `cd` took
+	// effect is not in the text: the branch runs on failure, and the shell
+	// after the branch is in the moved-to directory or the old one.
+	test("a cd on an '||' chain leaves the directory after the chain unknown, not stale", async () => {
+		// The same name in both directories: before the fix the scan read the
+		// one in the starting directory, which the interpreter never ran.
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(outside, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies(`cd ${outside} || true; python3 payload.py`, root, 8000);
+		expect(read.bodies).toEqual([]);
+		expect(read.refusal?.why).toContain("payload.py");
+		expect(read.refusal?.why).toContain("cannot be resolved from the command text");
+	});
+
+	test("the gate asks rather than judging text whose directory it cannot pin", async () => {
+		writeScript(outside, "payload.py", HARMFUL_CODE);
+		const result = await gate(`cd ${outside} || true; python3 payload.py`);
+		expect(refusalOf(result).layer).toBe("script-body");
+		expect(refusalOf(result).why).toContain("working directory");
+	});
+
+	test("the '||' branch itself is still read from the directory the cd found", () => {
+		// The branch runs only if the `cd` failed, so its own directory IS in
+		// the text: this is the case the deferred doubt must not break.
+		writeScript(root, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies(`cd ${outside} || python3 payload.py`, root, 8000);
+		expect(read.bodies.map(b => b.operand)).toEqual(["payload.py"]);
 	});
 });
 

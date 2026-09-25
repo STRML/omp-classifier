@@ -312,6 +312,57 @@ describe("the daemon decides the local claim, not the local file (#121 review)",
 		}
 	});
 
+	// Round 2 review: `DOCKER_HOST` answered alone and returned early, so a
+	// `DOCKER_CONTEXT` naming another machine was never read — and `--config`,
+	// which names the directory the CLI reads its contexts and its current
+	// context from, was consumed and discarded. Both made a remote compose
+	// service measure as local.
+	test("a selector in the chain that names another machine is not answered alone", () => {
+		const { sources, home, project, remove } = fixture();
+		try {
+			// A context that really resolves: `prod` names another machine, so the
+			// chain contradicts the local `DOCKER_HOST`.
+			const dir = dockerContext(join(home, ".docker"), "prod", "tcp://prod.example:2376");
+			const env = { DOCKER_HOST: "unix:///var/run/docker.sock", DOCKER_CONTEXT: "prod" };
+			// The two selectors disagree about the machine, and which of them the
+			// CLI's precedence picks is not recorded in this machine's state: no
+			// local claim is made, and the port table is not read either (its
+			// bindings would be claimed as this machine's own).
+			const measured = measureNetworkProvenance("curl -s http://localhost:8000/x", project, { ...sources, dockerConfigDir: dir, env });
+			expect(measured).toEqual({ localPorts: [8000], knownHosts: [], dockerNetworks: [] });
+			expect(measureNetworkProvenance("docker compose exec web sh", project, { ...sources, dockerConfigDir: dir, env })?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service" },
+			]);
+		} finally {
+			remove();
+		}
+	});
+
+	test("--config names the config directory the daemon is measured in, not the process's own", () => {
+		const { sources, home, project, remove } = fixture();
+		try {
+			const processConfig = dockerContext(join(home, ".docker"), "local", "unix:///var/run/docker.sock");
+			const remoteConfig = dockerContext(join(home, "remote-docker"), "prod", "tcp://prod.example:2376");
+			// The process config is this machine's; the directory the command
+			// names carries a context pointing at another machine.
+			expect(measureNetworkProvenance(`docker --config ${remoteConfig} compose exec web sh`, project, { ...sources, dockerConfigDir: processConfig })?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+			]);
+			// And the reverse: the command's own directory is the one that counts.
+			expect(measureNetworkProvenance(`docker --config ${processConfig} compose exec web sh`, project, { ...sources, dockerConfigDir: remoteConfig })?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: true },
+			]);
+			// A `--config` value the shell would expand names no directory this
+			// gate read, so the invocation's daemon is not measured — the fallback
+			// to the process config would be a file the command never reads.
+			expect(measureNetworkProvenance("docker --config $DOCKER_DIR compose exec web sh", project, { ...sources, dockerConfigDir: processConfig })?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service" },
+			]);
+		} finally {
+			remove();
+		}
+	});
+
 	test("the docker port table is this machine's only when this machine's daemon is local", () => {
 		const { sources, project, remove } = fixture();
 		try {

@@ -827,11 +827,9 @@ function dockerContextEndpoint(configDir: string, name: string): string | undefi
 	}
 }
 
-/** The context `DOCKER_CONTEXT`, else this machine's docker CLI config, makes
- *  current. Nothing recorded means the CLI's own default context. */
-function currentDockerContext(configDir: string, env: Record<string, string | undefined>): string | undefined {
-	const named = env.DOCKER_CONTEXT?.trim();
-	if (named !== undefined && named !== "") return named;
+/** The context the CLI config in `configDir` records as current: nothing
+ *  recorded means the CLI's own default context. */
+function configCurrentDockerContext(configDir: string): string | undefined {
 	const text = readTextFile(join(configDir, "config.json"));
 	if (text === undefined) return undefined;
 	try {
@@ -851,13 +849,38 @@ function dockerContextResolvesLocally(configDir: string, name: string | undefine
 	return value === "default" ? true : dockerDaemonResolvesLocally(dockerContextEndpoint(configDir, value));
 }
 
-/** The locality of the daemon this machine's own docker CLI talks to when a
- *  command names none: `DOCKER_HOST`, else the active context's endpoint, else
- *  the CLI's default socket. Precedence is the CLI's own. */
+/** What a chain of daemon selectors measures, or nothing at all: `true` only
+ *  when every selector the chain names puts the daemon on this machine, `false`
+ *  only when all of them put it on another, and nothing when any selector
+ *  cannot be measured or two of them disagree. Which of two spellings the
+ *  CLI's own precedence picks is not recorded in this machine's state — and
+ *  Docker's CLI reference and its implementation disagree about `DOCKER_HOST`
+ *  versus `DOCKER_CONTEXT` — so a chain like a local `DOCKER_HOST` beside a
+ *  remote `DOCKER_CONTEXT` makes no local claim at all. Absence means nothing
+ *  measured, never "safe" (#121 round 2 review). */
+function agreedDaemonLocality(measured: ReadonlyArray<boolean | undefined>): boolean | undefined {
+	if (measured.length === 0 || measured.includes(undefined)) return undefined;
+	const first = measured[0];
+	return measured.every(value => value === first) ? first : undefined;
+}
+
+/** The locality of the daemon this machine's own docker CLI reaches when a
+ *  command names none: every selector that chain carries — `DOCKER_HOST`,
+ *  `DOCKER_CONTEXT`, and the context `configDir`'s `config.json` records as
+ *  current — resolved together, with the CLI's own default socket when the
+ *  chain names nothing at all (#121 round 2 review: `DOCKER_HOST` used to
+ *  answer alone and return early, so a `DOCKER_CONTEXT` naming another machine
+ *  was never read, and the daemon was claimed as this machine's). */
 function machineDaemonResolvesLocally(env: Record<string, string | undefined>, configDir: string): boolean | undefined {
-	const named = env.DOCKER_HOST?.trim();
-	if (named !== undefined && named !== "") return dockerDaemonResolvesLocally(named);
-	return dockerContextResolvesLocally(configDir, currentDockerContext(configDir, env) ?? "default");
+	const selectors: Array<boolean | undefined> = [];
+	const host = env.DOCKER_HOST?.trim();
+	if (host !== undefined && host !== "") selectors.push(dockerDaemonResolvesLocally(host));
+	const named = env.DOCKER_CONTEXT?.trim();
+	if (named !== undefined && named !== "") selectors.push(dockerContextResolvesLocally(configDir, named));
+	const current = configCurrentDockerContext(configDir);
+	if (current !== undefined) selectors.push(dockerContextResolvesLocally(configDir, current));
+	if (selectors.length === 0) return dockerContextResolvesLocally(configDir, "default");
+	return agreedDaemonLocality(selectors);
 }
 
 /** Docker CLI options that take their value in the next word, so a daemon
@@ -867,11 +890,17 @@ const DOCKER_VALUE_FLAGS: Record<string, true> = {
 	"-l": true, "--log-level": true, "--tlscacert": true, "--tlscert": true, "--tlskey": true,
 };
 
-/** The daemon a docker CLI names before its subcommand: `-H`/`--host` (podman's
- *  `--url`) names the daemon itself, and `-c`/`--context` (podman's
- *  `--connection`) names a context to resolve. */
-function dockerDaemonFlags(words: readonly string[]): { daemon?: string; context?: string } {
-	const named: { daemon?: string; context?: string } = {};
+/** The daemon selectors a docker CLI names before its subcommand: `-H`/`--host`
+ *  (podman's `--url`) names the daemon itself, `-c`/`--context` (podman's
+ *  `--connection`) names a context to resolve, and `--config` names the CLI
+ *  config directory whose `config.json` and contexts the CLI reads — the file
+ *  that decides the current context when nothing else names one.
+ *
+ *  A selector named without a value (`-H --url …`, `--config=`) is reported as
+ *  an empty string rather than left absent: the command named a selector this
+ *  gate cannot read, which is not the same as naming none. */
+function dockerDaemonFlags(words: readonly string[]): { daemon?: string; context?: string; config?: string } {
+	const named: { daemon?: string; context?: string; config?: string } = {};
 	for (let i = 0; i < words.length; i++) {
 		const word = words[i];
 		if (!word.startsWith("-")) continue;
@@ -879,10 +908,49 @@ function dockerDaemonFlags(words: readonly string[]): { daemon?: string; context
 		const flag = eq === -1 ? word : word.slice(0, eq);
 		let value = eq === -1 ? undefined : word.slice(eq + 1);
 		if (value === undefined && DOCKER_VALUE_FLAGS[flag] === true) value = words[++i];
-		if (flag === "-H" || flag === "--host" || flag === "--url") named.daemon = value;
-		else if (flag === "-c" || flag === "--context" || flag === "--connection") named.context = value;
+		if (flag === "-H" || flag === "--host" || flag === "--url") named.daemon = value ?? "";
+		else if (flag === "-c" || flag === "--context" || flag === "--connection") named.context = value ?? "";
+		else if (flag === "--config") named.config = value ?? "";
 	}
 	return named;
+}
+
+/** Shell spellings that make a word name something only the shell knows: the
+ *  change happens before the CLI sees the word, so a path carrying one is not a
+ *  path this gate read. A `~` at the front is the one such spelling the gate
+ *  can measure for itself. */
+const SHELL_WORD_EXPANSION = /[$`*?[\]{}]/u;
+
+/** The config directory a `--config` value names, or undefined when this gate
+ *  cannot turn the text into one (an expansion, an empty value). */
+function dockerConfigPath(raw: string, cwd: string): string | undefined {
+	const value = raw.trim();
+	if (value === "" || SHELL_WORD_EXPANSION.test(value)) return undefined;
+	const expanded = value === "~" || value.startsWith("~/") ? join(homedir(), value.slice(1)) : value;
+	return resolve(cwd, expanded);
+}
+
+/** The locality of the daemon one compose invocation reaches: the daemon or the
+ *  context its own text names, read from the config directory `--config` names
+ *  when it names one, and else this machine's own chain read from that same
+ *  directory. `--config` is why the fallback is not the process's own config:
+ *  the file the command's daemon is recorded in is the one the command points
+ *  at, and a value this gate cannot turn into a path leaves the invocation's
+ *  daemon unmeasured rather than substituting a file the command never reads
+ *  (#121 round 2 review). */
+function composeDaemonResolvesLocally(
+	invocation: ComposeInvocation,
+	cwd: string,
+	env: Record<string, string | undefined>,
+	configDir: string,
+): boolean | undefined {
+	const commandConfig = invocation.config === undefined ? configDir : dockerConfigPath(invocation.config, cwd);
+	if (commandConfig === undefined) return undefined;
+	const selectors: Array<boolean | undefined> = [];
+	if (invocation.daemon !== undefined) selectors.push(dockerDaemonResolvesLocally(invocation.daemon));
+	if (invocation.context !== undefined) selectors.push(dockerContextResolvesLocally(commandConfig, invocation.context));
+	if (selectors.length === 0) return machineDaemonResolvesLocally(env, commandConfig);
+	return agreedDaemonLocality(selectors);
 }
 
 /** A CLI's own global options: the words before its subcommand, with value-flag
@@ -1057,6 +1125,9 @@ interface ComposeInvocation {
 	daemon?: string;
 	/** The context it names with `-c`/`--context`, if any. */
 	context?: string;
+	/** The CLI config directory it names with `--config`, if any: the file the
+	 *  current context is read from when nothing else names a daemon. */
+	config?: string;
 }
 
 /** Every compose invocation in the command, in order — a compound
@@ -1103,7 +1174,7 @@ function composeInvocations(command: string): ComposeInvocation[] {
 			if (COMPOSE_NO_SERVICE_SUBCOMMANDS[subcommand] !== true) operands.push(word);
 		}
 		const named = dockerDaemonFlags(cliWords);
-		invocations.push({ subcommand, operands, files, daemon: named.daemon, context: named.context });
+		invocations.push({ subcommand, operands, files, daemon: named.daemon, context: named.context, config: named.config });
 	}
 	return invocations;
 }
@@ -1166,12 +1237,7 @@ export function measureNetworkProvenance(command: string, cwd: string, sources: 
 		const files = invocation.files.length > 0 ? invocation.files.map(file => resolve(cwd, file)) : DEFAULT_COMPOSE_FILES.map(name => join(cwd, name));
 		const declared = composeServiceNames(files);
 		if (declared === undefined) continue;
-		const local =
-			invocation.daemon !== undefined
-				? dockerDaemonResolvesLocally(invocation.daemon)
-				: invocation.context !== undefined
-					? dockerContextResolvesLocally(configDir, invocation.context)
-					: daemon;
+		const local = composeDaemonResolvesLocally(invocation, cwd, env, configDir);
 		const first = invocation.operands[0];
 		if (first !== undefined && !declared.has(first)) dockerNetworks.push({ target: first, kind: "compose-service", resolvesLocally: false });
 		for (const operand of invocation.operands) {
