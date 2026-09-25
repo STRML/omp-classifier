@@ -2,6 +2,19 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-09-25
+
+### The eval gate judges a spawn in the spawn's own directory (#14)
+
+- A spawn that passes its own working directory no longer runs unread in the session's: `subprocess.run(cmd, cwd="/tmp/x")`, `exec(cmd, { cwd: "/" })`, `spawn(file, args, { cwd })`, `Bun.spawn(…, { cwd })`, a `Bun.$` shell's `.cwd(…)` call, Ruby `Dir.chdir("/tmp") do … end` and `system(…, chdir: …)` are read out of the payload's text, and the gate judges the payload in that directory. `exec("rm -rf .", { cwd: "/" })` used to be recorded, shown and classified as `rm -rf .` in the session directory; the dialog now says `working directory: / (declared by the payload's spawn call)` and the judge is asked about `/`. The directory is part of the identity of a judgement, not a display detail.
+- New `spawnCwd` field on every `decisions.jsonl` line the call writes, beside the resolved `cwd`: the record says which directory the payload chose for itself, since the `cmd` field is truncated to 120 characters and a reader cannot recover it from there. The resolved directory is also a fact the judge is given, not one it has to infer from the code.
+- The cache key gained both directories — the spawn's own, where the judged command runs, and the session's, where the payload's own process still runs and reads and writes. Dropping either would let a verdict cross a directory change it never saw, and no entry written before this can be hit: the key text differs.
+- The scan is site-scoped and structure-aware, where the marker scan is not: a `cwd=` inside a string, inside a comment, or inside a nested call's arguments (`env=make(cwd=…)`) is not read as the spawn's directory, because each of those would name a directory the payload does not run in. It is still a scan, not a parser (kernel interception, #13, is the structural fix): a quoted option key (`{ "cwd": … }`), a Ruby `"chdir" => …` hash key, and an alias it cannot follow leave the site reading as "no cwd argument".
+- Relative literals resolve against the directory in effect the way the bash path resolves a leading `cd`, so `cwd="../.."` and a relative `chdir:` under a `Dir.chdir` block resolve against what they follow. The resolved directory is shown as resolved even when it lands outside the session directory. A bare `/` keeps its literal meaning here: `resolveToCwd` reads it as a workspace-root alias for tool inputs, and a spawned child has no such alias — treating it as the session directory would understate what `rm -rf .` does in `/`.
+- Fail closed where the directory cannot be read: `{ cwd }`, `cwd=os.environ["X"]`, an f-string, a `**opts`/`{ ...opts }` options object, a value that is two literals concatenated, an internal-URL directory, and two spawns that disagree all raise a permission request under the new layer `cwd` with headline `unreadable spawn cwd`, naming what could not be read. Nothing is classified in those cases: a payload judged against a directory it does not run in was judged on the wrong question, and no verdict is worth asking it. `Dir.chdir` with no argument goes to the home directory and asks the same way.
+- Bash is untouched. Its own `cd`-resolution, internal-URL block and key are exactly as they were; the spawn scan is the eval path's alone.
+- No policy bump: the battery, the criteria and the derivation rules are unchanged, so `CLASSIFIER_POLICY_HASH` and every pinned digest stay put.
+
 ## 2026-09-22
 
 ### The jev-v3 shadow
