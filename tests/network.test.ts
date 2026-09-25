@@ -561,4 +561,14 @@ describe("a network verb inside a command substitution is outbound (#59)", () =>
 		expect(outbound("diff <(curl -o f https://x) b")).toBe(true);
 		expect(outbound("bash <(ssh host cat /f)")).toBe(true);
 	});
+
+	// The same class the #119 gate found in the risk-flag scan lived here
+	// first, in main: the parser's byte offsets were used as string indexes, so
+	// non-ASCII text ahead of a substitution truncated the span and the fetch
+	// inside it vanished.
+	test("non-ASCII text before the substitution hides nothing", () => {
+		expect(outbound("echo 漢字 $(curl -o /tmp/x https://example.test)")).toBe(true);
+		expect(outbound("echo 🚗 $(ssh host cat /f)")).toBe(true);
+		expect(outbound("echo 漢字 $(curl -s https://x | jq .)")).toBe(false);
+	});
 });

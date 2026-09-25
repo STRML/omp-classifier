@@ -17,6 +17,12 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 - Backend identity joins the config signature and both cache keys (`config.typesafeModel`, `judgeBackendFor(config.judgeBackend).id`), so a backend swap cannot serve a verdict the other judge produced — proven through the dry-run probe, the one cache read the signature deliberately leaves stale. A verdict cached under the host judge is no longer reported as an endpoint's.
 - `/classifier` shows the active backend as `judgeBackend: <id>` and `/classifier status` carries `backendId` (`typesafe/jev-latest`, `endpoint/http://127.0.0.1:8765#local-decide`). The shadow judgment asks the same backend as the live one. `/classifier reset` returns the key to the default; bad shapes (unknown kind, a non-URL baseUrl, a missing model, an env var name with a space) keep the default rather than half-applying an override.
 
+### Triage queue: three parser and loader defects
+
+- Risk verbs inside a substitution are now read from the parsed AST (`substitutionSpans`), the same source `commandHasOutboundNetwork` uses. `addSubstitutionFlags` collected `$(…)` and backtick spans with a quote-blind regex, so `echo '$(rm -rf /tmp/x)'` raised a risk flag for a substitution that never runs. Quoted spans are data now, nested spans are seen at every depth, and the removed local guard lets process substitution through, so `cat <(rm -rf /tmp/x)` asks. (#119)
+- `userWords` no longer normalizes the user's message with NFKC before stripping code fences. NFKC maps U+FF40 to a backtick, so a negation styled with fullwidth grave accents looked like inline code and was deleted with it: `｀don’t｀ delete build` matched `rm -rf build`. The passes now run in the order that cannot manufacture a fence: the explicit apostrophe and quote mappings first, the fenced and inline-code strippers next, NFKC last, before the blockquote filter and tokenization. U+FF02 joined the explicit quote set, since NFKC folds it to a double quote. A full sweep of U+0000..U+10FFFF confirmed U+FF40 and U+1FEF were the only code points NFKC maps to a backtick. (#88)
+- `eval/run.ts`'s four corpus loaders share one `parseJsonl(path)` that names `file:line` on a malformed line, with the real 1-based line in the file, instead of a bare `JSON.parse` `SyntaxError`. Blank and whitespace-only lines stay tolerated and the parsed rows are unchanged. (#81)
+
 ## 2026-09-22
 
 ### The jev-v3 shadow
