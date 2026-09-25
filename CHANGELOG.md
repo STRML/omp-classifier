@@ -10,6 +10,14 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 - `userWords` no longer normalizes the user's message with NFKC before stripping code fences. NFKC maps U+FF40 to a backtick, so a negation styled with fullwidth grave accents looked like inline code and was deleted with it: `｀don’t｀ delete build` matched `rm -rf build`. The passes now run in the order that cannot manufacture a fence: the explicit apostrophe and quote mappings first, the fenced and inline-code strippers next, NFKC last, before the blockquote filter and tokenization. U+FF02 joined the explicit quote set, since NFKC folds it to a double quote. A full sweep of U+0000..U+10FFFF confirmed U+FF40 and U+1FEF were the only code points NFKC maps to a backtick. (#88)
 - `eval/run.ts`'s four corpus loaders share one `parseJsonl(path)` that names `file:line` on a malformed line, with the real 1-based line in the file, instead of a bare `JSON.parse` `SyntaxError`. Blank and whitespace-only lines stay tolerated and the parsed rows are unchanged. (#81)
 
+### The floor against a real shell (#91)
+
+- New fixture `tests/shell-oracle.test.ts`: instead of a hand-written rule, the shell answers. Each of 24 command shapes runs in a real `bash` with stub `security`, `op`, `pass` and `pbcopy` on `PATH`, and the secret is looked for in all four channels — stdout, stderr, a file the command wrote in its working directory, and the sink process piped into. `evaluateFloor({ command }).asks` must equal what the shell did. A draft oracle that watched stdout alone reported four false mismatches.
+- The 24 rows cover the captures quoted, unquoted and backticked, the redirect spellings (`&>`, `&>>`, `>&`, `2>`, `2>/dev/null`, `1>&2`, a quoted `">/dev/null"`), the wrapper prefixes (`nohup`, `command`, `builtin`, `env`), the quoted read commands, and the historical mistakes from the four review rounds on #85.
+- One row is a file sink the file channel cannot walk, and it asserts the policy instead of the oracle: a file sink asks by `routeStdout` whether or not the oracle can see the write. The fixture keeps that distinction explicit rather than flattening it into the equality.
+- It runs in the default `bun test`, since the CI image has bash 5. A row the local `bash` cannot parse is named in the fixture's report rather than silently skipped, and `JEV_ORACLE_BASH` picks the interpreter.
+>>>>>>> fix/91
+
 ## 2026-09-22
 
 ### The jev-v3 shadow
