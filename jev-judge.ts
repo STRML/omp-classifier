@@ -37,6 +37,14 @@
  *     not validate — becomes JevUnavailableError, the single thing the gate
  *     treats as "there is no judgment". Nothing here ever returns a partial or
  *     defaulted answer set.
+ *   - One seam where the transport is chosen (issue #84). `JudgeBackend`
+ *     produces the `Judge` for a classification: `typesafe` is the host
+ *     resolution described above and the default, `endpoint` is any server
+ *     speaking the same System One contract with its credential in a named
+ *     environment variable. Its `id` is the judge's identity and joins the
+ *     config signature and the cache key, so a verdict is only ever served
+ *     under the backend that produced it. A missing credential is an outage,
+ *     never a request sent with nothing.
  */
 import {
 	type ChoiceQuestion,
@@ -46,6 +54,8 @@ import {
 	type Questions,
 	type ScoreQuestion,
 	TYPESAFE_PROVIDER,
+	TypeSafeJudge,
+	typesafeModel,
 	type Usage,
 } from "@oh-my-pi/pi-ai";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -102,6 +112,13 @@ export interface JudgeBatteryOptions {
 	 * testing.
 	 */
 	judge?: Judge;
+	/**
+	 * Which transport answers the battery (issue #84). Omitted, it is the
+	 * shipped `typesafe` backend — the host's own judge resolution above, byte
+	 * for byte. Production passes the config's `judgeBackend`; `judge` still
+	 * wins over it, so a test that scripts a judge is unaffected by either.
+	 */
+	backend?: JudgeBackendConfig;
 	/** Extension context: supplies the model registry and the session identity. */
 	context?: JudgeContext;
 	/**
@@ -110,6 +127,137 @@ export interface JudgeBatteryOptions {
 	 * `providers.judgmentProvider` and the credential store through it.
 	 */
 	settings?: Settings;
+}
+
+/**
+ * Which transport answers the battery (issue #84).
+ *
+ * `typesafe` is the host's own judge resolution — AuthStorage credentials,
+ * retries with backoff, the pinned judge role — and the only kind that needs
+ * `settings`/`context`. `endpoint` is any server speaking the same System One
+ * wire contract (`POST {state, model, questions}` -> `{answers, model}`),
+ * reached with the credential in the NAMED environment variable: a local or
+ * self-hosted judge needs no plugin patch, and no credential is ever written
+ * into the config file.
+ *
+ * The credential is deliberately NOT part of the identity below, exactly as the
+ * TypeSafe key is not part of the config signature today: the judge is its
+ * transport plus its model, and another key for the same endpoint is another
+ * login, not another judge.
+ */
+export type JudgeBackendConfig =
+	| { kind: "typesafe" }
+	| { kind: "endpoint"; baseUrl: string; model: string; apiKeyEnv: string };
+
+/** The shipped backend: the host's judge resolution, unchanged. */
+export const DEFAULT_JUDGE_BACKEND: JudgeBackendConfig = { kind: "typesafe" };
+
+/**
+ * The transport seam: a backend turns the battery's options into the `Judge`
+ * that answers them.
+ *
+ * `id` is the judge's identity, and it joins the config signature and every
+ * cache key (index.ts) so a verdict earned under one backend can never be
+ * served under another. It must be readable without touching the network or a
+ * credential: identity is asked for on every classification, including ones
+ * that end up cached.
+ */
+export interface JudgeBackend {
+	readonly id: string;
+	/** The judge to ask. Throws `JevUnavailableError` when this backend cannot
+	 *  produce one — a missing credential is an outage, never a half-built
+	 *  judge that would report an unauthenticated request as an answer. */
+	judge(options: JudgeBatteryOptions): Judge;
+}
+
+/** An environment variable NAME, never a value: the key is looked up per call
+ *  and never written to the config, the audit line, or the status report. */
+const ENV_VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+
+/** An http(s) endpoint, canonicalized: trailing slashes stripped, so `http://h/`
+ *  and `http://h` are one judge with one identity and an edit between them
+ *  flushes no cache. A bare hostname, another scheme, or a non-URL is a shape
+ *  this loader does not understand. */
+function endpointBaseUrl(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const text = value.trim();
+	if (text === "") return undefined;
+	try {
+		const protocol = new URL(text).protocol;
+		if (protocol !== "http:" && protocol !== "https:") return undefined;
+	} catch {
+		return undefined;
+	}
+	return text.replace(/\/+$/u, "");
+}
+
+/**
+ * Validate one `judgeBackend` config value, or `undefined` for a shape this
+ * loader does not understand.
+ *
+ * Same rule as every other key: garbage means "keep the default", never a
+ * half-configured judge. `{kind:"endpoint"}` missing its model, an unreachable
+ * scheme, or an env var name with a space in it is dropped whole — an override
+ * that is partially applied would fail closed on every command with a message
+ * naming a config the operator did not write.
+ */
+export function parseJudgeBackend(raw: unknown): JudgeBackendConfig | undefined {
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+	const record = raw as Record<string, unknown>;
+	// Extra keys are tolerated like every other unknown key: `{kind:"typesafe",
+	// baseUrl}` stays `typesafe`, because TypeSafe credential resolution is the
+	// host's and `kind: "typesafe"` is the host path.
+	if (record.kind === "typesafe") return { ...DEFAULT_JUDGE_BACKEND };
+	if (record.kind !== "endpoint") return undefined;
+	const baseUrl = endpointBaseUrl(record.baseUrl);
+	const model = typeof record.model === "string" ? record.model.trim() : "";
+	const apiKeyEnv = typeof record.apiKeyEnv === "string" ? record.apiKeyEnv.trim() : "";
+	if (baseUrl === undefined || model === "") return undefined;
+	if (apiKeyEnv === "" || !ENV_VAR_NAME.test(apiKeyEnv)) return undefined;
+	return { kind: "endpoint", baseUrl, model, apiKeyEnv };
+}
+
+/** The backend for one config value. Pure, and credential-free: the identity is
+ *  available to the cache even when the credential is not. */
+export function judgeBackendFor(config: JudgeBackendConfig = DEFAULT_JUDGE_BACKEND): JudgeBackend {
+	return config.kind === "endpoint" ? endpointBackend(config) : TYPESAFE_BACKEND;
+}
+
+/**
+ * The default backend: the host's own judge resolution (see
+ * `resolveHostJudge`). `id` reads the model pin at call time, because
+ * `TYPESAFE_DEFAULT_MODEL` can move mid-run and the id has to describe the
+ * judge the next call actually asks.
+ */
+const TYPESAFE_BACKEND: JudgeBackend = {
+	get id(): string {
+		return `${TYPESAFE_PROVIDER}/${typesafeModel()}`;
+	},
+	judge: options => resolveHostJudge(options),
+};
+
+/**
+ * An endpoint speaking the System One contract. The transport itself is the
+ * host's `TypeSafeJudge` — the same client the default path uses, so retries,
+ * timeouts, the error taxonomy and the wire shape are the host's and not a
+ * second implementation to keep in step. Its caller's `AbortSignal` still
+ * bounds the whole call, and `api: "typesafe"` still marks the answers as
+ * measured probabilities rather than a one-hot keyword bridge.
+ */
+function endpointBackend(config: Extract<JudgeBackendConfig, { kind: "endpoint" }>): JudgeBackend {
+	return {
+		id: `endpoint/${config.baseUrl}#${config.model}`,
+		judge: () => {
+			// Read per call, so a key exported (or rotated) after the session
+			// started is picked up, and so a missing one is an outage rather than
+			// a request sent with nothing.
+			const apiKey = process.env[config.apiKeyEnv]?.trim();
+			if (!apiKey) {
+				throw new JevUnavailableError(`judge endpoint credential ${config.apiKeyEnv} is not set`);
+			}
+			return new TypeSafeJudge({ baseUrl: config.baseUrl, model: config.model, apiKey });
+		},
+	};
 }
 
 /**
@@ -126,7 +274,7 @@ export interface JudgeBatteryOptions {
  * the whole availability policy.
  */
 export async function judgeBattery(signal: AbortSignal | undefined, options: JudgeBatteryOptions): Promise<JevAnswers> {
-	const judge = options.judge ?? judgeForClassification(options);
+	const judge = options.judge ?? judgeBackendFor(options.backend).judge(options);
 	const battery = jevQuestions(options.version) as JevBattery;
 	const startedAt = performance.now();
 	let result: JudgmentResult<JevBattery>;
@@ -165,7 +313,7 @@ type AuthorizationBattery = Questions & { user_authorization: ChoiceQuestion<Jev
  * decides, and the command loses only its fast path.
  */
 export async function judgeAuthorization(signal: AbortSignal | undefined, options: JudgeBatteryOptions): Promise<JevAuthorizationAnswer> {
-	const judge = options.judge ?? judgeForClassification(options);
+	const judge = options.judge ?? judgeBackendFor(options.backend).judge(options);
 	const battery = jevAuthorizationQuestions() as AuthorizationBattery;
 	const startedAt = performance.now();
 	let result: JudgmentResult<AuthorizationBattery>;
@@ -200,8 +348,9 @@ export async function judgeJevV3(
 	options: Omit<JudgeBatteryOptions, "state" | "version"> & { riskState: unknown; authorizationState: unknown },
 ): Promise<JevV3Judgment> {
 	const { riskState, authorizationState, ...rest } = options;
-	// Resolved once so both requests ask the same judge.
-	const judge = rest.judge ?? judgeForClassification({ ...rest, state: riskState });
+	// Resolved once so both requests ask the same judge, through the same
+	// backend: the shadow must measure the judge that actually decided.
+	const judge = rest.judge ?? judgeBackendFor(rest.backend).judge({ ...rest, state: riskState });
 	const [risk, authorization] = await Promise.allSettled([
 		judgeBattery(signal, { judge, state: riskState, version: JEV_V3_POLICY_VERSION }),
 		judgeAuthorization(signal, { judge, state: authorizationState }),
@@ -268,7 +417,8 @@ function toAuthorizationAnswer(
 }
 
 /**
- * The judge for one classification, resolved from the extension context.
+ * The default backend's implementation: the host judge for one classification,
+ * resolved from the extension context.
  *
  * TypeSafe in front with nothing behind it: the gate never degrades to a
  * keyword judge. The host's judge-role chain (modelRoles.judge, primary
@@ -286,8 +436,12 @@ function toAuthorizationAnswer(
  * identity is only advisory to the judge — it scopes the session's
  * credentials — so a context that cannot supply it must not cost the gate
  * its judgment.
+ *
+ * This is the `typesafe` backend and only that: an endpoint backend takes the
+ * `TypeSafeJudge` path instead (`endpointBackend`), and neither reads the
+ * other's config.
  */
-function judgeForClassification(options: JudgeBatteryOptions): Judge {
+function resolveHostJudge(options: JudgeBatteryOptions): Judge {
 	const { context, settings } = options;
 	if (context === undefined || settings === undefined) {
 		throw new JevUnavailableError(
