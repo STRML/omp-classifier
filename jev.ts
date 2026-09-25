@@ -61,7 +61,7 @@ import { redactSecrets } from "./redact";
  * threshold changes: jevQuestionsHash folds it into the fingerprint that the
  * audit log records, so a replay can tell which policy produced a decision.
  */
-export const JEV_POLICY_VERSION = "jev-v2.2";
+export const JEV_POLICY_VERSION = "jev-v2.3";
 /**
  * The intent-aware battery. It runs in shadow beside JEV_POLICY_VERSION and
  * decides nothing until the flip; its questions differ from jev-v2 only where

@@ -9,7 +9,11 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 - All three live evidence collectors — `collectUserEvidence`, `collectTaskEvidence`, `collectToolEvidence` — now read only what follows the latest `/clear` (`reset_boundary`), the way the host rebuilds model context (`session-context.ts:404` uses the same boundary for emission). Before this, a request the user cleared away came back as user evidence and could weigh as authorization for a later command. They previously started at branch index 0; `collectTaskEvidenceV3` already read from the boundary (#101).
 - One shared boundary helper, `branchStartAfterLatestResetBoundary`, serves all four collectors, so there is a single implementation of "start after the latest boundary".
 - A branch with no `reset_boundary` is unchanged, and the jev-v3 collector's behavior is unchanged — it used the same index before and after.
-- The policy hash is unchanged: the evidence a user-visible `policyHash` pins at module load is derived from the battery and thresholds, not from the evidence slice helper. Clearing cached verdicts for this change is a pending maintainer decision (see below).
+
+### Policy `jev-v2.3` (cache cleared for the #103 evidence change)
+
+- `JEV_POLICY_VERSION` is now `jev-v2.3`, which changes the policy hash (the pinned value moves from `87c99bf634aa9c64` to `941c92af52575162`) and clears every cached verdict once. The battery text and its pinned digest are unchanged.
+- Why the bump is safe now: the jev-v3 shadow week has recorded zero calls (`shadow-report-2026-09-22.txt`: "jev-v3 shadow since 2026-09-16T00:19:00.712Z: 0 calls, 0 shadow errors"), so there is no v2 shadow baseline to disturb — and holding the bump would have left a live authorization leak open to protect a baseline that does not exist.
 
 ## 2026-09-22
 

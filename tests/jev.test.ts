@@ -346,7 +346,7 @@ describe("jevQuestionsHash", () => {
 		// a jev-v2 question moved: put the change in the jev-v3 battery instead.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
 		expect(digest).toBe("29ed2ae6375f9d549d7c7631589406764759f7c2a2e68e5f039be815e232d680");
-		expect(jevQuestionsHash()).toBe("87c99bf634aa9c64");
+		expect(jevQuestionsHash()).toBe("941c92af52575162");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 

@@ -305,6 +305,6 @@ describe("redaction reaches every judge state", () => {
 	});
 
 	test("the policy version marks the change", () => {
-		expect(JEV_POLICY_VERSION).toBe("jev-v2.2");
+		expect(JEV_POLICY_VERSION).toBe("jev-v2.3");
 	});
 });
