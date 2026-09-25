@@ -661,11 +661,13 @@ export function substitutionSpans(text: string): string[] {
 	}
 	const spans: string[] = [];
 	// biome-ignore lint/suspicious/noExplicitAny: untyped AST
-	walk(parse(text), node => {
+	walk(parse(text), (node: unknown) => {
+		if (!node) return true;
 		const type = nodeType(node);
-		if (type !== "CmdSubst" && type !== "ProcSubst") return;
+		if (type !== "CmdSubst" && type !== "ProcSubst") return true;
 		const inner = sliceOf(node, text);
 		spans.push(inner.replace(/^\$\(|^<\(|^`/u, "").replace(/\)$|`$/u, ""));
+		return true;
 	});
 	return spans;
 }
