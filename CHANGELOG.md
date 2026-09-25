@@ -4,6 +4,13 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-25
 
+### Measured worktree geometry (#69 slice C)
+
+- New gate-measured tier `gitWorktreeProvenance`, same authority as `gitPushProvenance`: `git rev-parse --show-toplevel` for `workspaceRoot`, then `linkedWorktree` and `mainCheckoutRoot` read off `git worktree list --porcelain` — git lists the main worktree first, so the session's own root appearing after it is what makes it linked — and the repository's other registered roots as `siblingWorktreeRoots`, capped at 8 with `worktreeCount` reporting the registry size so a capped list cannot be mistaken for a complete one. `writes_outside_working_directory` fired on linked-worktree geometry (#63's table row `git worktree remove --force .claude/worktrees/garage-418-old`, UNSURE .51) because a worktree's siblings are outside `workingDirectory` by construction, and the hazard's criteria only knew about paths.
+- Every root comes from git's registry, never from the shape of a path. A directory named like a worktree that git did not register is covered by nothing, a separate clone of the same project is its own main worktree with no siblings, and containment runs one way only: a target is inside when it IS a root or lies under one — the main checkout contains its nested worktrees, and treating it as a root would have swallowed every path inside it. A bare repository, a path outside any repository, and a cwd where plumbing fails all carry no field at all.
+- Both batteries' verdict instructions and all three criteria of the worktree hazard name the fields by backticked path. The measured geometry rides the bash and eval cache keys, so a worktree registered, removed, or detached between two identical calls invalidates the cached verdict.
+- `JEV_POLICY_VERSION` is now `jev-v2.3`, and the criteria text moved the pinned battery digest and policy hash to `448d9fb26e53ce35…` / `6e233a887462f5fc` (from `29ed2ae6375f9d54…` / `87c99bf634aa9c64`), which clears every cached verdict once — the intent, not a bug to paper over. (#69)
+
 ### Triage queue: three parser and loader defects
 
 - Risk verbs inside a substitution are now read from the parsed AST (`substitutionSpans`), the same source `commandHasOutboundNetwork` uses. `addSubstitutionFlags` collected `$(…)` and backtick spans with a quote-blind regex, so `echo '$(rm -rf /tmp/x)'` raised a risk flag for a substitution that never runs. Quoted spans are data now, nested spans are seen at every depth, and the removed local guard lets process substitution through, so `cat <(rm -rf /tmp/x)` asks. (#119)

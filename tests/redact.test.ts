@@ -305,6 +305,10 @@ describe("redaction reaches every judge state", () => {
 	});
 
 	test("the policy version marks the change", () => {
-		expect(JEV_POLICY_VERSION).toBe("jev-v2.2");
+		// The redaction change landed as jev-v2.2; the version has moved on with
+		// later changes to what a state means (the measured git tiers), which is
+		// the point of pinning it: a state read under one version means
+		// something else under the next.
+		expect(JEV_POLICY_VERSION).toBe("jev-v2.3");
 	});
 });

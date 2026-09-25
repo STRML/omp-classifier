@@ -95,10 +95,12 @@ import {
 	JEV_POLICY_VERSION,
 	jevQuestionsHash,
 	type GitPushProvenance,
+	type GitWorktreeProvenance,
 	type JevHazard,
 	type JevPolicy,
 	type JevVerdict,
 	measureGitPushProvenance,
+	measureGitWorktreeProvenance,
 } from "./jev";
 
 type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "UNAVAILABLE";
@@ -3773,6 +3775,7 @@ export default function (pi: ExtensionAPI) {
 			timeoutMs: number;
 			operatorContext?: string;
 			pushProvenance?: GitPushProvenance;
+			worktreeProvenance?: GitWorktreeProvenance;
 			recordExtras: Record<string, unknown>;
 		},
 	): Promise<ShadowV3> => {
@@ -3815,6 +3818,7 @@ export default function (pi: ExtensionAPI) {
 					...userEvidence,
 					...(input.operatorContext ? { operatorContext: input.operatorContext } : {}),
 					...(input.pushProvenance !== undefined ? { gitPushProvenance: input.pushProvenance } : {}),
+					...(input.worktreeProvenance !== undefined ? { gitWorktreeProvenance: input.worktreeProvenance } : {}),
 					...(Object.keys(input.recordExtras).length > 0 ? { extra: input.recordExtras } : {}),
 				}),
 				authorizationState: buildAuthorizationState({ actions, ...userEvidence }),
@@ -3899,10 +3903,29 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			pushProvenance = undefined;
 		}
+		// Gate-measured worktree geometry (issue #69 slice C). Three side-effect
+		// free plumbing calls in the target cwd; a cwd outside any working tree
+		// (or a bare repository) leaves it undefined and the state carries no
+		// geometry — the criteria then read the command's paths alone.
+		let worktreeProvenance: GitWorktreeProvenance | undefined;
+		try {
+			worktreeProvenance = measureGitWorktreeProvenance(cwd);
+		} catch {
+			worktreeProvenance = undefined;
+		}
 		// Started before the live request so the two run in parallel; awaited
 		// on both return paths below, and it never throws.
 		const shadow = config.shadowV3
-			? shadowJevV3(ctx, { command, language, cwd, timeoutMs, recordExtras, ...(operatorContext ? { operatorContext } : {}), ...(pushProvenance !== undefined ? { pushProvenance } : {}) })
+			? shadowJevV3(ctx, {
+					command,
+					language,
+					cwd,
+					timeoutMs,
+					recordExtras,
+					...(operatorContext ? { operatorContext } : {}),
+					...(pushProvenance !== undefined ? { pushProvenance } : {}),
+					...(worktreeProvenance !== undefined ? { worktreeProvenance } : {}),
+				})
 			: undefined;
 		try {
 			const answers = await judgeBattery(AbortSignal.timeout(timeoutMs), {
@@ -3913,6 +3936,7 @@ export default function (pi: ExtensionAPI) {
 					...(taskEvidence?.ids.length ? { userMessageIds: taskEvidence.ids } : {}),
 					...(operatorContext ? { operatorContext } : {}),
 					...(pushProvenance !== undefined ? { gitPushProvenance: pushProvenance } : {}),
+					...(worktreeProvenance !== undefined ? { gitWorktreeProvenance: worktreeProvenance } : {}),
 					...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
 				}),
 				// The host settings instance, not a plugin-local singleton copy:
@@ -4561,8 +4585,12 @@ export default function (pi: ExtensionAPI) {
 			// Judge identity is the model selector plus the question battery: a
 			// verdict earned under one policy must not be reused under another.
 			// (The config signature clears the whole cache when either changes;
-			// this keeps the key honest on its own.)
-			const cacheKey = JSON.stringify(["eval", config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, language, evalCode, reviewEvidenceFingerprint]);
+			// this keeps the key honest on its own.) The measured worktree
+			// geometry rides here as it does on the bash path (issue #69 slice
+			// C): the judge read it off this cwd, so a worktree registered,
+			// removed, or detached between calls must invalidate the verdict.
+			const worktreeProvenanceForCache = measureGitWorktreeProvenance(cwd);
+			const cacheKey = JSON.stringify(["eval", config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, language, evalCode, reviewEvidenceFingerprint, worktreeProvenanceForCache ?? null]);
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
 			// session off, so it must hold here too, not only for bash.
@@ -4830,12 +4858,16 @@ export default function (pi: ExtensionAPI) {
 			// (The config signature clears the whole cache when either changes;
 			// this keeps the key honest on its own.) The measured push
 			// provenance (issue #63) is what the judge read about the refs, so
-			// a ref move between calls must invalidate the cached verdict.
+			// a ref move between calls must invalidate the cached verdict. The
+			// worktree geometry (issue #69 slice C) is the same kind of fact:
+			// registering, removing, or detaching a worktree changes it.
 			const pushProvenanceForCache = measureGitPushProvenance(command, cwd);
+			const worktreeProvenanceForCache = measureGitWorktreeProvenance(cwd);
 			const cacheKey = JSON.stringify([
 				config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, command,
 				reviewEvidenceFingerprint,
 				pushProvenanceForCache ?? null,
+				worktreeProvenanceForCache ?? null,
 			]);
 			// Refusal memory (issue #30): a reworded command meets its session's
 			// prior refusal. The record tells the model; the SAFE branch below
