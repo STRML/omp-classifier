@@ -2,6 +2,15 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-09-25
+
+### Live evidence respects `/clear` (#103)
+
+- All three live evidence collectors — `collectUserEvidence`, `collectTaskEvidence`, `collectToolEvidence` — now read only what follows the latest `/clear` (`reset_boundary`), the way the host rebuilds model context (`session-context.ts:404` uses the same boundary for emission). Before this, a request the user cleared away came back as user evidence and could weigh as authorization for a later command. They previously started at branch index 0; `collectTaskEvidenceV3` already read from the boundary (#101).
+- One shared boundary helper, `branchStartAfterLatestResetBoundary`, serves all four collectors, so there is a single implementation of "start after the latest boundary".
+- A branch with no `reset_boundary` is unchanged, and the jev-v3 collector's behavior is unchanged — it used the same index before and after.
+- The policy hash is unchanged: the evidence a user-visible `policyHash` pins at module load is derived from the battery and thresholds, not from the evidence slice helper. Clearing cached verdicts for this change is a pending maintainer decision (see below).
+
 ## 2026-09-22
 
 ### The jev-v3 shadow
