@@ -348,6 +348,70 @@ describe("eval spawn cwd (issue #14)", () => {
 		expect(evalSpawnCwd(`Dir.chdir("/tmp/rbel3") do\n  1\nend\ndef helper = 1\nsystem("ls")`, SESSION)).toEqual({
 			kind: "session",
 		});
+		// The `=` Ruby binds to a def's NAME or to a default parameter value is
+		// not the endless-body `=`: a setter, an element setter, an operator, and
+		// a default-valued parameter are all regular defs whose `end` the block
+		// balance must count. Misreading any of them as endless skips the opener,
+		// the method's own `end` then closes the chdir block, and the spawn
+		// inside is judged against the directory Ruby had already restored —
+		// silently, with no disagreement left to notice.
+		for (const def of [
+			"def value=(v); @value = v; end", // the spelled-out setter
+			"def value= v\n    @value = v\n  end",
+			"def []=(k, v); @h[k] = v; end", // element setter
+			"def ==(other); true; end", // operator names carry their own `=`
+			"def <=>(other); 0; end",
+			"def self.value=(v); @value = v; end", // singleton setter
+			"def value\n    @value = 1\n  end", // a plain method with an assignment in the body
+			"def helper(x = 1); x; end", // default value inside the parens
+			"def helper x = 1; x; end", // parenless default value
+		]) {
+			expect(evalSpawnCwd(`Dir.chdir("/tmp/rbsetter") do\n  ${def}\n  system("echo inside")\nend\nsystem("echo outside")`, SESSION)).toEqual({
+				kind: "opaque",
+				why: "spawn sites run in different directories (/tmp/rbsetter, /workspace)",
+			});
+		}
+		// A setter defined on one line with `;` separates: same class, same
+		// answer — the two spawns still run in two directories.
+		expect(
+			evalSpawnCwd(`Dir.chdir("/tmp/rbsetter") do; def value=(v); @value = v; end; system("echo inside"); end; system("echo outside")`, SESSION)
+		).toEqual({
+			kind: "opaque",
+			why: "spawn sites run in different directories (/tmp/rbsetter, /workspace)",
+		});
+		// The endless setter `def value=(v) = 1` is a SyntaxError on every Ruby
+		// that has endless methods (Feature #16746 prohibits it), so no runtime
+		// behavior turns on the reading; this scan reads past the setter's own
+		// `=` to the body one and skips the def, keeping the block balance.
+		expect(evalSpawnCwd(`Dir.chdir("/tmp/rbsetter") do\n  def value=(v) = 1\nend\nsystem("echo outside")`, SESSION)).toEqual({
+			kind: "session",
+		});
+		// An endless def whose body is a parenthesized expression may carry a
+		// `;` inside the parens (`def x = (1; 2)` is valid Ruby): the body `=`
+		// is found before any body byte is read.
+		expect(evalSpawnCwd(`Dir.chdir("/tmp/rbsetter") do\n  def x = (1; 2)\nend\nsystem("echo outside")`, SESSION)).toEqual({
+			kind: "session",
+		});
+	});
+
+	test("a Ruby setter def inside a chdir block does not move the judge's directory question", async () => {
+		setJevAnswer(jevSafeAnswer());
+		const ctx = fresh();
+		const sessionId = ctx.sessionManager.getSessionId();
+		const code = `Dir.chdir("/tmp/rbsetter") do\n  def value=(v); @value = v; end\n  system("echo inside")\nend\nsystem("echo outside")`;
+		const result = await fire("tool_call", evalEvent(code, "rb"), ctx);
+		// The setter's `=` is part of its name, not an endless-body marker, so
+		// both spawns are visible sites in two different directories: one inside
+		// the chdir block, one back in the session directory the block restored.
+		// Judging either silently — against /workspace, where the inside spawn
+		// never ran — is the wrong question, so the gate asks instead.
+		expect(modelCalls.length).toBe(0);
+		const lines = decisionsFor(sessionId);
+		expect(lines[0]).toMatchObject({ decision: "block", layer: "cwd" });
+		expect(lines[0].why).toContain("spawn sites run in different directories (/tmp/rbsetter, /workspace)");
+		expect(lines[1]).toMatchObject({ decision: "block", layer: "headless" });
+		const payload = refusalOf(result);
+		expect(payload.why).toContain("spawn sites run in different directories");
 	});
 
 	test("a spawn directory the scan cannot read is opaque, never guessed", () => {

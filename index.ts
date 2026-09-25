@@ -2365,19 +2365,67 @@ const RUBY_BLOCK_KEYWORD = /^(?:do|if|unless|while|until|case|begin|def|class|mo
  *  body is the expression after the `=`. Counting it as an opener would run
  *  the enclosing block past its real `end` (a spawn written after it would be
  *  judged against a directory Ruby has already restored) or leave the balance
- *  unable to close at all. The `=` that marks this form sits at paren depth 0
- *  on the statement's line; a normal method's default-value `=`, as in
- *  `def helper(x = 1)`, sits inside its parentheses and stays a plain opener. */
+ *  unable to close at all.
+ *
+ *  The endless `=` is the one that follows the COMPLETE header — the name and,
+ *  when present, its parenthesized parameter list. A `=` Ruby binds to the
+ *  name token is not it: the setter `def value=(v)`, the element setter
+ *  `def []=(k, v)`, and the operators `def ==(other)`/`def <=>(other)` all
+ *  carry their `=` inside the name, and a `=` in a parameter list is a default
+ *  value (`def helper(x = 1)`, the parenless `def helper x = 1`). Every one of
+ *  those is a regular def, an opener whose `end` the balance must count.
+ *  Reading the name's `=` as the endless marker was the shipped defect: the
+ *  setter's own `end` then closed the enclosing chdir block, and a spawn
+ *  written inside the block was judged against the directory Ruby had already
+ *  restored — with the two spawn sites agreeing, so nothing asked. The scan
+ *  walks the header shape first and only then looks for the standalone `=`,
+ *  so those spellings can never reach the marker check. A header this scan
+ *  cannot read stays a plain opener, the fail-closed side: an unbalanced
+ *  block asks, it does not guess. Text the Ruby grammar rejects outright —
+ *  the endless setter `def value=(v) = 1`, a SyntaxError on every Ruby that
+ *  has endless methods (Feature #16746) — reads past the name's `=` to the
+ *  body one and is skipped; such payloads never run, so no live behavior
+ *  turns on that reading. */
 function isRubyEndlessDef(masked: string, defAt: number): boolean {
-	let depth = 0;
-	for (let i = defAt + 3; i < masked.length; i += 1) {
-		const char = masked[i];
-		if (char === "\n" || char === ";") return false;
-		if (char === "(") depth += 1;
-		else if (char === ")") depth -= 1;
-		else if (char === "=" && depth === 0) return true;
+	// The receiver, if any: `self.`, `X.`, `A::B.` — an identifier followed by
+	// `.` or `::`, spaces around it allowed. Each round consumes the
+	// identifier and the separator, so the loop advances or stops.
+	let i = defAt + 3;
+	for (;;) {
+		while (i < masked.length && /\s/u.test(masked[i])) i += 1;
+		const word = /^[A-Za-z_]\w*/u.exec(masked.slice(i));
+		if (!word) break;
+		let j = i + word[0].length;
+		while (j < masked.length && /\s/u.test(masked[j])) j += 1;
+		if (masked[j] === ".") i = j + 1;
+		else if (masked.startsWith("::", j)) i = j + 2;
+		else break;
 	}
-	return false;
+	// The name: an identifier with its `?`/`!` and a setter's trailing `=`,
+	// the element forms `[]`/`[]=`, or an operator (`==`, `===`, `<=`, `<=>`,
+	// `!=`, `<<`, `>>`, `**`, the single-char set with `@` for `+@`/`-@`). The
+	// longest forms come first so `<=` never leaves a dangling `=` for the
+	// marker check below to read; in particular the setter's `=` is consumed
+	// HERE, as part of the name, and can never read as a body marker.
+	const name = /^(?:[A-Za-z_]\w*[?!]?=?|\[\]=?|===|<=>|!=|==|<=|>=|<<|>>|\*\*|[+\-*/%&|^~<!]@?)/u.exec(masked.slice(i));
+	// An unreadable name is not a shape this scan knows: stay a plain opener
+	// and let the balance ask when it cannot close.
+	if (!name) return false;
+	i += name[0].length;
+	// An optional parenthesized parameter list, skipped WHOLE (`scanGroupEnd`
+	// tracks all bracket pairs, so `def helper(k = {})` survives): the `=` of
+	// a default value inside it is a parameter's, never a body marker.
+	while (i < masked.length && /\s/u.test(masked[i])) i += 1;
+	if (masked[i] === "(") {
+		const close = scanGroupEnd(masked, i);
+		if (close === -1) return false;
+		i = close + 1;
+		while (i < masked.length && /\s/u.test(masked[i])) i += 1;
+	}
+	// Only past the complete header can a standalone `=` introduce the body.
+	// Anything else — a newline, a `;`, a parenless parameter list, the
+	// payload's end — spells a regular def.
+	return masked[i] === "=";
 }
 
 function scanRubyBlockEnd(masked: string, at: number): number {
