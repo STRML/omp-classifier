@@ -343,15 +343,15 @@ describe("jevQuestionsHash", () => {
 
 	test("the jev-v2 battery is pinned byte for byte until the flip", () => {
 		// The jev-v3 shadow week measures against this baseline. The pin moves
-		// only when the live battery moves on purpose: jev-v2.3 taught both
-		// verdict texts the gate-measured worktree geometry (issue #69 slice C),
-		// so it moved from
-		// 29ed2ae6375f9d549d7c7631589406764759f7c2a2e68e5f039be815e232d680 /
-		// 87c99bf634aa9c64. Every cached verdict is invalidated by that, which
-		// is the intent.
+		// only when the live battery moves on purpose: jev-v2.4 taught both
+		// verdict texts the gate-measured worktree geometry (issue #69 slice C)
+		// and the measured ref state (slice D), so the pair moved
+		// 29ed2ae6375f9d54… / 87c99bf634aa9c64 -> 448d9fb26e53ce35… /
+		// 6e233a887462f5fc -> ac741ac9a706dd3b… / 1661d83b37a8bdd9. Every cached
+		// verdict is invalidated by that, which is the intent.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("448d9fb26e53ce35a7adb8833380f8594361e5e62193cfaba3aa85113c230d74");
-		expect(jevQuestionsHash()).toBe("6e233a887462f5fc");
+		expect(digest).toBe("ac741ac9a706dd3b07aca5c0206fbc2163473561f7710800a12250021c55a40d");
+		expect(jevQuestionsHash()).toBe("1661d83b37a8bdd9");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 

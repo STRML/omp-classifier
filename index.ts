@@ -95,11 +95,13 @@ import {
 	JEV_POLICY_VERSION,
 	jevQuestionsHash,
 	type GitPushProvenance,
+	type GitRefProvenance,
 	type GitWorktreeProvenance,
 	type JevHazard,
 	type JevPolicy,
 	type JevVerdict,
 	measureGitPushProvenance,
+	measureGitRefProvenance,
 	measureGitWorktreeProvenance,
 } from "./jev";
 
@@ -3776,6 +3778,7 @@ export default function (pi: ExtensionAPI) {
 			operatorContext?: string;
 			pushProvenance?: GitPushProvenance;
 			worktreeProvenance?: GitWorktreeProvenance;
+			refProvenance?: GitRefProvenance;
 			recordExtras: Record<string, unknown>;
 		},
 	): Promise<ShadowV3> => {
@@ -3819,6 +3822,7 @@ export default function (pi: ExtensionAPI) {
 					...(input.operatorContext ? { operatorContext: input.operatorContext } : {}),
 					...(input.pushProvenance !== undefined ? { gitPushProvenance: input.pushProvenance } : {}),
 					...(input.worktreeProvenance !== undefined ? { gitWorktreeProvenance: input.worktreeProvenance } : {}),
+					...(input.refProvenance !== undefined ? { gitRefProvenance: input.refProvenance } : {}),
 					...(Object.keys(input.recordExtras).length > 0 ? { extra: input.recordExtras } : {}),
 				}),
 				authorizationState: buildAuthorizationState({ actions, ...userEvidence }),
@@ -3913,6 +3917,17 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			worktreeProvenance = undefined;
 		}
+		// Gate-measured ref state (issue #69 slice D): whether a branch delete
+		// would orphan its commits, whether a path restore has anything to
+		// discard, what a rebase would replay onto. Read-only plumbing; a command
+		// that is none of the three shapes leaves it undefined and the criteria
+		// read the syntax alone.
+		let refProvenance: GitRefProvenance | undefined;
+		try {
+			refProvenance = measureGitRefProvenance(command, cwd);
+		} catch {
+			refProvenance = undefined;
+		}
 		// Started before the live request so the two run in parallel; awaited
 		// on both return paths below, and it never throws.
 		const shadow = config.shadowV3
@@ -3925,6 +3940,7 @@ export default function (pi: ExtensionAPI) {
 					...(operatorContext ? { operatorContext } : {}),
 					...(pushProvenance !== undefined ? { pushProvenance } : {}),
 					...(worktreeProvenance !== undefined ? { worktreeProvenance } : {}),
+					...(refProvenance !== undefined ? { refProvenance } : {}),
 				})
 			: undefined;
 		try {
@@ -3937,6 +3953,7 @@ export default function (pi: ExtensionAPI) {
 					...(operatorContext ? { operatorContext } : {}),
 					...(pushProvenance !== undefined ? { gitPushProvenance: pushProvenance } : {}),
 					...(worktreeProvenance !== undefined ? { gitWorktreeProvenance: worktreeProvenance } : {}),
+					...(refProvenance !== undefined ? { gitRefProvenance: refProvenance } : {}),
 					...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
 				}),
 				// The host settings instance, not a plugin-local singleton copy:
@@ -4590,7 +4607,8 @@ export default function (pi: ExtensionAPI) {
 			// C): the judge read it off this cwd, so a worktree registered,
 			// removed, or detached between calls must invalidate the verdict.
 			const worktreeProvenanceForCache = measureGitWorktreeProvenance(cwd);
-			const cacheKey = JSON.stringify(["eval", config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, language, evalCode, reviewEvidenceFingerprint, worktreeProvenanceForCache ?? null]);
+			const refProvenanceForCache = measureGitRefProvenance(evalCode, cwd);
+			const cacheKey = JSON.stringify(["eval", config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, language, evalCode, reviewEvidenceFingerprint, worktreeProvenanceForCache ?? null, refProvenanceForCache ?? null]);
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
 			// session off, so it must hold here too, not only for bash.
@@ -4860,14 +4878,19 @@ export default function (pi: ExtensionAPI) {
 			// provenance (issue #63) is what the judge read about the refs, so
 			// a ref move between calls must invalidate the cached verdict. The
 			// worktree geometry (issue #69 slice C) is the same kind of fact:
-			// registering, removing, or detaching a worktree changes it.
+			// registering, removing, or detaching a worktree changes it. So is
+			// the measured ref state (slice D): a branch that becomes merged, a
+			// tree that becomes dirty, or a rebase target that moves must not
+			// reuse a verdict earned before the change.
 			const pushProvenanceForCache = measureGitPushProvenance(command, cwd);
 			const worktreeProvenanceForCache = measureGitWorktreeProvenance(cwd);
+			const refProvenanceForCache = measureGitRefProvenance(command, cwd);
 			const cacheKey = JSON.stringify([
 				config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, command,
 				reviewEvidenceFingerprint,
 				pushProvenanceForCache ?? null,
 				worktreeProvenanceForCache ?? null,
+				refProvenanceForCache ?? null,
 			]);
 			// Refusal memory (issue #30): a reworded command meets its session's
 			// prior refusal. The record tells the model; the SAFE branch below
