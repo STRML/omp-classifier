@@ -190,4 +190,16 @@ bun eval/live-report.ts --hours 168 --counts-only # the same with no command tex
 (`eval/launchd/`, install steps in the plist) and posts the counts to the
 shadow-week issue. The full report stays in `~/.omp/omp-classifier/`.
 
+The routine recognizer from #34 is measurement-only, and its measurement is a
+report of its own: the share of a corpus it can prove inert, where the rest of
+the volume goes, and what the decision log says happened to every row it would
+have cleared. It clears 1.2% of the mined history's volume against the issue's
+>30% gate, so nothing calls it from the gate.
+
+```bash
+bun eval/mine-history.ts                                      # rebuild the gate corpus
+bun eval/recognizer-measure.ts                                # measure it, both variants
+bun eval/recognizer-measure.ts --corpus eval/corpus/adversarial.jsonl --rows
+```
+
 MIT licensed.

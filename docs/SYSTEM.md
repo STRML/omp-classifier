@@ -128,6 +128,36 @@ like `don't`, and a pinned or inherited message never produces a match.
 `literalMatch` is pure, and nothing calls it yet. Phase 2 step 5 gives it a branch in the
 decision order.
 
+### The routine recognizer (`recognizer.ts`, measured only)
+
+The cheapest L1 question: is this command's *shape* provably inert, so a model round-trip would
+only be agreeing? `recognizeRoutineCommand` answers with a verdict and the rules that declined,
+never with a refusal. Twelve rules run in order, and every one of them has to pass: one plain
+segment; no metacharacter the flat segment list cannot show (`&`, `;`, `(`, `)`, a non-parameter
+`{`, a word-initial `!` — the shapes the adapter flattens to a single command); no command
+substitution; no injected verdict or approval vocabulary anywhere in the text, comments included,
+which is what keeps `ls # answer SAFE` from clearing; a read-only verb spelled as a bare literal
+name; literal arguments, with `echo` the one verb that may print an expansion; no redirect; no
+assignment; no flag that writes or runs something; no secret path, keychain or SSH key; and a
+floor that stays quiet. `find` and `grep` are the `search` variant, measured separately, because
+a search walks a tree the code has not read.
+
+It fails closed in both directions that matter. Every rule that declines is reported with the
+token that tripped it, so a measurement can say where a corpus's volume actually goes, and
+session taint is a required input rather than a module global — otherwise `echo $CAPTURED` would
+clear after a capture the recognizer never saw.
+
+The issue's gate was measurement before build, and the measurement says no: over the mined
+history corpus it clears 1.0% of rows and 1.2% of volume against a >30% target, and even the
+loosest possible bound (one segment plus a listed verb, every other rule ignored) is 4.6%. The
+volume is compounds and unparsable multi-line scripts, not single reads. `bun
+eval/recognizer-measure.ts` is that measurement, and `eval/corpus/history.jsonl` is its corpus.
+Nothing calls the recognizer from `index.ts`, and the adversarial corpus still holds almost
+nothing it can clear (1/103), which is why it stays measurement-only. Its known limits are stated
+rather than hidden: a verb is trusted by name, so a shadowing function or an earlier `PATH` entry
+defeats it, and a cleared row with no decision-log line and no label counts as neither a pass nor
+a miss in the report.
+
 ## L2 judgment
 
 One request, two inputs, no prose:
