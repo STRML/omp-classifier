@@ -315,4 +315,4 @@ The agent driving this system is owed three things:
 | L5 | Corpus breadth: authored cases plus mined history give a false-ask rate, not a distribution over real traffic. The mined decision log is the intended source. | Open |
 | L1 | Kernel-level spawn interception (structural scan fix) | Open; documented gap in README Limits |
 | L1, L2 | Cheap pre-filter stage | Measured NO-GO on the authored corpus (2.2-4.4% volume, 0 misses); re-measure on a history corpus first |
-| L0 | Eval payload cwd propagation (spawn's own cwd in the record) | Open |
+| L0 | Eval payload cwd propagation (spawn's own cwd in the record) | Done (#14): the marker scan reads a spawn's own cwd when it is a literal, resolves it against the directory in effect, and judges in it; an unreadable one asks instead of guessing |

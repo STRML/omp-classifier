@@ -34,6 +34,8 @@ A normal gate prompt is a four-choice selector — **Allow once**, **Allow for s
 
 The `eval` tool runs kernel code directly, so a host `eval: allow` would otherwise bypass every bash check. The plugin scans each payload for subprocess entry points (`child_process`, `Bun.spawn`, `Bun.$`, Python's `subprocess`/`os.system`, `exec`/`__import__`/`importlib` escapes). Expression-only code — compute, parse, format, local reads — passes with zero cost. Spawn-bearing code is classified like a bash command: judged by what the spawned command would do, SAFE auto-runs, UNSAFE or unsure raises a request. The scan is a marker list, not a parser: string-splitting evasion (`"child_pro" + "cess"`) gets through, the same way obfuscated shell gets past the bash gate. Kernel-level interception is the structural fix (issue #13).
 
+A spawn that passes its own working directory is judged in that directory, not the session's: `exec("rm -rf .", { cwd: "/" })` runs in `/`, so the dialog names `/` and the verdict is cached for `/` alone. The payload's own spawn directory is resolved against the session cwd for relative paths (`cwd="../.."`, Ruby `Dir.chdir("/tmp") do … end`, `system(…, chdir: …)`) and recorded as `spawnCwd` beside the resolved `cwd`. When the scan cannot read it — `{ cwd }`, `cwd=os.environ["X"]`, an options object built by spread, two spawns that disagree — the payload asks instead of classifying: there is no single directory to judge it in, and a verdict earned against the session cwd would be answering a different question.
+
 ## Fails closed
 
 The plugin never guesses its way to silent execution.
@@ -144,7 +146,7 @@ The state can carry an `evidence` object whose fields have different authors, an
 
 ## Limits
 
-- **Spawn-bearing eval code only.** Expression-only eval passes unread, and the payload scan is a marker list: string-splitting evasion gets through. `hub op: "start"` and other exec-tier tools still auto-run under `yolo`. An attacker who picks the tool picks around this.
+- **Spawn-bearing eval code only.** Expression-only eval passes unread, and the payload scan is a marker list: string-splitting evasion gets through. The spawn-cwd scan reads the `cwd`/`chdir` forms the issue lists; a quoted option key (`{"cwd": …}`), a Ruby `"chdir" => …` hash key, and an alias it cannot follow all leave the spawn reading as "no cwd", so the session directory stands. `hub op: "start"` and other exec-tier tools still auto-run under `yolo`. An attacker who picks the tool picks around this.
 - **Later handlers win.** Another extension's `tool_call` handler can revise the command after this one judges it; the host applies the last revision. Input-mutating extensions alongside this plugin are unsupported.
 - **Internal-URL working directories are blocked.** `skill://` and similar cwds expand from session state the plugin cannot see. Pass the resolved filesystem path.
 - **Command contents are not inspected.** `npm test` and `make` are judged as the routine commands they look like. Package scripts and hooks go unread.

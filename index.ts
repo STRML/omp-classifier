@@ -873,6 +873,13 @@ export interface DecisionRecord {
 	why: string;
 	cmd: string;
 	cwd: string;
+	/** The eval payload's OWN spawn directory (issue #14), when the payload
+	 *  named one: `cwd` above is the directory this decision judged in, and for
+	 *  a payload whose spawns declare their own directory that is where the
+	 *  judged command would run, not where the payload's own process runs. Kept
+	 *  as its own field so a reader can tell a directory the payload chose from
+	 *  one the session supplied without re-reading the (truncated) `cmd`. */
+	spawnCwd?: string;
 	verdict: Verdict | null;
 	cached: 0 | 1;
 	ms: number;
@@ -1863,6 +1870,460 @@ export function evalSubprocessMarkers(code: string, language: string): string[] 
 	// hit costs one dialog; a miss passes a spawn silently.
 	const union = [...EVAL_SPAWN_MARKERS_JS, ...EVAL_SPAWN_MARKERS_RB_JL];
 	return scan(union);
+}
+
+// ---------------------------------------------------------------------------
+// The directory an eval payload's spawn runs in (issue #14)
+//
+// A spawn can pass its own working directory — `subprocess.run(cmd, cwd=…)`,
+// `exec(cmd, { cwd: … })`, Ruby `Dir.chdir` and `system(…, chdir: …)`. That
+// directory is part of the identity of a judgement: `rm -rf .` in the session
+// directory and `rm -rf .` in `/` are different questions, and the same payload
+// re-run against a different directory must not reuse the other's verdict. The
+// gates below therefore read the payload's own text and judge it in the
+// directory the spawns actually run in.
+//
+// Three outcomes, and the third is the whole point:
+//   - a literal, resolved the way the bash path resolves a leading `cd`;
+//   - nothing readable at all, which leaves the session directory in force;
+//   - UNREADABLE (a computed value, `{ cwd }` shorthand, sites that disagree
+//     with each other, an internal-URL directory, an argument list that never
+//     closes). That is not a reason to guess: a payload judged against a
+//     directory it does not run in was judged on the wrong question, so it
+//     asks a human instead of classifying.
+//
+// The scan is site-scoped where the marker scan is not — a `cwd=` inside a
+// string, a comment, or a nested call's arguments must not be read as the
+// spawn's directory, which is the same mislabelling error as the issue's,
+// pointing the other way. It is still a scan, not a parser: a quoted option key
+// (`{ "cwd": … }`) or an alias the scan cannot follow leaves the site reading as
+// "no cwd argument", and that is the session directory's answer, not this one.
+// Kernel-level interception (issue #13) is the structural fix for that class.
+// ---------------------------------------------------------------------------
+
+/** One call whose directory the scan can read. `spawn` sites take an options
+ *  key or keyword (`cwd=`/`cwd:`/`chdir:`) that overrides the directory for that
+ *  child; `chdir` sites (Ruby `Dir.chdir`) move the payload's OWN directory for
+ *  everything after them, which is why the scan walks sites in source order.
+ *
+ *  The tables below hold the shapes that can NAME a directory — the ones the
+ *  issue lists — plus the cwd-less call of the same family. That second part
+ *  matters: a payload that declares `/` for one spawn and lets another inherit
+ *  the session directory runs in two directories, and the scan has to see both
+ *  to say so. Shapes that cannot name one (`os.system`, `pty.spawn`,
+ *  `Function()`) are not sites: there is no directory argument to read, and
+ *  listing every spawn marker here would dialog every payload that shells out
+ *  twice. */
+interface EvalCwdSite {
+	pattern: RegExp;
+	name: string;
+	kind: "spawn" | "chdir";
+	/** The FIRST argument IS the directory (`Dir.chdir("/tmp")`,
+	 *  `` `ls`.cwd("/tmp") ``), not an options key. */
+	positional?: true;
+	/** Ruby calls parenthesize optionally, so the argument list may be the rest
+	 *  of the line (`system "ls", chdir: "/tmp"`). Only Ruby sites set this:
+	 *  a parenthesized-looking member access in JS/Python (`subprocess.PIPE`)
+	 *  is not a call at all and must not be read as one. */
+	parenless?: true;
+}
+
+/** JS: the child_process methods (bare after a destructured import, qualified
+ *  otherwise) and Bun's shell `cwd()`. `Bun.$` itself is not a site: it takes
+ *  its directory from a `.cwd()` chain, which is. */
+const EVAL_CWD_SITES_JS: EvalCwdSite[] = [
+	{ pattern: /(?:^|[^\w.$])(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|fork)\b/u, name: "spawn/exec", kind: "spawn" },
+	{ pattern: /\.\s*(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|fork)\b/u, name: "child_process", kind: "spawn" },
+	{ pattern: /\.\s*cwd\b/u, name: "shell cwd()", kind: "spawn", positional: true },
+];
+
+/** PY: the subprocess family, asyncio's subprocess helpers, and the bare names
+ *  a `from subprocess import run` leaves behind. Every entry here can NAME a
+ *  directory (`cwd=`); `os.system`/`os.popen`/`pty.spawn` cannot, and a shape
+ *  that cannot name one has nothing for this scan to read — see the site-table
+ *  note above. */
+const EVAL_CWD_SITES_PY: EvalCwdSite[] = [
+	{ pattern: /\bsubprocess\s*\.\s*\w+/u, name: "subprocess", kind: "spawn" },
+	{ pattern: /\basyncio\s*\.\s*create_subprocess\w*/u, name: "asyncio.create_subprocess", kind: "spawn" },
+	{ pattern: /(?:^|[^\w.$])(?:run|Popen|call|check_call|check_output)\b/u, name: "subprocess", kind: "spawn" },
+];
+
+/** RB: the shell-literal surfaces those kernels use, plus the two chdir forms.
+ *  `chdir:` is handled by the keyed read; `Dir.chdir` by the positional one. */
+const EVAL_CWD_SITES_RB: EvalCwdSite[] = [
+	{ pattern: /(?:^|[^\w.$])(?:system|spawn|popen|open3)\b/u, name: "system/spawn", kind: "spawn", parenless: true },
+	{ pattern: /\b(?:Dir\s*\.\s*chdir|FileUtils\s*\.\s*cd)\b/u, name: "Dir.chdir", kind: "chdir", positional: true, parenless: true },
+];
+
+/** What a masked string body becomes. NOT a space: the scan skips whitespace to
+ *  find the argument list after a callee, and a string sitting there must stop
+ *  that walk instead of being walked through. Not a bracket, delimiter or word
+ *  character either, so balance, value boundaries and token matches all behave
+ *  as if the text were never there. */
+const MASK_FILL = "\u0001";
+
+/** End (exclusive) of the string literal starting at `start`, or -1 when it
+ *  never closes. Escapes are respected, a quoted string may not span lines in
+ *  any of these languages (backticks and Python's triple quotes may). */
+function scanStringEnd(text: string, start: number): number {
+	const quote = text[start];
+	if (text[start + 1] === quote && text[start + 2] === quote) {
+		for (let i = start + 3; i < text.length; i += 1) {
+			if (text[i] === "\\") {
+				i += 1;
+				continue;
+			}
+			if (text.startsWith(quote.repeat(3), i)) return i + 3;
+		}
+		return -1;
+	}
+	for (let i = start + 1; i < text.length; i += 1) {
+		const char = text[i];
+		if (char === "\\") {
+			i += 1;
+			continue;
+		}
+		if (char === "\n" && quote !== "`") return -1;
+		if (char === quote) return i + 1;
+	}
+	return -1;
+}
+
+/** Blank the parts of a payload that are text, not code: every string body,
+ *  and every comment. Length is preserved so indices map straight back to the
+ *  original, which is where values are read from.
+ *
+ *  Without this, `subprocess.run(["sh", "-c", "cwd=/tmp"])` reads as a spawn in
+ *  /tmp and `cwd="/tmp"  # cwd="/evil"` reads as /evil — false directories of
+ *  exactly the kind this scan exists to stop reporting. */
+function maskCodeText(code: string): string {
+	let masked = "";
+	let i = 0;
+	while (i < code.length) {
+		const char = code[i];
+		if (char === '"' || char === "'" || char === "`") {
+			const end = scanStringEnd(code, i);
+			const stop = end === -1 ? code.length : end;
+			masked += MASK_FILL.repeat(stop - i);
+			i = stop;
+			continue;
+		}
+		if (char === "#" || (char === "/" && code[i + 1] === "/")) {
+			while (i < code.length && code[i] !== "\n") {
+				masked += " ";
+				i += 1;
+			}
+			continue;
+		}
+		if (char === "/" && code[i + 1] === "*") {
+			const end = code.indexOf("*/", i + 2);
+			const stop = end === -1 ? code.length : end + 2;
+			masked += code.slice(i, stop).replace(/[^\n]/gu, " ");
+			i = stop;
+			continue;
+		}
+		masked += char;
+		i += 1;
+	}
+	return masked;
+}
+
+/** Index of the bracket that closes the group opening at `open`, or -1 when the
+ *  payload's structure runs out first. */
+function scanGroupEnd(masked: string, open: number): number {
+	let depth = 0;
+	for (let i = open; i < masked.length; i += 1) {
+		const char = masked[i];
+		if (char === "(" || char === "[" || char === "{") depth += 1;
+		else if (char === ")" || char === "]" || char === "}") {
+			depth -= 1;
+			if (depth === 0) return i;
+		}
+	}
+	return -1;
+}
+
+/** End (exclusive) of a cwd VALUE: the first delimiter at the value's own
+ *  nesting depth. `subprocess.run(["ls"], cwd=join(a, b))` ends at the call's
+ *  closing paren, not at the comma inside `join`. */
+function scanValueEnd(masked: string, start: number, end: number): number {
+	let depth = 0;
+	for (let i = start; i < end; i += 1) {
+		const char = masked[i];
+		if (char === "(" || char === "[" || char === "{") depth += 1;
+		else if (char === ")" || char === "]" || char === "}") {
+			if (depth === 0) return i;
+			depth -= 1;
+		} else if (depth === 0 && (char === "," || char === ";" || char === "\n")) return i;
+	}
+	return end;
+}
+
+/** The directory text of a cwd argument, or null when it is not a plain string
+ *  literal. Everything else — a variable, a call, an f-string, an interpolated
+ *  Ruby string, a concatenation, a value with an escape this does not model —
+ *  is unreadable on purpose: the caller turns that into a permission request
+ *  rather than a directory it guessed. */
+function cwdLiteralText(raw: string): string | null {
+	// The body may not contain an unescaped copy of its own quote: without that
+	// `"/tmp/a" + "/b"` (and Python's implicit `"/tmp/a" "/b"`) reads as one
+	// string whose text is `/tmp/a" + "/b`, a directory that exists nowhere.
+	const match = /^([A-Za-z]{0,2})(["'])((?:(?!\2)[\s\S])*)\2$/u.exec(raw);
+	if (!match) return null;
+	const [, prefix, , body] = match;
+	// f-strings interpolate; a prefix that could interpolate is not a literal.
+	if (/[fF]/u.test(prefix)) return null;
+	if (body.includes("#{") || body.includes("${")) return null;
+	let text = "";
+	for (let i = 0; i < body.length; i += 1) {
+		if (body[i] !== "\\") {
+			text += body[i];
+			continue;
+		}
+		// Only the escapes that cannot change which directory is named are
+		// modeled; `\t`, `\x41` and friends stay unreadable.
+		if (body[i + 1] !== "\\") return null;
+		text += "\\";
+		i += 1;
+	}
+	return text;
+}
+
+/**
+ * Read a spawn's cwd literal (issue #14) into the absolute directory the
+ * payload would run in, or null when it cannot be resolved.
+ *
+ * `resolveToCwd` is the bash path's resolver for a leading `cd`, so a relative
+ * literal resolves against the directory in effect exactly as bash resolves one
+ * against the session directory. A BARE `/` is the one exception: resolveToCwd
+ * treats it as a workspace-root alias (its doc comment says so, "for tool
+ * inputs"), while a spawned child has no such alias — `cwd="/"` really is the
+ * filesystem root, and reading it as the session directory would UNDERSTATE
+ * what `rm -rf .` does there, the one direction this gate may never fail in.
+ * An internal URL and an empty string are not directories a child can run in,
+ * so both are unreadable rather than approximated.
+ */
+function resolveSpawnCwdLiteral(raw: string, base: string): string | null {
+	if (raw === "" || raw.includes("://") || raw.includes("local:/")) return null;
+	const resolved = /^\/+$/u.test(raw) ? "/" : resolveToCwd(raw, base);
+	return resolved === "" ? null : resolved;
+}
+
+/** One cwd argument found in a call's arguments. `value` is the argument's
+ *  SOURCE text (quotes and all) and `detail` the source text of an unreadable
+ *  one, for the dialog: the human decides what to do with a directory the scan
+ *  refused to guess. Whether that source text is a literal, and what directory
+ *  it names, is decided in one place — see evalSpawnCwd. */
+type EvalCwdArgument = { kind: "none" } | { kind: "value"; value: string } | { kind: "dynamic"; detail: string };
+
+/** The directory argument of a positional site (`Dir.chdir("/tmp")`,
+ *  `` `ls`.cwd("/tmp") ``): the call's FIRST argument, read as one token. */
+function readPositionalCwd(masked: string, code: string, start: number, end: number): EvalCwdArgument {
+	let i = start;
+	while (i < end && (masked[i] === " " || masked[i] === "\t")) i += 1;
+	if (i >= end) return { kind: "none" };
+	const quote = code[i];
+	if (quote === '"' || quote === "'" || quote === "`") {
+		const quoted = scanStringEnd(code, i);
+		if (quoted === -1) return { kind: "dynamic", detail: truncated(code.slice(i), 60) };
+		// A quoted string is the directory only when the call ends there or a
+		// block follows (`Dir.chdir "/tmp" do … end`). Anything else can extend
+		// the value past what was read — `Dir.chdir "/a" "/b"` is not /a.
+		const rest = code.slice(quoted).trimStart();
+		if (rest === "" || /^[),;{}\n]/u.test(rest) || /^(?:do|then|end)\b/u.test(rest)) {
+			return { kind: "value", value: code.slice(i, quoted) };
+		}
+	}
+	return { kind: "dynamic", detail: truncated(code.slice(i, Math.max(i + 1, scanValueEnd(masked, i, end))).trim(), 60) };
+}
+
+/** The cwd an options object or keyword argument names, as far as the scan can
+ *  read it. Only the OUTERMOST `cwd`/`chdir` reference in the call counts: a
+ *  `cwd` inside a nested call's arguments (`env=build(cwd=…)`) is that call's,
+ *  not this spawn's. A bare `cwd` in key position — `{ cwd }`, the shorthand the
+ *  issue lists — is a variable, so it is unreadable, not absent. */
+function readKeyedCwd(masked: string, code: string, start: number, end: number): EvalCwdArgument {
+	// Bracket depth AND the group enclosing each offset, so a `cwd` can be told
+	// apart from one that belongs to a nested call: `env=make(cwd=…)` is make's
+	// keyword, not this spawn's, while `{ cwd: … }` IS this spawn's options
+	// object — a property one level down, inside the call's own brace. Without
+	// the distinction the nested value wins whenever it is the only one, and the
+	// spawn is judged in a directory only its environment builder runs in.
+	const depth: number[] = [];
+	const opener: string[] = [];
+	const stack: string[] = [];
+	for (let i = start; i < end; i += 1) {
+		const char = masked[i];
+		if (char === ")" || char === "]" || char === "}") stack.pop();
+		depth.push(stack.length);
+		opener.push(stack[stack.length - 1] ?? "");
+		if (char === "(" || char === "[" || char === "{") stack.push(char);
+	}
+	const ownArgument = (at: number): { depth: number; inBrace: boolean } | undefined => {
+		const relative = at - start;
+		if (relative < 0 || relative >= depth.length) return undefined;
+		const atDepth = depth[relative];
+		const inBrace = opener[relative] === "{";
+		// Depth 0 is a keyword of this call (`cwd="/tmp"`); depth 1 inside the
+		// call's own brace is a property of its options object (`{ cwd: "/tmp" }`).
+		return atDepth === 0 || (atDepth === 1 && inBrace) ? { depth: atDepth, inBrace } : undefined;
+	};
+	const found: Array<{ depth: number; argument: EvalCwdArgument }> = [];
+	for (const match of masked.slice(start, end).matchAll(/(?<![\w.$])(?:cwd|chdir)\b/gu)) {
+		const at = start + (match.index ?? 0);
+		const own = ownArgument(at);
+		if (own === undefined) continue;
+		const after = at + match[0].length;
+		let cursor = after;
+		while (cursor < end && (masked[cursor] === " " || masked[cursor] === "\t")) cursor += 1;
+		const separator = masked[cursor];
+		if (separator === ":" || (separator === "=" && masked[cursor + 1] !== "=")) {
+			let valueStart = cursor + 1;
+			while (valueStart < end && (masked[valueStart] === " " || masked[valueStart] === "\t")) valueStart += 1;
+			const raw = code.slice(valueStart, Math.max(valueStart, scanValueEnd(masked, valueStart, end))).trim();
+			found.push({ depth: own.depth, argument: raw === "" ? { kind: "dynamic", detail: `${match[0]}=` } : { kind: "value", value: raw } });
+			continue;
+		}
+		// Key position only: `{ cwd }` is the shorthand form of the option,
+		// while a `cwd` after `:` or `(` is some other expression's value.
+		let before = at - 1;
+		while (before >= start && (masked[before] === " " || masked[before] === "\t")) before -= 1;
+		const previous = before < start ? "" : masked[before];
+		const closer = masked[cursor] ?? "";
+		if (match[0] === "cwd" && own.inBrace && (previous === "{" || previous === ",") && (closer === "," || closer === "}")) {
+			found.push({ depth: own.depth, argument: { kind: "dynamic", detail: `{ ${match[0]} }` } });
+		}
+	}
+	if (found.length === 0) {
+		// No `cwd` token at all is "this call names no directory" — except when
+		// the options came from somewhere else entirely: `{ ...opts }` (JS) and
+		// `**opts` (Python) name their keys in no text this scan can read. Then
+		// the keys are unknown, which is unreadable, not absent: reporting the
+		// session directory there would be a guess wearing a fact's clothes.
+		const args = masked.slice(start, end);
+		const spread = /\{\s*\.\.\.[^}]*\}/u.exec(args)?.[0] ?? /\*\*[\w$]*/u.exec(args)?.[0];
+		return spread ? { kind: "dynamic", detail: spread } : { kind: "none" };
+	}
+	const outermost = Math.min(...found.map(entry => entry.depth));
+	const atOutermost = found.filter(entry => entry.depth === outermost);
+	const values = atOutermost.filter(entry => entry.argument.kind === "value");
+	if (values.length === atOutermost.length && new Set(values.map(entry => (entry.argument as { value: string }).value)).size === 1) {
+		return atOutermost[0].argument;
+	}
+	// A computed value, or the same option set twice: either way there is no
+	// single directory this call is known to run in.
+	const dynamic = atOutermost.find(entry => entry.argument.kind === "dynamic");
+	return dynamic ? dynamic.argument : { kind: "dynamic", detail: "cwd set more than once" };
+}
+
+/** Every spawn/chdir call site the tables match, in source order, with the span
+ *  of its argument list. Matched against the MASKED text so only code can match,
+ *  with spans that index the original, which is where values are read.
+ *
+ *  The tables are scanned as a UNION rather than by the payload's `language`
+ *  label. That label is model-written and shared across tool schemas, the marker
+ *  scan already refuses to trust it, and the forms overlap — `exec(cmd, { cwd })`
+ *  is JavaScript, while a payload labeled `py` can carry `exec(` and still be a
+ *  spawn to the marker scan. Reading it with the wrong table would report the
+ *  session directory for a spawn that names its own, which is the error this
+ *  whole section exists to stop; a stray match costs one question instead. */
+function evalCwdSites(masked: string): Array<{ name: string; kind: "spawn" | "chdir"; positional: boolean; argStart: number; argEnd: number }> {
+	const table = [...EVAL_CWD_SITES_JS, ...EVAL_CWD_SITES_PY, ...EVAL_CWD_SITES_RB];
+	const sites = new Map<number, { name: string; kind: "spawn" | "chdir"; positional: boolean; argStart: number; argEnd: number }>();
+	for (const site of table) {
+		for (const match of masked.matchAll(new RegExp(site.pattern.source, `${site.pattern.flags.replace("g", "")}g`))) {
+			let open = (match.index ?? 0) + match[0].length;
+			while (open < masked.length && (masked[open] === " " || masked[open] === "\t")) open += 1;
+			if (masked[open] !== "(") {
+				if (site.parenless !== true) continue;
+				const lineEnd = masked.indexOf("\n", open);
+				const argEnd = lineEnd === -1 ? masked.length : lineEnd;
+				// A call whose first token is its block (`Dir.chdir do … end`)
+				// wrote no argument at all — the block IS the argument list, and
+				// an empty span says so instead of reading `do` as a directory.
+				const argStart = /^(?:do|then|end|\{)/u.test(masked.slice(open, argEnd).trimStart()) ? argEnd : open;
+				if (!sites.has(open)) sites.set(open, { name: site.name, kind: site.kind, positional: site.positional === true, argStart, argEnd });
+				continue;
+			}
+			if (sites.has(open)) continue;
+			const close = scanGroupEnd(masked, open);
+			sites.set(open, { name: site.name, kind: site.kind, positional: site.positional === true, argStart: open + 1, argEnd: close === -1 ? -1 : close });
+		}
+	}
+	return [...sites.values()].sort((a, b) => a.argStart - b.argStart);
+}
+
+/** The headline the eval gate asks under when a spawn's own directory cannot be
+ *  read (issue #14). Named once because two things key on it: the dialog title,
+ *  and the rule that this layer offers no grant (see requestPermission). */
+const EVAL_SPAWN_CWD_HEADLINE = "unreadable spawn cwd";
+
+/** The directory an eval payload's spawns run in (issue #14), or why the scan
+ *  cannot tell. Exported for the test seam: the gate asks once per payload. */
+export type EvalSpawnCwd = { kind: "session" } | { kind: "literal"; cwd: string } | { kind: "opaque"; why: string };
+
+/**
+ * Read the directory an eval payload spawns in, resolved against the session
+ * directory it starts from. The payload's `language` label does not take part:
+ * see evalCwdSites.
+ *
+ * Sites are walked in source order because `Dir.chdir("/tmp") do … end` moves
+ * the directory for every site after it, and a relative literal resolves
+ * against whatever directory is in effect at that point. Every spawn site is
+ * counted, not just the ones that name a directory: a site with no cwd runs in
+ * the directory in effect, which is a fact about the payload, not a guess. When
+ * those facts disagree — one spawn in the session directory, another in `/` —
+ * there is no single directory this payload runs in, and the answer is "ask",
+ * not one of the two.
+ */
+export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
+	const masked = maskCodeText(code);
+	const sites = evalCwdSites(masked);
+	if (sites.length === 0) return { kind: "session" };
+	let current = sessionCwd;
+	const perSite: string[] = [];
+	let opaque = "";
+	for (const site of sites) {
+		if (site.argEnd === -1) {
+			if (opaque === "") opaque = `${site.name}: the argument list does not close`;
+			continue;
+		}
+		const argument = site.positional ? readPositionalCwd(masked, code, site.argStart, site.argEnd) : readKeyedCwd(masked, code, site.argStart, site.argEnd);
+		if (argument.kind === "none") {
+			// `Dir.chdir()` with nothing in it goes to the home directory, which
+			// is not a directory this scan can name.
+			if (site.kind === "chdir") {
+				if (opaque === "") opaque = `${site.name}: no directory argument`;
+				continue;
+			}
+			perSite.push(current);
+			continue;
+		}
+		if (argument.kind === "dynamic") {
+			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${argument.detail})`;
+			continue;
+		}
+		const literal = cwdLiteralText(argument.value);
+		if (literal === null) {
+			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${truncated(argument.value, 60)})`;
+			continue;
+		}
+		const resolved = resolveSpawnCwdLiteral(literal, current);
+		if (resolved === null) {
+			if (opaque === "") opaque = `${site.name}: ${truncated(argument.value, 60)} does not name a directory`;
+			continue;
+		}
+		if (site.kind === "chdir") current = resolved;
+		else perSite.push(resolved);
+	}
+	if (opaque !== "") return { kind: "opaque", why: opaque };
+	// A chdir that moved the payload's own directory is also the directory of
+	// every spawn this table does not model (`Dir.chdir("/tmp") do \`ls\` end`):
+	// when no site named one, the payload's own directory is the answer.
+	const effective = perSite.length === 0 ? [current] : perSite;
+	const distinct = [...new Set(effective)];
+	if (distinct.length > 1) return { kind: "opaque", why: `spawn sites run in different directories (${distinct.join(", ")})` };
+	return samePath(distinct[0], sessionCwd) ? { kind: "session" } : { kind: "literal", cwd: distinct[0] };
 }
 
 // Commands whose ARGUMENT is the program that runs: look through them to the
@@ -4080,6 +4541,10 @@ export default function (pi: ExtensionAPI) {
 		target: {
 			command: string;
 			cwd: string;
+			/** The directory the payload named for its own spawns (issue #14),
+			 *  present only when it named one: `cwd` above IS that directory
+			 *  then, and the dialog says so on the working-directory line. */
+			spawnCwd?: string;
 			envKeys: string[];
 			pty: boolean;
 			timeout: number | undefined;
@@ -4106,7 +4571,12 @@ export default function (pi: ExtensionAPI) {
 		// "/workspace" prints a line saying the cwd is the cwd, which is exactly
 		// the noise this is meant to remove.
 		if (target.cwd && !samePath(target.cwd, sessionCwd)) {
-			details.push(`working directory: ${detailValue(target.cwd)}`);
+			// An eval payload can name its own spawn directory (issue #14) — the
+			// case the whole field exists for — and a reader who cannot tell that
+			// directory from the session's is reading a detail row that lies by
+			// omission about who chose it. A literal that resolves OUTSIDE the
+			// session directory is shown exactly as resolved: never folded back.
+			details.push(`working directory: ${detailValue(target.cwd)}${target.spawnCwd === undefined ? "" : " (declared by the payload's spawn call)"}`);
 		}
 		// 0 disables the deadline (host schema, tools/bash.ts), so "0s" would
 		// read as the exact opposite of what it does.
@@ -4290,6 +4760,10 @@ export default function (pi: ExtensionAPI) {
 		target: {
 			command: string;
 			cwd: string;
+			/** The directory the payload named for its own spawns (issue #14),
+			 *  present only when it named one: `cwd` above IS that directory
+			 *  then, and the dialog says so on the working-directory line. */
+			spawnCwd?: string;
 			envKeys: string[];
 			pty: boolean;
 			timeout: number | undefined;
@@ -4306,7 +4780,7 @@ export default function (pi: ExtensionAPI) {
 		 *  as the verdict line it follows. One object rather than one parameter
 		 *  per field: this list grew a field per phase, and each time a caller
 		 *  was missed the log came out half-filled. */
-		auditExtras: Pick<DecisionRecord, "userMessageIds" | "authorization" | "v3" | "floor"> = {},
+		auditExtras: Pick<DecisionRecord, "userMessageIds" | "authorization" | "v3" | "floor" | "spawnCwd"> = {},
 		/** The still-running judgment behind a timed-out classification (issue
 		 *  #62), with the guards a late SAFE must still clear. Present only
 		 *  where classify hit its deadline: the dialog then races the late
@@ -4350,6 +4824,7 @@ export default function (pi: ExtensionAPI) {
 				...(auditExtras.authorization ? { authorization: auditExtras.authorization } : {}),
 				...(auditExtras.v3 ? { v3: auditExtras.v3 } : {}),
 				...(auditExtras.floor ? { floor: auditExtras.floor } : {}),
+				...(auditExtras.spawnCwd ? { spawnCwd: auditExtras.spawnCwd } : {}),
 			});
 		const block = (whyOverride?: string, approval: DecisionRecord["approval"] = ctx.hasUI ? "deny" : "headless"): { block: true; reason: string } => {
 			// Verdict-driven callers pass "follows verdict" so the dialog/headless
@@ -4415,7 +4890,15 @@ export default function (pi: ExtensionAPI) {
 		// Compounds/substitutions have an exact-text key; changed payloads still
 		// miss it.
 		const grantKey = tool === "eval" ? normalizeEvalGrantTarget(target.command) : grantKeyForCommand(target.command);
-		const grantsHonoredAtLayer = headline !== "critical pattern" && headline !== "environment override";
+		// A grant is only OFFERED when the resolver below can honor it. Critical
+		// patterns and env overrides outrank grants, so showing a grant choice
+		// there would promise an authorization that the next call can never use.
+		// `unreadable spawn cwd` is on that list for its own reason: the eval path
+		// asks before the grant check, because a grant for this payload was scoped
+		// to a directory the payload never named — offering one would promise a
+		// scope the gate cannot honestly write down.
+		const grantsHonoredAtLayer =
+			headline !== "critical pattern" && headline !== "environment override" && headline !== EVAL_SPAWN_CWD_HEADLINE;
 		const sessionGrantAvailable = grantKey !== "" && grantsHonoredAtLayer;
 		const persistentGrantAvailable = tool === "bash" && readClassifierConfig().persistentGrants && grantsHonoredAtLayer;
 		// The late-answer race (issue #62). The dialog the deadline opened keeps
@@ -4746,7 +5229,6 @@ export default function (pi: ExtensionAPI) {
 
 		if (isEval) {
 			const language = typeof event.input?.language === "string" ? event.input.language : "";
-			const cwd = ctx.cwd;
 			const markers = evalSubprocessMarkers(evalCode, language);
 			// Expression-only payload: the host's `eval` approval applies, the
 			// gate adds nothing (posture A's whole point).
@@ -4755,14 +5237,25 @@ export default function (pi: ExtensionAPI) {
 			// a per-session `/classifier off` pause does the same for just this
 			// session. Neither touches trust state, so cached verdicts survive.
 			if (!config.enabled || sessionOff.has(ctx.sessionManager.getSessionId())) return;
+			// The payload's own spawn directory (issue #14): a spawn that passes
+			// one runs there, not in the session directory, and the directory is
+			// part of what was judged. `declaredCwd` is the directory the payload
+			// named; `cwd` is the one everything below judges in.
+			const spawn = evalSpawnCwd(evalCode, ctx.cwd);
+			const declaredCwd = spawn.kind === "literal" ? spawn.cwd : undefined;
+			const cwd = declaredCwd ?? ctx.cwd;
+			// Rides every line this call writes, so an audit reader can tell a
+			// directory the payload declared from the session's without going
+			// back to the payload text — which the `cmd` field truncates.
+			const spawnField = declaredCwd === undefined ? {} : { spawnCwd: declaredCwd };
 			// Over-bound spawn-bearing code is blocked unseen, like bash: no
 			// classifier or dialog may approve text it did not read.
 			if (evalCode.length > config.maxCommandLength) {
 				const why =
 					`eval code blocked: ${evalCode.length} chars exceeds the ` +
 					`${config.maxCommandLength}-character review limit`;
-				const replay = replayDecision({ tool: "eval", command: evalCode, cwd: ctx.cwd, maxCommandLength: config.maxCommandLength, headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: replay.layer, why, cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, maxCommandLength: config.maxCommandLength, headless: !ctx.hasUI });
+				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: replay.layer, why, cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields(), ...spawnField });
 				addRefusal(ctx, evalCode, why, { source: "cap", cwd });
 				return {
 					block: true,
@@ -4776,20 +5269,47 @@ export default function (pi: ExtensionAPI) {
 					),
 				};
 			}
-			const target = { command: evalCode, cwd, envKeys: [], pty: false, timeout: undefined as number | undefined, async: false };
+			const target = { command: evalCode, cwd, envKeys: [], pty: false, timeout: undefined as number | undefined, async: false, ...spawnField };
+			// A spawn directory this scan could not read is not a reason to
+			// classify anyway: a payload judged against a directory it does not
+			// run in was judged on the wrong question, and a verdict earned that
+			// way is worth less than a human's answer. Ask, and say what could
+			// not be read — the code text on the dialog carries the rest.
+			if (spawn.kind === "opaque") {
+				const headline = EVAL_SPAWN_CWD_HEADLINE;
+				// No `spawnCwd` on these lines: the whole reason this path exists
+				// is that no directory could be read from the payload.
+				logDecisionFor(ctx, {
+					tool: "eval",
+					decision: "block",
+					layer: "cwd",
+					why: `${headline}: ${spawn.why}`,
+					cmd: evalCode,
+					cwd,
+					verdict: null,
+					cached: 0,
+					ms: Date.now() - started,
+					...auditFields(),
+				});
+				return await requestPermission(ctx, target, headline, spawn.why, "eval", "", userScopeFingerprint, auditFields());
+			}
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
 			// Judge identity is the model selector plus the question battery: a
 			// verdict earned under one policy must not be reused under another.
 			// (The config signature clears the whole cache when either changes;
-			// this keeps the key honest on its own.)
-			const cacheKey = JSON.stringify(["eval", config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, language, evalCode, reviewEvidenceFingerprint]);
+			// this keeps the key honest on its own.) Both directories are in the
+			// key: the spawn's own, which is where the judged command runs, and
+			// the session's, which is where the payload's own process still runs
+			// and reads and writes. Dropping either would let a verdict cross a
+			// directory change it never saw.
+			const cacheKey = JSON.stringify(["eval", config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, ctx.cwd, language, evalCode, reviewEvidenceFingerprint]);
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
 			// session off, so it must hold here too, not only for bash.
 			if (matchingGrant(ctx, normalizeEvalGrantTarget(evalCode), cwd, userScopeFingerprint)) {
 				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, grant: "session" });
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: replay.layer, why: "session grant", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+					logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: replay.layer, why: "session grant", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields(), ...spawnField });
 					return;
 				}
 			}
@@ -4807,9 +5327,13 @@ export default function (pi: ExtensionAPI) {
 			// prior refusal. The record tells the model; the SAFE branch below
 			// stops trusting a bare SAFE for a refused target.
 			const prior = priorRefusalFor(ctx, evalCode, cwd, reviewEvidenceFingerprint);
-			const recordExtras: Record<string, unknown> = prior
-				? { priorRefusal: { target: prior.normalizedTarget, why: prior.why, when: new Date(prior.ts).toISOString() } }
-				: {};
+			const recordExtras: Record<string, unknown> = {
+				// The judge is told which directory the payload named for itself,
+				// because `cwd` arrives as the working directory and a spawn's own
+				// directory is a second fact about the same payload.
+				...spawnField,
+				...(prior ? { priorRefusal: { target: prior.normalizedTarget, why: prior.why, when: new Date(prior.ts).toISOString() } } : {}),
+			};
 			try {
 				let classifyError = "";
 				const judgement = cached ? withoutShadow(cached) : (await classify(ctx, evalCode, cwd, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, reviewOperatorContext, evidenceSnapshot, "code").catch(
@@ -4820,7 +5344,7 @@ export default function (pi: ExtensionAPI) {
 					},
 				));
 				if (!judgement) {
-					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", userScopeFingerprint, auditFields());
+					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", userScopeFingerprint, { ...auditFields(), ...spawnField });
 				}
 				if (!cached && judgement.verdict !== "UNAVAILABLE" && !judgement.noCache) remember(scoped, cacheKey, judgement);
 				const logCode = truncated(evalCode.replace(/\s+/gu, " ").trim(), 120);
@@ -4847,7 +5371,7 @@ export default function (pi: ExtensionAPI) {
 					if (replay.decision === "allow") {
 						// Fresh SAFE auto-run logs layer "verdict"; a replayed cached
 						// verdict logs "cached" — provenance, same allow.
-						logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
+						logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
 						return;
 					}
 					// A SAFE on a target this session already refused is not a
@@ -4860,8 +5384,8 @@ export default function (pi: ExtensionAPI) {
 						flagList.length > 0
 							? `classifier-safe but flags: ${flagList.join(", ")}`
 							: replay.why;
-					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
-					return await requestPermission(ctx, target, "flagged for approval", why, "eval", flagList.length > 0 ? "follows verdict" : "despite prior refusal", userScopeFingerprint, { ...auditFields(), ...judgementAudit(judgement) });
+					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
+					return await requestPermission(ctx, target, "flagged for approval", why, "eval", flagList.length > 0 ? "follows verdict" : "despite prior refusal", userScopeFingerprint, { ...auditFields(), ...judgementAudit(judgement), ...spawnField });
 				}
 				const detail =
 					judgement.verdict === "UNSAFE"
@@ -4886,6 +5410,7 @@ export default function (pi: ExtensionAPI) {
 					...(judgement.jev ? { jev: judgement.jev } : {}),
 					...auditFields(),
 					...judgementAudit(judgement),
+					...spawnField,
 				});
 				// A refusal record (issue #30) needs a verdict that judged the
 				// content, and with Jev that means UNSAFE outright: UNSURE is
@@ -4898,7 +5423,8 @@ export default function (pi: ExtensionAPI) {
 				}
 				// The dialog is offered the still-running judgment, with the guards
 				// a late SAFE would still have to clear (see GuardedLateJudgement): the
-				// same `prior` and spawn-scan flags the SAFE branch above judges with.
+				// same `prior` and spawn-scan flags the SAFE branch above judges with,
+				// and the spawn cwd the payload declared (issue #14).
 				return await requestPermission(
 					ctx,
 					target,
@@ -4907,14 +5433,14 @@ export default function (pi: ExtensionAPI) {
 					"eval",
 					"follows verdict",
 					userScopeFingerprint,
-					{ ...auditFields(), ...judgementAudit(judgement) },
+					{ ...auditFields(), ...judgementAudit(judgement), ...spawnField },
 					judgement.late === undefined
 						? undefined
 						: { handle: judgement.late, priorRefusal: prior, riskFlags: evalRiskFlags(evalCode) },
 				);
 			} catch (err) {
 				pi.logger.error(`classifier: ${err instanceof Error ? err.message : String(err)}`);
-				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "internal-error", why: "classifier failed; eval code not run", cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "internal-error", why: "classifier failed; eval code not run", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields(), ...spawnField });
 				return {
 					block: true,
 					reason: refusalPayload(
