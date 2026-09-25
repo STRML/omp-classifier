@@ -33,7 +33,9 @@
  *                   bare literal name, not a path and not a variable.
  *   6. `expansion`  every argument of a path-taking verb is a literal; only
  *                   `echo` may print an expansion, and the floor answers for a
- *                   secret-named one.
+ *                   secret-named one. A caller that reports the session's
+ *                   taint as unknown does not get the `echo` exemption either:
+ *                   any expansion may hold a captured secret.
  *   7. `redirect`   no redirect at all: `2>/dev/null` counts, and so does a
  *                   heredoc or a here-string.
  *   8. `assignment` no `NAME=value`, prefix or otherwise.
@@ -52,6 +54,8 @@
  * Pure: no I/O, no clock, no module state. Session taint is an explicit input
  * (`taintedVars`) rather than a module global, because a pure recognizer that
  * silently assumed an untainted session would clear `echo $CAPTURED_SECRET`.
+ * A caller with no session to read passes `"unknown"`, which fails closed
+ * rather than claiming the session captured nothing.
  */
 import { evaluateFloor, secretPathIn } from "./floor";
 import { type ShellWord, parseShell, verbOf } from "./shell-ast";
@@ -60,10 +64,15 @@ import { type ShellWord, parseShell, verbOf } from "./shell-ast";
  *  read subcommands below; `find` and `grep` are the `search` variant, measured
  *  separately because a search can walk a tree the recognizer has not read.
  *  Static tables are null-prototype records, so no verb can hit a member that
- *  `Object.prototype` happens to carry. */
+ *  `Object.prototype` happens to carry.
+ *
+ *  `env` is deliberately absent. Bare `env` prints every variable in the
+ *  session, credentials included, and `env VAR=1 cmd` runs `cmd` — neither is
+ *  a read. (The floor's `env TOKEN=$(…)` capture rule is about where a secret
+ *  lands, not about clearing the command that prints it.) */
 export const ROUTINE_VERBS: Readonly<Record<string, true>> = Object.assign(Object.create(null), {
 	ls: true, cat: true, head: true, tail: true, wc: true, pwd: true, which: true,
-	echo: true, env: true, date: true, stat: true, file: true, du: true, df: true, git: true,
+	echo: true, date: true, stat: true, file: true, du: true, df: true, git: true,
 } satisfies Record<string, true>);
 
 /** The second variant: the same rules plus the two search verbs. */
@@ -117,9 +126,20 @@ export interface RoutineOptions {
 	 *  Required, because the one thing this function cannot see is the session
 	 *  around it: with a default of "nothing was ever captured", `echo $K` after
 	 *  `K=$(security find-generic-password -w)` would clear. A caller must say
-	 *  what it knows rather than inherit an assumption. */
-	taintedVars: readonly string[];
+	 *  what it knows rather than inherit an assumption, and a caller that cannot
+	 *  see the session at all says `"unknown"` — see `SessionTaint`. */
+	taintedVars: SessionTaint;
 }
+
+/** What the caller knows about the session's taint: the names an earlier
+ *  command captured a secret into, or `"unknown"` for a caller that has no
+ *  session to look at — a corpus, a replayed decision log, a fresh process.
+ *
+ *  `"unknown"` is not `[]`. An empty list is a claim: nothing was captured, so
+ *  a variable is only a secret when its own name says so. A caller that does
+ *  not know makes no such claim, and every expansion may hold a captured
+ *  secret, so a command that expands one is a no-clear. */
+export type SessionTaint = readonly string[] | "unknown";
 
 /** `git` subcommands that only read. `branch` is here for its bare listing and
  *  for `--list` shapes; a positional creates, renames or deletes one, below. */
@@ -205,9 +225,6 @@ function flagReason(verb: string, words: readonly ShellWord[]): string | undefin
 		if (verb === "date" && DATE_SET_FLAG.test(token)) return `date ${token} sets the clock`;
 		if (verb === "file" && FILE_COMPILE_FLAG.test(token)) return `file ${token} compiles a magic database to disk`;
 	}
-	// `env` with arguments is `env VAR=1 cmd`: it runs the command its words
-	// name. Print-only means no arguments at all.
-	if (verb === "env" && words.length > 1) return `env runs the command its words name (${words[1]?.value ?? ""}), so it is not a print-only read`;
 	if (verb === "git") return gitFlagReason(words);
 	return undefined;
 }
@@ -249,6 +266,7 @@ function gitFlagReason(words: readonly ShellWord[]): string | undefined {
  */
 export function recognizeRoutineCommand(command: string, options: RoutineOptions): RoutineVerdict {
 	const variant = options.variant ?? "core";
+	const taintUnknown = options.taintedVars === "unknown";
 	const declines: RoutineRule[] = [];
 	const reasons: string[] = [];
 	const decline = (rule: RoutineRule, reason: string): void => {
@@ -332,11 +350,20 @@ export function recognizeRoutineCommand(command: string, options: RoutineOptions
 		decline("verb", `the verb ${verb} is not on the read-only list${variant === "core" ? " (the search variant adds find and grep)" : ""}`);
 	}
 
-	// (6) expansions in argument position: a path nobody here read.
-	if (verb !== "echo") {
+	// (6) expansions in argument position: a path nobody here read. `echo` is
+	// the one verb exempt from this when the caller reports the session as it
+	// is, because printing an argument is what echo does — but an unknown
+	// session is one where any expansion may print a captured secret, so the
+	// exemption goes with it.
+	if (verb !== "echo" || taintUnknown) {
 		for (const word of segment.words.slice(1)) {
 			if (word.literal) continue;
-			decline("expansion", `the argument "${word.value}" is an expansion whose value this code has not read`);
+			decline(
+				"expansion",
+				taintUnknown && verb === "echo"
+					? `the argument "${word.value}" is an expansion, and this session's taint is unknown, so it may print a captured secret`
+					: `the argument "${word.value}" is an expansion whose value this code has not read`,
+			);
 			break;
 		}
 	}
@@ -367,8 +394,13 @@ export function recognizeRoutineCommand(command: string, options: RoutineOptions
 	}
 
 	// (11) the floor. It outranks every layer above it, so anything it would
-	// stop is not routine, whatever the rules above concluded.
-	const floor = evaluateFloor({ command: text, taintedVars: options.taintedVars });
+	// stop is not routine, whatever the rules above concluded. With the taint
+	// unknown it is asked with the names that are known — none — and that is
+	// sound because no expansion survives to a sink: the verb word (rule 5),
+	// every argument (rule 6), an assignment (8) and a redirect target (7) are
+	// all declines by the time the floor runs, so nothing a capture could have
+	// tainted still reaches it.
+	const floor = evaluateFloor({ command: text, taintedVars: options.taintedVars === "unknown" ? [] : options.taintedVars });
 	const floorEntries = floor.findings.map(finding => finding.entry);
 	if (floor.asks) decline("floor", `the floor would ask: ${floorEntries.join(", ")}`);
 

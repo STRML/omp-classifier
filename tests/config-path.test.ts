@@ -14,7 +14,8 @@
  * the host's rule; the `hostDataRoot` comparison additionally proves the
  * resolved path tracks that resolver rather than a coincidence of one machine.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -22,6 +23,28 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "config-path-probe.ts");
 const PLUGIN_NAME = "omp-classifier";
 const CONFIG_FILE = "omp-classifier.json";
+
+/** Temp roots the case that is running made, removed when it ends. Every case
+ *  needs a fresh home (the probe's resolver reads it at load), so a run that
+ *  keeps them accumulates a directory per case per run. */
+let MADE: string[] = [];
+
+afterEach(() => {
+	if (MADE.length === 0) return;
+	// `trash` where the CLI exists, `rm -rf` where it does not: the same
+	// convention the repo's other temp-dir tests use. One call for the case's
+	// roots rather than one per root.
+	const roots = MADE.map(root => JSON.stringify(root)).join(" ");
+	execSync(`trash ${roots} 2>/dev/null || rm -rf ${roots}`);
+	MADE = [];
+});
+
+/** A fresh temp root, removed when its case ends. */
+function tempRoot(prefix: string): string {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	MADE.push(root);
+	return root;
+}
 
 interface Paths {
 	configPath: string;
@@ -49,13 +72,13 @@ function resolveWith(env: Record<string, string>): Paths {
 
 /** A fresh home plus case env vars, so no case can read another's fixtures. */
 function env(extra: Record<string, string> = {}): { home: string; vars: Record<string, string> } {
-	const home = fs.mkdtempSync(path.join(os.tmpdir(), "omp-config-path-home-"));
+	const home = tempRoot("omp-config-path-home-");
 	return { home, vars: { HOME: home, ...extra } };
 }
 
 /** A temp XDG root, with `$XDG_DATA_HOME/omp` created when `migrated`. */
 function xdgRoot(migrated: boolean): string {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-config-path-xdg-"));
+	const root = tempRoot("omp-config-path-xdg-");
 	if (migrated) fs.mkdirSync(path.join(root, "omp"), { recursive: true });
 	return root;
 }
@@ -136,7 +159,7 @@ describe("classifier paths follow the host directory resolver", () => {
 
 	test("OMP_JEV_CONFIG still overrides everything", () => {
 		const { vars } = env({ OMP_PROFILE: "work", PI_CONFIG_DIR: ".omp-alt" });
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-config-path-override-"));
+		const dir = tempRoot("omp-config-path-override-");
 		const override = path.join(dir, CONFIG_FILE);
 		const paths = resolveWith({ ...vars, OMP_JEV_CONFIG: override });
 		expect(paths.configPath).toBe(override);
@@ -144,5 +167,25 @@ describe("classifier paths follow the host directory resolver", () => {
 		// dir and find the config, the decision log and the status report there.
 		expect(paths.dataDir).toBe(dir);
 		expect(paths.decisionsLogPath).toBe(path.join(dir, "decisions.jsonl"));
+	});
+});
+
+/**
+ * The teardown, seen from inside: bun runs a file's cases in declaration order,
+ * so the second case can look at what the first one left. Nine cases above each
+ * make a home and a couple make an XDG root, and a run that kept them would
+ * leave one directory per case per run behind.
+ */
+describe("temp roots do not accumulate", () => {
+	let previous: string | undefined;
+
+	test("a case's root is there while the case runs", () => {
+		previous = env().home;
+		expect(fs.existsSync(previous)).toBe(true);
+	});
+
+	test("the root the case before this one made is gone", () => {
+		expect(previous).toBeDefined();
+		expect(fs.existsSync(previous as string)).toBe(false);
 	});
 });

@@ -10,6 +10,11 @@
  * (`eval/corpus/history.jsonl`, ~19k distinct commands), and this script is
  * that measurement.
  *
+ * The gate it prints has two halves and needs both: a clear share above 30% of
+ * the volume, and a safety half that is verified rather than assumed — no
+ * cleared row refused by the log or a label, and no cleared row without
+ * evidence either way. An unlabeled row is not a pass.
+ *
  *   bun eval/recognizer-measure.ts
  *   bun eval/recognizer-measure.ts --corpus eval/corpus/adversarial.jsonl
  *   bun eval/recognizer-measure.ts --variant core --rows
@@ -29,10 +34,18 @@
  * Two things it states rather than hides:
  *
  *   - a cleared row with no log line and no label is UNLABELED. It is counted
- *     as neither a pass nor a miss: the corpus cannot answer for it.
- *   - the log stores commands redacted and truncated to 120 characters, so the
- *     join key is that same transform on the corpus side; a link found through
- *     the truncation prefix is reported separately.
+ *     as neither a pass nor a miss, and it blocks the gate: a GO needs the
+ *     safety half verified, so a share nothing can check is not a share the
+ *     issue's gate may accept.
+ *   - the log stores commands redacted and cut to 120 characters, so the join
+ *     key is that same transform on the corpus side; a command longer than the
+ *     cut joins only through a prefix, which is reported and counted as no
+ *     evidence at all (a different suffix stores the same key).
+ *
+ * The taint is another input the corpus cannot supply: a mined row has no
+ * session around it, so every call says `"unknown"`, and a shape that expands
+ * a variable does not clear (`echo $CAPTURED` after a secret capture is the
+ * case the recognizer's taint input exists for).
  *
  * Command text printed here is redacted and truncated, the same rule the
  * decisions log itself follows (#71): real history carries private paths,
@@ -42,7 +55,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { decisionsLogPath, type DecisionRecord } from "../index";
 import { redactSecrets } from "../redact";
-import { type RoutineRule, type RoutineVariant, ROUTINE_VERBS, SEARCH_VERBS, recognizeRoutineCommand } from "../recognizer";
+import { type RoutineRule, type RoutineVariant, ROUTINE_VERBS, SEARCH_VERBS, type SessionTaint, recognizeRoutineCommand } from "../recognizer";
 import { parseShell, verbOf } from "../shell-ast";
 import { type DecisionLog, readDecisionLog } from "./live-report";
 
@@ -66,8 +79,6 @@ interface LogLink {
 	layers: Set<string>;
 	verdicts: Set<string>;
 	reasonCodes: Set<string>;
-	/** Linked through a 120-character prefix rather than an exact key. */
-	prefix: boolean;
 	/** One line, redacted, for the report's example rows. */
 	sample: string;
 }
@@ -77,10 +88,24 @@ type Safety = "pass" | "miss" | "unlabeled";
 
 /** What the log said about one cleared row, for the outcome histogram: every
  *  outcome any of its lines carries, or the row's own label when the corpus has
- *  one, or `unlabeled` when nothing does. */
-type ClearedOutcome = LogOutcome | "label-allow" | "label-ask" | "no-record";
+ *  one, or `unlabeled` when nothing does. A row that joined the log only
+ *  through the 120-character cut gets its own bucket: the line it found is
+ *  about a command that shares its first 120 characters, not about this one. */
+type ClearedOutcome = LogOutcome | "label-allow" | "label-ask" | "no-record" | "cut-ambiguous";
 
 const MAX_LOG_CMD = 120;
+
+/** The character the log's writer appends when it had to cut a command
+ *  (`truncated`, index.ts): a stored key that carries it holds only the first
+ *  120 characters of the command it came from. */
+const CUT_MARK = "…";
+
+/** The corpus carries no session taint: a row has a command and a count, and
+ *  nothing about what an earlier command in that session captured. So every
+ *  call says "unknown", which is not the same as "nothing was captured" —
+ *  with an empty list, `echo $CAPTURED` after a secret capture would clear
+ *  here and inflate the measured share with a shape the real session refuses. */
+const CORPUS_TAINT: SessionTaint = "unknown";
 
 /** The decisions.jsonl writer's own transform (#71): a command stored in the
  *  log has had continuations joined, whitespace flattened, secrets redacted
@@ -127,33 +152,48 @@ const ALLOW_OUTCOMES: readonly LogOutcome[] = ["auto-allowed", "allowed-by-layer
  *  one, otherwise the log — and "unlabeled" when neither can answer, which is
  *  a third state rather than a silent pass. A row is a miss as soon as one log
  *  line refused that command; it is a pass when a line allowed it and none
- *  refused. */
-function safetyOf(row: { label?: "allow" | "ask" }, link: LogLink | undefined): Safety {
+ *  refused. A row whose only link is the log's 120-character cut is unlabeled:
+ *  the stored key is a prefix, and a different suffix would carry it. */
+function safetyOf(row: { label?: "allow" | "ask" }, join: LogJoin | undefined): Safety {
 	if (row.label !== undefined) return row.label === "allow" ? "pass" : "miss";
-	if (link === undefined) return "unlabeled";
+	if (join === undefined || join.cut) return "unlabeled";
+	const { link } = join;
 	if (REFUSAL_OUTCOMES.some(outcome => link.outcomes.has(outcome))) return "miss";
 	if (ALLOW_OUTCOMES.some(outcome => link.outcomes.has(outcome))) return "pass";
 	return "unlabeled";
 }
 
-/** Index the log by command text, with a prefix index for the truncated keys,
- *  because a stored key that is 120 characters long may be a prefix of a
- *  longer command the corpus still holds in full. */
-function indexLog(lines: readonly DecisionRecord[]): { byCmd: Map<string, LogLink>; byPrefix: Map<string, LogLink[]> } {
+/** What the log says about one corpus command, and how it was asked for. Only
+ *  an exact key is evidence: `cut` marks a join that went through the log's
+ *  120-character cut, where the stored text is a prefix of this command rather
+ *  than the whole of it. */
+interface LogJoin {
+	link: LogLink;
+	/** The key is the first 120 characters of this command, and this command is
+	 *  longer than that: a different suffix stores the same key. */
+	cut: boolean;
+}
+
+/** Index the log by command text, with a second index for the keys its writer
+ *  had to cut, because those can only ever be answered as prefixes. A key is
+ *  cut when the writer marked it, or when it is exactly 120 characters long:
+ *  at that length it is the whole of one command and the beginning of any
+ *  longer one, and the two are not told apart by the text alone. */
+function indexLog(lines: readonly DecisionRecord[]): { byCmd: Map<string, LogLink>; byCut: Map<string, Array<{ key: string; link: LogLink }>> } {
 	const byCmd = new Map<string, LogLink>();
-	const byPrefix = new Map<string, LogLink[]>();
+	const byCut = new Map<string, Array<{ key: string; link: LogLink }>>();
 	for (const line of lines) {
 		const key = line.cmd;
 		if (typeof key !== "string" || key === "") continue;
 		let link = byCmd.get(key);
 		if (link === undefined) {
-			link = { lines: 0, outcomes: new Set(), layers: new Set(), verdicts: new Set(), reasonCodes: new Set(), prefix: false, sample: printable(line.cmd) };
+			link = { lines: 0, outcomes: new Set(), layers: new Set(), verdicts: new Set(), reasonCodes: new Set(), sample: printable(key) };
 			byCmd.set(key, link);
-			if (key.length === MAX_LOG_CMD) {
-				const short = key.slice(0, 100);
-				const bucket = byPrefix.get(short);
-				if (bucket === undefined) byPrefix.set(short, [link]);
-				else bucket.push(link);
+			const prefix = key.endsWith(CUT_MARK) ? key.slice(0, -1) : key;
+			if (prefix.length >= MAX_LOG_CMD) {
+				const bucket = byCut.get(prefix.slice(0, 100));
+				if (bucket === undefined) byCut.set(prefix.slice(0, 100), [{ key: prefix, link }]);
+				else bucket.push({ key: prefix, link });
 			}
 		}
 		link.lines++;
@@ -162,21 +202,21 @@ function indexLog(lines: readonly DecisionRecord[]): { byCmd: Map<string, LogLin
 		if (line.verdict !== null && line.verdict !== undefined) link.verdicts.add(line.verdict);
 		if (typeof line.reasonCode === "string") link.reasonCodes.add(line.reasonCode);
 	}
-	return { byCmd, byPrefix };
+	return { byCmd, byCut };
 }
 
-function linkOf(index: { byCmd: Map<string, LogLink>; byPrefix: Map<string, LogLink[]> }, command: string): LogLink | undefined {
+function linkOf(index: { byCmd: Map<string, LogLink>; byCut: Map<string, Array<{ key: string; link: LogLink }>> }, command: string): LogJoin | undefined {
 	const form = logForm(command);
-	const direct = index.byCmd.get(form) ?? index.byCmd.get(form.slice(0, MAX_LOG_CMD));
-	if (direct !== undefined) return direct;
-	const bucket = index.byPrefix.get(form.slice(0, 100));
+	const exact = index.byCmd.get(form);
+	if (exact !== undefined) return { link: exact, cut: false };
+	// Longer than the log's cut: no key can hold this command whole, so a key
+	// that matches its first 120 characters matches only that much. Reported as
+	// a join, counted as nothing.
+	if (form.length <= MAX_LOG_CMD) return undefined;
+	const bucket = index.byCut.get(form.slice(0, 100));
 	if (bucket === undefined) return undefined;
-	// A truncated key links only when it really is a prefix of this command.
 	for (const candidate of bucket) {
-		if (form.startsWith(candidate.sample)) {
-			candidate.prefix = true;
-			return candidate;
-		}
+		if (form.startsWith(candidate.key)) return { link: candidate.link, cut: true };
 	}
 	return undefined;
 }
@@ -187,8 +227,9 @@ interface VariantTally {
 	clearedCalls: number;
 	/** Cleared rows whose command text was found in the decision log. */
 	linked: number;
-	/** ... of those, linked through the 120-character truncation prefix. */
-	linkedByPrefix: number;
+	/** ... of those, joined only through the log's 120-character cut, which is
+	 *  a prefix of the command rather than the command. */
+	linkedByCut: number;
 	/** First-decline attribution: rows and calls, per rule. */
 	first: Map<RoutineRule, { rows: number; calls: number; reasons: Map<string, number> }>;
 	/** Rows where the rule declined at all (rules after a `segments` decline do
@@ -226,13 +267,36 @@ const RULES: readonly RoutineRule[] = [
 	"expansion", "redirect", "assignment", "flags", "secret-path", "floor",
 ];
 
+const pct = (part: number, whole: number): string => (whole === 0 ? "n/a" : `${((part / whole) * 100).toFixed(1)}%`);
+
+/** The issue's gate, both halves at once: the clear share has to be above 30%
+ *  of the volume the gate sees, and the safety half has to be *verified* — no
+ *  cleared row the log or a label refused, and no cleared row whose safety
+ *  nothing can answer for.
+ *
+ *  The second requirement is what keeps a GO honest. An unlabeled row is not a
+ *  pass: it is a row this corpus cannot check at all (no decision line, no
+ *  authored label, or a line that only matches its first 120 characters), and
+ *  a measurement that counted those as clear would report GO on a share it
+ *  never verified. Fail closed: the gate says NO-GO and names what is missing. */
+function gateOf(tally: VariantTally, calls: number, logRead: boolean): { go: boolean; why: string[] } {
+	const why: string[] = [];
+	if (!(tally.clearedCalls / calls > 0.3)) why.push(`volume ${pct(tally.clearedCalls, calls)} is not above 30.0%`);
+	if (tally.safety.miss.rows > 0) why.push(`${tally.safety.miss.rows} cleared row(s) were refused by the log or an allow-label`);
+	if (tally.safety.unlabeled.rows > 0) {
+		const cut = tally.linkedByCut > 0 ? `, ${tally.linkedByCut} of them joined the log only through its 120-character cut` : "";
+		why.push(`${tally.safety.unlabeled.rows} cleared row(s) carry no safety evidence${cut}${logRead ? "" : " (no decision log was read)"}`);
+	}
+	return { go: why.length === 0, why };
+}
+
 function emptyTally(variant: RoutineVariant): VariantTally {
 	return {
 		variant,
 		clearedRows: 0,
 		clearedCalls: 0,
 		linked: 0,
-		linkedByPrefix: 0,
+		linkedByCut: 0,
 		first: new Map(RULES.map(rule => [rule, { rows: 0, calls: 0, reasons: new Map<string, number>() }])),
 		any: new Map(RULES.map(rule => [rule, 0])),
 		safety: { pass: { rows: 0, calls: 0 }, miss: { rows: 0, calls: 0 }, unlabeled: { rows: 0, calls: 0 } },
@@ -315,7 +379,7 @@ async function main(): Promise<void> {
 				tally.ceilingRows++;
 				tally.ceilingCalls += count;
 			}
-			const verdict = recognizeRoutineCommand(row.command, { variant: tally.variant, taintedVars: [] });
+			const verdict = recognizeRoutineCommand(row.command, { variant: tally.variant, taintedVars: CORPUS_TAINT });
 			for (const rule of verdict.declines) tally.any.set(rule, (tally.any.get(rule) ?? 0) + 1);
 			const first = verdict.declinedBy;
 			if (first !== undefined) {
@@ -330,21 +394,24 @@ async function main(): Promise<void> {
 			}
 			tally.clearedRows++;
 			tally.clearedCalls += count;
-			const link = row.label === undefined ? linkOf(index, row.command) : undefined;
-			if (link !== undefined) {
+			const join = row.label === undefined ? linkOf(index, row.command) : undefined;
+			if (join !== undefined) {
 				tally.linked++;
-				if (link.prefix) tally.linkedByPrefix++;
+				if (join.cut) tally.linkedByCut++;
 			}
-			const resolved = safetyOf(row, link);
+			const resolved = safetyOf(row, join);
 			tally.safety[resolved].rows++;
 			tally.safety[resolved].calls += count;
+			const link = join?.link;
 			if (row.label !== undefined) {
 				const bucket: ClearedOutcome = row.label === "allow" ? "label-allow" : "label-ask";
 				tally.outcomeHistogram.set(bucket, (tally.outcomeHistogram.get(bucket) ?? 0) + 1);
-			} else if (link === undefined) {
+			} else if (join === undefined) {
 				tally.outcomeHistogram.set("no-record", (tally.outcomeHistogram.get("no-record") ?? 0) + 1);
+			} else if (join.cut) {
+				tally.outcomeHistogram.set("cut-ambiguous", (tally.outcomeHistogram.get("cut-ambiguous") ?? 0) + 1);
 			} else {
-				for (const outcome of link.outcomes) tally.outcomeHistogram.set(outcome, (tally.outcomeHistogram.get(outcome) ?? 0) + 1);
+				for (const outcome of join.link.outcomes) tally.outcomeHistogram.set(outcome, (tally.outcomeHistogram.get(outcome) ?? 0) + 1);
 			}
 			if (resolved === "miss") {
 				if (link !== undefined && link.verdicts.has("UNSAFE")) tally.missUnsafe++;
@@ -356,10 +423,10 @@ async function main(): Promise<void> {
 		}
 	}
 
-	const pct = (part: number, whole: number): string => (whole === 0 ? "n/a" : `${((part / whole) * 100).toFixed(1)}%`);
 	console.log(`corpus      ${corpusPath}`);
 	console.log(`rows        ${rows.length} distinct, ${calls} weighted calls`);
 	console.log(`indexer     ${log.lines.length} decision lines${log.malformed.length > 0 ? `, ${log.malformed.length} unreadable` : ""}${logNote === "" ? "" : ` — ${logNote}`}`);
+	console.log(`taint       ${CORPUS_TAINT} — a corpus row carries no session, so a shape that expands a variable cannot clear; "unknown" is not "nothing was captured"`);
 	console.log("");
 
 	for (const tally of tallies) {
@@ -369,11 +436,11 @@ async function main(): Promise<void> {
 		console.log(`ceiling (one segment + a listed verb, every other rule ignored): ${tally.ceilingRows}/${rows.length} rows = ${pct(tally.ceilingRows, rows.length)}, ${tally.ceilingCalls}/${calls} calls = ${pct(tally.ceilingCalls, calls)}`);
 		console.log(`safety: pass=${tally.safety.pass.rows} rows (${tally.safety.pass.calls} calls), miss=${tally.safety.miss.rows} rows (${tally.safety.miss.calls} calls), unlabeled=${tally.safety.unlabeled.rows} rows (${tally.safety.unlabeled.calls} calls)`);
 		console.log(`miss severity: ${tally.missUnsafe} carry an UNSAFE verdict, ${tally.missDenied} were denied by a human, ${tally.misses.length - tally.missDenied} were blocked by a non-verdict layer, a headless session or an outage`);
-		console.log(`label coverage: ${tally.linked}/${tally.clearedRows} cleared rows found in the log${tally.linkedByPrefix > 0 ? ` (${tally.linkedByPrefix} through the 120-char prefix)` : ""}; the rest carry no verdict anywhere and count as neither pass nor miss`);
+		console.log(`safety evidence: ${tally.linked}/${tally.clearedRows} cleared rows found in the log${tally.linkedByCut > 0 ? `, ${tally.linkedByCut} of them only through its 120-character cut (a prefix: a different suffix would store the same key)` : ""}; an unlabeled row is not a pass and blocks the gate`);
 		const histogram = [...tally.outcomeHistogram.entries()].sort((a, b) => b[1] - a[1]);
 		console.log(`what the record says about cleared rows (a row can carry more than one outcome): ${histogram.length === 0 ? "nothing" : histogram.map(([outcome, rows]) => `${outcome}=${rows}`).join(", ")}`);
-		const gate = tally.clearedCalls / calls > 0.3 && tally.safety.miss.rows === 0;
-		console.log(`gate: ${gate ? "GO" : "NO-GO"} — needs >30.0% of volume and zero allow-labeled misses`);
+		const gate = gateOf(tally, calls, logNote === "");
+		console.log(`gate: ${gate.go ? "GO" : `NO-GO — ${gate.why.join("; ")}`} — needs >30.0% of volume, zero refused rows and zero unverified rows`);
 		console.log("");
 		console.log("first-decline attribution (where the non-cleared volume goes):");
 		for (const rule of RULES) {
@@ -406,10 +473,10 @@ async function main(): Promise<void> {
 		if (values.rows === true) {
 			console.log("cleared rows:");
 			for (const row of rows) {
-				const verdict = recognizeRoutineCommand(row.command, { variant: tally.variant, taintedVars: [] });
+				const verdict = recognizeRoutineCommand(row.command, { variant: tally.variant, taintedVars: CORPUS_TAINT });
 				if (!verdict.routine) continue;
-				const link = row.label === undefined ? linkOf(index, row.command) : undefined;
-				console.log(`  ${safetyOf(row, link).padEnd(9)} ${String(row.count ?? 1).padStart(4)} ${printable(row.command)}`);
+				const join = row.label === undefined ? linkOf(index, row.command) : undefined;
+				console.log(`  ${safetyOf(row, join).padEnd(9)} ${String(row.count ?? 1).padStart(4)} ${printable(row.command)}`);
 			}
 			console.log("");
 		}

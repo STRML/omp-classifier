@@ -16,21 +16,22 @@
  */
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
-import { ROUTINE_VERBS, SEARCH_VERBS, type RoutineRule, type RoutineVariant, recognizeRoutineCommand } from "../recognizer";
+import { ROUTINE_VERBS, SEARCH_VERBS, type RoutineRule, type RoutineVariant, type SessionTaint, recognizeRoutineCommand } from "../recognizer";
 
-const verdict = (command: string, variant: RoutineVariant = "core", taintedVars: readonly string[] = []) =>
+const verdict = (command: string, variant: RoutineVariant = "core", taintedVars: SessionTaint = []) =>
 	recognizeRoutineCommand(command, { variant, taintedVars });
 
-const clears = (command: string, variant: RoutineVariant = "core", taintedVars: readonly string[] = []): boolean =>
+const clears = (command: string, variant: RoutineVariant = "core", taintedVars: SessionTaint = []): boolean =>
 	verdict(command, variant, taintedVars).routine;
 
-const ruleOf = (command: string, variant: RoutineVariant = "core"): RoutineRule | undefined => verdict(command, variant).declinedBy;
+const ruleOf = (command: string, variant: RoutineVariant = "core", taintedVars: SessionTaint = []): RoutineRule | undefined =>
+	verdict(command, variant, taintedVars).declinedBy;
 
 /** A representative invocation of every verb on the read-only list, so a verb
  *  added to the table without its own clear-shape test fails here. */
 const VERB_SAMPLE: Record<string, string> = {
 	ls: "ls", cat: "cat README.md", head: "head -n 5 README.md", tail: "tail -5 README.md",
-	wc: "wc -l README.md", pwd: "pwd", which: "which node", echo: "echo hi", env: "env",
+	wc: "wc -l README.md", pwd: "pwd", which: "which node", echo: "echo hi",
 	date: "date", stat: "stat README.md", file: "file README.md", du: "du -sh .", df: "df -h",
 	git: "git status", find: "find . -name '*.ts'", grep: "grep -rn TODO src",
 };
@@ -46,8 +47,17 @@ describe("the read-only verb list", () => {
 
 	test("the list is the issue's list, not a wider one", () => {
 		expect(Object.keys(ROUTINE_VERBS).sort()).toEqual([
-			"cat", "date", "df", "du", "echo", "env", "file", "git", "head", "ls", "pwd", "stat", "tail", "wc", "which",
+			"cat", "date", "df", "du", "echo", "file", "git", "head", "ls", "pwd", "stat", "tail", "wc", "which",
 		]);
+	});
+
+	test("env is not a read: bare, it prints every variable, secrets included", () => {
+		for (const command of ["env", "env -0", "env FOO=1 cmd", "env ls", "env $TOKEN"]) {
+			expect(clears(command, "search"), command).toBe(false);
+		}
+		expect(ruleOf("env", "search")).toBe("verb");
+		expect(ruleOf("env -0", "search")).toBe("verb");
+		expect(verdict("env", "search").reasons[0]).toContain("not on the read-only list");
 	});
 
 	test("find and grep clear only in the search variant", () => {
@@ -213,6 +223,20 @@ describe("sensitive paths, keychains and the floor", () => {
 		expect(clears("echo $CAPTURED", "search", ["CAPTURED"])).toBe(false);
 		expect(verdict("echo $CAPTURED", "search", ["CAPTURED"]).declinedBy).toBe("floor");
 	});
+
+	test("a session whose taint is unknown is not an empty one", () => {
+		// A corpus, a replayed log, a fresh process: none of them can say what
+		// earlier commands captured. "unknown" is that state, and it must not
+		// read as "nothing was captured" — every expansion may print a captured
+		// secret, so the echo exemption is gone.
+		expect(clears("echo $CAPTURED", "search", "unknown")).toBe(false);
+		expect(ruleOf("echo $CAPTURED", "search", "unknown")).toBe("expansion");
+		expect(verdict("echo $CAPTURED", "search", "unknown").reasons[0]).toContain("taint is unknown");
+		// A shape with nothing to expand knows nothing more to fear.
+		expect(clears("echo hi", "core", "unknown")).toBe(true);
+		expect(clears("git log --oneline", "core", "unknown")).toBe(true);
+		expect(clears("cat README.md", "search", "unknown")).toBe(true);
+	});
 });
 
 describe("redirects, assignments and flags", () => {
@@ -245,7 +269,7 @@ describe("redirects, assignments and flags", () => {
 	test("a flag that writes or runs something never clears", () => {
 		for (const command of [
 			"ls --output=text", "cat --write=out file", "ls --exec=rm", "cat --in-place file",
-			"env FOO=1 cmd", "env ls", "date -s 20200101", "date --set=2020-01-01", "file -C -m magic",
+			"date -s 20200101", "date --set=2020-01-01", "file -C -m magic",
 		]) {
 			expect(clears(command, "search"), command).toBe(false);
 			expect(ruleOf(command, "search"), command).toBe("flags");
