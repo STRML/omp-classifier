@@ -191,10 +191,11 @@ export interface JudgeBatteryDeadlineOptions extends JudgeBatteryOptions {
  * reasoned dialog, never into a bypass.
  *
  * Listening stops at `min(2 x timeoutMs, 30s)` past the deadline, or as soon as
- * the caller cancels, and either one aborts the request. A cancel leaves the
- * window timer armed, because it can still fire: it then aborts an already
- * settled request and resolves nothing twice, so no handle has to be kept just
- * to disarm it.
+ * the caller cancels, and either one aborts the request and disarms the window.
+ * The window timer is kept in a handle for that reason: a cancel that left it
+ * armed would hold the process's event loop for up to 30 seconds after a
+ * decision that is already final (the headless path and a dialog the human
+ * answered both cancel), which is a resource leak with nothing to show for it.
  */
 export async function judgeBatteryUnderDeadline(options: JudgeBatteryDeadlineOptions): Promise<BatteryOutcome> {
 	const { timeoutMs, ...request } = options;
@@ -203,6 +204,9 @@ export async function judgeBatteryUnderDeadline(options: JudgeBatteryDeadlineOpt
 	const { promise: deadlineReached, resolve: reachDeadline } = Promise.withResolvers<undefined>();
 	const { promise: late, resolve: settleLate } = Promise.withResolvers<JevAnswers | undefined>();
 	const deadlineTimer = setTimeout(() => reachDeadline(undefined), timeoutMs);
+	/** The late listen window, armed only once the deadline has fired. Held so
+	 *  both ways of ending the listen can disarm it. */
+	let windowTimer: typeof deadlineTimer | undefined;
 	let lateSettled = false;
 	const settle = (answers: JevAnswers | undefined): void => {
 		if (lateSettled) return;
@@ -216,8 +220,12 @@ export async function judgeBatteryUnderDeadline(options: JudgeBatteryDeadlineOpt
 		() => settle(undefined),
 	);
 	// One body for both ways listening ends, so a cancel and a closed window
-	// cannot drift apart.
+	// cannot drift apart. Clearing the window here is what makes a cancel a
+	// cancel: the timer itself calls this, and a clear on an already-fired
+	// timer — or on the undefined handle before the window is armed — is a
+	// no-op by the timers spec.
 	const stopListening = (): void => {
+		clearTimeout(windowTimer);
 		controller.abort();
 		settle(undefined);
 	};
@@ -232,7 +240,7 @@ export async function judgeBatteryUnderDeadline(options: JudgeBatteryDeadlineOpt
 		clearTimeout(deadlineTimer);
 		return outcome;
 	}
-	setTimeout(stopListening, Math.min(2 * timeoutMs, MAX_LATE_LISTEN_MS));
+	windowTimer = setTimeout(stopListening, Math.min(2 * timeoutMs, MAX_LATE_LISTEN_MS));
 	return outcome;
 }
 

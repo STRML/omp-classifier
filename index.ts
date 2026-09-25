@@ -284,6 +284,16 @@ const REFUSAL_CAP = 20;
 interface Grant {
 	normalizedTarget: string;
 	cwd: string;
+	/** The session's own directory at approval time, for the targets that can
+	 *  act in a second directory of their own (eval, issue #14): `cwd` above is
+	 *  the payload's spawn directory then, and this is where the payload's own
+	 *  process runs, reads and writes. The judge's cache key carries both
+	 *  directories for exactly that reason — a verdict earned under one pair
+	 *  must not be reused under another — and the grant is the same
+	 *  authorization over the same pair, so it carries both too. Absent for
+	 *  bash, whose one directory is `cwd` already (the host runs the whole
+	 *  command there). */
+	scopeCwd?: string;
 	ts: number;
 	/** User scope at approval time. A later restriction/revocation invalidates
 	 *  the grant, while ordinary tool evidence remains non-authorizing. */
@@ -2116,6 +2126,22 @@ function resolveSpawnCwdLiteral(raw: string, base: string): string | null {
  *  it names, is decided in one place — see evalSpawnCwd. */
 type EvalCwdArgument = { kind: "none" } | { kind: "value"; value: string } | { kind: "dynamic"; detail: string };
 
+/** One `cwd`/`chdir` key found in a call's own arguments, with the bracket
+ *  depth it sits at (so the outermost is the one that counts) and its offset in
+ *  the masked text (so an object spread written after it can be told apart from
+ *  one written before it). */
+interface EvalCwdKey {
+	depth: number;
+	at: number;
+	argument: EvalCwdArgument;
+}
+
+/** The same key narrowed to a readable literal: the shape a value check leaves
+ *  behind, for callers that need `.value` without asserting it. */
+interface EvalCwdLiteralKey extends EvalCwdKey {
+	argument: { kind: "value"; value: string };
+}
+
 /** The directory argument of a positional site (`Dir.chdir("/tmp")`,
  *  `` `ls`.cwd("/tmp") ``): the call's FIRST argument, read as one token. */
 function readPositionalCwd(masked: string, code: string, start: number, end: number): EvalCwdArgument {
@@ -2168,7 +2194,7 @@ function readKeyedCwd(masked: string, code: string, start: number, end: number):
 		// call's own brace is a property of its options object (`{ cwd: "/tmp" }`).
 		return atDepth === 0 || (atDepth === 1 && inBrace) ? { depth: atDepth, inBrace } : undefined;
 	};
-	const found: Array<{ depth: number; argument: EvalCwdArgument }> = [];
+	const found: EvalCwdKey[] = [];
 	for (const match of masked.slice(start, end).matchAll(/(?<![\w.$])(?:cwd|chdir)\b/gu)) {
 		const at = start + (match.index ?? 0);
 		const own = ownArgument(at);
@@ -2181,7 +2207,7 @@ function readKeyedCwd(masked: string, code: string, start: number, end: number):
 			let valueStart = cursor + 1;
 			while (valueStart < end && (masked[valueStart] === " " || masked[valueStart] === "\t")) valueStart += 1;
 			const raw = code.slice(valueStart, Math.max(valueStart, scanValueEnd(masked, valueStart, end))).trim();
-			found.push({ depth: own.depth, argument: raw === "" ? { kind: "dynamic", detail: `${match[0]}=` } : { kind: "value", value: raw } });
+			found.push({ depth: own.depth, at, argument: raw === "" ? { kind: "dynamic", detail: `${match[0]}=` } : { kind: "value", value: raw } });
 			continue;
 		}
 		// Key position only: `{ cwd }` is the shorthand form of the option,
@@ -2191,7 +2217,7 @@ function readKeyedCwd(masked: string, code: string, start: number, end: number):
 		const previous = before < start ? "" : masked[before];
 		const closer = masked[cursor] ?? "";
 		if (match[0] === "cwd" && own.inBrace && (previous === "{" || previous === ",") && (closer === "," || closer === "}")) {
-			found.push({ depth: own.depth, argument: { kind: "dynamic", detail: `{ ${match[0]} }` } });
+			found.push({ depth: own.depth, at, argument: { kind: "dynamic", detail: `{ ${match[0]} }` } });
 		}
 	}
 	if (found.length === 0) {
@@ -2204,16 +2230,59 @@ function readKeyedCwd(masked: string, code: string, start: number, end: number):
 		const spread = /\{\s*\.\.\.[^}]*\}/u.exec(args)?.[0] ?? /\*\*[\w$]*/u.exec(args)?.[0];
 		return spread ? { kind: "dynamic", detail: spread } : { kind: "none" };
 	}
+	// A spread can carry this call's own `cwd` key out of text the scan never
+	// reads, so a literal found first is not the last word: `cp.exec("x", {
+	// cwd: "/tmp", ...opts })` runs wherever `opts` says, and reporting the
+	// literal it saw first would name a directory this call does not run in —
+	// the one direction this scan may never fail in. The read is
+	// order-sensitive in the one language that has object spread (the last
+	// write wins), so only a spread AFTER the key can beat it; a `**`
+	// expansion is not readable either way (`f(cwd="/tmp", **opts)` is a
+	// TypeError when `opts` carries cwd and "/tmp" when it does not, and no
+	// text here says which). Only this call's own level counts: a spread
+	// inside a nested call's arguments (`env=build({ ...opts })`) is that
+	// call's, not this one's.
+	const spreads: Array<{ at: number; kwargs: boolean; detail: string }> = [];
+	for (const match of masked.slice(start, end).matchAll(/\.{3}|\*{2}/gu)) {
+		const at = start + (match.index ?? 0);
+		if (ownArgument(at) === undefined) continue;
+		// `2 ** 8` is an operator, not an expansion: an expansion starts where
+		// a value may start, never right after an operand.
+		const head = masked.slice(start, at).trimEnd();
+		const previous = head === "" ? "" : (head.at(-1) ?? "");
+		if (previous !== "" && !/[(\[{,;=]/u.test(previous)) continue;
+		const detail = masked.slice(at, Math.max(at + match[0].length, scanValueEnd(masked, at + match[0].length, end))).trim();
+		spreads.push({ at, kwargs: match[0] === "**", detail: truncated(detail === "" ? match[0] : detail, 60) });
+	}
 	const outermost = Math.min(...found.map(entry => entry.depth));
 	const atOutermost = found.filter(entry => entry.depth === outermost);
-	const values = atOutermost.filter(entry => entry.argument.kind === "value");
-	if (values.length === atOutermost.length && new Set(values.map(entry => (entry.argument as { value: string }).value)).size === 1) {
-		return atOutermost[0].argument;
+	const values = atOutermost.filter((entry): entry is EvalCwdLiteralKey => entry.argument.kind === "value");
+	if (values.length === atOutermost.length && new Set(values.map(entry => entry.argument.value)).size === 1) {
+		const chosen = atOutermost[0];
+		const overriding = spreads.find(spread => spread.kwargs || spread.at > chosen.at);
+		return overriding ? { kind: "dynamic", detail: overriding.detail } : chosen.argument;
 	}
 	// A computed value, or the same option set twice: either way there is no
 	// single directory this call is known to run in.
 	const dynamic = atOutermost.find(entry => entry.argument.kind === "dynamic");
 	return dynamic ? dynamic.argument : { kind: "dynamic", detail: "cwd set more than once" };
+}
+
+/** One spawn/chdir call the tables matched: its name and kind, the span of its
+ *  argument list (`argEnd` is -1 when that list never closes), where the call's
+ *  own text starts (for ordering it against the block spans around it), and
+ *  where a Ruby block opener after its arguments can sit. */
+interface EvalCwdSiteMatch {
+	name: string;
+	kind: "spawn" | "chdir";
+	positional: boolean;
+	argStart: number;
+	argEnd: number;
+	at: number;
+	/** For a parenthesized call, right after its closing paren; for a parenless
+	 *  one, the call's first argument token, because its `do` sits on the same
+	 *  line inside that span. -1 when the argument list does not close. */
+	blockFrom: number;
 }
 
 /** Every spawn/chdir call site the tables match, in source order, with the span
@@ -2227,12 +2296,13 @@ function readKeyedCwd(masked: string, code: string, start: number, end: number):
  *  spawn to the marker scan. Reading it with the wrong table would report the
  *  session directory for a spawn that names its own, which is the error this
  *  whole section exists to stop; a stray match costs one question instead. */
-function evalCwdSites(masked: string): Array<{ name: string; kind: "spawn" | "chdir"; positional: boolean; argStart: number; argEnd: number }> {
+function evalCwdSites(masked: string): EvalCwdSiteMatch[] {
 	const table = [...EVAL_CWD_SITES_JS, ...EVAL_CWD_SITES_PY, ...EVAL_CWD_SITES_RB];
-	const sites = new Map<number, { name: string; kind: "spawn" | "chdir"; positional: boolean; argStart: number; argEnd: number }>();
+	const sites = new Map<number, EvalCwdSiteMatch>();
 	for (const site of table) {
 		for (const match of masked.matchAll(new RegExp(site.pattern.source, `${site.pattern.flags.replace("g", "")}g`))) {
-			let open = (match.index ?? 0) + match[0].length;
+			const at = match.index ?? 0;
+			let open = at + match[0].length;
 			while (open < masked.length && (masked[open] === " " || masked[open] === "\t")) open += 1;
 			if (masked[open] !== "(") {
 				if (site.parenless !== true) continue;
@@ -2242,12 +2312,21 @@ function evalCwdSites(masked: string): Array<{ name: string; kind: "spawn" | "ch
 				// wrote no argument at all — the block IS the argument list, and
 				// an empty span says so instead of reading `do` as a directory.
 				const argStart = /^(?:do|then|end|\{)/u.test(masked.slice(open, argEnd).trimStart()) ? argEnd : open;
-				if (!sites.has(open)) sites.set(open, { name: site.name, kind: site.kind, positional: site.positional === true, argStart, argEnd });
+				if (!sites.has(open))
+					sites.set(open, { name: site.name, kind: site.kind, positional: site.positional === true, argStart, argEnd, at, blockFrom: open });
 				continue;
 			}
 			if (sites.has(open)) continue;
 			const close = scanGroupEnd(masked, open);
-			sites.set(open, { name: site.name, kind: site.kind, positional: site.positional === true, argStart: open + 1, argEnd: close === -1 ? -1 : close });
+			sites.set(open, {
+				name: site.name,
+				kind: site.kind,
+				positional: site.positional === true,
+				argStart: open + 1,
+				argEnd: close === -1 ? -1 : close,
+				at,
+				blockFrom: close === -1 ? -1 : close + 1,
+			});
 		}
 	}
 	return [...sites.values()].sort((a, b) => a.argStart - b.argStart);
@@ -2262,28 +2341,123 @@ const EVAL_SPAWN_CWD_HEADLINE = "unreadable spawn cwd";
  *  cannot tell. Exported for the test seam: the gate asks once per payload. */
 export type EvalSpawnCwd = { kind: "session" } | { kind: "literal"; cwd: string } | { kind: "opaque"; why: string };
 
+/** Ruby keywords that open a block of their own, whose closing token is an
+ *  `end`. `end` is in the list because the balance has to see closers too. */
+const RUBY_BLOCK_KEYWORD = /^(?:do|if|unless|while|until|case|begin|def|class|module|for|end)$/u;
+
+/**
+ * End (exclusive) of the Ruby block opening at `at` — the `do` keyword, or the
+ * `{` of a brace block — or -1 when this scan cannot place it.
+ *
+ * `end` is balanced against the keywords that open a block, so a nested `if` or
+ * `each do` inside the block does not close it early. A keyword opens a block
+ * only where a statement can start: a mid-expression `puts x if y` is a
+ * modifier that needs no `end`, and counting those would run the block past its
+ * real end and hand a spawn after it the wrong directory. The trailing `do` of
+ * `while x do`/`for x in y do` is that statement's own opener, not a second
+ * one. Anything the balance cannot place — an `end` with nothing open, or a
+ * keyword that never closes before the payload ends — reports -1, and the
+ * caller asks rather than guess a directory.
+ */
+function scanRubyBlockEnd(masked: string, at: number): number {
+	if (masked[at] === "{") {
+		const close = scanGroupEnd(masked, at);
+		return close === -1 ? -1 : close + 1;
+	}
+	let depth = 0;
+	for (const match of masked.slice(at).matchAll(/[A-Za-z_]\w*/gu)) {
+		const word = match[0];
+		if (!RUBY_BLOCK_KEYWORD.test(word)) continue;
+		const position = at + (match.index ?? 0);
+		if (word === "end") {
+			depth -= 1;
+			if (depth <= 0) return position + word.length;
+			continue;
+		}
+		// `while x do`/`for x in y do` spell one block two ways: the trailing
+		// `do` of such a line is that statement's own opener, not a second one.
+		const before = masked.slice(masked.lastIndexOf("\n", position - 1) + 1, position).trimEnd();
+		if (word === "do" && /^(?:while|until|for)\b/u.test(before)) continue;
+		// Every other `do` opens a block wherever it is written — `items.each do
+		// |item|`, and a block-taking call's own `do` after its `)`. The other
+		// keywords open one only where a statement can start: a mid-expression
+		// `puts x if y` is a modifier that needs no `end`, and counting those
+		// would run the block past its real end and hand a spawn written after
+		// it the directory of a block that is already over.
+		if (word !== "do" && before !== "" && !/[(,=;|&[{]$/u.test(before)) continue;
+		depth += 1;
+	}
+	return -1;
+}
+
+/** How a Ruby chdir call's directory change ends: for the rest of the payload
+ *  (`Dir.chdir("/tmp")`, no block), or for the block alone — Ruby restores the
+ *  previous directory when the block returns, so a spawn after the block runs
+ *  where the payload started, not where the block did. `unreadable` is the
+ *  fail-closed case: the block is there but its end cannot be placed, and a
+ *  directory this scan cannot bound is one it must not report. */
+type EvalChdirScope = { kind: "process" } | { kind: "block"; end: number } | { kind: "unreadable"; why: string };
+
+/**
+ * Read which directory state a Ruby chdir call leaves behind. The block opener
+ * is looked for on the call's own line and after its arguments: Ruby's `do` and
+ * `{` bind to the call they follow, and a bare hash argument cannot be mistaken
+ * for one here because the only caller is a chdir, which takes its directory as
+ * a single positional argument.
+ */
+function evalChdirScope(masked: string, site: EvalCwdSiteMatch): EvalChdirScope {
+	if (site.blockFrom === -1) return { kind: "unreadable", why: "the argument list does not close" };
+	// The call's own statement ends at its line, or at a `;`: a block opener
+	// written after either one belongs to the next statement, not to this call
+	// (`Dir.chdir("/tmp"); items.each do … end` moves the payload's directory
+	// for good, and that `do` is `each`'s).
+	const cuts = [masked.indexOf("\n", site.blockFrom), masked.indexOf(";", site.blockFrom), masked.length].filter(at => at !== -1);
+	const header = masked.slice(site.blockFrom, Math.min(...cuts));
+	const doAt = /(?<![\w$])do(?=[\s|]|$)/u.exec(header);
+	const braceAt = header.indexOf("{");
+	const doOffset = doAt === null ? -1 : site.blockFrom + (doAt.index ?? 0);
+	const braceOffset = braceAt === -1 ? -1 : site.blockFrom + braceAt;
+	if (doOffset === -1 && braceOffset === -1) return { kind: "process" };
+	const opener = braceOffset === -1 || (doOffset !== -1 && doOffset < braceOffset) ? doOffset : braceOffset;
+	const end = scanRubyBlockEnd(masked, opener);
+	return end === -1 ? { kind: "unreadable", why: "the block's end cannot be read" } : { kind: "block", end };
+}
+
 /**
  * Read the directory an eval payload spawns in, resolved against the session
  * directory it starts from. The payload's `language` label does not take part:
  * see evalCwdSites.
  *
- * Sites are walked in source order because `Dir.chdir("/tmp") do … end` moves
- * the directory for every site after it, and a relative literal resolves
- * against whatever directory is in effect at that point. Every spawn site is
- * counted, not just the ones that name a directory: a site with no cwd runs in
- * the directory in effect, which is a fact about the payload, not a guess. When
- * those facts disagree — one spawn in the session directory, another in `/` —
- * there is no single directory this payload runs in, and the answer is "ask",
- * not one of the two.
+ * Sites are walked in source order because a chdir moves the directory for the
+ * sites after it, and a relative literal resolves against whatever directory is
+ * in effect at that point. A Ruby `Dir.chdir("…") do … end` moves it for the
+ * block alone, so what it moved is kept for the sites the block contains and
+ * dropped at the first site past it; a `Dir.chdir("…")` with no block moves it
+ * for the rest of the payload. Every spawn site is counted, not just the ones
+ * that name a directory: a site with no cwd runs in the directory in effect,
+ * which is a fact about the payload, not a guess. When those facts disagree —
+ * one spawn in the session directory, another in `/` — there is no single
+ * directory this payload runs in, and the answer is "ask", not one of the two.
  */
 export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
 	const masked = maskCodeText(code);
 	const sites = evalCwdSites(masked);
 	if (sites.length === 0) return { kind: "session" };
 	let current = sessionCwd;
+	/** The chdir blocks still open at this point in the walk, innermost last. */
+	const blocks: Array<{ end: number; saved: string }> = [];
 	const perSite: string[] = [];
 	let opaque = "";
 	for (const site of sites) {
+		// The block is over once the walk reaches a site it does not contain:
+		// that site — and every one after it — runs in the directory the chdir
+		// found in place, not the one it moved to.
+		while (blocks.length > 0) {
+			const open = blocks[blocks.length - 1];
+			if (open.end > site.at) break;
+			blocks.pop();
+			current = open.saved;
+		}
 		if (site.argEnd === -1) {
 			if (opaque === "") opaque = `${site.name}: the argument list does not close`;
 			continue;
@@ -2313,10 +2487,31 @@ export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
 			if (opaque === "") opaque = `${site.name}: ${truncated(argument.value, 60)} does not name a directory`;
 			continue;
 		}
-		if (site.kind === "chdir") current = resolved;
-		else perSite.push(resolved);
+		if (site.kind === "chdir") {
+			const scope = evalChdirScope(masked, site);
+			if (scope.kind === "unreadable") {
+				if (opaque === "") opaque = `${site.name}: ${scope.why}`;
+				continue;
+			}
+			if (scope.kind === "block") blocks.push({ end: scope.end, saved: current });
+			current = resolved;
+		} else perSite.push(resolved);
 	}
 	if (opaque !== "") return { kind: "opaque", why: opaque };
+	// A chdir block the payload is still inside where its text ends is the
+	// directory of the spawns this table does not model — `Dir.chdir("/tmp") do
+	// \`ls\` end` is that payload — which is what the fallback below reads. A
+	// block that closed with code after it did not leave the payload there: the
+	// payload's own directory is the restored one, so `Dir.chdir("/tmp") { }`
+	// followed by \`ls\` spawns in the session directory, not in the empty
+	// block's. Trailing whitespace is not code, so the common `… end\n` spelling
+	// of a block that wraps the payload keeps its directory.
+	while (blocks.length > 0) {
+		const open = blocks[blocks.length - 1];
+		if (masked.slice(open.end).trim() === "") break;
+		blocks.pop();
+		current = open.saved;
+	}
 	// A chdir that moved the payload's own directory is also the directory of
 	// every spawn this table does not model (`Dir.chdir("/tmp") do \`ls\` end`):
 	// when no site named one, the payload's own directory is the answer.
@@ -3838,31 +4033,48 @@ function sessionGrants(sessionId: string): Grant[] {
 }
 
 /** Record a session grant: this command's target, in this exact directory,
- *  may run ungated for the rest of the session. */
-function addGrant(ctx: ExtensionContext, key: string, cwd: string, evidenceFingerprint?: string): void {
+ *  may run ungated for the rest of the session. `scopeCwd` is the second
+ *  directory the human's dialog put on screen for eval payloads that name a
+ *  spawn directory of their own; it is part of the grant's identity, so a
+ *  session that moves workspaces (`/move` rewrites ctx.cwd) cannot reuse an
+ *  authorization the human gave while looking at the old one. */
+function addGrant(ctx: ExtensionContext, key: string, cwd: string, evidenceFingerprint?: string, scopeCwd?: string): void {
 	try {
 		if (key === "") return;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const list = sessionGrants(sessionId);
-		// One grant per (target, directory): re-approving refreshes ts and moves
-		// the grant to newest instead of stacking duplicates.
-		const existing = list.findIndex(grant => grant.normalizedTarget === key && grant.cwd === cwd);
+		// One grant per (target, directory, scope directory): re-approving
+		// refreshes ts and moves the grant to newest instead of stacking
+		// duplicates.
+		const existing = list.findIndex(grant => grant.normalizedTarget === key && grant.cwd === cwd && grant.scopeCwd === scopeCwd);
 		if (existing !== -1) list.splice(existing, 1);
 		while (list.length >= GRANT_CAP) list.shift();
-		list.push({ normalizedTarget: key, cwd, ts: Date.now(), evidenceFingerprint });
+		list.push({ normalizedTarget: key, cwd, ts: Date.now(), evidenceFingerprint, ...(scopeCwd === undefined ? {} : { scopeCwd }) });
 	} catch {
 		// No session id, no grant; the caller's decision below is unchanged.
 	}
 }
 
-/** The session's grant for this command's target and directory, if any. */
-function matchingGrant(ctx: ExtensionContext, key: string, cwd: string, evidenceFingerprint?: string): Grant | undefined {
+/** The session's grant for this command's target and directories, if any. */
+function matchingGrant(
+	ctx: ExtensionContext,
+	key: string,
+	cwd: string,
+	evidenceFingerprint?: string,
+	scopeCwd?: string,
+): Grant | undefined {
 	try {
 		if (key === "") return undefined;
 		const cwdInput = cwd ?? "";
 		return grants
 			.get(ctx.sessionManager.getSessionId())
-			?.find(grant => grant.normalizedTarget === key && grant.cwd === cwdInput && grant.evidenceFingerprint === evidenceFingerprint);
+			?.find(
+				grant =>
+					grant.normalizedTarget === key &&
+					grant.cwd === cwdInput &&
+					grant.scopeCwd === scopeCwd &&
+					grant.evidenceFingerprint === evidenceFingerprint,
+			);
 	} catch {
 		return undefined;
 	}
@@ -4577,6 +4789,15 @@ export default function (pi: ExtensionAPI) {
 			// omission about who chose it. A literal that resolves OUTSIDE the
 			// session directory is shown exactly as resolved: never folded back.
 			details.push(`working directory: ${detailValue(target.cwd)}${target.spawnCwd === undefined ? "" : " (declared by the payload's spawn call)"}`);
+			// The second directory of an eval payload (issue #14): with a spawn
+			// directory declared, `working directory` above is that one, and the
+			// session's own directory is where the payload's own process reads
+			// and writes, so a relative write still lands there. It is part of
+			// what "Allow for session" covers, so it is on the line: a grant
+			// whose scope the human cannot see is a grant nobody approved.
+			if (target.spawnCwd !== undefined && sessionCwd !== undefined && !samePath(target.spawnCwd, sessionCwd)) {
+				details.push(`session directory: ${detailValue(sessionCwd)} (what this payload's own code runs in)`);
+			}
 		}
 		// 0 disables the deadline (host schema, tools/bash.ts), so "0s" would
 		// read as the exact opposite of what it does.
@@ -4862,6 +5083,11 @@ export default function (pi: ExtensionAPI) {
 				...(stale === "" ? {} : { staleCode: 1 as const }),
 				...(auditExtras.userMessageIds && auditExtras.userMessageIds.length > 0 ? { userMessageIds: auditExtras.userMessageIds } : {}),
 				...(auditExtras.floor ? { floor: auditExtras.floor } : {}),
+				// Same fields as the `audit` line above, spawn directory
+				// included: a late line is read as the verdict line that
+				// answered a dialog, and an audit reader must not have to guess
+				// which directory the payload named from the one it is in.
+				...(auditExtras.spawnCwd ? { spawnCwd: auditExtras.spawnCwd } : {}),
 			});
 
 		// Dry-run probe (issue #32): never open a dialog, never audit. When a
@@ -4901,6 +5127,14 @@ export default function (pi: ExtensionAPI) {
 			headline !== "critical pattern" && headline !== "environment override" && headline !== EVAL_SPAWN_CWD_HEADLINE;
 		const sessionGrantAvailable = grantKey !== "" && grantsHonoredAtLayer;
 		const persistentGrantAvailable = tool === "bash" && readClassifierConfig().persistentGrants && grantsHonoredAtLayer;
+		// An eval payload that declared a spawn directory of its own has two
+		// directories on the Details above, and its session grant covers both:
+		// "this directory" there would name half of what the human is agreeing
+		// to, so the option says which pair it means.
+		const sessionGrantDescription =
+			tool === "eval" && target.spawnCwd !== undefined && !samePath(target.spawnCwd, ctx.cwd)
+				? "This action, in both directories above, for the rest of the session"
+				: "This action, in this directory, for the rest of the session";
 		// The late-answer race (issue #62). The dialog the deadline opened keeps
 		// the judgment request alive, so a verdict that lands while the human is
 		// reading can still improve the answer in front of them:
@@ -4930,9 +5164,7 @@ export default function (pi: ExtensionAPI) {
 			`Run ${subject}? (${headline}${stale})\n${buildPermissionBody(target, shownReason, ctx.cwd)}`,
 			[
 				{ label: "Allow once", description: "This call only" },
-				...(sessionGrantAvailable
-					? [{ label: "Allow for session", description: "This action, in this directory, for the rest of the session" }]
-					: []),
+				...(sessionGrantAvailable ? [{ label: "Allow for session", description: sessionGrantDescription }] : []),
 				...(persistentGrantAvailable
 					? [{ label: "Always allow", description: "This exact command, in this directory, for 30 days (stored alongside omp-classifier.json)" }]
 					: []),
@@ -5021,7 +5253,13 @@ export default function (pi: ExtensionAPI) {
 			// is live, refusal memory never fires for this text+cwd — the human
 			// outvoted the model, once, for every session.
 			liftRefusals(ctx, target.command, target.cwd);
-			if (choice === "Allow for session") addGrant(ctx, grantKey, target.cwd, userScopeFingerprint);
+			// An eval grant covers BOTH directories: the payload's own spawn
+			// directory (target.cwd) and the session directory its own process
+			// runs in (ctx.cwd). Both were on the dialog the human answered, and
+			// both are part of the identity the next call has to match, so a
+			// session that moves workspaces cannot ride this grant into a
+			// directory nobody approved.
+			if (choice === "Allow for session") addGrant(ctx, grantKey, target.cwd, userScopeFingerprint, tool === "eval" ? ctx.cwd : undefined);
 			if (choice === "Always allow") addPersistentGrant(target.command, target.cwd);
 			audit(
 				"allow",
@@ -5305,8 +5543,11 @@ export default function (pi: ExtensionAPI) {
 			const cacheKey = JSON.stringify(["eval", config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, ctx.cwd, language, evalCode, reviewEvidenceFingerprint]);
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
-			// session off, so it must hold here too, not only for bash.
-			if (matchingGrant(ctx, normalizeEvalGrantTarget(evalCode), cwd, userScopeFingerprint)) {
+			// session off, so it must hold here too, not only for bash. The
+			// session directory rides along: the grant identity is the pair the
+			// judge's cache key uses, so the payload's relative work in ctx.cwd
+			// is authorized only in the workspace the human was shown.
+			if (matchingGrant(ctx, normalizeEvalGrantTarget(evalCode), cwd, userScopeFingerprint, ctx.cwd)) {
 				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, grant: "session" });
 				if (replay.decision === "allow") {
 					logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: replay.layer, why: "session grant", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields(), ...spawnField });

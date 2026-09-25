@@ -177,16 +177,18 @@ interface LateRun {
 	tool: Promise<unknown>;
 }
 
-/** Start a run whose judgment cannot answer inside the deadline. `answerMs` is
- *  the fixture judge's delay, so the caller decides whether the answer lands
- *  inside the listen window (`LATE_ANSWER_MS`) or outside it (5s). Returns at
- *  the point the deadline has fired: the dialog is up, the answer is still
- *  owed, and the listen window is open. */
+/** Start a run whose judgment cannot answer inside the deadline. `payload` is
+ *  the bash command, or the code cell of an `eval` run. `answerMs` is the
+ *  fixture judge's delay, so the caller decides whether the answer lands inside
+ *  the listen window (`LATE_ANSWER_MS`) or outside it (5s). Returns at the
+ *  point the deadline has fired: the dialog is up, the answer is still owed,
+ *  and the listen window is open. */
 async function timeoutRun(
-	command: string,
+	payload: string,
 	sessionId: string,
 	answers: JevFixtureAnswers[],
 	answerMs: number,
+	toolName: "bash" | "eval" = "bash",
 ): Promise<LateRun> {
 	writeConfig({ timeoutMs: DEADLINE_MS });
 	jest.useFakeTimers();
@@ -195,7 +197,8 @@ async function timeoutRun(
 	setJevDelay(answerMs);
 	setJevAnswers(answers);
 	const dialog = deferredCtx(sessionId);
-	const tool = fire("tool_call", makeEvent(command), dialog.ctx);
+	const event = toolName === "eval" ? { toolName, input: { code: payload, language: "js" } } : makeEvent(payload);
+	const tool = fire("tool_call", event, dialog.ctx);
 	await until(() => modelCalls.length > 0);
 	jest.advanceTimersByTime(DEADLINE_MS + 5);
 	await until(() => dialog.opened() > 0);
@@ -440,5 +443,85 @@ describe("a judgment that answers after its deadline (issue #62)", () => {
 		expect(dialog.opened()).toBe(0);
 		expect(signalOf()?.aborted).toBe(false);
 		expect(readDecisions().map(line => line.layer)).toEqual(["verdict"]);
+	});
+
+	test("a late verdict on an eval payload carries the payload's spawn directory", async () => {
+		seq += 1;
+		const code = `const cp = require("child_process");\ncp.exec("rm -rf .", { cwd: "/tmp/late-spawn" });`;
+		const { dialog, tool } = await timeoutRun(code, `late-eval-${seq}`, [jevUnsafeAnswer()], LATE_ANSWER_MS, "eval");
+
+		jest.advanceTimersByTime(20);
+		await until(() => lateLines().length > 0);
+
+		// The late line is this dialog's record of the answer that arrived
+		// behind the deadline, and the verdict line above it already says which
+		// directory the payload declared. A late line without it makes the pair
+		// disagree about the directory the gate judged, which is exactly what an
+		// audit reader reads them for.
+		const lines = readDecisions();
+		expect(lines.map(line => line.layer)).toEqual(["verdict", "late-verdict"]);
+		expect(lines[0]).toMatchObject({
+			decision: "block",
+			layer: "verdict",
+			verdict: "UNAVAILABLE",
+			cwd: "/tmp/late-spawn",
+			spawnCwd: "/tmp/late-spawn",
+		});
+		expect(lines[1]).toMatchObject({
+			decision: "block",
+			layer: "late-verdict",
+			verdict: "UNSAFE",
+			cwd: "/tmp/late-spawn",
+			spawnCwd: "/tmp/late-spawn",
+		});
+
+		dialog.answer(DENY);
+		expect(refusalOf(resultText(await tool)).layer).toBe("dialog");
+	});
+
+	test("a canceled late judgment disarms the listen window's timer", async () => {
+		seq += 1;
+		const sessionId = `late-window-${seq}`;
+		writeConfig({ timeoutMs: DEADLINE_MS });
+		jest.useFakeTimers();
+		await loadPlugin(makeSettings([]));
+		setJevDelay(LATE_ANSWER_MS);
+		setJevAnswers([jevUnsafeAnswer()]);
+		// Installed after the fake timers, so calls still reach the clock this
+		// file drives; the wrapper only remembers the handles and whether a
+		// clear ever reached one. The listen window is armed at the deadline for
+		// `min(2 x timeoutMs, 30s)`, and it is a resource the gate owns: a cancel
+		// that leaves it armed keeps the process's event loop busy for the rest
+		// of the window with nothing left to say.
+		const armed: Array<{ handle: unknown; cleared: boolean }> = [];
+		const fakeSetTimeout = globalThis.setTimeout;
+		const fakeClearTimeout = globalThis.clearTimeout;
+		globalThis.setTimeout = ((callback: () => void, ms?: number) => {
+			const handle: unknown = fakeSetTimeout(callback, ms);
+			armed.push({ handle, cleared: false });
+			return handle;
+		}) as typeof setTimeout;
+		globalThis.clearTimeout = ((handle?: number) => {
+			for (const entry of armed) {
+				if (entry.handle === handle) entry.cleared = true;
+			}
+			fakeClearTimeout(handle);
+		}) as typeof clearTimeout;
+		try {
+			const dialog = deferredCtx(sessionId);
+			const tool = fire("tool_call", makeEvent(`git status --late-window-${seq}`), dialog.ctx);
+			await until(() => modelCalls.length > 0);
+			jest.advanceTimersByTime(DEADLINE_MS + 5);
+			await until(() => dialog.opened() > 0);
+			const windowTimer = armed.at(-1);
+			expect(windowTimer).toBeDefined();
+
+			dialog.answer(ALLOW_ONCE);
+			expect(await tool).toBeUndefined();
+			expect(windowTimer?.cleared).toBe(true);
+		} finally {
+			globalThis.setTimeout = fakeSetTimeout;
+			globalThis.clearTimeout = fakeClearTimeout;
+		}
 	});
 });

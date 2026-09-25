@@ -33,9 +33,11 @@ thresholds. Four consequences shape every layer below:
   still act on the dialog the deadline opened: a late `SAFE` dismisses it and the command runs,
   a late `UNSAFE` leaves it open with the real reason beside it, a late `UNSURE` goes on the
   record. A human who answers first cancels the request and the late answer does nothing.
-  Listening stops at `min(2 x timeoutMs, 30s)` past the deadline. The three cases are written
-  as they happen, on a `late-verdict` layer, with the pair (`unavailable → late UNSAFE`) in
-  `why` so calibration can read the late answer next to the human's own line. A late verdict
+  Listening stops at `min(2 x timeoutMs, 30s)` past the deadline, or at a cancel — the human
+  answering, or the headless path with no dialog to refine — and either one aborts the
+  request and disarms the window. The three cases are written as they happen, on a
+  `late-verdict` layer, with the pair (`unavailable → late UNSAFE`) in `why` so calibration
+  can read the late answer next to the human's own line. A late verdict
   can never bypass a dialog, and a late `UNSAFE` never re-blocks what a human allowed: the
   dialog is the only thing it can refine. A late `SAFE` dismisses only where an on-time `SAFE`
   would have auto-run — the destructive-token overlay and a refusal this session already holds
@@ -233,7 +235,10 @@ what would work instead, what not to try. The human gets one line plus the short
 that can be answered correctly: the command, the axes, the alternatives.
 
 Session grants and 30-day persistent grants let a human pre-authorize a family of actions
-once instead of answering the same dialog five times. Dialog reasons are built from the same
+once instead of answering the same dialog five times. A grant is scoped to the directories
+its dialog put on screen: for an eval payload that declares a spawn directory of its own,
+both that directory and the session's, so a session that moves workspaces re-asks instead of
+riding an authorization nobody gave. Dialog reasons are built from the same
 numbers as the audit line, and the rm-family prompts carry the reversible-alternative
 footnote. Dry-run lets an agent ask the gate what it would do before doing it. A dialog from
 a session older than the on-disk plugin says so in its subtitle.
