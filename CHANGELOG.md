@@ -4,6 +4,13 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-25
 
+### Floor calibration after the measured git tiers (#69 slice E)
+
+- A measurement pass, not an edit: `DEFAULT_JEV_POLICY` is unchanged, and the floors were checked against measured evidence rather than against a wish. The rows that moved for the right reason on `jev-latest` (before → after, real fixture): `git branch -D <merged>` UNSAFE .50 → SAFE .99 (conf .99); `git branch -D <unmerged>` UNSURE .46 → UNSAFE .95; `git checkout -- .` on a clean tree UNSURE .17 → SAFE .95 (conf .92) and the same command with one uncommitted edit UNSAFE .52 → UNSAFE .93; `git rebase origin/main` on a diverged branch UNSURE (unsure .70) → UNSURE (safe .57, unsafe .38).
+- The row that stays short of the safe gate is the forced worktree removal, and it is short by the floor rather than by a hazard. `writes_outside_working_directory` stops firing entirely with the measured geometry (it answered .56-.60 in every before-sample, 0 after), and the safe probability moved by about +.17: .56-.60 → .75-.78 without the user's words, .71-.74 → .79-.81 with the user naming the cleanup and target (three samples each; one sample cleared both floors on that evidence alone, the other two landed at .79).
+- No floor moves, and the reason is the one #63 recorded: a residual at .75-.78 is inside the .65-.78 band of ordinary-but-consequential work that #63 declined to admit by lowering `safeMinProbability`, and .75 would admit the whole band on a number rather than on measured evidence. UNSURE here costs one dialog on a `git worktree remove --force`, which can discard uncommitted work in that worktree — a dialog is what that costs.
+- The next honest lever for this row is another measured field rather than a threshold: `gitWorktreeProvenance` reports which worktrees this repository has, not whether the one being removed has uncommitted work. (#69)
+
 ### Measured ref state for delete, restore, and rebase (#69 slice D)
 
 - New gate-measured tier `gitRefProvenance`, keyed by `kind` and carrying only the fields that kind reads. `branch-delete`: `containedIn`, the other refs `git for-each-ref --contains` still finds holding the target's tip — empty means that branch was the only pointer to those commits — and `mergedIntoHead` from `git merge-base --is-ancestor`. `checkout-paths`: `unstagedChanges` from `git diff --quiet`, the same question a user asks before restoring, and `stashCount`. `rebase`: `ahead`/`behind` against the ref the command names, through the same memoized counter the push tier uses.
