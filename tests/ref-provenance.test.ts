@@ -10,9 +10,10 @@
  * restore on a clean tree versus a dirty one.
  *
  * The tier is a list, one entry per effect the command carries: a compound
- * command measures EVERY segment rather than the first shape that matches, the
- * ref a delete removes never counts as its own survivor (in any namespace), and
- * a restore's dirtiness is measured over the paths it names rather than the
+ * command measures EVERY segment rather than the first shape that matches, a
+ * ref a delete CERTAINLY removes never counts as its own survivor (in any
+ * namespace) while one a delete the shell may skip would remove stays named,
+ * and a restore's dirtiness is measured over the paths it names rather than the
  * whole tree.
  */
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
@@ -250,24 +251,74 @@ describe("the measured ref state", () => {
 			// Same twin tip as the `&&` case: a and b are the only pointers to this
 			// commit. But `git branch -D a || git branch -D b` may never run its
 			// right side — a successful first delete short-circuits it — so the
-			// command may leave refs/heads/b behind. The `&&` union would call that
-			// pointer-deletion certain; this reading keeps it measured.
+			// command may leave refs/heads/b behind, and AT MOST one of the two
+			// deletes ever runs. Neither entry may call the tip orphaned: the tip
+			// is reachable through `b` when the first delete succeeded, and through
+			// `a` when it failed and the right arm ran.
 			gitIn(own.main, "git checkout -q --detach HEAD && git commit -q --allow-empty -m twin-only && git branch a && git branch b && git checkout -q main");
 			const pair = measureGitRefProvenance("git branch -D a || git branch -D b", own.main);
 			expect(pair?.map(shape => shape.target)).toEqual(["a", "b"]);
-			// The reached delete of `a` removes refs/heads/a, and the or-joined
-			// delete of `b` may be skipped by the shell — so `b` still holds the
-			// tip and the delete reads recoverable, which is what the list says.
-			expect(pair?.map(shape => shape.containedIn)).toEqual([["refs/heads/b"], []]);
-			// The second entry reads a tip orphaned here — in the world where the
-			// right arm runs, `a` was already removed and `b` removes itself —
-			// which errs toward alarm on a command that may delete less than it
-			// reads, never toward calling unreachable work recoverable.
+			// The reached delete of `a` removes refs/heads/a; the or-joined delete
+			// of `b` may be skipped, so refs/heads/b is a ref neither delete is
+			// certain to remove and it stays named by both entries — an uncertain
+			// segment never excludes its own ref, because if the shell skips it
+			// that ref is the last pointer to the work.
+			expect(pair?.map(shape => shape.containedIn)).toEqual([["refs/heads/b"], ["refs/heads/b"]]);
 			// The mirror: `&&` and `;` are unconditional joins, and their deletes
 			// still exclude each other's refs exactly as before.
 			const andPair = measureGitRefProvenance("git branch -D a && git branch -D b", own.main);
 			expect(andPair?.map(shape => shape.containedIn)).toEqual([[], []]);
 			expect(measureGitRefProvenance("git branch -D a; git branch -D b", own.main)?.map(shape => shape.containedIn)).toEqual([[], []]);
+		} finally {
+			removeFixture(own.root);
+		}
+	});
+
+	test("a delete behind a command the shell certainly fails is not certain to run", () => {
+		const own = makeWorktreeFixture();
+		try {
+			// `false` cannot succeed, so nothing after it in its `&&` chain runs:
+			// `b` survives and its ref is the tip's remaining pointer. Reading only
+			// the delete's own join calls both deletes certain and reports `a` as
+			// having orphaned a tip `refs/heads/b` still holds.
+			gitIn(own.main, "git checkout -q --detach HEAD && git commit -q --allow-empty -m twin-only && git branch a && git branch b && git checkout -q main");
+			const killed = measureGitRefProvenance("git branch -D a && false && git branch -D b", own.main);
+			expect(killed?.map(shape => shape.target)).toEqual(["a", "b"]);
+			expect(killed?.map(shape => shape.containedIn)).toEqual([["refs/heads/b"], ["refs/heads/b"]]);
+			// `! true` and a nonzero `exit` are the same kind of certainty: the
+			// negation is not a word, so it is read off the statement.
+			expect(measureGitRefProvenance("git branch -D a && ! true && git branch -D b", own.main)?.map(shape => shape.containedIn)).toEqual([
+				["refs/heads/b"],
+				["refs/heads/b"],
+			]);
+			expect(measureGitRefProvenance("git branch -D a && exit 1 && git branch -D b", own.main)?.map(shape => shape.containedIn)).toEqual([
+				["refs/heads/b"],
+				["refs/heads/b"],
+			]);
+			// Known success does not stop the chain: both deletes still run.
+			expect(measureGitRefProvenance("git branch -D a && true && git branch -D b", own.main)?.map(shape => shape.containedIn)).toEqual([[], []]);
+			// A chain that fails at its head skips BOTH deletes, and each one's
+			// ref stays named — an uncertain delete never excludes its own ref.
+			expect(measureGitRefProvenance("false && git branch -D a && git branch -D b", own.main)?.map(shape => shape.containedIn)).toEqual([
+				["refs/heads/a", "refs/heads/b"],
+				["refs/heads/a", "refs/heads/b"],
+			]);
+			// The path spelling is the same statement.
+			expect(measureGitRefProvenance("git branch -D a && /bin/false && git branch -D b", own.main)?.map(shape => shape.containedIn)).toEqual([
+				["refs/heads/b"],
+				["refs/heads/b"],
+			]);
+			// `exit` ends the list whatever joins the segment after it.
+			expect(measureGitRefProvenance("git branch -D a; exit 1; git branch -D b", own.main)?.map(shape => shape.containedIn)).toEqual([
+				["refs/heads/b"],
+				["refs/heads/b"],
+			]);
+			// A `$(…)` delete runs only when the command holding it does, so a
+			// skipped command skips the delete inside its substitution too.
+			expect(measureGitRefProvenance('false && echo "$(git branch -D b)"', own.main)?.map(shape => shape.containedIn)).toEqual([
+				["refs/heads/a", "refs/heads/b"],
+			]);
+			expect(measureGitRefProvenance('echo "$(git branch -D b)"', own.main)?.map(shape => shape.containedIn)).toEqual([["refs/heads/a"]]);
 		} finally {
 			removeFixture(own.root);
 		}
@@ -377,18 +428,53 @@ describe("the ref state through the gate", () => {
 			expect(measuredState?.map(entry => entry.target)).toEqual(["a", "b"]);
 			expect(measuredState?.map(entry => entry.containedIn)).toEqual([[], []]);
 			// The `||` reading differs through the gate too: the right arm may be
-			// skipped, so refs/heads/b is a survivor of the first delete's deletion
-			// and the judge receives it as the work's remaining pointer.
+			// skipped, so refs/heads/b is a survivor of the first delete's deletion,
+			// and no entry may call the tip orphaned — the second delete removes
+			// itself only in a world where refs/heads/a was left behind.
 			await removeFixture(own.root);
 			const orOwn = makeWorktreeFixture();
 			try {
 				gitIn(orOwn.main, "git checkout -q --detach HEAD && git commit -q --allow-empty -m twin-only && git branch a && git branch b && git checkout -q main");
 				const orState = await stateFor("git branch -D a || git branch -D b", orOwn.main);
 				expect(orState?.map(entry => entry.target)).toEqual(["a", "b"]);
-				expect(orState?.map(entry => entry.containedIn)).toEqual([["refs/heads/b"], []]);
+				expect(orState?.map(entry => entry.containedIn)).toEqual([["refs/heads/b"], ["refs/heads/b"]]);
 			} finally {
 				removeFixture(orOwn.root);
 			}
+		} finally {
+			removeFixture(own.root);
+		}
+	});
+
+	test("a delete the shell may skip hands the judge the refs it leaves behind", async () => {
+		const own = makeWorktreeFixture();
+		try {
+			// `a` and `b` are the only refs to one unmerged tip, so each reading
+			// turns entirely on which deletes the shell certainly runs.
+			gitIn(own.main, "git checkout -q --detach HEAD && git commit -q --allow-empty -m twin-only && git branch a && git branch b && git checkout -q main");
+			const readings = async (command: string): Promise<Array<unknown> | undefined> => (await stateFor(command, own.main))?.map(entry => entry.containedIn);
+
+			// Both arms of an `&&` chain are certain, and the command removes both
+			// pointers: the pair is one deletion of the tip.
+			expect(await readings("git branch -D a && git branch -D b")).toEqual([[], []]);
+			// `false` certainly fails, so the shell never runs the right arm:
+			// refs/heads/b still holds the tip, and `a` must not read as orphaned.
+			expect(await readings("git branch -D a && false && git branch -D b")).toEqual([["refs/heads/b"], ["refs/heads/b"]]);
+			// An or-arm runs only on the previous command's failure, which is not
+			// settled here: at most one of the two deletes runs.
+			expect(await readings("git branch -D a || git branch -D b")).toEqual([["refs/heads/b"], ["refs/heads/b"]]);
+			// `;` reaches its statement whatever came before it.
+			expect(await readings("git branch -D a; git branch -D b")).toEqual([[], []]);
+
+			// A third pointer at the SAME twin commit, and a three-segment chain:
+			// the known failure poisons only its own chain, so `a` and `c` go and
+			// `b` is what remains.
+			gitIn(own.main, 'git branch c "$(git rev-parse a)"');
+			expect(await readings("git branch -D a && false && git branch -D b; git branch -D c")).toEqual([
+				["refs/heads/b"],
+				["refs/heads/b"],
+				["refs/heads/b"],
+			]);
 		} finally {
 			removeFixture(own.root);
 		}

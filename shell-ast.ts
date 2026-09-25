@@ -260,6 +260,11 @@ export interface ShellCommand {
 	assigns: ShellAssign[];
 	redirects: ShellRedirect[];
 	join: ShellJoin;
+	/** True for `! cmd`, read off the statement. The negation is not a word, so
+	 *  a caller that reasons about a command's exit status cannot see it in the
+	 *  words: `! true` has the words of `true` and the opposite status, and a
+	 *  caller that reads the words alone calls it a command that succeeds. */
+	negated: boolean;
 	/** True when this command sits inside a substitution rather than at the
 	 *  top level, so `echo "$(rm -rf build)"` reports the delete as its own
 	 *  command and marks it nested. */
@@ -333,6 +338,9 @@ function parserMessage(err: unknown): string {
 function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string, out: ShellCommand[]): ShellCommand[] {
 	const cmd = stmt?.Cmd;
 	const type = cmd ? nodeType(cmd) : "";
+	// `! cmd` is a flag on the statement, not a word, so it is read here once and
+	// handed to every command this statement produced.
+	const negated = stmt?.Negated === true;
 	if (type === "BinaryCmd") {
 		return [...collectStmt(cmd.X, join, nested, source, out), ...collectStmt(cmd.Y, joinOf(cmd.Op), nested, source, out)];
 	}
@@ -341,7 +349,7 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 		// Pushed before its words are read, so the command comes ahead of the
 		// commands in its substitutions: `echo "$(rm -rf build)"` lists echo,
 		// then rm.
-		const command: ShellCommand = { words: [], assigns: [], redirects: [], join, nested };
+		const command: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested };
 		out.push(command);
 		if (type === "CallExpr") readCall(cmd, command, source, out);
 		else readDecl(cmd, command, source, out);
@@ -350,7 +358,7 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 	}
 	const expression = EXPRESSION_SHAPES[type];
 	if (expression !== undefined) {
-		const command: ShellCommand = { words: [], assigns: [], redirects: [], join, nested, expression: expression.kind };
+		const command: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, expression: expression.kind };
 		out.push(command);
 		command.words = [literalWord(expression.verb), ...expressionWords(cmd, expression.kind === "arithmetic", source, out)];
 		command.redirects = redirs.map((redir: any) => readRedirect(redir, source, out));
@@ -364,7 +372,7 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 	// nothing at all.
 	const own: ShellCommand[] = [];
 	if (redirs.length > 0) {
-		const carrier: ShellCommand = { words: [], assigns: [], redirects: [], join, nested };
+		const carrier: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested };
 		out.push(carrier);
 		own.push(carrier);
 		carrier.redirects = redirs.map((redir: any) => readRedirect(redir, source, out));
@@ -378,7 +386,7 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 	for (const stmt of inner) own.push(...collectStmt(stmt, join, nested, source, out));
 	// Nothing read at all is still a command that ran.
 	if (inner.length === 0 && substitutions.length === 0 && cmd) {
-		const marker: ShellCommand = { words: [], assigns: [], redirects: [], join, nested, unreadShape: type };
+		const marker: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, unreadShape: type };
 		out.push(marker);
 		own.push(marker);
 	}

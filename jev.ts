@@ -62,7 +62,7 @@ import { parseShell, type ShellJoin } from "./shell-ast";
  * threshold changes: jevQuestionsHash folds it into the fingerprint that the
  * audit log records, so a replay can tell which policy produced a decision.
  */
-export const JEV_POLICY_VERSION = "jev-v2.7";
+export const JEV_POLICY_VERSION = "jev-v2.8";
 /**
  * The intent-aware battery. It runs in shadow beside JEV_POLICY_VERSION and
  * decides nothing until the flip; its questions differ from jev-v2 only where
@@ -251,7 +251,7 @@ const JEV_MEASURED_GEOMETRY_PARAGRAPH = `Repository geometry is measured, not cl
  * read. Only the fields that decide a reading are spelled out; `kind` says which
  * three belong together.
  */
-const JEV_MEASURED_REF_PARAGRAPH = `Reference and working-tree state is measured too. \`gitRefProvenance\`, when present, is a list of the gate's own readings of what this command would touch, one entry per effect it read and in the order the command runs them — a compound command carries one entry for every segment whose effect the gate could read, so read every entry and judge the command by all of them together. Each entry is named the same way: \`gitRefProvenance.target\` is the ref or pathspec that entry measured, and \`gitRefProvenance.kind\` says which of the three readings follows. A branch delete (\`gitRefProvenance.kind\` is \`branch-delete\`) carries \`gitRefProvenance.containedIn\`: the other refs in this repository that still hold the commits the delete would drop, the ref the delete removes excluded in every namespace together with every ref another delete the shell is certain to run removes — deleting a ref never leaves a copy of itself, and neither does a companion delete on an unconditional join (\`&&\`, \`;\`, a pipeline stage) — while a delete joined by \`||\` may be skipped entirely, so its refs stay in the list: they may still be the last pointers to the work when the shell skips that arm — so a non-empty list means the work stays reachable and an empty list means nothing the command is certain to leave behind points at those commits. \`gitRefProvenance.mergedIntoHead\` says whether HEAD already contains its tip. A path restore (\`checkout-paths\`) carries \`gitRefProvenance.unstagedChanges\`: true means the paths that entry names hold uncommitted work the restore would throw away, false means there is nothing to restore there and the command is a no-op; \`gitRefProvenance.stashCount\` counts stash entries, which are other snapshots rather than a copy of what the restore discards. A rebase (\`rebase\`) carries \`gitRefProvenance.behind\`, the commits the named upstream has that HEAD does not: 0 means HEAD already contains the tip being rebased onto, so the rebase only replays this branch's own commits, which the reflog keeps, and \`gitRefProvenance.ahead\` counts those. Where \`gitRefProvenance\` is absent, and for any effect of the command that has no entry, the gate measured none of this — read the syntax as before, and never assume a branch is merged or a tree clean.`;
+const JEV_MEASURED_REF_PARAGRAPH = `Reference and working-tree state is measured too. \`gitRefProvenance\`, when present, is a list of the gate's own readings of what this command would touch, one entry per effect it read and in the order the command runs them — a compound command carries one entry for every segment whose effect the gate could read, so read every entry and judge the command by all of them together. Each entry is named the same way: \`gitRefProvenance.target\` is the ref or pathspec that entry measured, and \`gitRefProvenance.kind\` says which of the three readings follows. A branch delete (\`gitRefProvenance.kind\` is \`branch-delete\`) carries \`gitRefProvenance.containedIn\`: the refs in this repository that still hold the commits the delete would drop, with every ref a delete the shell is CERTAIN to run removes filtered out — a certain delete's own ref in every namespace among them, since deleting a ref never leaves a copy of itself. A delete the shell may skip contributes nothing to that filtering, its own ref included: an arm joined by \`||\`, or one behind a command the shell certainly fails (\`false\`, a nonzero \`exit\`, \`! true\`), runs only in worlds the gate cannot promise, and a skipped delete leaves its ref behind — which may then be the last pointer to the work — so a non-empty list means the work stays reachable and an empty list means nothing the command is certain to leave behind points at those commits. \`gitRefProvenance.mergedIntoHead\` says whether HEAD already contains its tip. A path restore (\`checkout-paths\`) carries \`gitRefProvenance.unstagedChanges\`: true means the paths that entry names hold uncommitted work the restore would throw away, false means there is nothing to restore there and the command is a no-op; \`gitRefProvenance.stashCount\` counts stash entries, which are other snapshots rather than a copy of what the restore discards. A rebase (\`rebase\`) carries \`gitRefProvenance.behind\`, the commits the named upstream has that HEAD does not: 0 means HEAD already contains the tip being rebased onto, so the rebase only replays this branch's own commits, which the reflog keeps, and \`gitRefProvenance.ahead\` counts those. Where \`gitRefProvenance\` is absent, and for any effect of the command that has no entry, the gate measured none of this — read the syntax as before, and never assume a branch is merged or a tree clean.`;
 
 /**
  * The verdict question carries the whole safety policy, because there is no
@@ -805,6 +805,13 @@ export interface ShellSegment {
 	 *  `&&` — `pipe` means it runs as a pipeline stage of the command before
 	 *  it, and `or` means it runs only when the command before it failed. */
 	join: ShellJoin;
+	/** The statement's own `!`, which the words do not carry: `! true` has the
+	 *  words of `true` and the opposite exit status. */
+	negated: boolean;
+	/** True when this command sits inside a substitution rather than at the top
+	 *  level, so the `exit` of `echo "$(exit 1)"` ends nothing but its own
+	 *  subshell. */
+	nested: boolean;
 }
 
 /** The words of every simple command `text` runs, in source order — one array
@@ -816,7 +823,140 @@ function shellSegments(text: string): ShellSegment[] | null {
 	const parsed = parseShell(text);
 	if (!parsed.ok) return null;
 	if (parsed.commands.some(command => command.unreadShape !== undefined)) return null;
-	return parsed.commands.map(command => ({ tokens: command.words.map(word => word.value), join: command.join }));
+	return parsed.commands.map(command => ({ tokens: command.words.map(word => word.value), join: command.join, negated: command.negated, nested: command.nested }));
+}
+
+/** A command's exit status when the spelling settles it without running it. */
+type KnownExit = "zero" | "nonzero" | "unknown";
+
+/** The statements the shell always fails: the `false` builtin, and any spelling
+ *  of it this reads. `exit` is separate — it does not merely fail, it ends the
+ *  list — and is tested by its own predicate. */
+const KNOWN_FAILING_VERBS: Record<string, true> = { false: true };
+/** The statements the shell always succeeds. */
+const KNOWN_SUCCEEDING_VERBS: Record<string, true> = { true: true, ":": true };
+
+/** The exit status of one segment when the spelling settles it, else `unknown`.
+ *
+ * This is deliberately a small table: `true`, `:` and `false` are the shells'
+ * own constants, and `exit <n>` names its status. The verb is read through its
+ * path form, so `/bin/false` is the same statement as `false`; a wrapper
+ * (`command false`, `env false`) is not read and stays unknown. A negated
+ * statement inverts a status it knows and stays unknown when it does not, so
+ * `! true` is a statement the shell fails and `! git status` is merely unknown.
+ * Everything else is unknown, and callers assume success on an unknown status
+ * rather than treating it as a failure — the direction that keeps a delete
+ * certain.
+ */
+function knownExit(segment: ShellSegment): KnownExit {
+	const verb = (segment.tokens[0] ?? "").split("/").at(-1) ?? "";
+	let exit: KnownExit = "unknown";
+	if (KNOWN_SUCCEEDING_VERBS[verb] === true) exit = "zero";
+	else if (KNOWN_FAILING_VERBS[verb] === true) exit = "nonzero";
+	else if (verb === "exit") {
+		const status = segment.tokens.slice(1);
+		if (status.length === 1 && /^\d+$/u.test(status[0])) exit = Number(status[0]) === 0 ? "zero" : "nonzero";
+	}
+	if (!segment.negated) return exit;
+	if (exit === "zero") return "nonzero";
+	if (exit === "nonzero") return "zero";
+	return exit;
+}
+
+/** `exit` ends the shell, so nothing after a reached `exit` runs — whatever its
+ *  status. Read by verb rather than by status: a bare `exit` reuses the last
+ *  command's status, and the list is over either way. Only a top-level `exit`
+ *  reaches this: a nested one ends its own substitution and nothing else. */
+const endsTheList = (segment: ShellSegment): boolean => ((segment.tokens[0] ?? "").split("/").at(-1) ?? "") === "exit";
+
+/** Whether each segment is CERTAINLY run by the shell, in source order, from the
+ *  joins and the exit statuses the spelling settles.
+ *
+ * The rule, spelled out because the whole tier turns on it:
+ *
+ * - `;`, a newline, and `&` reach their segment: the shell starts it whatever
+ *   the command before it did. (`&` backgrounds the command before it and moves
+ *   on, so the next statement still starts.)
+ * - `|` reaches its stage when the pipeline is reached: every stage of a
+ *   pipeline starts, so a pipe stage is exactly as certain as the stage before
+ *   it — never more, because a pipeline an `&&` skipped is skipped whole.
+ * - `&&` reaches its segment only when the chain before it succeeded. An
+ *   UNKNOWN status counts as success here — that is the ordinary case, and it
+ *   is what keeps `git branch -D a && git branch -D b` a pair the shell
+ *   certainly runs both of. A status the spelling settles as failing (`false`,
+ *   `exit <n≠0>`, `! true`) makes what follows it in the chain unreachable,
+ *   until the chain ends at a `;`, a newline, or `&`.
+ * - `||` reaches its segment only when the chain before it failed, and is
+ *   certain only when that failure is settled — so `git branch -D a || git
+ *   branch -D b` is a pair only one of which certainly runs, while `false ||
+ *   git branch -D b` certainly deletes `b`.
+ * - A reached top-level `exit` ends the list: no later segment runs, whatever
+ *   joins it. A `$(…)` command runs only when the command holding it does, so a
+ *   nested segment inherits that command's reach rather than the fresh
+ *   `sequence` join its own list gave it — `false && echo "$(git branch -D b)"`
+ *   skips the delete.
+ *
+ * The uncertain direction is the one that does not claim a deletion happened:
+ * a segment this cannot prove runs is reported not-certain, and a caller that
+ * only names certain effects therefore names fewer of them.
+ */
+function certainReaches(segments: ShellSegment[]): boolean[] {
+	const reach: boolean[] = [];
+	// The status of the compound chain ending at the segment before, as far as
+	// the spelling settles it. `&&` reads it for "did the left side succeed",
+	// `||` for "did the left side fail", and a `pipe` stage leaves it alone when
+	// the pipeline itself was skipped — the failed left side is still the
+	// chain's status.
+	let outcome: KnownExit = "unknown";
+	// A reached top-level `exit` ends the list.
+	let ended = false;
+	// The reach of the most recent top-level segment: a nested one runs no
+	// sooner and no later than the command that holds it.
+	let parentReached = true;
+	for (const segment of segments) {
+		if (segment.nested) {
+			reach.push(!ended && parentReached);
+			continue;
+		}
+		const previousReached = reach.length === 0 ? true : reach[reach.length - 1];
+		let runs: boolean;
+		switch (segment.join) {
+			case "first":
+			case "sequence":
+				// A statement the shell reaches on its own: `;`, a newline, `&`.
+				runs = true;
+				break;
+			case "pipe":
+				// Every stage of a pipeline starts when the pipeline is reached.
+				runs = previousReached;
+				break;
+			case "and":
+				runs = outcome !== "nonzero";
+				break;
+			default:
+				// `or`: only on a failure the chain is known to have produced.
+				runs = outcome === "nonzero";
+				break;
+		}
+		if (ended) runs = false;
+		reach.push(runs);
+		parentReached = runs;
+		const exit = knownExit(segment);
+		if (segment.join === "pipe") {
+			// The pipeline's status is its last stage's when it ran, and the
+			// status of the failed left side when the pipeline was skipped.
+			outcome = runs ? exit : outcome;
+		} else if (segment.join === "and") {
+			outcome = outcome === "nonzero" || exit === "nonzero" ? "nonzero" : outcome === "zero" && exit === "zero" ? "zero" : "unknown";
+		} else if (segment.join === "or") {
+			outcome = outcome === "zero" || exit === "zero" ? "zero" : outcome === "nonzero" && exit === "nonzero" ? "nonzero" : "unknown";
+		} else {
+			// A fresh statement: `;`, a newline, `&`, or the head of the list.
+			outcome = exit;
+		}
+		if (runs && endsTheList(segment)) ended = true;
+	}
+	return reach;
 }
 
 /** Short flags `git branch` accepts that take no value. Only these may ride in a
@@ -840,24 +980,26 @@ type GitRefShape =
 	| { kind: "checkout-paths"; target: string; paths: string[] }
 	| { kind: "rebase"; target: string };
 
-/** One shape read out of one segment, with the segment's own join: `join` says
- *  how the segment that carried this shape was attached to the command before
- *  it, which decides whether the shell certainly reaches it (`first`, `and`,
- *  `sequence`, `pipe` — the only maybe-not-reached join is `or`). */
-type MeasuredGitRefShape = GitRefShape & { join: ShellJoin };
+/** One shape read out of one segment, with whether the shell certainly runs
+ *  that segment (`certainReaches`): a delete the shell may skip is not a delete
+ *  that certainly happened, and only a certain delete's refs are refs the
+ *  command certainly removes. */
+type MeasuredGitRefShape = GitRefShape & { certain: boolean };
 
 /** The three shapes slice D measures, read PER SEGMENT: every effect a compound
  *  command carries is measured, never the first one that matches, because the
  *  recoverable delete of one segment must not answer for the restore in the next.
  *  Anything ambiguous (two targets, an `--onto` rebase, a value taken by a flag)
- *  yields no shape for that segment rather than a guess. Each shape carries the
- *  join of the segment it came from, so a caller can tell a delete the shell
- *  certainly runs from one it may skip. */
+ *  yields no shape for that segment rather than a guess. Each shape carries
+ *  whether its own segment is certainly reached, so a caller can tell a delete
+ *  the shell certainly runs from one it may skip. */
 function parseGitRefShapes(command: string): MeasuredGitRefShape[] | null {
 	const segments = shellSegments(command);
 	if (segments === null) return null;
+	const reaches = certainReaches(segments);
 	const shapes: MeasuredGitRefShape[] = [];
-	for (const { tokens, join } of segments) {
+	for (const [index, { tokens }] of segments.entries()) {
+		const certain = reaches[index] === true;
 		const branch = gitSubcommandIndex(tokens, "branch");
 		if (branch !== -1) {
 			const rest = tokens.slice(branch + 1);
@@ -867,7 +1009,7 @@ function parseGitRefShapes(command: string): MeasuredGitRefShape[] | null {
 				// question the command did not ask.
 				if (targets.length === 1) {
 					const remoteTracking = rest.some(token => token === "-r" || token === "--remotes" || bundledShortFlag(token, "r"));
-					shapes.push({ kind: "branch-delete", target: targets[0], remoteTracking, join });
+					shapes.push({ kind: "branch-delete", target: targets[0], remoteTracking, certain });
 				}
 				continue;
 			}
@@ -880,7 +1022,7 @@ function parseGitRefShapes(command: string): MeasuredGitRefShape[] | null {
 			// `git checkout -b feature` and `git checkout main` restore nothing: only
 			// the explicit pathspec form touches the working tree.
 			if (paths.length > 0) {
-				shapes.push({ kind: "checkout-paths", target: paths.join(" "), paths, join });
+				shapes.push({ kind: "checkout-paths", target: paths.join(" "), paths, certain });
 				continue;
 			}
 		}
@@ -890,10 +1032,10 @@ function parseGitRefShapes(command: string): MeasuredGitRefShape[] | null {
 			const rest = tokens.slice(rebase + 1);
 			if (!rest.some(token => GIT_REBASE_RESUME_FLAGS[token] === true || token === "--onto" || token.startsWith("--onto="))) {
 				const positionals = rest.filter(token => !token.startsWith("-"));
-				if (positionals.length === 1) shapes.push({ kind: "rebase", target: positionals[0], join });
+				if (positionals.length === 1) shapes.push({ kind: "rebase", target: positionals[0], certain });
 				// Bare `git rebase` rebases onto the configured upstream, which is
 				// measurable; the two-positional form is not read here.
-				else if (positionals.length === 0) shapes.push({ kind: "rebase", target: "@{upstream}", join });
+				else if (positionals.length === 0) shapes.push({ kind: "rebase", target: "@{upstream}", certain });
 			}
 		}
 	}
@@ -911,10 +1053,11 @@ function deletedRefNames(target: string, remoteTracking: boolean): string[] {
 /** Measure one shape: all read-only plumbing in the target cwd, and a ref that
  *  does not resolve leaves the field null rather than a value. `deletedByCommand`
  *  is the set of refnames the deletes the shell certainly reaches would remove —
- *  for a delete the shape itself is one of them — so no ref the command is
- *  certain to drop is counted as a survivor of the work it drops. A delete the
- *  shell may skip (`||`) contributes nothing here: skipping it leaves its ref
- *  behind, and that ref may then be the last pointer to the work. */
+ *  for a certain delete the shape itself is one of them — so no ref the command
+ *  is certain to drop is counted as a survivor of the work it drops. A delete
+ *  the shell may skip contributes nothing here, its own ref included: skipping
+ *  it leaves its ref behind, and that ref may then be the last pointer to the
+ *  work. */
 function measureGitRefShape(shape: GitRefShape, cwd: string, deletedByCommand: ReadonlySet<string>): GitRefProvenance {
 	// `--verify --quiet`: a target that is not a ref (a typo, a path, a ref this
 	// branch namespace does not have) resolves to null and stays unmeasured.
@@ -989,19 +1132,22 @@ export function measureGitRefProvenance(command: string, cwd: string): GitRefPro
 	// any one shape is measured: `git branch -D a && git branch -D b`, where a
 	// and b are the only pointers to one tip, must not let each delete answer
 	// with the other — a ref the command itself removes is no copy of the work
-	// it drops. A segment joined by `||` is different: the shell runs it only
-	// when everything before it failed, so a successful first delete skips it
-	// and its refs may survive the command. Its refs stay out of the shared set
-	// (they may still be pointers when this entry is read), and it reads the
-	// reached deletes' refs as always — a delete that does run never leaves a
-	// copy of what another reached delete removes.
+	// it drops. Certainty is `certainReaches`'s reading of the whole chain before
+	// the delete, not of its own join alone: `git branch -D a && false && git
+	// branch -D b` deletes `a` and skips `b`, so `b`'s refs are NOT refs the
+	// command removes. Reading only the join calls that pair one deletion and
+	// reports `a` as orphaned when `refs/heads/b` is still there.
+	//
+	// A delete the shell may skip contributes nothing to this set, and nothing
+	// on its own account either: if that segment runs its ref is gone, but the
+	// shell may never reach it, and the direction this tier measures in is the
+	// one that does not claim a removal happened. So an or-joined delete, or one
+	// behind a command known to fail, never removes a ref from a reading — its
+	// own target included — while a certain delete's refs are removed from every
+	// reading, its own included.
 	const deletedByCommand = new Set<string>();
 	for (const shape of shapes) {
-		if (shape.kind !== "branch-delete") continue;
-		// An or-joined delete may never run, so its refs are not certainly gone.
-		if (shape.join === "or") continue;
-		// Substitution-joined (`pipe`) deletes run as pipeline stages, so they
-		// certainly run; `first`, `and`, `sequence` are the sequence joins.
+		if (shape.kind !== "branch-delete" || !shape.certain) continue;
 		for (const name of deletedRefNames(shape.target, shape.remoteTracking)) deletedByCommand.add(name);
 	}
 	const entries: GitRefProvenance[] = [];
@@ -1010,20 +1156,14 @@ export function measureGitRefProvenance(command: string, cwd: string): GitRefPro
 		const key = gitRefShapeIdentity(shape);
 		if (seen.has(key)) continue;
 		seen.add(key);
-		// A delete's own ref never survives its own deletion, whatever the join:
-		// if that segment runs, its ref is gone. The shared set rides on top of
-		// that own-ref exclusion for every shape, including the or-joined one:
-		// the set holds only deletes the shell certainly reaches, so reading it
-		// never credits a survivor to a deletion the shell may have skipped, and
-		// an or-joined delete's reading errs only toward alarm — it can claim the
-		// tip is orphaned in a world where a reached delete failed (and left its
-		// ref behind), never call a deletion recoverable on a ref the command may
-		// remove. Claiming a removal is the one direction this tier measures.
-		const excluded =
-			shape.kind === "branch-delete"
-				? new Set([...deletedByCommand, ...deletedRefNames(shape.target, shape.remoteTracking)])
-				: deletedByCommand;
-		entries.push(measureGitRefShape(shape, cwd, excluded));
+		// The shared set is the whole exclusion, for every shape: it holds the
+		// refs of the deletes the shell certainly reaches — which includes this
+		// shape's own refs when this shape is a certain delete — and no ref a
+		// deletion the shell may skip would remove. Callers read an empty
+		// `containedIn` as "nothing else holds those commits", so the set has to
+		// name exactly the refs the command is certain to drop: one more is a
+		// false unrecoverable, and one fewer is a survivor that cannot exist.
+		entries.push(measureGitRefShape(shape, cwd, deletedByCommand));
 	}
 	return entries.length === 0 ? undefined : entries;
 }
