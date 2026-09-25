@@ -2,6 +2,10 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-09-25
+
+- `--compare` keys a baseline row on the case's whole identity — command, cwd, kind, language and evidence, the same inputs the answer cache keys on — instead of the command alone. `eval/corpus/intent.jsonl` lists 14 commands twice (13 of them with opposite labels) differing only in the evidence that authorizes them, and `--corpus heldout` repeats all 20 commands 25 times differing only in cwd, so the last twin in the baseline stood in for every row sharing its command: the diff mis-attributed FIXED/REGRESSION lines and dropped the movements of the twin that came first (#80). Two rows that still share an identity, in the baseline or in the run under test, now throw with the command and cwd named instead of one of them being picked silently. The evidence identity is canonicalized before it is compared, so a report written with differently ordered object keys still matches.
+
 ## 2026-09-22
 
 ### The jev-v3 shadow

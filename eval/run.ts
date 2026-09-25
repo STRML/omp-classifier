@@ -1055,14 +1055,16 @@ function identityKey(row: PriorOutcome): string {
 
 /** Index a set of rows by identity, refusing to resolve a duplicate. Picking one
  *  silently is the defect this exists to prevent: the movement then reads as if
- *  it belonged to whichever row happened to be last. */
-function indexByIdentity(rows: PriorOutcome[], source: string): Map<string, PriorOutcome> {
+ *  it belonged to whichever row happened to be last. `side` names the set in the
+ *  error, because a baseline and the run under test can each hold a duplicate and
+ *  the fix differs (re-run the baseline vs deduplicate the corpus). */
+function indexByIdentity(rows: PriorOutcome[], side: string): Map<string, PriorOutcome> {
 	const index = new Map<string, PriorOutcome>();
 	for (const row of rows) {
 		const key = identityKey(row);
 		if (index.has(key)) {
 			throw new Error(
-				`--compare ${source}: two rows share the same case identity (command, cwd and evidence), so a movement cannot be attributed to either: ` +
+				`${side}: two rows share the same case identity (command, cwd and evidence), so a movement cannot be attributed to either: ` +
 					`${JSON.stringify(row.command)} (cwd ${JSON.stringify(row.cwd ?? "")}). A diff needs each case to appear once.`,
 			);
 		}
@@ -1086,10 +1088,10 @@ export interface CompareSummary {
  *  verdicts, and nothing else. `source` names the baseline in a duplicate-key
  *  error. */
 export function compareAgainstPrior(previous: PriorOutcome[], outcomes: PriorOutcome[], source: string): CompareSummary {
-	const before = indexByIdentity(previous, `baseline ${source}`);
+	const before = indexByIdentity(previous, `--compare baseline ${source}`);
 	// The run's own rows are checked too: a corpus that lists one case twice makes
 	// both of its rows diff against a single baseline entry.
-	indexByIdentity(outcomes, `this run (--compare ${source})`);
+	indexByIdentity(outcomes, `--compare this run (baseline ${source})`);
 	let fixed = 0;
 	let regressed = 0;
 	let noise = 0;
