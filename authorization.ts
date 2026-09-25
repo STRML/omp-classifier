@@ -25,7 +25,7 @@
 import { createHash } from "node:crypto";
 import { secretPathIn, secretStoreRead, secretVariableNames } from "./floor";
 import { REDACTED, redactSecrets } from "./redact";
-import { parseShell, type ShellCommand, type ShellWord } from "./shell-ast";
+import { parseShell, substitutionSpans, type ShellCommand, type ShellWord } from "./shell-ast";
 
 /**
  * The vocabulary. Every segment of every command lands on exactly one of these
@@ -130,10 +130,16 @@ function readsAsSentence(parts: readonly string[]): boolean {
 }
 
 /** A target as the state carries it: its own text when that text is a name, a
- *  stable hash of it when it is long, carries a word aimed at a reviewer, or is
- *  written as a sentence. The hash is unsalted on purpose — two segments naming
- *  one target have to look like one target. */
-function presentTarget(raw: string): string {
+ *  stable hash of it when it is long, carries a word aimed at a reviewer, is
+ *  written as a sentence, or is a value the shell computes at run time. The
+ *  hash is unsalted on purpose — two segments naming one target have to look
+ *  like one target.
+ *
+ *  `computed` marks a value the shell produces rather than a name the command
+ *  wrote: a substitution's own text is a command, so it is never a name
+ *  whatever its shape. Hashing it keeps command text out of the state and
+ *  still tells one computed value from another. */
+function presentTarget(raw: string, computed = false): string {
 	// Shell punctuation that rode along on the edge of a word: `"$(cat
 	// ~/.ssh/id_rsa)"` arrives as one token, and `id_rsa)` matches nothing the
 	// user wrote. A target with nothing but punctuation left, such as the `$`
@@ -155,7 +161,7 @@ function presentTarget(raw: string): string {
 	// word can carry a whole command: the tokenizer strips the quotes, so
 	// `echo "$(rm -rf build)"` handed `$(rm -rf build` straight to the model.
 	const isName =
-		value.length <= TARGET_MAX_LENGTH && !carriesCommandText && !parts.some(part => REVIEWER_WORD.test(part)) && !readsAsSentence(parts);
+		!computed && value.length <= TARGET_MAX_LENGTH && !carriesCommandText && !parts.some(part => REVIEWER_WORD.test(part)) && !readsAsSentence(parts);
 	// A secret-shaped target is redacted, never hashed: an unsalted hash of a
 	// secret lets anyone holding the state test guesses against it offline.
 	if (redactSecrets(value) !== value) return REDACTED;
@@ -311,7 +317,9 @@ function classifyCommand(command: ShellCommand, tainted: readonly string[]): Raw
 	// A redirect belongs to the command, not to the verb's arguments, and the
 	// parser keeps them apart: `rm -rf build > log` deletes build and writes log.
 	const outputs = command.redirects.filter(redirect => redirect.direction !== "in" && !redirect.duplicate && redirect.target.value !== "/dev/null");
-	if (outputs.length > 0) actions.push({ kind: "write", targets: outputs.map(redirect => redirect.target.value) });
+	if (outputs.length > 0) {
+		actions.push(withComputedValues({ kind: "write", targets: outputs.map(redirect => redirect.target.value) }, outputs.map(redirect => redirect.target)));
+	}
 	// `[[ … ]]` and `(( … ))` evaluate and print nothing.
 	if (command.expression !== undefined) return [...actions, { kind: "read", targets: [] }];
 	// An assignment with no command, or a compound's redirect carrier, has no
@@ -324,9 +332,34 @@ function classifyCommand(command: ShellCommand, tainted: readonly string[]): Raw
 	// store read has already named it. Privilege does NOT stand in for it:
 	// `sudo frobnicate` must still report the verb nobody recognized.
 	const namedBySecret = actions.some(action => action.kind === "secret-read");
-	if (!(main.kind === "other" && namedBySecret)) actions.push(main);
+	if (!(main.kind === "other" && namedBySecret)) actions.push(withComputedValues(main, words));
 	actions.push(...inPlaceWrites(words));
 	return actions;
+}
+
+/**
+ * An action plus the values the command computes rather than names: the text of
+ * every `$(…)`, `<(...)` and backtick substitution in `words`, read from the
+ * parsed AST, rendered as a hash.
+ *
+ * `curl $(cat url.txt)` reaches a host only that file names, and the summary
+ * said nothing about the value at all: a word the verb's grammar claimed was
+ * dropped once `presentTarget` refused it (`rm -rf $(cat list.txt)` reported a
+ * delete with no targets, and `curl https://$(cat host.txt)/x` a network action
+ * with no targets), and elsewhere it was covered by `unnamed-arguments` with no
+ * way to tell one computed value from another. That is #95's first residual: a
+ * value the model could not see was a value the model could not judge. The host
+ * is still not named — no summary reads the file — but the value is now a
+ * target, and two commands that compute different values read differently.
+ *
+ * The text of a substitution is a command, so it is hashed rather than named: it
+ * never enters the state as prose, and one substitution still hashes the same
+ * way twice. Quoting is the parser's to decide, so a `'$(cat url.txt)'` the
+ * shell never runs contributes nothing.
+ */
+function withComputedValues(action: RawAction, words: readonly ShellWord[]): RawAction {
+	const computed = words.flatMap(word => substitutionSpans(word.source)).map(span => presentTarget(span, true)).filter(target => target !== "");
+	return computed.length === 0 ? action : { kind: action.kind, targets: [...action.targets, ...computed] };
 }
 
 /** `sed -i` and `yq -i` rewrite the files they were handed. The program itself
@@ -617,7 +650,7 @@ function collect(raw: readonly RawAction[]): ActionSummaryEntry[] {
 		let count = 0;
 		let overflow = 0;
 		for (const action of mine) {
-			const presented = action.targets.map(presentTarget).filter(target => target.length > 0);
+			const presented = action.targets.map(target => presentTarget(target)).filter(target => target.length > 0);
 			// One classified action is one action, however many targets it
 			// names. Counting targets turned `git push origin main` into two
 			// publishes and `gh pr merge 42 --admin` into two merges, which
