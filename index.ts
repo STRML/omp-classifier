@@ -4099,7 +4099,15 @@ export default function (pi: ExtensionAPI) {
 				// hold a bearer token or a `--password` value. The file is created
 				// 0600 so a secret that still slips the shape match is not readable
 				// by other accounts. `mode` applies on creation only.
-				cmd: truncated(redactSecrets(line.cmd).replace(/\s+/gu, " ").trim(), 120),
+				//
+				// The backslash-newline splice goes first: redact.ts redacts line
+				// by line, so in `tool --password \` / `hunter2` the value sits on
+				// a marker-less line and would have survived the REDACTED the
+				// first line got. The shell deletes the pair before word splitting
+				// (same rule and regex as matchModerateRiskTokens), so joining
+				// makes the redactor see the logical argument, then the newline
+				// flatten below cannot re-expose it.
+				cmd: truncated(redactSecrets(line.cmd.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120),
 			};
 			fs.appendFileSync(decisionsLogPath(), `${JSON.stringify(record)}\n`, { mode: 0o600 });
 		} catch (err) {
@@ -5013,8 +5021,12 @@ export default function (pi: ExtensionAPI) {
 			// echoed is redacted first, so a token inside the first 120
 			// characters does not reach the log file. This is the choke point for
 			// both the SAFE auto-run and the prompt path, and it feeds the issue
-			// #2 eval corpus.
-			const logCommand = truncated(redactSecrets(command).replace(/\s+/gu, " ").trim(), 120);
+			// #2 eval corpus. A backslash-newline splice is joined before the
+			// redactor looks at the text, because redact.ts redacts line by
+			// line: a `--password` value on the continued line is otherwise on a
+			// marker-less line of its own, and flattening it back onto the flag
+			// would strand the real value after the REDACTED marker.
+			const logCommand = truncated(redactSecrets(command.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120);
 			if (!dryRun) pi.logger.info(
 				`classifier: verdict=${judgement.verdict}` +
 					` cached=${cached ? 1 : 0} reason="${judgement.reason}" cmd="${logCommand}"`,

@@ -102,6 +102,34 @@ describe("log-side secret redaction", () => {
 		expect(record.cmd).not.toContain(secret);
 	});
 
+	test("a value on a backslash-continued line is redacted, not stranded past the splice", async () => {
+		// `echo marker --password \` then `hunter2` is one logical argument:
+		// the shell deletes the backslash-newline pair before word splitting.
+		// Redaction is line-shaped, so it used to redact only the backslash's
+		// line, and flattening the newline afterwards put the real value right
+		// after the REDACTED marker in both on-disk copies.
+		seq += 1;
+		const marker = `splice-marker-${seq}`;
+		const secret = `hunter3-continued-${seq}`;
+		const command = `echo ${marker} --password \\\n${secret}`;
+		await fire("tool_call", makeEvent(command), makeCtx({ sessionId: `redact-splice-${seq}` }));
+
+		// The judge still sees the command verbatim; only the disk copy is redacted.
+		expect(stateOf(0).command).toBe(command);
+
+		const record = lastDecision();
+		expect(record.cmd).toContain(marker);
+		expect(record.cmd).toContain("--password");
+		expect(record.cmd).toContain(REDACTED);
+		expect(record.cmd).not.toContain(secret);
+
+		const log = loggerInfos.join("\n");
+		expect(log).toContain("verdict=SAFE");
+		expect(log).toContain(marker);
+		expect(log).toContain("--password");
+		expect(log).not.toContain(secret);
+	});
+
 	test("decisions.jsonl is created with mode 0600", async () => {
 		seq += 1;
 		await fire("tool_call", makeEvent(`echo mode-marker-${seq}`), makeCtx({ sessionId: `redact-mode-${seq}` }));
