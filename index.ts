@@ -4094,9 +4094,14 @@ export default function (pi: ExtensionAPI) {
 				policyVersion: CLASSIFIER_POLICY_VERSION,
 				policyHash: CLASSIFIER_POLICY_HASH,
 				...line,
-				cmd: truncated(line.cmd.replace(/\s+/gu, " ").trim(), 120),
+				// The judged command is never redacted (redact.ts header), but the
+				// copy that lands on disk is: the first 120 flattened characters can
+				// hold a bearer token or a `--password` value. The file is created
+				// 0600 so a secret that still slips the shape match is not readable
+				// by other accounts. `mode` applies on creation only.
+				cmd: truncated(redactSecrets(line.cmd).replace(/\s+/gu, " ").trim(), 120),
 			};
-			fs.appendFileSync(decisionsLogPath(), `${JSON.stringify(record)}\n`);
+			fs.appendFileSync(decisionsLogPath(), `${JSON.stringify(record)}\n`, { mode: 0o600 });
 		} catch (err) {
 			if (!auditLogWarned) {
 				auditLogWarned = true;
@@ -5004,10 +5009,12 @@ export default function (pi: ExtensionAPI) {
 			// Every resolved decision is logged so prompt/auto-run behavior is
 			// observable from ~/.omp/logs without watching dialogs. Verdict,
 			// the cache/reason provenance, and a truncated command; the full
-			// command is not echoed (it can carry secrets in flags). This is
-			// the choke point for both the SAFE auto-run and the prompt path,
-			// and it feeds the issue #2 eval corpus.
-			const logCommand = truncated(command.replace(/\s+/gu, " ").trim(), 120);
+			// command is not echoed (it can carry secrets in flags) and what is
+			// echoed is redacted first, so a token inside the first 120
+			// characters does not reach the log file. This is the choke point for
+			// both the SAFE auto-run and the prompt path, and it feeds the issue
+			// #2 eval corpus.
+			const logCommand = truncated(redactSecrets(command).replace(/\s+/gu, " ").trim(), 120);
 			if (!dryRun) pi.logger.info(
 				`classifier: verdict=${judgement.verdict}` +
 					` cached=${cached ? 1 : 0} reason="${judgement.reason}" cmd="${logCommand}"`,
