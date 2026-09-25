@@ -199,10 +199,11 @@ behind it. The sweep in L5 exists to make that cheap enough to be routine.
 
 - **Verdict cache**: per session, keyed by command + cwd + env/pty identity, and cleared
   whenever the effective config signature changes. `UNAVAILABLE` is never cached.
-- **Refusal memory**: what this session was denied, keyed by normalized target and cwd and
-  fingerprinted by the evidence the judge saw, fed back into the state as `priorRefusal` so
-  rewording cannot launder a refusal into a fresh judgment. A SAFE under a prior refusal is
-  not a clean bill: the refusal rode in the state the judge saw.
+- **Refusal memory**: what this session was denied, keyed by `normalizeGrantTarget` — the same
+  identity a session grant uses, so an approval lifts exactly what a refusal covers (issue #64)
+  — plus the cwd, and fingerprinted by the evidence the judge saw, fed back into the state as
+  `priorRefusal` so rewording cannot launder a refusal into a fresh judgment. A SAFE under a
+  prior refusal is not a clean bill: the refusal rode in the state the judge saw.
 - **Decision audit**: one JSONL line per decision at
   `<agentDir>/omp-classifier/decisions.jsonl`, every path, with session/decision ids,
   `policyVersion`/`policyHash` (the battery hash), `modelId`, `verdict`, `reasonCode`, the

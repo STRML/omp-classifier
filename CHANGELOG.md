@@ -2,6 +2,15 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-09-25
+
+### Refusal memory keys on the grant identity (#64)
+
+- Refusal memory now keys on `normalizeGrantTarget` — verb, flags, first argument — the identity a session grant is stored under, instead of the first two non-flag words. `ssh raw-ovh 'mysql --version'`, `ssh raw-ovh 'wp db delete --all'` and `ssh raw-ovh 'ls /tmp'` were one target (`ssh raw-ovh`) and every `docker exec …` was another; 152 blocks in the 2026-09-12 log window carried `prior refusal` as a reason. One refused remote cleanup no longer turns each later read of that host or container into a dialog for the rest of the session.
+- The identity is the grant's, so a refusal and an approval agree about what "this action" is: `liftRefusals` clears exactly the target a refusal remembered, and a refusal still meets a respelled re-run (case, whitespace, `./` spellings, short-flag bundles in any order, a leading `cd X &&`). Human, critical and cap refusals stay sticky; a model refusal still expires when the evidence fingerprint moves; the store still caps at 20 targets per session.
+- What the grant identity cannot separate, refusals cannot separate either: commands that agree on flags and first argument share a target, so two branches of `git push --force origin <branch>` or two `docker compose exec -T wordpress php -r '…'` payloads are still one. Branch-level push provenance is #63's work.
+- `normalizeRefusalTarget` is gone; `addRefusal`, `liftRefusals` and `priorRefusalFor` all read the one function. `tests/refusal-memory.test.ts` moved with it: its old pin (`rm -rf x` -> `rm x`) asserted the two-word over-match that caused the friction, and the tests that relied on `git diff --stat` and `git diff --name-only` being one target now respell one target instead of pairing two.
+
 ## 2026-09-22
 
 ### The jev-v3 shadow
