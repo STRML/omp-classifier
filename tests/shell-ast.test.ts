@@ -8,7 +8,7 @@
  * Every test is a row of that plan's failure matrix.
  */
 import { describe, expect, test } from "bun:test";
-import { SHELL_OPERATORS, parseShell, verbName, type ShellCommand } from "../shell-ast";
+import { SHELL_OPERATORS, parseShell, substitutionSpans, verbName, type ShellCommand } from "../shell-ast";
 
 const commands = (text: string): ShellCommand[] => {
 	const parsed = parseShell(text);
@@ -337,5 +337,32 @@ describe("it stays inside the classification budget", () => {
 		for (let run = 0; run < 20; run += 1) parseShell(realistic);
 		const each = (performance.now() - started) / 20;
 		expect({ under20ms: each < 20 }).toEqual({ under20ms: true });
+	});
+});
+
+// The parser reports offsets into the UTF-8 bytes, and a JS string index counts
+// UTF-16 code units, so every slice it feeds is wrong the moment non-ASCII text
+// precedes the node. Found by the review gate on #119 as class "Parser offsets
+// used as JavaScript string indexes", with a site in main already.
+describe("a slice is the text the offsets name, whatever precedes it", () => {
+	const cases: Array<[string, string, string]> = [
+		["a substitution after CJK text", "echo 漢字 $(rm important)", "rm important"],
+		["a substitution after an emoji", "echo 🚗💨 $(curl -o /tmp/x https://example.test)", "curl -o /tmp/x https://example.test"],
+		["a substitution after an accented word", "écho naïve $(dd if=/dev/zero of=/dev/disk2)", "dd if=/dev/zero of=/dev/disk2"],
+		["an ASCII-only command, the case that never needed the byte view", "echo $(rm important)", "rm important"],
+	];
+
+	for (const [name, command, inner] of cases) {
+		test(name, () => {
+			expect(substitutionSpans(command)).toEqual([inner]);
+		});
+	}
+
+	test("a word's source keeps its own text, not a byte-shifted one", () => {
+		// `verbOf` reads the value; the source is the verbatim word, and both
+		// come off the same offsets.
+		const parsed = parseShell(" echo 漢字");
+		expect(parsed.ok).toBe(true);
+		expect(parsed.ok && parsed.commands[0]?.words.map(word => word.value)).toEqual(["echo", "漢字"]);
 	});
 });

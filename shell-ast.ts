@@ -604,10 +604,45 @@ function unescapeLit(text: string, quoted: boolean): string {
 	return quoted ? text.replace(/\\([$`"\\\n])/gu, "$1") : text.replace(/\\(.)/gsu, "$1");
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function sliceOf(node: any, source: string): string {
+/** The last source string and the byte view the offset conversion needs. The
+ *  parser reports offsets into the UTF-8 bytes it was handed, and a JavaScript
+ *  string index counts UTF-16 code units, so the two agree only while the text
+ *  is ASCII: `echo 漢字 $(rm important)` has the substitution starting at byte
+ *  15 and index 11, and slicing by the byte offset lands mid-word. Most
+ *  commands are ASCII, so that case is answered with no copy at all, and the
+ *  rest are decoded from the bytes the offsets were measured in. */
+interface SourceBytes {
+	source: string;
+	ascii: boolean;
+	bytes?: Uint8Array;
+}
+
+let lastSource: SourceBytes | undefined;
+
+function sourceBytes(source: string): SourceBytes {
+	if (lastSource?.source === source) return lastSource;
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: the ASCII range is the question
+	const ascii = !/[^\u0000-\u007f]/u.test(source);
+	lastSource = ascii ? { source, ascii } : { source, ascii, bytes: Buffer.from(source, "utf8") };
+	return lastSource;
+}
+
+/** A parser node's byte range. `mvdan-sh` ships no TypeScript declarations, so
+ *  the two methods are read structurally at this one boundary rather than
+ *  trusted; the caller's node comes from the same untyped AST. */
+interface ParserRange {
+	Pos(): { Offset(): number };
+	End(): { Offset(): number };
+}
+
+function sliceOf(node: unknown, source: string): string {
 	try {
-		return source.slice(node.Pos().Offset(), node.End().Offset());
+		const range = node as ParserRange; // untyped parser AST, per the interface note above
+		const from = range.Pos().Offset();
+		const to = range.End().Offset();
+		const view = sourceBytes(source);
+		if (view.ascii) return source.slice(from, to);
+		return Buffer.from((view.bytes as Uint8Array).subarray(from, to)).toString("utf8");
 	} catch {
 		return "";
 	}

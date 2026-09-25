@@ -3104,9 +3104,10 @@ export function matchModerateRiskTokens(
 	// Command substitution is outside the tokenizer's scope, so a risk verb
 	// inside a substitution cannot be cleared by position: `echo "$(rm
 	// important)"` would otherwise auto-run. Narrow to what the substitution
-	// actually CONTAINS — collect $(...) spans (plus an unterminated tail) and
-	// backtick spans, and flag risk verbs only inside those spans. Text outside
-	// (`grep $(git rev-parse HEAD) file`) stays on the graceful path.
+	// actually CONTAINS — the spans the parser finds at every depth, quoted
+	// ones correctly read as data — and flag risk verbs only inside those
+	// spans. Text outside (`grep $(git rev-parse HEAD) file`) stays on the
+	// graceful path.
 	addSubstitutionFlags(normalized, flags);
 
 	// The masked regions (#60 heredoc bodies, #61 quote spans) carry their own
@@ -3132,21 +3133,16 @@ export function matchModerateRiskTokens(
 	return [...flags].sort();
 }
 
-/** Risk verbs inside `$(…)` and backtick spans of `text`. Substitution is
- *  outside the tokenizer's scope, so a verb in one cannot be cleared by
- *  position: `echo "$(rm important)"` would otherwise auto-run. Narrowed to
- *  what a span actually CONTAINS, so `grep $(git rev-parse HEAD) file` stays
- *  on the graceful path. */
+/** Risk verbs inside `$(…)`, `<(...)` and backtick spans of `text`.
+ *  Substitution is outside the tokenizer's scope, so a verb in one cannot be
+ *  cleared by position: `echo "$(rm important)"` would otherwise auto-run.
+ *  {@link substitutionSpans} reads the spans off the parsed AST, so quoting is
+ *  honoured — the `$(rm …)` inside `'…'` is data and raises nothing — and
+ *  nesting and process substitution are seen at every depth. Narrowed to what
+ *  a span actually CONTAINS, so `grep $(git rev-parse HEAD) file` stays on the
+ *  graceful path. */
 function addSubstitutionFlags(text: string, flags: Set<string>): void {
-	if (!/\$\(|`/u.test(text)) return;
-	const spans: string[] = [];
-	for (const m of text.matchAll(/\$\(([^)]*)\)/gu)) spans.push(m[1]);
-	const dollarTail = /\$\(([^)]*)$/u.exec(text);
-	if (dollarTail) spans.push(dollarTail[1]);
-	for (const m of text.matchAll(/`([^`]*)`/gu)) spans.push(m[1]);
-	const backtickTail = /`([^`]*)$/u.exec(text);
-	if (backtickTail) spans.push(backtickTail[1]);
-	for (const span of spans) {
+	for (const span of substitutionSpans(text)) {
 		for (const token of MODERATE_RISK_TOKENS) {
 			if (new RegExp(`\\b${token}\\b`, "iu").test(span)) flags.add(token);
 		}
