@@ -6,9 +6,16 @@
  * Every test runs in a FRESH session (the module-level cache is per-session),
  * and unique payloads where the test asserts a fresh classification.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
-import { evalSubprocessMarkers } from "../index";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { evalSpawnCwd, evalSubprocessMarkers } from "../index";
+import type { DecisionRecord } from "../index";
 import {
+	ALLOW_SESSION,
+	DENY,
+	dialogText,
 	fire,
 	jevSafeAnswer,
 	jevUnsafeAnswer,
@@ -19,6 +26,7 @@ import {
 	removeConfigFile,
 	refusalOf,
 	resultText,
+	selectCalls,
 	setJevAnswer,
 	stateOf,
 	writeConfigFile,
@@ -31,6 +39,9 @@ beforeEach(async () => {
 	await loadPlugin(makeSettings([]));
 	setJevAnswer(jevSafeAnswer());
 });
+// Producer-side cleanup (issue #107): this file writes the config file, so it
+// removes it after itself instead of relying on the next consumer's reset.
+afterEach(removeConfigFile);
 
 const fresh = (opts: Parameters<typeof makeCtx>[0] = {}) => {
 	seq += 1;
@@ -203,5 +214,387 @@ describe("eval gate routing", () => {
 		expect(sent).toContain('"kind":"eval-code"');
 		expect(sent).toContain('"language":"py"');
 		expect(sent).toContain("subprocess");
+	});
+});
+
+/**
+ * The directory an eval payload's spawn runs in (issue #14).
+ *
+ * A spawn that passes its own cwd runs there, not in the session directory, and
+ * the resolved directory is part of what a judgement is about: it is the
+ * directory the dialog names, the state the judge reads, and the cache key's
+ * directory component. A spawn directory the scan cannot READ is not a reason
+ * to judge the payload against the session directory anyway — that answers a
+ * different question than the one the payload asks — so it asks a human.
+ *
+ * The audit lines are read from this block's own config directory (the file's
+ * beforeEach has already re-pointed OMP_JEV_CONFIG, so this re-points it again
+ * per test) and filtered by session, since the log is append-only and shared.
+ */
+describe("eval spawn cwd (issue #14)", () => {
+	const SESSION = "/workspace";
+	let dir = "";
+
+	const decisionsFor = (sessionId: string): DecisionRecord[] =>
+		fs
+			.readFileSync(path.join(dir, "decisions.jsonl"), "utf8")
+			.split("\n")
+			.filter(line => line.trim() !== "")
+			.map(line => JSON.parse(line) as DecisionRecord)
+			.filter(line => line.sessionId === sessionId);
+
+	beforeEach(() => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-eval-cwd-"));
+		process.env.OMP_JEV_CONFIG = path.join(dir, "omp-classifier.json");
+	});
+
+	test("a literal spawn cwd is read across the forms the issue lists", () => {
+		const forms: Array<[string, string]> = [
+			[`import subprocess\nsubprocess.run(["rm", "-rf", "."], cwd="/tmp/run")`, "/tmp/run"],
+			[`import subprocess\nsubprocess.Popen(["ls"], cwd="/tmp/popen")`, "/tmp/popen"],
+			[`cp.exec("rm -rf .", { cwd: "/" })`, "/"],
+			[`spawn("ls", ["-la"], { cwd: "/tmp/js" })`, "/tmp/js"],
+			[`Bun.spawn(["ls"], { cwd: "/tmp/bun" })`, "/tmp/bun"],
+			[`Dir.chdir("/tmp/rb") do\n  system("rm -rf .")\nend`, "/tmp/rb"],
+			[`system("rm -rf .", chdir: "/tmp/rbsys")`, "/tmp/rbsys"],
+			// Ruby parenthesizes optionally, and a call without parentheses is
+			// still the call: its arguments run to the end of the line.
+			[`system "rm -rf .", chdir: "/tmp/parenless"`, "/tmp/parenless"],
+		];
+		for (const [code, expected] of forms) {
+			expect(evalSpawnCwd(code, SESSION)).toEqual({ kind: "literal", cwd: expected });
+		}
+	});
+
+	test("the payload's language label does not decide which forms are read", () => {
+		// The label is model-written and shared across tool schemas, so it is not
+		// consulted: `exec(cmd, { cwd })` labeled `py` is still a spawn that named
+		// its own directory, and reading it as the session's would judge the
+		// payload in a directory it does not run in.
+		expect(evalSpawnCwd(`exec("rm -rf .", { cwd: "/" })`, SESSION)).toEqual({ kind: "literal", cwd: "/" });
+	});
+
+	test("a relative literal resolves against the directory in effect", () => {
+		expect(evalSpawnCwd(`import subprocess\nsubprocess.run(["rm", "-rf", "."], cwd="../..")`, "/workspace/a/b")).toEqual({
+			kind: "literal",
+			cwd: "/workspace",
+		});
+		// A chdir moves the payload's own directory for the sites after it, so a
+		// relative spawn cwd under one resolves against the chdir'd directory.
+		expect(evalSpawnCwd(`Dir.chdir("/tmp/x") do\n  system("ls", chdir: "sub")\nend`, SESSION)).toEqual({
+			kind: "literal",
+			cwd: "/tmp/x/sub",
+		});
+		// A spawn the cwd tables do not model (Ruby backticks cannot name a
+		// directory) still runs in the directory the payload moved itself to.
+		expect(evalSpawnCwd("Dir.chdir(\"/tmp/rbbt\") do\n  `rm -rf .`\nend", SESSION)).toEqual({ kind: "literal", cwd: "/tmp/rbbt" });
+	});
+
+	test("a Ruby chdir block's directory does not leak past the block", () => {
+		// Ruby restores the previous directory when the block returns, so the
+		// two spawns here run in two directories — and the scan says so instead
+		// of judging the second against the block's.
+		const scan = evalSpawnCwd(`Dir.chdir("/tmp/rbblk") do\n  system("echo inside")\nend\nsystem("echo outside")`, SESSION);
+		expect(scan.kind).toBe("opaque");
+		expect(scan.kind === "opaque" ? scan.why : "").toContain("different directories");
+		// A site after the block resolves its relative literal against the
+		// RESTORED directory, not the one the block moved to.
+		expect(evalSpawnCwd(`Dir.chdir("/tmp/rbx") do\n  1\nend\nsystem("ls", chdir: "sub")`, SESSION)).toEqual({
+			kind: "literal",
+			cwd: `${SESSION}/sub`,
+		});
+		// The brace form is a block too, and a spawn after it is back in the
+		// session directory.
+		expect(evalSpawnCwd(`Dir.chdir("/tmp/rbrace") { 1 }\nsystem("ls")`, SESSION)).toEqual({ kind: "session" });
+		// Nested blocks restore innermost first: the inner block is over, the
+		// outer one is not.
+		expect(evalSpawnCwd(`Dir.chdir("/tmp/a") do\n  Dir.chdir("/tmp/b") do\n    1\n  end\n  system("ls", chdir: "sub")\nend`, SESSION)).toEqual({
+			kind: "literal",
+			cwd: "/tmp/a/sub",
+		});
+		// A `do` that opens a nested block of its own does not end the block it
+		// is nested in: the spawn after it is still inside the chdir'd one.
+		expect(evalSpawnCwd(`Dir.chdir("/tmp/nest") do\n  items.each do |item|\n    1\n  end\n  system("ls")\nend`, SESSION)).toEqual({
+			kind: "literal",
+			cwd: "/tmp/nest",
+		});
+		// A chdir with no block moves the payload's directory for the rest of the
+		// payload, so a `do` written after a `;` is the next statement's and does
+		// not turn this call into a block.
+		expect(evalSpawnCwd(`Dir.chdir("/tmp/bare"); items.each do |item|\n  1\nend\nsystem("ls")`, SESSION)).toEqual({
+			kind: "literal",
+			cwd: "/tmp/bare",
+		});
+		// The same shape as the first case, written with `;` separators.
+		const semi = evalSpawnCwd(`Dir.chdir("/tmp/semi") do; system("echo inside"); end; system("echo outside")`, SESSION);
+		expect(semi.kind).toBe("opaque");
+		// The unmodelled-spawn fallback follows the payload's own directory: a
+		// block that wraps the payload keeps its directory (trailing whitespace
+		// is not code), while a block the payload has moved past does not.
+		expect(evalSpawnCwd("Dir.chdir(\"/tmp/rbwrap\") do\n  `ls`\nend\n", SESSION)).toEqual({ kind: "literal", cwd: "/tmp/rbwrap" });
+		expect(evalSpawnCwd("Dir.chdir(\"/tmp/rbempty\") { }\n`ls`", SESSION)).toEqual({ kind: "session" });
+		// A Ruby 3 endless method (`def helper = 1`) opens no block and closes
+		// none: counting it as a `def`-opener would run the block past its real
+		// `end` and judge a spawn written after it against the block's
+		// directory, which Ruby has already restored.
+		expect(evalSpawnCwd(`Dir.chdir("/tmp/rbendless") do\n  def helper = 1\nend\nsystem("echo outside")`, SESSION)).toEqual({
+			kind: "session",
+		});
+		// The same endless def written on one line, and one written after the
+		// block: neither may throw the balance off in either direction.
+		expect(
+			evalSpawnCwd(`Dir.chdir("/tmp/rbendless2") do; def helper = 1; end; system("echo outside")`, SESSION)
+		).toEqual({ kind: "session" });
+		expect(evalSpawnCwd(`Dir.chdir("/tmp/rbel3") do\n  1\nend\ndef helper = 1\nsystem("ls")`, SESSION)).toEqual({
+			kind: "session",
+		});
+		// The `=` Ruby binds to a def's NAME or to a default parameter value is
+		// not the endless-body `=`: a setter, an element setter, an operator, and
+		// a default-valued parameter are all regular defs whose `end` the block
+		// balance must count. Misreading any of them as endless skips the opener,
+		// the method's own `end` then closes the chdir block, and the spawn
+		// inside is judged against the directory Ruby had already restored —
+		// silently, with no disagreement left to notice.
+		for (const def of [
+			"def value=(v); @value = v; end", // the spelled-out setter
+			"def value= v\n    @value = v\n  end",
+			"def []=(k, v); @h[k] = v; end", // element setter
+			"def ==(other); true; end", // operator names carry their own `=`
+			"def <=>(other); 0; end",
+			"def self.value=(v); @value = v; end", // singleton setter
+			"def value\n    @value = 1\n  end", // a plain method with an assignment in the body
+			"def helper(x = 1); x; end", // default value inside the parens
+			"def helper x = 1; x; end", // parenless default value
+		]) {
+			expect(evalSpawnCwd(`Dir.chdir("/tmp/rbsetter") do\n  ${def}\n  system("echo inside")\nend\nsystem("echo outside")`, SESSION)).toEqual({
+				kind: "opaque",
+				why: "spawn sites run in different directories (/tmp/rbsetter, /workspace)",
+			});
+		}
+		// A setter defined on one line with `;` separates: same class, same
+		// answer — the two spawns still run in two directories.
+		expect(
+			evalSpawnCwd(`Dir.chdir("/tmp/rbsetter") do; def value=(v); @value = v; end; system("echo inside"); end; system("echo outside")`, SESSION)
+		).toEqual({
+			kind: "opaque",
+			why: "spawn sites run in different directories (/tmp/rbsetter, /workspace)",
+		});
+		// The endless setter `def value=(v) = 1` is a SyntaxError on every Ruby
+		// that has endless methods (Feature #16746 prohibits it), so no runtime
+		// behavior turns on the reading; this scan reads past the setter's own
+		// `=` to the body one and skips the def, keeping the block balance.
+		expect(evalSpawnCwd(`Dir.chdir("/tmp/rbsetter") do\n  def value=(v) = 1\nend\nsystem("echo outside")`, SESSION)).toEqual({
+			kind: "session",
+		});
+		// An endless def whose body is a parenthesized expression may carry a
+		// `;` inside the parens (`def x = (1; 2)` is valid Ruby): the body `=`
+		// is found before any body byte is read.
+		expect(evalSpawnCwd(`Dir.chdir("/tmp/rbsetter") do\n  def x = (1; 2)\nend\nsystem("echo outside")`, SESSION)).toEqual({
+			kind: "session",
+		});
+	});
+
+	test("a Ruby setter def inside a chdir block does not move the judge's directory question", async () => {
+		setJevAnswer(jevSafeAnswer());
+		const ctx = fresh();
+		const sessionId = ctx.sessionManager.getSessionId();
+		const code = `Dir.chdir("/tmp/rbsetter") do\n  def value=(v); @value = v; end\n  system("echo inside")\nend\nsystem("echo outside")`;
+		const result = await fire("tool_call", evalEvent(code, "rb"), ctx);
+		// The setter's `=` is part of its name, not an endless-body marker, so
+		// both spawns are visible sites in two different directories: one inside
+		// the chdir block, one back in the session directory the block restored.
+		// Judging either silently — against /workspace, where the inside spawn
+		// never ran — is the wrong question, so the gate asks instead.
+		expect(modelCalls.length).toBe(0);
+		const lines = decisionsFor(sessionId);
+		expect(lines[0]).toMatchObject({ decision: "block", layer: "cwd" });
+		expect(lines[0].why).toContain("spawn sites run in different directories (/tmp/rbsetter, /workspace)");
+		expect(lines[1]).toMatchObject({ decision: "block", layer: "headless" });
+		const payload = refusalOf(result);
+		expect(payload.why).toContain("spawn sites run in different directories");
+	});
+
+	test("a spawn directory the scan cannot read is opaque, never guessed", () => {
+		const opaqueWhy = (code: string): string => {
+			const scan = evalSpawnCwd(code, SESSION);
+			expect(scan.kind).toBe("opaque");
+			return scan.kind === "opaque" ? scan.why : "";
+		};
+		// Shorthand: the variable's value is not in the payload at all.
+		expect(opaqueWhy(`spawn(file, args, { cwd })`)).toContain("not a literal");
+		expect(opaqueWhy(`cp.exec("rm -rf .", { cwd: process.env.TARGET })`)).toContain("process.env.TARGET");
+		expect(opaqueWhy(`import subprocess, os\nsubprocess.run(["ls"], cwd=os.environ["X"])`)).toContain("os.environ");
+		// An f-string interpolates, so the directory it names is not this text.
+		expect(opaqueWhy(`import subprocess\nsubprocess.run(["ls"], cwd=f"/tmp/{name}")`)).toContain("not a literal");
+		// Sites that disagree: one spawn in /tmp/a, the next left in the session
+		// directory. There is no single directory this payload runs in.
+		expect(opaqueWhy(`import subprocess\nsubprocess.run(["ls"], cwd="/tmp/a")\nsubprocess.run(["uname"])`)).toContain("different directories");
+		// An options object built by spread names its keys nowhere.
+		expect(opaqueWhy(`cp.exec("x", { ...opts })`)).toContain("not a literal");
+		expect(opaqueWhy(`import subprocess\nsubprocess.run(["ls"], **opts)`)).toContain("not a literal");
+		// A concatenation is two strings, and reading either one alone would
+		// name a directory that exists nowhere.
+		expect(opaqueWhy(`import subprocess\nsubprocess.run(["ls"], cwd="/tmp/a" + "/b")`)).toContain("not a literal");
+		// `Dir.chdir` with no argument goes to the home directory.
+		expect(opaqueWhy(`Dir.chdir do\n  system("ls")\nend`)).toContain("no directory argument");
+	});
+
+	test("a cwd in a string or a comment is text, not a directory", () => {
+		expect(evalSpawnCwd(`cp.exec("echo cwd: '/evil'", { cwd: "/tmp/good" })`, SESSION)).toEqual({ kind: "literal", cwd: "/tmp/good" });
+		expect(evalSpawnCwd(`cp.exec("x", { cwd: "/tmp/a" }); // cwd: "/evil"`, SESSION)).toEqual({ kind: "literal", cwd: "/tmp/a" });
+		// A nested call's keyword belongs to that call, not to the spawn's own
+		// arguments: the spawn still names no directory.
+		expect(evalSpawnCwd(`import subprocess\nsubprocess.run(["ls"], env=make(cwd="/nested"))`, SESSION)).toEqual({ kind: "session" });
+		// `**` inside a string is text, so it is not read as an expanded object.
+		expect(evalSpawnCwd(`import subprocess\nsubprocess.run(["python", "-c", "print(2 ** 8)"])`, SESSION)).toEqual({ kind: "session" });
+	});
+
+	test("an object spread can override the literal the scan read first", () => {
+		const opaqueWhy = (code: string): string => {
+			const scan = evalSpawnCwd(code, SESSION);
+			expect(scan.kind).toBe("opaque");
+			return scan.kind === "opaque" ? scan.why : "";
+		};
+		// The literal is in the payload, but the options object is not the one
+		// it runs with: the last write wins, so the directory is `opts`'.
+		expect(opaqueWhy(`cp.exec("echo hi", { cwd: "/tmp/read", ...opts })`)).toContain("...opts");
+		expect(opaqueWhy(`cp.exec("echo hi", { cwd: "/tmp/read" }, ...rest)`)).toContain("...rest");
+		// A `**` expansion is unreadable whichever side it is written on: it
+		// either wins the key or raises, and no text here says which.
+		expect(opaqueWhy(`import subprocess\nsubprocess.run(["echo"], cwd="/tmp/kw", **opts)`)).toContain("**opts");
+		expect(opaqueWhy(`import subprocess\nsubprocess.run(["echo"], **opts, cwd="/tmp/kw")`)).toContain("**opts");
+		// Written before the key, the spread cannot beat it: the literal is the
+		// last write, so the directory it names is the one this call runs in.
+		expect(evalSpawnCwd(`cp.exec("echo hi", { ...opts, cwd: "/tmp/after" })`, SESSION)).toEqual({ kind: "literal", cwd: "/tmp/after" });
+		expect(evalSpawnCwd(`cp.exec("echo hi", ...rest, { cwd: "/tmp/after" })`, SESSION)).toEqual({ kind: "literal", cwd: "/tmp/after" });
+		// A nested call's spread is that call's, and `2 ** 8` is an operator:
+		// neither is a key of this spawn's options.
+		expect(evalSpawnCwd(`cp.exec("echo hi", { cwd: "/tmp/pow", n: 2 ** 8 })`, SESSION)).toEqual({ kind: "literal", cwd: "/tmp/pow" });
+		expect(evalSpawnCwd(`import subprocess\nsubprocess.run(["ls"], env=make(**opts), cwd="/tmp/nested")`, SESSION)).toEqual({
+			kind: "literal",
+			cwd: "/tmp/nested",
+		});
+	});
+
+	test("no spawn cwd leaves the session directory in force", () => {
+		expect(evalSpawnCwd(`import subprocess\nsubprocess.run(["ls", "-la"])`, SESSION)).toEqual({ kind: "session" });
+		expect(evalSpawnCwd(`cp.exec("ls")`, SESSION)).toEqual({ kind: "session" });
+	});
+
+	test("the payload's own spawn cwd is the directory it is judged in", async () => {
+		setJevAnswer(jevSafeAnswer());
+		const ctx = fresh();
+		const sessionId = ctx.sessionManager.getSessionId();
+		const code = `const cp = require("child_process");\ncp.exec("rm -rf .", { cwd: "/" });`;
+		const result = await fire("tool_call", evalEvent(code, "js"), ctx);
+		expect(resultText(result)).toContain("flagged for approval");
+		// Two lines: the verdict, then the headless outcome that followed it.
+		const lines = decisionsFor(sessionId);
+		expect(lines).toHaveLength(2);
+		expect(lines[0]).toMatchObject({ decision: "block", layer: "verdict", cwd: "/", spawnCwd: "/" });
+		expect(lines[1]).toMatchObject({ decision: "block", cwd: "/", spawnCwd: "/" });
+		// The judge was asked about `rm -rf .` in /, not in the session
+		// directory: judging the right text against the wrong directory is the
+		// defect this test exists for.
+		expect(stateOf(0).workingDirectory).toBe("/");
+		expect(stateOf(0).spawnCwd).toBe("/");
+	});
+
+	test("a spawn with no cwd argument keeps the session directory", async () => {
+		setJevAnswer(jevSafeAnswer());
+		const ctx = fresh();
+		const sessionId = ctx.sessionManager.getSessionId();
+		const result = await fire("tool_call", evalEvent(`const cp = require("child_process");\ncp.exec("rm -rf .");`, "js"), ctx);
+		expect(resultText(result)).toContain("flagged for approval");
+		const lines = decisionsFor(sessionId);
+		expect(lines[0]).toMatchObject({ cwd: SESSION });
+		expect(lines[0].spawnCwd).toBeUndefined();
+		expect(stateOf(0).workingDirectory).toBe(SESSION);
+		expect(stateOf(0).spawnCwd).toBeUndefined();
+	});
+
+	test("a spawn cwd that leaves the session directory is shown in the dialog", async () => {
+		setJevAnswer(jevSafeAnswer());
+		const ctx = fresh({ cwd: "/workspace/a/b", hasUI: true, selectResult: DENY });
+		const result = await fire("tool_call", evalEvent(`const cp = require("child_process");\ncp.exec("rm -rf .", { cwd: "../.." });`, "js"), ctx);
+		expect(refusalOf(result).layer).toBe("dialog");
+		// The resolved directory is outside the session directory and is shown
+		// as resolved — never folded back into the session's, and never named as
+		// if the session had chosen it.
+		expect(dialogText(ctx)).toContain("working directory: /workspace (declared by the payload's spawn call)");
+	});
+
+	test("two payloads differing only in their literal spawn cwd are judged separately", async () => {
+		setJevAnswer(jevSafeAnswer());
+		const ctx = fresh();
+		const sessionId = ctx.sessionManager.getSessionId();
+		await fire("tool_call", evalEvent(`import subprocess # cwd-key-probe\nsubprocess.run(["rm", "-rf", "."], cwd="/tmp/a")`, "py"), ctx);
+		await fire("tool_call", evalEvent(`import subprocess # cwd-key-probe\nsubprocess.run(["rm", "-rf", "."], cwd="/tmp/b")`, "py"), ctx);
+		expect(modelCalls.length).toBe(2);
+		expect(decisionsFor(sessionId).map(line => line.spawnCwd)).toEqual(["/tmp/a", "/tmp/a", "/tmp/b", "/tmp/b"]);
+	});
+
+	test("an unreadable spawn cwd asks instead of judging against a guess", async () => {
+		setJevAnswer(jevSafeAnswer());
+		const ctx = fresh();
+		const sessionId = ctx.sessionManager.getSessionId();
+		const code = `const cp = require("child_process");\ncp.exec("echo hi", { cwd: process.env.TARGET });`;
+		const result = await fire("tool_call", evalEvent(code, "js"), ctx);
+		const payload = refusalOf(result);
+		expect(payload.why).toContain("unreadable spawn cwd");
+		expect(payload.why).toContain("process.env.TARGET");
+		// Nothing was classified: a payload whose directory cannot be read has
+		// no correct question to put to the judge, so the gate does not ask one.
+		expect(modelCalls.length).toBe(0);
+		const lines = decisionsFor(sessionId);
+		expect(lines[0]).toMatchObject({ decision: "block", layer: "cwd" });
+		expect(lines[1]).toMatchObject({ decision: "block", layer: "headless" });
+	});
+
+	test("a session grant covers the two directories the dialog showed, and only those", async () => {
+		setJevAnswer(jevSafeAnswer());
+		const sessionId = `eval-grant-scope-${seq}`;
+		const code = `const cp = require("child_process");\ncp.exec("rm -rf .", { cwd: "/tmp/granted" });`;
+		// The dialog names both directories the grant covers: the payload's own
+		// spawn directory, and the session's — where the payload's relative work
+		// still lands.
+		const a = fresh({ sessionId, cwd: "/workspace/a", hasUI: true, selectResult: ALLOW_SESSION });
+		expect(await fire("tool_call", evalEvent(code, "js"), a)).toBeUndefined();
+		expect(dialogText(a)).toContain("working directory: /tmp/granted (declared by the payload's spawn call)");
+		expect(dialogText(a)).toContain("session directory: /workspace/a");
+		expect(selectCalls(a)[0][1].find(item => item.label === ALLOW_SESSION)?.description).toBe(
+			"This action, in both directories above, for the rest of the session",
+		);
+		expect(modelCalls.length).toBe(1);
+		// Same workspace, same payload: the grant answers for the session, with
+		// no dialog and no model call.
+		const again = fresh({ sessionId, cwd: "/workspace/a", hasUI: true, selectResult: DENY });
+		expect(await fire("tool_call", evalEvent(code, "js"), again)).toBeUndefined();
+		expect(selectCalls(again)).toHaveLength(0);
+		expect(modelCalls.length).toBe(1);
+		// The session moved (`/move` rewrites ctx.cwd) to another workspace while
+		// this payload declares its own absolute spawn directory, so nothing but
+		// the session's directory changed — and that directory is one the human
+		// never saw when they granted. The relative `rm -rf .` would now run in
+		// /workspace/b, so the grant must not answer for it.
+		const b = fresh({ sessionId, cwd: "/workspace/b", hasUI: true, selectResult: DENY });
+		const blocked = await fire("tool_call", evalEvent(code, "js"), b);
+		expect(refusalOf(blocked).layer).toBe("dialog");
+		expect(selectCalls(b)).toHaveLength(1);
+		expect(modelCalls.length).toBe(2);
+	});
+
+	test("the ask for an unreadable spawn cwd offers no grant", async () => {
+		setJevAnswer(jevSafeAnswer());
+		const ctx = fresh({ hasUI: true, selectResult: DENY });
+		const code = `const cp = require("child_process");\ncp.exec("echo hi", { cwd: process.env.TARGET });`;
+		await fire("tool_call", evalEvent(code, "js"), ctx);
+		const labels = selectCalls(ctx)[0][1].map(item => item.label);
+		expect(labels).toContain("Allow once");
+		expect(labels).toContain("Deny");
+		// A grant names a directory, and this payload's directory was never
+		// readable, so the dialog offers no scope the gate could not honor.
+		expect(labels).not.toContain("Allow for session");
+		expect(labels).not.toContain("Always allow");
 	});
 });

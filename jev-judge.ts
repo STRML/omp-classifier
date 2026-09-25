@@ -331,14 +331,21 @@ function endpointBackend(config: Extract<JudgeBackendConfig, { kind: "endpoint" 
 }
 
 /**
- * Ask the whole battery about one state and map the answers into `JevAnswers`.
+ * The REQUEST half of the split (issue #62): ask the whole battery about one
+ * state and map the answers into `JevAnswers`.
  *
- * `signal` is the caller's deadline — the gate passes
- * `AbortSignal.timeout(timeoutMs)` when its own budget is shorter than the
- * judge's defaults; `undefined` leaves the native timeouts in charge. One call,
- * no retries of our own and no second opinion: the judge already retries its
- * own transients, and a request that could not be answered has to surface as no
- * judgment rather than as a guess.
+ * `signal` is the request's own control, not the gate's deadline — the two are
+ * separate on purpose. The shadow and the eval harness hand in
+ * `AbortSignal.timeout(...)`, where aborting the request IS the failure policy,
+ * because neither wants a verdict after the fact. The live path hands in a
+ * cancellation signal and owns the deadline itself (`judgeBatteryUnderDeadline`
+ * below): aborting the transport destroys the answer it was waiting for, and
+ * the issue is exactly that the answer lands a beat late.
+ *
+ * `undefined` leaves the native timeouts in charge. One call, no retries of our
+ * own and no second opinion: the judge already retries its own transients, and
+ * a request that could not be answered has to surface as no judgment rather
+ * than as a guess.
  *
  * Throws `JevUnavailableError` for every failure, so the caller's `catch` is
  * the whole availability policy.
@@ -356,6 +363,103 @@ export async function judgeBattery(signal: AbortSignal | undefined, options: Jud
 	// Measured across the whole call, so latencyMs is what the classification
 	// waited for the judgment rather than the time to the first answer.
 	return toJevAnswers(result, battery, Math.round(performance.now() - startedAt));
+}
+
+/** How long past the deadline the gate keeps listening for a late answer
+ *  (issue #62): `min(2 x timeoutMs, 30s)`. The dialog may outlive the request,
+ *  but not by more than this — a wedged provider must not hold a socket for the
+ *  rest of the session. */
+const MAX_LATE_LISTEN_MS = 30_000;
+
+/** A judgment whose deadline fired while its request was still in flight
+ *  (issue #62). The answer it eventually produces is worth keeping: it can
+ *  refine the dialog the deadline opened, and nothing else. */
+export interface LateAnswers {
+	/** The late answers, or undefined when the request was cancelled (the
+	 *  human answered first) or the listen window closed. Never rejects. */
+	answers: Promise<JevAnswers | undefined>;
+	/** Stop listening and abort the in-flight request. */
+	cancel(): void;
+}
+
+/** How one judgment request ended under its deadline. `deadline` is not a
+ *  failure: the request is still running, and `late` carries what a late
+ *  answer can still do. */
+export type BatteryOutcome =
+	| { kind: "answered"; answers: JevAnswers }
+	| { kind: "failed"; error: unknown }
+	| { kind: "deadline"; late: LateAnswers };
+
+export interface JudgeBatteryDeadlineOptions extends JudgeBatteryOptions {
+	/** The caller's deadline in millis (config `timeoutMs`). */
+	timeoutMs: number;
+}
+
+/**
+ * The judge half of the split (issue #62): ask the battery under a deadline
+ * WITHOUT giving up on the answer the deadline was waiting for.
+ *
+ * The request owns its signal and the deadline is a race, not an abort. That is
+ * the whole fix: `judgeBattery(AbortSignal.timeout(timeoutMs), ...)` killed the
+ * transport at the deadline, so the judgment that finished a beat later was
+ * discarded and the user answered a dialog that said nothing but "the gate
+ * broke". Here the deadline reports `UNAVAILABLE` to the caller as before, and
+ * `late` hands back the answer when it lands: the caller (classify, then
+ * requestPermission) turns a late SAFE into a dismissal or a late UNSAFE into a
+ * reasoned dialog, never into a bypass.
+ *
+ * Listening stops at `min(2 x timeoutMs, 30s)` past the deadline, or as soon as
+ * the caller cancels, and either one aborts the request and disarms the window.
+ * The window timer is kept in a handle for that reason: a cancel that left it
+ * armed would hold the process's event loop for up to 30 seconds after a
+ * decision that is already final (the headless path and a dialog the human
+ * answered both cancel), which is a resource leak with nothing to show for it.
+ */
+export async function judgeBatteryUnderDeadline(options: JudgeBatteryDeadlineOptions): Promise<BatteryOutcome> {
+	const { timeoutMs, ...request } = options;
+	const controller = new AbortController();
+	const pending = judgeBattery(controller.signal, request);
+	const { promise: deadlineReached, resolve: reachDeadline } = Promise.withResolvers<undefined>();
+	const { promise: late, resolve: settleLate } = Promise.withResolvers<JevAnswers | undefined>();
+	const deadlineTimer = setTimeout(() => reachDeadline(undefined), timeoutMs);
+	/** The late listen window, armed only once the deadline has fired. Held so
+	 *  both ways of ending the listen can disarm it. */
+	let windowTimer: typeof deadlineTimer | undefined;
+	let lateSettled = false;
+	const settle = (answers: JevAnswers | undefined): void => {
+		if (lateSettled) return;
+		lateSettled = true;
+		settleLate(answers);
+	};
+	// Attached before the race so an answer that lands after the deadline is
+	// already routed to `settle`, and so a failure is never unhandled.
+	void pending.then(
+		answers => settle(answers),
+		() => settle(undefined),
+	);
+	// One body for both ways listening ends, so a cancel and a closed window
+	// cannot drift apart. Clearing the window here is what makes a cancel a
+	// cancel: the timer itself calls this, and a clear on an already-fired
+	// timer — or on the undefined handle before the window is armed — is a
+	// no-op by the timers spec.
+	const stopListening = (): void => {
+		clearTimeout(windowTimer);
+		controller.abort();
+		settle(undefined);
+	};
+	const outcome = await Promise.race([
+		pending.then(
+			(answers): BatteryOutcome => ({ kind: "answered", answers }),
+			(error): BatteryOutcome => ({ kind: "failed", error }),
+		),
+		deadlineReached.then((): BatteryOutcome => ({ kind: "deadline", late: { answers: late, cancel: stopListening } })),
+	]);
+	if (outcome.kind !== "deadline") {
+		clearTimeout(deadlineTimer);
+		return outcome;
+	}
+	windowTimer = setTimeout(stopListening, Math.min(2 * timeoutMs, MAX_LATE_LISTEN_MS));
+	return outcome;
 }
 
 /** How far a returned distribution may sit from summing to 1 before it stops

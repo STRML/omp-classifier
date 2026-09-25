@@ -5,7 +5,7 @@
  * honor the flag itself (a project-scope lockfile may legitimately re-enable a
  * plugin the user-scope one disables), so it says so once per session.
  */
-import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	fire,
 	loadPlugin,
@@ -36,6 +36,9 @@ beforeEach(async () => {
 	setJevDelay(5);
 	await loadPlugin(makeSettings([]));
 });
+// Producer-side cleanup (issue #107): this file writes the config file, so it
+// removes it after itself instead of relying on the next consumer's reset.
+afterEach(removeConfigFile);
 
 const DISABLED = { plugins: { "omp-classifier": { version: "0.2.0", enabled: false } } };
 const ENABLED = { plugins: { "omp-classifier": { version: "0.2.0", enabled: true } } };

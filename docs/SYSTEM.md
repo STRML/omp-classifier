@@ -28,6 +28,21 @@ thresholds. Four consequences shape every layer below:
 - **Fail-closed is a code path, not a promise.** A missing key, a non-2xx, a timeout, or an
   answer that does not match the battery yields `UNAVAILABLE`, which raises a dialog and is
   never cached. Nothing admits a guess in place of an answer.
+- **A missed deadline keeps listening, and that can only help the dialog.** The deadline is a
+  race the gate owns, not an abort on the request, so the judgment that lands a beat late can
+  still act on the dialog the deadline opened: a late `SAFE` dismisses it and the command runs,
+  a late `UNSAFE` leaves it open with the real reason beside it, a late `UNSURE` goes on the
+  record. A human who answers first cancels the request and the late answer does nothing.
+  Listening stops at `min(2 x timeoutMs, 30s)` past the deadline, or at a cancel — the human
+  answering, or the headless path with no dialog to refine — and either one aborts the
+  request and disarms the window. The three cases are written as they happen, on a
+  `late-verdict` layer, with the pair (`unavailable → late UNSAFE`) in `why` so calibration
+  can read the late answer next to the human's own line. A late verdict
+  can never bypass a dialog, and a late `UNSAFE` never re-blocks what a human allowed: the
+  dialog is the only thing it can refine. A late `SAFE` dismisses only where an on-time `SAFE`
+  would have auto-run — the destructive-token overlay and a refusal this session already holds
+  for the target keep the dialog open, because the late path recovers the deadline's answer,
+  never a guard the verdict path applies.
 
 ## The tower
 
@@ -262,10 +277,11 @@ behind it. The sweep in L5 exists to make that cheap enough to be routine.
 - **Verdict cache**: per session, keyed by command + cwd + env/pty identity + the judge's
   identity (the active backend and the model it answers with), and cleared whenever the
   effective config signature changes. `UNAVAILABLE` is never cached.
-- **Refusal memory**: what this session was denied, keyed by normalized target and cwd and
-  fingerprinted by the evidence the judge saw, fed back into the state as `priorRefusal` so
-  rewording cannot launder a refusal into a fresh judgment. A SAFE under a prior refusal is
-  not a clean bill: the refusal rode in the state the judge saw.
+- **Refusal memory**: what this session was denied, keyed by `normalizeGrantTarget` — the same
+  identity a session grant uses, so an approval lifts exactly what a refusal covers (issue #64)
+  — plus the cwd, and fingerprinted by the evidence the judge saw, fed back into the state as
+  `priorRefusal` so rewording cannot launder a refusal into a fresh judgment. A SAFE under a
+  prior refusal is not a clean bill: the refusal rode in the state the judge saw.
 - **Decision audit**: one JSONL line per decision at
   `<agentDir>/omp-classifier/decisions.jsonl`, every path, with session/decision ids,
   `policyVersion`/`policyHash` (the battery hash), `modelId`, `verdict`, `reasonCode`, the
@@ -282,7 +298,10 @@ what would work instead, what not to try. The human gets one line plus the short
 that can be answered correctly: the command, the axes, the alternatives.
 
 Session grants and 30-day persistent grants let a human pre-authorize a family of actions
-once instead of answering the same dialog five times. Dialog reasons are built from the same
+once instead of answering the same dialog five times. A grant is scoped to the directories
+its dialog put on screen: for an eval payload that declares a spawn directory of its own,
+both that directory and the session's, so a session that moves workspaces re-asks instead of
+riding an authorization nobody gave. Dialog reasons are built from the same
 numbers as the audit line, and the rm-family prompts carry the reversible-alternative
 footnote. Dry-run lets an agent ask the gate what it would do before doing it. A dialog from
 a session older than the on-disk plugin says so in its subtitle.
@@ -364,4 +383,4 @@ The agent driving this system is owed three things:
 | L5 | Corpus breadth: authored cases plus mined history give a false-ask rate, not a distribution over real traffic. The mined decision log is the intended source. | Open |
 | L1 | Kernel-level spawn interception (structural scan fix) | Open; documented gap in README Limits |
 | L1, L2 | Cheap pre-filter stage | Measured NO-GO on the authored corpus (2.2-4.4% volume, 0 misses); re-measure on a history corpus first |
-| L0 | Eval payload cwd propagation (spawn's own cwd in the record) | Open |
+| L0 | Eval payload cwd propagation (spawn's own cwd in the record) | Done (#14): the marker scan reads a spawn's own cwd when it is a literal, resolves it against the directory in effect, and judges in it; an unreadable one asks instead of guessing |

@@ -48,7 +48,12 @@ export interface ShadowReport {
 
 function liveOutcome(line: DecisionRecord): LiveOutcome | undefined {
 	if (line.cached === 1) return undefined;
-	const terminal = line.approval !== undefined || (line.decision === "allow" && line.layer === "verdict");
+	// A `late-verdict` allow (issue #62) is the dismissal from a judgment that
+	// answered after its deadline: the human was never asked, so it is an
+	// auto-allow. Its block lines — a late UNSAFE or UNSURE that left the dialog
+	// open — are not terminal: the human's own dialog line, when they answer,
+	// counts for that call.
+	const terminal = line.approval !== undefined || (line.decision === "allow" && (line.layer === "verdict" || line.layer === "late-verdict"));
 	if (!terminal) return undefined;
 	// A decision with no live verdict can't be told from an outage: not counted.
 	if (line.v3 !== undefined && !("error" in line.v3) && line.v3.live === undefined) return undefined;
