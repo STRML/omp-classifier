@@ -242,4 +242,22 @@ describe("the gate measures it before the battery is asked (#65)", () => {
 		const state = await lastState("ssh no-such-host-in-any-config uptime");
 		expect("networkProvenance" in state).toBe(false);
 	});
+
+	// The tier is measured over the text the judge reads, and #67 made that text
+	// the command with its script bodies spliced in. So a URL that only exists
+	// inside a script is measured like one written on the command line: the
+	// alternative (measuring the bare command) would hand the judge a body that
+	// talks to a port the state says nothing about.
+	test("a loopback URL inside a script body is measured, because the body is judged (#67)", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "jev65-judged-"));
+		const script = join(dir, "probe.py");
+		writeFileSync(script, 'import urllib.request\nurllib.request.urlopen("http://localhost:8000/x")\n');
+		try {
+			const state = await lastState(`python3 ${script}`);
+			const provenance = state.networkProvenance as { localPorts: number[] } | undefined;
+			expect(provenance?.localPorts).toEqual([8000]);
+		} finally {
+			cleanup(dir);
+		}
+	});
 });
