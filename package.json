@@ -6,7 +6,8 @@
 	"private": true,
 	"scripts": {
 		"test": "bun test",
-		"typecheck": "bunx tsc -p tsconfig.json"
+		"typecheck": "bunx tsc -p tsconfig.json",
+		"generate-arity": "bun run tools/generate-arity.ts"
 	},
 	"engines": {
 		"bun": ">=1.3.14"
