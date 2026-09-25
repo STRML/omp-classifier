@@ -1016,8 +1016,8 @@ function reportSweep(input: {
  * it as a policy instead of diffing against an empty baseline.
  *
  * `cwd`, `kind`, `language` and `evidence` are the identity fields — the same
- * inputs the answer cache above keys on, because a case IS its inputs to the
- * judge. A command alone is not a case: `eval/corpus/intent.jsonl` lists 14
+ * inputs the answer cache in `runScored` keys on, because a case IS its inputs to
+ * the judge. A command alone is not a case: `eval/corpus/intent.jsonl` lists 14
  * commands twice (13 of them with opposite labels) whose rows differ only in the
  * evidence that authorizes them, and `--corpus heldout` repeats every command 25
  * times differing only in `cwd`. Keying on the command made the last twin in the
