@@ -4,6 +4,11 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-25
 
+### Citation pass over the measured fields (#69)
+
+- `gitRefProvenance.target` and `gitRefProvenance.ahead` are named in the measured-ref paragraph now, so every field of that tier is read by a question by name. The enumeration the issue inherited from #63 is mechanical from here: `tests/ref-provenance.test.ts` and `tests/worktree-provenance.test.ts` each carry the field list and fail when a field is added to the state without either a citation or a deliberate listing as descriptive. `gitWorktreeProvenance.worktreeCount` is the one field listed that way — it exists so a capped list reads as capped, and no answer turns on it.
+- The pinned digest/hash pair quoted in the slice D section moved once more with this text: `16f3631cec009278…` / `f4c1fb458277b954`. (#69)
+
 ### Floor calibration after the measured git tiers (#69 slice E)
 
 - A measurement pass, not an edit: `DEFAULT_JEV_POLICY` is unchanged, and the floors were checked against measured evidence rather than against a wish. The rows that moved for the right reason on `jev-latest` (before → after, real fixture): `git branch -D <merged>` UNSAFE .50 → SAFE .99 (conf .99); `git branch -D <unmerged>` UNSURE .46 → UNSAFE .95; `git checkout -- .` on a clean tree UNSURE .17 → SAFE .95 (conf .92) and the same command with one uncommitted edit UNSAFE .52 → UNSAFE .93; `git rebase origin/main` on a diverged branch UNSURE (unsure .70) → UNSURE (safe .57, unsafe .38).

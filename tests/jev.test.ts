@@ -347,11 +347,14 @@ describe("jevQuestionsHash", () => {
 		// verdict texts the gate-measured worktree geometry (issue #69 slice C)
 		// and the measured ref state (slice D), so the pair moved
 		// 29ed2ae6375f9d54… / 87c99bf634aa9c64 -> 448d9fb26e53ce35… /
-		// 6e233a887462f5fc -> ac741ac9a706dd3b… / 1661d83b37a8bdd9. Every cached
-		// verdict is invalidated by that, which is the intent.
+		// 6e233a887462f5fc -> ac741ac9a706dd3b… / 1661d83b37a8bdd9 ->
+		// 16f3631cec009278… / f4c1fb458277b954, the last move naming
+		// `gitRefProvenance.target` and `gitRefProvenance.ahead` in the same
+		// paragraph. Every cached verdict is invalidated by that, which is the
+		// intent.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("ac741ac9a706dd3b07aca5c0206fbc2163473561f7710800a12250021c55a40d");
-		expect(jevQuestionsHash()).toBe("1661d83b37a8bdd9");
+		expect(digest).toBe("16f3631cec0092784ad5f3d038c0014bee38fa68d41d443d672d9a6a2488ade3");
+		expect(jevQuestionsHash()).toBe("f4c1fb458277b954");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 

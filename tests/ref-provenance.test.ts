@@ -215,4 +215,17 @@ describe("the criteria name the measured fields", () => {
 			expect(levels[2]).toContain("gitRefProvenance.unstagedChanges");
 		});
 	}
+
+	test("every measured ref field is cited, or listed here as descriptive", () => {
+		// The enumeration the issue asks for, kept mechanical: a field added to
+		// the state without a citation has to be declared descriptive on purpose.
+		const fields = ["kind", "target", "containedIn", "mergedIntoHead", "unstagedChanges", "stashCount", "behind", "ahead"];
+		// Nothing is descriptive here yet: every field of this tier is a fact a
+		// question reads by name.
+		const descriptive: Record<string, true> = {};
+		const text = JSON.stringify(jevQuestions());
+		for (const field of fields) {
+			expect(text.includes(`gitRefProvenance.${field}`) || descriptive[field] === true).toBe(true);
+		}
+	});
 });

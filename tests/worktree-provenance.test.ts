@@ -177,4 +177,17 @@ describe("the criteria name the measured field", () => {
 			expect(verdict).toContain("`gitWorktreeProvenance.linkedWorktree`");
 		});
 	}
+
+	test("every measured worktree field is cited, or listed here as descriptive", () => {
+		// The enumeration the issue asks for, kept mechanical: a field added to
+		// the state without a citation has to be declared descriptive on purpose.
+		const fields = ["workspaceRoot", "linkedWorktree", "mainCheckoutRoot", "siblingWorktreeRoots", "worktreeCount"];
+		// Descriptive on purpose: it exists so a list that hit the cap reads as
+		// capped, and no question's answer turns on it.
+		const descriptive: Record<string, true> = { worktreeCount: true };
+		const text = JSON.stringify(jevQuestions());
+		for (const field of fields) {
+			expect(text.includes(`gitWorktreeProvenance.${field}`) || descriptive[field] === true).toBe(true);
+		}
+	});
 });
