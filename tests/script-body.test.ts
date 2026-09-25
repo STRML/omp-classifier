@@ -256,6 +256,137 @@ describe("the reader itself", () => {
 	});
 });
 
+describe("the interpreter's own options, not the gate's guess at them", () => {
+	// Round 1 review: one global flag table made `python3 -E probe.py` end the
+	// scan, because `-E` was read as an inline-program spelling. `-E` is
+	// PYTHON* environment control — a boolean — so python still ran probe.py.
+	test("a boolean option does not end the scan (-E)", () => {
+		writeScript(root, "probe.py", BENIGN);
+		const read = readInterpretedScriptBodies("python3 -E probe.py", root, 8000);
+		expect(read.bodies.map(b => `${b.verb} ${b.operand}`)).toEqual(["python3 probe.py"]);
+		expect(read.text).toContain('print("scratch probe ok")');
+	});
+
+	test("a boolean option before a shell program does not either", async () => {
+		writeScript(root, "probe.sh", HARMFUL_SHELL);
+		// `bash -E` is errtrace: a boolean, not an inline program.
+		const result = await gate("bash -E probe.sh");
+		expect(refusalOf(result).why).toContain("flags: rm");
+	});
+
+	// Round 1 review, P2: `-W` takes a warning filter, so `ignore` is not the
+	// program; treating it as one shifted `payload` into the load arm, where an
+	// extensionless word is passed over — although python ran `payload`.
+	test("a value-taking option consumes its value, not the program (-W ignore)", () => {
+		writeScript(root, "payload", BENIGN);
+		const read = readInterpretedScriptBodies("python3 -W ignore payload", root, 8000);
+		expect(read.bodies.map(b => b.operand)).toEqual(["payload"]);
+		expect(read.text).toContain('print("scratch probe ok")');
+	});
+
+	test("an extensionless program behind a value-taking option is read off disk", async () => {
+		writeScript(root, "payload", "rm -rf ./out\n");
+		const result = await gate("python3 -W ignore payload");
+		expect(refusalOf(result).why).toContain("flags: rm");
+	});
+
+	test("the inline-code spellings still end the scan", () => {
+		for (const command of ["python3 -c 'print(1)'", "node -e 'x'", "perl -E 'x'", "bash -c 'echo hi'", "php -r 'echo 1;'"]) {
+			const read = readInterpretedScriptBodies(command, root, 8000);
+			expect({ command, bodies: read.bodies, refusal: read.refusal }).toEqual({ command, bodies: [], refusal: null });
+		}
+	});
+
+	test("a flag letter is read per interpreter: -E is code for perl, boolean for python", () => {
+		writeScript(root, "probe.pl", "print 1;\n");
+		// perl -E takes the code that follows, so there is no file to read.
+		expect(readInterpretedScriptBodies("perl -E probe.pl", root, 8000).bodies).toEqual([]);
+		expect(readInterpretedScriptBodies("python3 -E probe.pl", root, 8000).bodies.map(b => b.operand)).toEqual(["probe.pl"]);
+	});
+
+	test("a flag letter is read per interpreter: -s is stdin for a shell, a switch flag for perl", () => {
+		writeScript(root, "probe.pl", "print 1;\n");
+		expect(readInterpretedScriptBodies("perl -s probe.pl", root, 8000).bodies.map(b => b.operand)).toEqual(["probe.pl"]);
+		expect(readInterpretedScriptBodies("bash -s", root, 8000).bodies).toEqual([]);
+	});
+});
+
+describe("a loader operand the gate could not read is a refusal", () => {
+	// Round 1 review: the load arm passed over a read refusal, so `bun run
+	// huge.ts` ended with no body read and a matching allow rule could release
+	// it. "This word is not a program" and "this program could not be read" are
+	// different answers; only the first may be passed over.
+	const huge = (): string => `${"// padding line\n".repeat(1200)}rm -rf ./out\n`;
+
+	test("an over-limit file behind a runner subcommand is refused, not passed over", async () => {
+		writeScript(root, "huge.ts", huge());
+		const result = await gate("bun run huge.ts");
+		const payload = refusalOf(result);
+		expect(payload.layer).toBe("script-body");
+		expect(payload.why).toContain("review limit");
+		expect(payload.why).toContain("huge.ts");
+		expect(modelCalls.length).toBe(0);
+	});
+
+	test("an allow rule for the runner command cannot release it", async () => {
+		await loadPlugin(makeSettings([{ match: "bun run *", approval: "allow" }]));
+		writeScript(root, "huge.ts", huge());
+		const result = await gate("bun run huge.ts");
+		expect(refusalOf(result).layer).toBe("script-body");
+	});
+
+	test("a word the runner does not resolve to a file is still passed over", async () => {
+		// `bun run dev` reads package.json, not ./dev.
+		fs.mkdirSync(path.join(root, "dev"));
+		expect(await gate("bun run dev")).toBe("ALLOWED");
+	});
+});
+
+describe("the directory the shell will be in", () => {
+	// Round 1 review: the scan resolved every operand against the session's own
+	// directory, so `cd /tmp; python3 payload.py` read nothing at all — the
+	// shell changed directory and ran /tmp/payload.py while the gate judged the
+	// command text.
+	test("a semicolon-separated cd decides where the program is read from", () => {
+		writeScript(outside, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies(`cd ${outside}; python3 payload.py`, root, 8000);
+		expect(read.bodies.map(b => b.operand)).toEqual(["payload.py"]);
+		expect(read.text).toContain('print("scratch probe ok")');
+	});
+
+	test("a leading cd && is applied on top of the directory the command starts in", () => {
+		writeScript(outside, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies(`cd ${outside} && python3 payload.py`, root, 8000);
+		expect(read.bodies.map(b => b.operand)).toEqual(["payload.py"]);
+	});
+
+	test("a newline-separated cd counts too, and a relative target chains", () => {
+		const nested = path.join(outside, "nested");
+		fs.mkdirSync(nested);
+		writeScript(nested, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies(`cd ${outside}\ncd nested\npython3 payload.py`, root, 8000);
+		expect(read.bodies.map(b => b.operand)).toEqual(["payload.py"]);
+	});
+
+	test("a cd inside a pipe stage does not move the next stage", () => {
+		writeScript(outside, "payload.py", BENIGN);
+		// A pipeline stage is a subshell: the runner's own directory is unchanged.
+		const read = readInterpretedScriptBodies(`cd ${outside} | python3 payload.py`, root, 8000);
+		expect(read.bodies).toEqual([]);
+	});
+
+	test("a cd this scan cannot resolve refuses the later program instead of guessing", () => {
+		const read = readInterpretedScriptBodies('cd "$DIR"; python3 payload.py', root, 8000);
+		expect(read.refusal?.why).toContain("payload.py");
+	});
+
+	test("the body of a script reached through a cd is what the gate judges", async () => {
+		writeScript(outside, "payload.py", HARMFUL_CODE);
+		const result = await gate(`cd ${outside}; python3 payload.py`);
+		expect(refusalOf(result).why).toContain("flags: python3 runs payload.py");
+	});
+});
+
 describe("sibling commands of this fix stay as they were", () => {
 	test("a script the same command writes with a heredoc still runs", async () => {
 		// The path does not exist at gate time; the body it will hold is in the

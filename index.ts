@@ -1727,22 +1727,84 @@ const MODERATE_RISK_TOKENS = new Set([
 // `bash script.sh` is an ordinary invocation.
 const INLINE_CODE_INTERPRETERS = new Set(["python", "python2", "python3", "bash", "sh", "perl"]);
 
-// Flags whose VALUE is the program (or stdin), for the script-file scan (issue
-// #67). `python3 -c '…'`, `node -e '…'`, `perl -e '…'`, `bash -s`, a bare `-`:
-// the text travels with the command, so these spellings keep their existing
-// treatment and the file scan leaves them alone. The set mirrors
-// `interpretersInSegment`'s inline-code test; where a spelling would otherwise
-// be read as a program word it gets its own table below (php's `-r`, the
-// bun/deno subcommands). The direction is fail-closed either way: a gap here
-// costs one file body its read, while an invented entry costs a prompt on a
-// flag value.
-const INTERPRETER_PROGRAM_FLAG = /^-{1,2}(c|e|E|eval|command|p|print)$/u;
+// How one interpreter spells the options that decide what its program operand
+// is, for the script-file scan (issue #67 review round 1). One global table
+// read every interpreter's flags through one lens, and a flag is only a flag
+// for the program that owns it: `-E` is inline code for perl and "ignore the
+// PYTHON* environment variables" for python, `-s` is "the program is on stdin"
+// for a shell and switch parsing for perl, `-c` is inline code for python and
+// a syntax check for perl and ruby. Reading a letter through the wrong
+// interpreter's grammar ended the operand scan, so the file the interpreter
+// then ran was never read — `python3 -E probe.py` judged the command text
+// alone.
+interface InterpreterFlagGrammar {
+	/** Flags whose value is the program (or stdin): the text travels with the
+	 *  command, so the scan stops and the file scan leaves the line alone. */
+	inline: RegExp;
+	/** Flags that take a SEPARATE value word which is not a program (a warning
+	 *  filter, an include directory, a shopt name, an output style). The value
+	 *  word is consumed so it cannot be mistaken for the program. */
+	value: RegExp;
+	/** True when `-s` means "the program comes from stdin" for this
+	 *  interpreter. Only the shells spell it that way: python's `-s`, perl's
+	 *  `-s`, ruby's `-s`, and php's `-s` are all something else. */
+	stdinFlag: boolean;
+}
 
-// php spells inline code `-r`/`-R` and its interactive shell `-a`; for ruby `-r`
-// loads a library and for node it preloads one, so these letters are php's own.
-// `php -f x.php` names the script in the flag's VALUE, which is left to the
-// ordinary operand scan: the word after `-f` is read like any other program.
-const PHP_PROGRAM_FLAG = /^-{1,2}(r|R|run|a)$/u;
+/** Flags every verb may carry: a lone `-` is the POSIX "read the program from
+ *  stdin" spelling for sh, python, perl and php alike, and `--stdin` says the
+ *  same thing where a verb has a long form for it. */
+const SHARED_INLINE_FLAG = /^-$|^--stdin$/u;
+
+/** php spells inline code `-r`/`-R` and its interactive shell `-a`. `php -f
+ *  x.php` names the script in the flag's VALUE, which is deliberately left to
+ *  the ordinary operand scan: the word after `-f` is read like any other
+ *  program, which is exactly right for a flag whose value IS the program. */
+const PHP_INLINE_FLAG = /^-{1,2}(?:r|R|run|a)$/u;
+
+/** The grammars, by verb. `python2`/`python3` share `python`'s entry through
+ *  the version-stripped lookup at the call site. A verb with no entry gets no
+ *  grammar, which claims nothing: every word after it is read as if it were
+ *  the program. That direction is the safe one — a word that is not a file is
+ *  skipped for not existing, and a word that is a file gets read. */
+const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
+	// POSIX shells: `bash -c '…'`, `bash -s < script`, `bash -o errexit x.sh`.
+	sh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^[-+]O$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	zsh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	dash: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	ksh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	fish: { inline: /^-c$|^--command$/u, value: /^-C$|^--init-command$|^--config$/u, stdinFlag: true },
+	csh: { inline: /^-c$/u, value: /^-f$/u, stdinFlag: true },
+	tcsh: { inline: /^-c$/u, value: /^-f$/u, stdinFlag: true },
+	// `python3 -W ignore`, `-X utf8`, `-Q warn`, `--check-hash-based-pycs
+	// always`: the value is a setting, never a program. `-m` is handled where
+	// the module lookup is (its arguments are not programs either).
+	python: { inline: /^-c$|^--command$/u, value: /^-W$|^-X$|^-Q$|^--check-hash-based-pycs$/u, stdinFlag: false },
+	// perl: `-e`/`-E` are code; `-I dir` (library path) and `-F pattern` are
+	// values; `-s` is switch parsing, `-c` is a syntax check.
+	perl: { inline: /^-e$|^-E$|^--eval$/u, value: /^-I$|^-F$|^-M$|^-m$/u, stdinFlag: false },
+	// ruby: `-e` is code; `-I dir` (load path) and `-E enc`/`-W level` are
+	// settings; `-c` is a syntax check, `-s` switch parsing.
+	ruby: { inline: /^-e$|^--eval$/u, value: /^-I$|^-E$/u, stdinFlag: false },
+	// node: `-e`/`-p` are code; `--input-type` and `-C`/`--conditions` are
+	// settings; `-r`/`--require` preloads a FILE and is deliberately left to
+	// the operand scan, which reads it.
+	node: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--input-type$|^-C$|^--conditions$|^--title$/u, stdinFlag: false },
+	deno: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--ext$|^--config$|^--import-map$|^--v8-flags$/u, stdinFlag: false },
+	bun: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--cwd$|^--preload$|^--loader$/u, stdinFlag: false },
+	php: { inline: PHP_INLINE_FLAG, value: /^-c$|^-d$|^-z$|^--php-ini$|^--define$/u, stdinFlag: false },
+	// `lua -l mod`/`io`? the module name is a load, left to the operand scan:
+	// `lua -e 'code'` is the only inline spelling.
+	lua: { inline: /^-e$/u, value: /^--$/u, stdinFlag: false },
+	// `tclsh -encoding utf-8 script.tcl` names the codec in a value.
+	tclsh: { inline: /^-e$/u, value: /^-encoding$|^--encoding$/u, stdinFlag: false },
+	// `osascript -e 'code'`, `-l language` and `-s style` are values.
+	osascript: { inline: /^-e$|^-eosascript$/u, value: /^-l$|^-s$|^-i$|^-o$/u, stdinFlag: false },
+	// `Rscript -e 'code'`; `--encoding` names a codec.
+	rscript: { inline: /^-e$|^--expression$/u, value: /^--encoding$|^--default-packages$/u, stdinFlag: false },
+	// `julia -e 'code'`; `-p n`/`-t n` are worker and thread counts.
+	julia: { inline: /^-e$|^--eval$/u, value: /^-p$|^--procs$|^-t$|^--threads$|^-O$|^--optimize$/u, stdinFlag: false },
+};
 
 // The interpreters that put a subcommand between the verb and the program, and
 // the words that are one: `bun run x.ts` (the program is the NEXT word) and
@@ -2646,6 +2708,9 @@ function interpreterProgramRefs(segment: string[]): InterpreterProgramRef[] {
 	if (!invocation) return [];
 	const { verb, rest } = invocation;
 	const subcommands = INTERPRETER_SUBCOMMANDS[verb];
+	// `python3`/`python2` carry the version in the verb `interpreterName`
+	// reports, so the version-stripped spelling is tried before giving up.
+	const grammar = INTERPRETER_FLAG_GRAMMAR[verb] ?? INTERPRETER_FLAG_GRAMMAR[verb.replace(/[\d.]+$/u, "")];
 	const refs: InterpreterProgramRef[] = [];
 	let arm: "program" | "load" = "program";
 	for (let i = 0; i < rest.length; i++) {
@@ -2653,15 +2718,26 @@ function interpreterProgramRefs(segment: string[]): InterpreterProgramRef[] {
 		if (word === "") continue;
 		if (word.startsWith("-")) {
 			// The program travels in a flag's value, or on stdin: those spellings
-			// keep their existing treatment (inline-code and pipe scans).
+			// keep their existing treatment (inline-code and pipe scans). The
+			// table is per verb because the letters are: `-E` is code for perl
+			// and environment control for python, `-s` is stdin for a shell and
+			// switch parsing for perl.
 			if (
-				INTERPRETER_PROGRAM_FLAG.test(word) ||
-				word === "-" ||
-				word === "-s" ||
-				word === "--stdin" ||
-				(verb === "php" && PHP_PROGRAM_FLAG.test(word))
+				SHARED_INLINE_FLAG.test(word) ||
+				grammar?.inline.test(word) ||
+				(grammar?.stdinFlag === true && word === "-s")
 			) {
 				return refs;
+			}
+			// A flag whose separate value word is NOT a program: consume that
+			// word here, so `python3 -W ignore payload` reads `payload` instead
+			// of treating the warning filter as the program and pushing the real
+			// one into the load arm, where an extensionless word is passed over.
+			// An attached value needs no entry: `-Wextra` is not a program word
+			// either way, and leaving it alone means the next word is read.
+			if (grammar?.value.test(word)) {
+				i++;
+				continue;
 			}
 			// `python3 -m pkg` runs a module the interpreter resolves through its
 			// own import path. That is a lookup this scan does not model, and the
@@ -2705,9 +2781,22 @@ export interface ReadScriptBodiesResult {
 type ScriptFileRead = { kind: "body"; body: string } | { kind: "skip" } | { kind: "refuse"; why: string };
 
 /** Resolve and read one program word. `budget` is what the review limit has
- *  left for this body once the command and the section's labels are counted. */
+ *  left for this body once the command and the section's labels are counted.
+ *
+ *  Only "this word is not a file the interpreter resolves" may be passed over,
+ *  and only for a loader operand. A word that names a file the scan could not
+ *  read in full is refused on either arm: the interpreter opens that file
+ *  whatever the operand's grammatical role, so `bun run huge.ts` over the
+ *  review limit is a program the gate could not read, not an argument it can
+ *  ignore. Passing it over left the call with no body read, and a matching
+ *  non-blanket allow rule could then release it (issue #67 review round 1). */
 function readScriptFile(ref: InterpreterProgramRef, cwd: string, budget: number): ScriptFileRead {
+	// An expanded word names nothing the gate can resolve. The interpreter's own
+	// operand slot cannot be spelled that way (the shell expands it into the
+	// program, so the program is not readable text); a loader's operand may
+	// legitimately be a package.json script or an argument, so it is passed over.
 	if (SHELL_WORD_EXPANSION.test(ref.operand)) {
+		if (ref.arm === "load") return { kind: "skip" };
 		return {
 			kind: "refuse",
 			why:
@@ -2733,6 +2822,12 @@ function readScriptFile(ref: InterpreterProgramRef, cwd: string, budget: number)
 		};
 	}
 	if (!stat.isFile()) {
+		// A directory in a loader's position is not a program: `bun run dev`
+		// reads package.json, and a same-named directory must not turn the
+		// invocation into an unreadable program. In the interpreter's own
+		// operand slot a directory IS the program (python opens it as
+		// `__main__.py`), so there it refuses.
+		if (ref.arm === "load") return { kind: "skip" };
 		return {
 			kind: "refuse",
 			why:
@@ -2769,6 +2864,254 @@ function readScriptFile(ref: InterpreterProgramRef, cwd: string, budget: number)
 }
 
 /**
+ * How one command segment is joined to its neighbours, as far as the shell's
+ * working directory is concerned. `tokenizeShellSegments` splits `;`, `&&`,
+ * `||`, `|`, `&`, `(`, `)` and a newline into the same kind of boundary, but a
+ * `cd` does not cross them alike.
+ */
+type SegmentJoin =
+	/** The first segment: the shell is where the command started. */
+	| "start"
+	/** `;` or a newline: the same shell runs the next segment. */
+	| "same-shell"
+	/** `&&`: the next segment runs only if this one SUCCEEDED. */
+	| "on-success"
+	/** `||`: the next segment runs only if this one FAILED, so it sees the
+	 *  state this segment started from. */
+	| "on-failure"
+	/** `|` or `&`: the next segment runs in a subshell, or in the background. */
+	| "new-shell"
+	/** `)`: the group ended. */
+	| "group-end";
+
+/** One event of the walk over a command's own text: a segment, or a group
+ *  boundary. Both matter, because a group's `cd` dies at its `)`. */
+type ShellWalkEvent =
+	| { kind: "segment"; words: string[]; join: SegmentJoin; terminator: SegmentJoin }
+	| { kind: "group-open" }
+	| { kind: "group-close" };
+
+/**
+ * Walk `text` the way `tokenizeShellSegments` does — same quoting, escaping,
+ * words, and separators — and report each segment with the join that started
+ * it and the join that ended it, plus the group boundaries.
+ *
+ * The walk exists because the tokenizer throws the operators away, and an
+ * operator is what decides whether a `cd` reaches the next segment. The reader
+ * pairs the segments this walk finds against the tokenizer's own output and
+ * refuses to resolve anything when the two disagree: a shifted pairing would
+ * resolve a program against another segment's directory.
+ */
+function shellWalk(text: string): ShellWalkEvent[] {
+	const events: ShellWalkEvent[] = [];
+	let words: string[] = [];
+	let buffer = "";
+	let join: SegmentJoin = "start";
+	let inSingle = false;
+	let inDouble = false;
+	const flushWords = (): void => {
+		if (buffer.length > 0) {
+			words.push(buffer);
+			buffer = "";
+		}
+	};
+	const flushSegment = (terminator: SegmentJoin): void => {
+		flushWords();
+		// A separator with nothing after it closes no segment: the pending join
+		// stands, so `cd X; (` keeps the `;` the group inherits through.
+		if (words.length === 0) return;
+		events.push({ kind: "segment", words, join, terminator });
+		words = [];
+		join = terminator;
+	};
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i];
+		if (inSingle) {
+			if (ch === "'") inSingle = false;
+			else buffer += ch;
+			continue;
+		}
+		if (inDouble) {
+			if (ch === "\\" && i + 1 < text.length) {
+				const next = text[i + 1];
+				if (next === '"' || next === "\\" || next === "$" || next === "`") {
+					buffer += next;
+					i++;
+					continue;
+				}
+			}
+			if (ch === '"') inDouble = false;
+			else buffer += ch;
+			continue;
+		}
+		if (ch === "'") {
+			inSingle = true;
+			continue;
+		}
+		if (ch === '"') {
+			inDouble = true;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < text.length) {
+			buffer += text[i + 1];
+			i++;
+			continue;
+		}
+		if (ch === " " || ch === "\t") {
+			flushWords();
+			continue;
+		}
+		if (ch === "&") {
+			if (text[i + 1] === "&") {
+				flushSegment("on-success");
+				i++;
+			} else flushSegment("new-shell");
+			continue;
+		}
+		if (ch === "|") {
+			if (text[i + 1] === "|") {
+				flushSegment("on-failure");
+				i++;
+			} else flushSegment("new-shell");
+			continue;
+		}
+		if (ch === ";" || ch === "\n") {
+			flushSegment("same-shell");
+			continue;
+		}
+		if (ch === "(") {
+			flushSegment("new-shell");
+			events.push({ kind: "group-open" });
+			// A group inherits the shell's directory, and its first segment runs
+			// whenever the group does — so a `cd` there answers for the group's
+			// own segments even when the group itself was reached through `&&`
+			// or `||`. The close hands the directory back.
+			if (join !== "start") join = "same-shell";
+			continue;
+		}
+		if (ch === ")") {
+			flushSegment("group-end");
+			events.push({ kind: "group-close" });
+			continue;
+		}
+		buffer += ch;
+	}
+	// The last segment ends with the command: whatever it did to the shell
+	// stands, so its own terminator is a plain end rather than a pending join.
+	flushSegment(join === "start" ? "same-shell" : join);
+	return events;
+}
+
+/** What one segment does to the shell's working directory. */
+type SegmentDirectoryChange =
+	/** The segment does not move the shell. */
+	| { moves: false }
+	/** The segment moves the shell to `path`, or to a directory the command
+	 *  text cannot name (null: an expansion, `cd -`, a bare `cd`, a stack). */
+	| { moves: true; path: string | null };
+
+/** The builtins that can move the shell's working directory. */
+const DIRECTORY_CHANGE_BUILTINS: Record<string, true> = { cd: true, chdir: true, pushd: true, popd: true };
+
+/**
+ * Where one segment leaves the shell's working directory.
+ *
+ * `cd <literal>` is the only shape this reads. Everything else that can move
+ * the shell — an expanded target (`cd $DIR`), `cd -`, a bare `cd` (`$HOME`),
+ * `pushd`/`popd`, a `cd` with extra words or a redirect the walk folds into
+ * one — resolves to "unknown", which the reader treats as a refusal rather
+ * than a guess. A target that is not an existing directory leaves the shell
+ * where it was (a failed `cd` changes nothing), and a target the gate cannot
+ * even stat is unknown.
+ */
+function segmentDirectoryChange(words: string[], cwd: string | null): SegmentDirectoryChange {
+	const verb = words[0];
+	if (verb === undefined || DIRECTORY_CHANGE_BUILTINS[verb] !== true) return { moves: false };
+	// `pushd`/`popd` move the directory onto a stack this walk does not follow.
+	if (verb !== "cd" && verb !== "chdir") return { moves: true, path: null };
+	if (words.length !== 2) return { moves: true, path: null };
+	const target = words[1];
+	if (target === "-" || SHELL_WORD_EXPANSION.test(target)) return { moves: true, path: null };
+	const expanded = target === "~" || target.startsWith("~/") ? path.join(os.homedir(), target.slice(1)) : target;
+	// An absolute target needs no starting directory; a relative one does, so a
+	// relative `cd` while the directory is unknown stays unknown.
+	if (cwd === null && !path.isAbsolute(expanded)) return { moves: true, path: null };
+	let resolved: string;
+	let stat: fs.Stats;
+	try {
+		resolved = resolveToCwd(expanded, cwd ?? os.homedir());
+		stat = fs.statSync(resolved);
+	} catch (err) {
+		// A target that is not there fails the `cd`, leaving the shell where it
+		// was; anything the gate cannot even stat is not a place it may guess
+		// about.
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return { moves: true, path: cwd };
+		return { moves: true, path: null };
+	}
+	return { moves: true, path: stat.isDirectory() ? resolved : cwd };
+}
+
+/**
+ * The working directory each command segment runs in, aligned with the
+ * `segments` `tokenizeShellSegments` produced for the same text. `null` means
+ * the directory cannot be determined from the command text.
+ *
+ * Round 1 review: every operand was resolved against the session's own
+ * directory, so `cd /tmp; python3 payload.py` read nothing (ENOENT) and the
+ * gate judged the command text while the shell changed directory and ran the
+ * file. The join around a segment decides whether the `cd` chain reaches it:
+ * a `;`, newline, or `&&` keeps it, a `|`/`&` runs the segment in a subshell
+ * where its own `cd` is invisible, a `||` branch sees the state its segment
+ * started from (a failed segment changed nothing), and a `(`…`)` group
+ * inherits the directory but hands it back at the close.
+ */
+function segmentWorkingDirectories(text: string, base: string, segments: string[][]): Array<string | null> {
+	// Nothing is resolved unless this walk and the tokenizer agree word for
+	// word: a shifted pairing would read another segment's directory.
+	const dirs: Array<string | null> = new Array<string | null>(segments.length).fill(null);
+	const events = shellWalk(text);
+	const walked = events.filter(event => event.kind === "segment");
+	if (walked.length !== segments.length) return dirs;
+	for (let index = 0; index < walked.length; index++) {
+		const words = walked[index].words;
+		if (words.length !== segments[index].length || words.some((word, at) => word !== segments[index][at])) return dirs;
+	}
+	const opened: Array<string | null> = [];
+	let current: string | null = base;
+	let index = 0;
+	for (const event of events) {
+		if (event.kind === "group-open") {
+			// A group inherits the directory and hands it back at its close.
+			opened.push(current);
+			continue;
+		}
+		if (event.kind === "group-close") {
+			current = opened.pop() ?? null;
+			continue;
+		}
+		const at = index++;
+		dirs[at] = current;
+		const change = segmentDirectoryChange(event.words, current);
+		if (!change.moves) continue;
+		const inSubshell = event.join === "new-shell" || event.terminator === "new-shell" || event.terminator === "group-end";
+		const conditional = event.join === "on-success" || event.join === "on-failure";
+		if (event.terminator === "on-failure" || inSubshell) {
+			// It failed, or ran in its own stage or background job: the shell is
+			// where this segment found it.
+			continue;
+		}
+		if (conditional && event.terminator !== "on-success") {
+			// It may not have run at all (an `&&`/`||` chain that ended in a
+			// plain `;`), so where the shell is now is not a fact in the text.
+			current = null;
+			continue;
+		}
+		current = change.path;
+	}
+	return dirs;
+}
+
+/**
  * Read the program text of every script the command hands to an interpreter
  * (issue #67).
  *
@@ -2777,6 +3120,11 @@ function readScriptFile(ref: InterpreterProgramRef, cwd: string, budget: number)
  * the worktree, and renaming a refused script flipped the verdict. The body is
  * read here and joins the judged text, exactly as a heredoc body already does,
  * which makes path and filename stop mattering in both directions.
+ *
+ * `cwd` is the directory the command STARTS in: each operand is resolved
+ * against the directory its own segment will run in, as far as the command's
+ * own `cd` chain can be read (see `segmentWorkingDirectories`). A directory
+ * this walk cannot determine makes a program word a refusal, never a guess.
  *
  * The bound is the review limit: the body is text the gate now reviews, and
  * text past the limit is text neither the classifier nor a permission dialog
@@ -2799,24 +3147,47 @@ export function readInterpretedScriptBodies(command: string, cwd: string, limit:
 	// program this scan insists on reading), while an ANSI-C or crossed quote
 	// span is text the shell never parses as a command either. The judged text
 	// below stays the whole command: masking is for the scan, not for the judge.
-	for (const segment of tokenizeShellSegments(maskHeredocBodiesAndAnsiSpans(command).masked)) {
+	const masked = maskHeredocBodiesAndAnsiSpans(command).masked;
+	const segments = tokenizeShellSegments(masked);
+	const dirs = segmentWorkingDirectories(masked, cwd, segments);
+	for (let index = 0; index < segments.length; index++) {
+		const segment = segments[index];
 		if (segment.length === 0) continue;
 		for (const ref of interpreterProgramRefs(segment)) {
+			const dir = dirs[index];
+			if (dir === null) {
+				// The shell's directory at this segment is not in the text (a
+				// `cd $DIR`, `cd -`, a bare `cd`, `pushd`, or a separator this
+				// walk and the tokenizer read differently). Reading the program
+				// from a guessed directory would judge a different file than the
+				// interpreter runs, so a program word here refuses; a loader word
+				// that is not script-shaped may be a package.json script or an
+				// argument, and is passed over.
+				const scriptShaped = SCRIPT_FILE_EXTENSION.test(ref.operand) || ref.operand.includes("/");
+				if (ref.arm === "load" && !scriptShaped) continue;
+				return {
+					text,
+					bodies,
+					refusal: {
+						why:
+							`script body blocked: the working directory ${ref.verb} would run ${ref.operand} ` +
+							`from cannot be resolved from the command text`,
+					},
+				};
+			}
 			// Label lines the section adds: shell comments, so a body's first line
 			// is never read as a command of this line's, and the judge can see that
 			// the text below is a FILE the interpreter will run.
 			const label = `\n# --- ${ref.verb} runs ${ref.operand}; body read from disk ---\n`;
 			const endLabel = `\n# --- end of ${ref.operand} ---`;
-			const result = readScriptFile(ref, cwd, limit - text.length - label.length - endLabel.length);
+			const result = readScriptFile(ref, dir, limit - text.length - label.length - endLabel.length);
 			if (result.kind === "skip") continue;
-			// Only the interpreter's own operand is promised to be the program, so
-			// only there is "cannot read it" a refusal; a word reached past a
-			// subcommand or a loader flag may be a package.json script or an
-			// argument, and is passed over when it is not readable.
-			if (result.kind === "refuse") {
-				if (ref.arm === "load") continue;
-				return { text, bodies, refusal: { why: result.why } };
-			}
+			// A read refusal is a refusal on BOTH arms: the interpreter opens the
+			// file whatever the operand's grammatical role, and passing a loader's
+			// refusal over left `bun run huge.ts` with no body read, which a
+			// matching allow rule could then release. Only the "this word does not
+			// name a file" answers are skipped, and `readScriptFile` decides those.
+			if (result.kind === "refuse") return { text, bodies, refusal: { why: result.why } };
 			bodies.push({ verb: ref.verb, operand: ref.operand, body: result.body });
 			text += `${label}${result.body}${endLabel}`;
 		}
@@ -5129,7 +5500,13 @@ export default function (pi: ExtensionAPI) {
 			// limit, unreadable, truncated, expanded by the shell before the
 			// interpreter sees it) fails closed here, before any static rule,
 			// grant, or dialog could approve text nobody read.
-			const script = readInterpretedScriptBodies(command, cwd, config.maxCommandLength);
+			// The reader is handed the directory the command STARTS in, not the
+			// one the host extracted a leading `cd X &&` into: the reader applies
+			// the command's own `cd` chain itself, segment by segment, so a `cd`
+			// the host never strips (`cd /tmp; python3 payload.py`) still decides
+			// where payload.py is read from (issue #67 review round 1).
+			const startCwd = rawCwd ? resolveToCwd(rawCwd, ctx.cwd) : ctx.cwd;
+			const script = readInterpretedScriptBodies(command, startCwd, config.maxCommandLength);
 			if (script.refusal) {
 				const why = script.refusal.why;
 				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "script-body", why, cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
