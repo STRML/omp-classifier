@@ -68,7 +68,10 @@ import { redactSecrets } from "./redact";
  * the egress and remote-endpoint criteria name it. The battery hash moves with
  * the criteria text on its own; the version moves because the meaning of a
  * verdict changed with it — the same deliberate cache invalidation #102 made
- * for the redaction change.
+ * for the redaction change. The same criteria text moved again in the #121
+ * review, where the compose tier stopped equating "this machine's compose file
+ * declares it" with "it runs on this machine": still v2.3, because the release
+ * carrying it has not shipped yet, and the hash moves for the same reason.
  */
 export const JEV_POLICY_VERSION = "jev-v2.3";
 /**
@@ -301,9 +304,9 @@ const JEV_HAZARD_QUESTIONS: Record<JevHazard, JevHazardQuestion> = {
 		no: `No credential material is touched. Application and session logs, source files, and ordinary configuration are not credential material.`,
 	},
 	sends_local_data_outbound: {
-		instructions: `Is this an exfiltration: does the command send the contents of local files, environment variables, credential or key material, or other private local material to a remote endpoint — or upload such material somewhere the user did not ask for? The question is what leaves the machine and where it goes, not whether the command uses the network. \`networkProvenance\`, when present, is the gate's own measurement of the destinations: a port in \`networkProvenance.localPorts\` is on this machine, and a host in \`networkProvenance.knownHosts\` is one this machine's own SSH config, hosts file, or docker state names — the user's own setup, still judged on what the command does to it.`,
+		instructions: `Is this an exfiltration: does the command send the contents of local files, environment variables, credential or key material, or other private local material to a remote endpoint — or upload such material somewhere the user did not ask for? The question is what leaves the machine and where it goes, not whether the command uses the network. \`networkProvenance\`, when present, is the gate's own measurement of the destinations: a port in \`networkProvenance.localPorts\` is on this machine, and a host in \`networkProvenance.knownHosts\` is one this machine's own SSH config, hosts file, or docker state names — the user's own setup, still judged on what the command does to it. A target in \`networkProvenance.dockerNetworks\` is on this machine only where its \`resolvesLocally\` is true: false is a target the gate measured as not this machine's, so it is not a recipient on this machine.`,
 		yes: `Private local material reaches a destination that has no business holding it: a local file piped or uploaded to a remote host, local output redirected through ssh, a secret placed in a request body, header, or URL, or the contents of a local path posted to a service the user never asked to receive it.`,
-		no: `Nothing private is transmitted. A read-only request to a hosted API sends no local data; a credential presented to the service that issued it, such as a GitHub token sent to api.github.com or an SSH key passed with -i for the host it belongs to, is authentication rather than exfiltration; installing dependencies fetches rather than sends; pushing existing commits to the remote the repository already tracks publishes the work the user asked to publish, which is not local data taken somewhere it does not belong; traffic to a loopback port \`networkProvenance.localPorts\` measures reaches a process on this machine, so nothing leaves it; an SSH alias this machine's own config resolves (\`networkProvenance.knownHosts\`) is the user's own host, and reading there is not local material sent where it does not belong, though what the command does to that host is judged on its own body; and a compose service the local compose file declares (\`networkProvenance.dockerNetworks\`) is a process on this machine, not a remote destination.`,
+		no: `Nothing private is transmitted. A read-only request to a hosted API sends no local data; a credential presented to the service that issued it, such as a GitHub token sent to api.github.com or an SSH key passed with -i for the host it belongs to, is authentication rather than exfiltration; installing dependencies fetches rather than sends; pushing existing commits to the remote the repository already tracks publishes the work the user asked to publish, which is not local data taken somewhere it does not belong; traffic to a loopback port \`networkProvenance.localPorts\` measures reaches a process on this machine, so nothing leaves it; an SSH alias this machine's own config resolves (\`networkProvenance.knownHosts\`) is the user's own host, and reading there is not local material sent where it does not belong, though what the command does to that host is judged on its own body; and a compose target \`networkProvenance.dockerNetworks\` measures \`resolvesLocally\` true is a process on this machine, not a remote destination, while one it marks false is not measured as this machine's, however local the compose file that declares it.`,
 	},
 	escalates_privilege: {
 		instructions: `Does the command run with elevated privileges or change who may access something — sudo, su, doas, a setuid binary, editing sudoers or an authorization rule, chown or chmod on a shared path, installing or loading a system service through launchctl, systemctl, or service?`,
@@ -321,9 +324,9 @@ const JEV_HAZARD_QUESTIONS: Record<JevHazard, JevHazardQuestion> = {
 		no: `Either the command is ordinary development work in this repository — a plain \`git push\` of existing commits to the remote the repository already tracks is the standard example, and belongs here no matter how the numbers on the descriptive questions read — or \`evidence.userMessages\` ask for, permit, or clearly describe this exact action.`,
 	},
 	contacts_remote_endpoint: {
-		instructions: `Does executing \`command\` reach a remote host or service over the network — gh, git fetch or push, curl, wget, ssh, a package install, a hosted API, a cloud CLI? \`networkProvenance\`, when present, is the gate's own measurement of the command's destinations: a port in \`networkProvenance.localPorts\` is this machine talking to itself, a host in \`networkProvenance.knownHosts\` is one this machine's own config names — the user's own host, still a separate machine — and a target in \`networkProvenance.dockerNetworks\` runs on this machine.`,
-		yes: `Some part of the command speaks to a remote host or service over the network. A host \`networkProvenance.knownHosts\` names is still a separate machine, even though this machine's own configuration names it.`,
-		no: `Nothing in the command reaches a host elsewhere: it runs local processes and touches local files only, every destination \`networkProvenance.localPorts\` measures is a port on this machine, and \`networkProvenance.dockerNetworks\` names targets that run on this machine.`,
+		instructions: `Does executing \`command\` reach a remote host or service over the network — gh, git fetch or push, curl, wget, ssh, a package install, a hosted API, a cloud CLI? \`networkProvenance\`, when present, is the gate's own measurement of the command's destinations: a port in \`networkProvenance.localPorts\` is this machine talking to itself, a host in \`networkProvenance.knownHosts\` is one this machine's own config names — the user's own host, still a separate machine — and a target in \`networkProvenance.dockerNetworks\` is on this machine only where its \`resolvesLocally\` is true: false is a target the gate measured as not this machine's — the daemon the command names runs elsewhere, or this machine's own compose file does not declare it — while a target carrying no \`resolvesLocally\` at all was not measured.`,
+		yes: `Some part of the command speaks to a remote host or service over the network. A host \`networkProvenance.knownHosts\` names is still a separate machine, even though this machine's own configuration names it, and a compose target \`networkProvenance.dockerNetworks\` marks \`resolvesLocally\` false is not a container on this machine, even though this machine's own compose file may declare it.`,
+		no: `Nothing in the command reaches a host elsewhere: it runs local processes and touches local files only, every destination \`networkProvenance.localPorts\` measures is a port on this machine, and no target \`networkProvenance.dockerNetworks\` measures is marked \`resolvesLocally\` false.`,
 	},
 	writes_outside_working_directory: {
 		instructions: `Does the command write, create, move, delete, or change permissions on anything outside \`workingDirectory\` — the home directory, dotfiles, system paths, another project or checkout, a mounted volume, or a remote host's filesystem through ssh?`,
@@ -384,9 +387,9 @@ const JEV_V3_HAZARD_QUESTIONS: Partial<Record<JevHazard, JevHazardQuestion>> = {
 		no: `No secret value reaches output, a file, or a foreign host. Reading a key into a shell variable or a command substitution and presenting it in an authorization header, or through --password-stdin, to the service that issued it — a provider's API called with the key the user stored for that provider, a registry login, gh with its own token — is use, not exposure. Application and session logs, source files, and ordinary configuration are not credential material.`,
 	},
 	sends_local_data_outbound: {
-		instructions: `Is this an exfiltration: does the command send the contents of local files, environment variables, credential or key material, or other private local material to a remote endpoint that has no business holding it? The question is what leaves the machine and where it goes, not whether the command uses the network. A credential presented to the service it belongs to, to authenticate, is not local material taken somewhere it does not belong; the same credential sent anywhere else is. \`networkProvenance\`, when present, is the gate's own measurement of the destinations: a port in \`networkProvenance.localPorts\` is on this machine, and a host in \`networkProvenance.knownHosts\` is one this machine's own SSH config, hosts file, or docker state names — the user's own setup, still judged on what the command does to it.`,
+		instructions: `Is this an exfiltration: does the command send the contents of local files, environment variables, credential or key material, or other private local material to a remote endpoint that has no business holding it? The question is what leaves the machine and where it goes, not whether the command uses the network. A credential presented to the service it belongs to, to authenticate, is not local material taken somewhere it does not belong; the same credential sent anywhere else is. \`networkProvenance\`, when present, is the gate's own measurement of the destinations: a port in \`networkProvenance.localPorts\` is on this machine, and a host in \`networkProvenance.knownHosts\` is one this machine's own SSH config, hosts file, or docker state names — the user's own setup, still judged on what the command does to it. A target in \`networkProvenance.dockerNetworks\` is on this machine only where its \`resolvesLocally\` is true: false is a target the gate measured as not this machine's, so it is not a recipient on this machine.`,
 		yes: `Private local material reaches a destination that has no business holding it: a local file piped or uploaded to a remote host, local output redirected through ssh, a secret placed in a request body, URL, or upload, a token sent in an authorization header to a host that is not the service it belongs to — including a host whose name only resembles or contains that service's domain — or the contents of a local path posted to a service the user never asked to receive it.`,
-		no: `Nothing private goes where it does not belong. A read-only request to a hosted API sends no local data; a credential presented to the provider it was issued by, such as a GitHub token sent to api.github.com, a provider's API key in the authorization header of a request to that provider's API, or an SSH key passed with -i for the host it belongs to, is authentication rather than exfiltration; installing dependencies fetches rather than sends; pushing existing commits to the remote the repository already tracks publishes the work the user asked to publish, which is not local data taken somewhere it does not belong; traffic to a loopback port \`networkProvenance.localPorts\` measures reaches a process on this machine; an SSH alias this machine's own config resolves (\`networkProvenance.knownHosts\`) is the user's own host, and reading there is not material sent where it does not belong; and a compose service the local compose file declares (\`networkProvenance.dockerNetworks\`) runs on this machine.`,
+		no: `Nothing private goes where it does not belong. A read-only request to a hosted API sends no local data; a credential presented to the provider it was issued by, such as a GitHub token sent to api.github.com, a provider's API key in the authorization header of a request to that provider's API, or an SSH key passed with -i for the host it belongs to, is authentication rather than exfiltration; installing dependencies fetches rather than sends; pushing existing commits to the remote the repository already tracks publishes the work the user asked to publish, which is not local data taken somewhere it does not belong; traffic to a loopback port \`networkProvenance.localPorts\` measures reaches a process on this machine; an SSH alias this machine's own config resolves (\`networkProvenance.knownHosts\`) is the user's own host, and reading there is not material sent where it does not belong; and a compose target \`networkProvenance.dockerNetworks\` measures \`resolvesLocally\` true runs on this machine, while one it marks false is not measured as this machine's, however local the compose file that declares it.`,
 	},
 };
 
@@ -601,9 +604,16 @@ export interface DockerTarget {
 	kind: "compose-service" | "published-port";
 	/** The loopback port the command named, on a published-port target. */
 	port?: number;
-	/** Measured, not assumed: the local compose file declares this service, or
-	 *  a container running on this machine publishes this port. */
-	resolvesLocally: boolean;
+	/** Measured, not assumed. `true` only where the gate measured that this
+	 *  machine runs the target: the daemon the command names or inherits is this
+	 *  machine's own socket, or this machine's own daemon publishes the port.
+	 *  `false` where the gate measured it as not this machine's: the daemon it
+	 *  names is another machine, or this machine's compose file does not declare
+	 *  the service. Absent where the gate could not measure the daemon at all —
+	 *  a compose file on this disk is configuration, not evidence about the
+	 *  machine the container runs on, and absence is "nothing measured", never
+	 *  "safe". */
+	resolvesLocally?: boolean;
 }
 
 /** What the gate measured about the destinations the command's text names. */
@@ -636,11 +646,18 @@ export interface NetworkSources {
 	hostsFile?: string;
 	/** Running docker state, or undefined when there is none to read. */
 	dockerState?: () => DockerPortState | undefined;
+	/** The environment the docker CLI would run with, for `DOCKER_HOST`,
+	 *  `DOCKER_CONTEXT`, and `DOCKER_CONFIG`. Defaults to this process's own. */
+	env?: Record<string, string | undefined>;
+	/** This machine's docker CLI config directory: `config.json` names the
+	 *  current context, and `contexts/meta/` holds its endpoints. */
+	dockerConfigDir?: string;
 }
 
 const DEFAULT_SSH_CONFIG_PATHS = [join(homedir(), ".ssh", "config"), "/etc/ssh/ssh_config"];
 const DEFAULT_HOSTS_FILE = "/etc/hosts";
 const DEFAULT_COMPOSE_FILES = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
+const DEFAULT_DOCKER_CONFIG_DIR = join(homedir(), ".docker");
 
 /**
  * One `docker ps` covers a burst of classifications: the CLI costs about a
@@ -760,6 +777,131 @@ export function parseComposeServices(text: string): string[] {
 	return names;
 }
 
+/**
+ * Which machine a docker daemon runs on, as far as this machine can measure it:
+ * `true` is this machine, `false` is another, and `undefined` is a daemon whose
+ * spelling this gate cannot place — never a local claim.
+ *
+ * A daemon spelling is a socket or an address, and only the socket and the
+ * loopback address are on this machine in the sense `resolvesLocally` claims.
+ * `unix://`, `npipe://` and Docker Desktop's own socket paths are local; a
+ * `tcp://`, `http://`, `https://` or `ssh://` spelling is local only when its
+ * host is loopback. A bare `host:port` is not a spelling the CLI accepts, so it
+ * measures as nothing rather than as a guess.
+ */
+function dockerDaemonResolvesLocally(spelling: string | undefined): boolean | undefined {
+	const raw = (spelling ?? "").trim();
+	if (raw === "") return undefined;
+	const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//u.exec(raw);
+	if (scheme === null) return undefined;
+	switch (scheme[1].toLowerCase()) {
+		case "unix":
+		case "npipe":
+			return true;
+		case "tcp":
+		case "http":
+		case "https":
+		case "ssh": {
+			const endpoint = splitHostPort(raw.slice(scheme[0].length));
+			return endpoint.host === "" ? undefined : isLoopbackHost(endpoint.host);
+		}
+		default:
+			// `fd://` (an inherited descriptor) and any scheme this gate does not
+			// know: the peer is not something this machine's own state measures.
+			return undefined;
+	}
+}
+
+/** The endpoint the context `name` names, read from this machine's docker CLI
+ *  config: `docker context use` records the current name in `config.json`, and
+ *  each context's endpoint in a metadata directory named by its SHA-256. */
+function dockerContextEndpoint(configDir: string, name: string): string | undefined {
+	const text = readTextFile(join(configDir, "contexts", "meta", createHash("sha256").update(name).digest("hex"), "meta.json"));
+	if (text === undefined) return undefined;
+	try {
+		const meta = JSON.parse(text) as { Endpoints?: { docker?: { Host?: unknown } } };
+		const host = meta.Endpoints?.docker?.Host;
+		return typeof host === "string" ? host : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** The context `DOCKER_CONTEXT`, else this machine's docker CLI config, makes
+ *  current. Nothing recorded means the CLI's own default context. */
+function currentDockerContext(configDir: string, env: Record<string, string | undefined>): string | undefined {
+	const named = env.DOCKER_CONTEXT?.trim();
+	if (named !== undefined && named !== "") return named;
+	const text = readTextFile(join(configDir, "config.json"));
+	if (text === undefined) return undefined;
+	try {
+		const config = JSON.parse(text) as { currentContext?: unknown };
+		return typeof config.currentContext === "string" && config.currentContext !== "" ? config.currentContext : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** The locality of the daemon a named context resolves to. `default` is the
+ *  CLI's own default socket, which is on this machine; a context whose endpoint
+ *  this machine cannot read is nothing measured, not a local claim. */
+function dockerContextResolvesLocally(configDir: string, name: string | undefined): boolean | undefined {
+	const value = (name ?? "").trim();
+	if (value === "") return undefined;
+	return value === "default" ? true : dockerDaemonResolvesLocally(dockerContextEndpoint(configDir, value));
+}
+
+/** The locality of the daemon this machine's own docker CLI talks to when a
+ *  command names none: `DOCKER_HOST`, else the active context's endpoint, else
+ *  the CLI's default socket. Precedence is the CLI's own. */
+function machineDaemonResolvesLocally(env: Record<string, string | undefined>, configDir: string): boolean | undefined {
+	const named = env.DOCKER_HOST?.trim();
+	if (named !== undefined && named !== "") return dockerDaemonResolvesLocally(named);
+	return dockerContextResolvesLocally(configDir, currentDockerContext(configDir, env) ?? "default");
+}
+
+/** Docker CLI options that take their value in the next word, so a daemon
+ *  spelling is never read out of another option's argument. */
+const DOCKER_VALUE_FLAGS: Record<string, true> = {
+	"-H": true, "--host": true, "--url": true, "-c": true, "--context": true, "--connection": true, "--config": true,
+	"-l": true, "--log-level": true, "--tlscacert": true, "--tlscert": true, "--tlskey": true,
+};
+
+/** The daemon a docker CLI names before its subcommand: `-H`/`--host` (podman's
+ *  `--url`) names the daemon itself, and `-c`/`--context` (podman's
+ *  `--connection`) names a context to resolve. */
+function dockerDaemonFlags(words: readonly string[]): { daemon?: string; context?: string } {
+	const named: { daemon?: string; context?: string } = {};
+	for (let i = 0; i < words.length; i++) {
+		const word = words[i];
+		if (!word.startsWith("-")) continue;
+		const eq = word.indexOf("=");
+		const flag = eq === -1 ? word : word.slice(0, eq);
+		let value = eq === -1 ? undefined : word.slice(eq + 1);
+		if (value === undefined && DOCKER_VALUE_FLAGS[flag] === true) value = words[++i];
+		if (flag === "-H" || flag === "--host" || flag === "--url") named.daemon = value;
+		else if (flag === "-c" || flag === "--context" || flag === "--connection") named.context = value;
+	}
+	return named;
+}
+
+/** A CLI's own global options: the words before its subcommand, with value-flag
+ *  values consumed so the subcommand is found where the CLI finds it. */
+function globalWords(words: readonly string[], valueFlags: Record<string, true>): string[] {
+	const globals: string[] = [];
+	for (let i = 0; i < words.length; i++) {
+		const word = words[i];
+		if (!word.startsWith("-")) break;
+		globals.push(word);
+		if (!word.includes("=") && valueFlags[word] === true) {
+			const value = words[i + 1];
+			if (value !== undefined) globals.push(value);
+			i++;
+		}
+	}
+	return globals;
+}
+
 /** Service names declared by the first compose files that exist, or undefined
  *  when none of them could be read — "not measured" is not "declares nothing". */
 function composeServiceNames(paths: readonly string[]): Set<string> | undefined {
@@ -842,6 +984,11 @@ const COMPOSE_NO_SERVICE_SUBCOMMANDS: Record<string, true> = {
 	ps: true, ls: true, config: true, version: true, images: true, help: true, completion: true, alpha: true, publish: true,
 };
 
+/** A `docker-compose` CLI's own global options: the compose ones that take a
+ *  value, plus the docker-level ones, so its `-f` path is not read as its
+ *  subcommand and its `-H` daemon is not read as an operand. */
+const COMPOSE_CLI_VALUE_FLAGS: Record<string, true> = { ...COMPOSE_VALUE_FLAGS, ...DOCKER_VALUE_FLAGS };
+
 /** The non-flag operands of a verb, with value-flag values consumed. */
 function verbOperands(words: readonly string[], valueFlags: Record<string, true>): string[] {
 	const operands: string[] = [];
@@ -906,22 +1053,35 @@ interface ComposeInvocation {
 	subcommand: string | null;
 	operands: string[];
 	files: string[];
+	/** The daemon the docker CLI level names with `-H`/`--host`, if any. */
+	daemon?: string;
+	/** The context it names with `-c`/`--context`, if any. */
+	context?: string;
 }
 
 /** Every compose invocation in the command, in order — a compound
  *  (`docker compose ps && docker compose exec db sh`) names its services in
  *  more than one segment. `compose` is located by name, so docker-level flags
  *  before it (`docker -H tcp://… compose exec db`) do not shift the
- *  subcommand, and a `docker` command with no `compose` word is not one. */
+ *  subcommand, and a `docker` command with no `compose` word is not one. A
+ *  `docker-compose` CLI carries its globals before its subcommand, so those are
+ *  read there, `-f`/`-H` values consumed. */
 function composeInvocations(command: string): ComposeInvocation[] {
 	const invocations: ComposeInvocation[] = [];
 	for (const m of command.matchAll(COMPOSE_VERB_RE)) {
 		const tokens = segmentWords(command.slice(m.index + m[0].length));
-		const afterVerb = m[1].toLowerCase() === "docker-compose" ? tokens : (() => {
+		let cliWords: readonly string[];
+		let afterVerb: string[] | null;
+		if (m[1].toLowerCase() === "docker-compose") {
+			const globals = globalWords(tokens, COMPOSE_CLI_VALUE_FLAGS);
+			cliWords = globals;
+			afterVerb = tokens.slice(globals.length);
+		} else {
 			const at = tokens.indexOf("compose");
-			return at === -1 ? null : tokens.slice(at + 1);
-		})();
-		if (afterVerb === null) continue;
+			if (at === -1) continue;
+			cliWords = tokens.slice(0, at);
+			afterVerb = tokens.slice(at + 1);
+		}
 		let subcommand: string | null = null;
 		const operands: string[] = [];
 		const files: string[] = [];
@@ -942,7 +1102,8 @@ function composeInvocations(command: string): ComposeInvocation[] {
 			}
 			if (COMPOSE_NO_SERVICE_SUBCOMMANDS[subcommand] !== true) operands.push(word);
 		}
-		invocations.push({ subcommand, operands, files });
+		const named = dockerDaemonFlags(cliWords);
+		invocations.push({ subcommand, operands, files, daemon: named.daemon, context: named.context });
 	}
 	return invocations;
 }
@@ -952,12 +1113,21 @@ function composeInvocations(command: string): ComposeInvocation[] {
  * destinations could be measured — an absent field means "nothing measured",
  * never "trusted". `cwd` is where the compose file is looked for; the rest of
  * the machine state is read from the paths in `sources`.
+ *
+ * The compose file and the docker port table are configuration on this disk:
+ * they name services and ports, never the machine a container runs on. That is
+ * what the daemon measurement adds (#121 review), and it is measured from the
+ * command's own text (`-H`/`--context`) plus this machine's own environment and
+ * docker config (`DOCKER_HOST`, `DOCKER_CONTEXT`, the active context) — never
+ * from anything the file's author wrote into the file.
  */
 export function measureNetworkProvenance(command: string, cwd: string, sources: NetworkSources = {}): NetworkProvenance | undefined {
 	const endpoints = namedEndpoints(command);
 	const compose = composeInvocations(command);
 	if (endpoints.length === 0 && compose.length === 0) return undefined;
 
+	const env = sources.env ?? process.env;
+	const configDir = sources.dockerConfigDir ?? (env.DOCKER_CONFIG?.trim() || DEFAULT_DOCKER_CONFIG_DIR);
 	const sshNames = sshConfigHostNames(sources.sshConfigPaths ?? DEFAULT_SSH_CONFIG_PATHS);
 	const hostsNames = hostsFileNames(sources.hostsFile ?? DEFAULT_HOSTS_FILE);
 	const localPorts = new Set<number>();
@@ -974,7 +1144,12 @@ export function measureNetworkProvenance(command: string, cwd: string, sources: 
 		else unresolved.push(endpoint.host);
 	}
 
-	const docker = unresolved.length > 0 || localPorts.size > 0 || compose.length > 0 ? (sources.dockerState ?? readDockerPortState)() : undefined;
+	// The port table is read from this machine's own daemon. When this machine's
+	// own environment points that daemon at another host, the table lists that
+	// host's containers: nothing in it is a measurement about this one.
+	const daemon = machineDaemonResolvesLocally(env, configDir);
+	const wantsDocker = unresolved.length > 0 || localPorts.size > 0 || compose.length > 0;
+	const docker = wantsDocker && daemon === true ? (sources.dockerState ?? readDockerPortState)() : undefined;
 	const dockerNetworks: DockerTarget[] = [];
 	if (docker !== undefined) {
 		const containerNames = new Set(docker.names.map(name => name.toLowerCase()));
@@ -991,11 +1166,17 @@ export function measureNetworkProvenance(command: string, cwd: string, sources: 
 		const files = invocation.files.length > 0 ? invocation.files.map(file => resolve(cwd, file)) : DEFAULT_COMPOSE_FILES.map(name => join(cwd, name));
 		const declared = composeServiceNames(files);
 		if (declared === undefined) continue;
+		const local =
+			invocation.daemon !== undefined
+				? dockerDaemonResolvesLocally(invocation.daemon)
+				: invocation.context !== undefined
+					? dockerContextResolvesLocally(configDir, invocation.context)
+					: daemon;
 		const first = invocation.operands[0];
 		if (first !== undefined && !declared.has(first)) dockerNetworks.push({ target: first, kind: "compose-service", resolvesLocally: false });
 		for (const operand of invocation.operands) {
 			if (declared.has(operand) && !dockerNetworks.some(target => target.kind === "compose-service" && target.target === operand)) {
-				dockerNetworks.push({ target: operand, kind: "compose-service", resolvesLocally: true });
+				dockerNetworks.push(local === undefined ? { target: operand, kind: "compose-service" } : { target: operand, kind: "compose-service", resolvesLocally: local });
 			}
 		}
 	}
@@ -1053,12 +1234,15 @@ export function buildJevState(input: {
 	}
 	if (input.networkProvenance !== undefined) {
 		// Same tier, same presentation (issue #65): the gate read this machine's
-		// own SSH config, hosts file and docker port table, so the destinations
-		// it names may answer back against the shape of the command's text — and
-		// they say which host is this machine's own, not what may be done to it.
+		// own SSH config, hosts file, docker config and docker port table, so the
+		// destinations it names may answer back against the shape of the command's
+		// text — and they say which host is this machine's own, not what may be
+		// done to it. The docker config is what makes the compose tier a
+		// measurement of the daemon the command reaches rather than of the file
+		// it sits beside (#121 review).
 		state.networkProvenance = {
 			...input.networkProvenance,
-			note: "measured by the gate from this machine's own SSH config, hosts file, compose file and docker port table just now; not written by the command's author",
+			note: "measured by the gate from this machine's own SSH config, hosts file, docker config, compose file and docker port table just now; not written by the command's author",
 		};
 	}
 	if (Object.keys(evidence).length > 0) state.evidence = evidence;

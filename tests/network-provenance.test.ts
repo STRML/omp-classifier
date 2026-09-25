@@ -15,10 +15,11 @@
  */
 import { beforeEach, describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildJevState, isLoopbackHost, jevQuestions, JEV_POLICY_VERSION, JEV_V3_POLICY_VERSION, measureNetworkProvenance, type JevBatteryVersion, type NetworkSources } from "../jev.ts";
+import { buildJevState, isLoopbackHost, jevQuestions, JEV_POLICY_VERSION, JEV_V3_POLICY_VERSION, measureNetworkProvenance, type DockerTarget, type JevBatteryVersion, type NetworkSources } from "../jev.ts";
 import { fire, jevSafeAnswer, loadPlugin, makeCtx, makeEvent, makeSettings, modelCalls, removeConfigFile, setJevAnswer, stateOf } from "./fixtures";
 
 const SOCKET = { names: ["fixture-web", "fixture-db"], bindings: [{ container: "fixture-web", hostPort: 8000, containerPort: 80 }] };
@@ -27,9 +28,22 @@ const cleanup = (dir: string): void => {
 	execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
 };
 
-/** A temp home with an SSH config and a hosts file, and a temp project with a
- *  compose file. Sources are injected so no test depends on this machine. */
-const fixture = (): { sources: NetworkSources; project: string; remove: () => void } => {
+/** A docker CLI config dir whose current context names `endpoint`, written the
+ *  way `docker context use` records it: the context name is in `config.json`,
+ *  and the endpoint in the metadata dir named by its SHA-256. */
+const dockerContext = (dir: string, name: string, endpoint: string): string => {
+	const meta = join(dir, "contexts", "meta", createHash("sha256").update(name).digest("hex"));
+	mkdirSync(meta, { recursive: true });
+	writeFileSync(join(meta, "meta.json"), JSON.stringify({ Name: name, Endpoints: { docker: { Host: endpoint } } }));
+	writeFileSync(join(dir, "config.json"), JSON.stringify({ currentContext: name }));
+	return dir;
+};
+
+/** A temp home with an SSH config, a hosts file, and an empty docker config
+ *  dir, and a temp project with a compose file. Sources are injected so no test
+ *  depends on this machine: the empty environment and the home-local config
+ *  dir are what make the daemon measurement hermetic too. */
+const fixture = (): { sources: NetworkSources; home: string; project: string; remove: () => void } => {
 	const home = mkdtempSync(join(tmpdir(), "jev65-home-"));
 	const project = mkdtempSync(join(tmpdir(), "jev65-project-"));
 	mkdirSync(join(home, ".ssh"), { recursive: true });
@@ -38,7 +52,8 @@ const fixture = (): { sources: NetworkSources; project: string; remove: () => vo
 	writeFileSync(hostsFile, "192.168.1.9 fixture-nas alias-nas\n127.0.0.1 fixture-www fixture.local\n");
 	writeFileSync(join(project, "compose.yaml"), "services:\n  db:\n    image: mysql:8\n  web:\n    image: wordpress\nvolumes:\n  data:\n");
 	return {
-		sources: { sshConfigPaths: [join(home, ".ssh", "config")], hostsFile, dockerState: () => SOCKET },
+		sources: { sshConfigPaths: [join(home, ".ssh", "config")], hostsFile, dockerState: () => SOCKET, env: {}, dockerConfigDir: join(home, ".docker") },
+		home,
 		project,
 		remove: () => {
 			cleanup(home);
@@ -144,8 +159,11 @@ describe("the docker tier is measured against this machine (#65)", () => {
 			expect(measureNetworkProvenance("docker compose exec db wp db query 'SELECT 1'", project, sources)?.dockerNetworks).toEqual([
 				{ target: "db", kind: "compose-service", resolvesLocally: true },
 			]);
+			// A daemon named as another host means the container runs there: the
+			// local compose file declaring `web` is configuration for that stack,
+			// not evidence that `web` runs on this machine (#121 review).
 			expect(measureNetworkProvenance("docker -H tcp://x compose -f compose.yaml exec -u root web bash -c id", project, sources)?.dockerNetworks).toEqual([
-				{ target: "web", kind: "compose-service", resolvesLocally: true },
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
 			]);
 			// A service the file does not declare is measured as not this stack's.
 			expect(measureNetworkProvenance("docker compose exec cache redis-cli ping", project, sources)?.dockerNetworks).toEqual([
@@ -171,6 +189,142 @@ describe("the docker tier is measured against this machine (#65)", () => {
 		} finally {
 			remove();
 			cleanup(empty);
+		}
+	});
+});
+
+describe("the daemon decides the local claim, not the local file (#121 review)", () => {
+	test("a daemon the command names as another host takes the local claim away", () => {
+		const { sources, project, remove } = fixture();
+		try {
+			// The compose file declares `web`; the daemon the command names runs
+			// on another host, so `web` is not a container on this machine.
+			expect(measureNetworkProvenance("docker -H tcp://prod.example:2376 compose -f compose.yaml exec web sh", project, sources)?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+			]);
+			// The long form and the `=` form name the same daemon.
+			expect(measureNetworkProvenance("docker --host tcp://prod.example:2376 compose exec web sh", project, sources)?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+			]);
+			expect(measureNetworkProvenance("docker --host=tcp://prod.example:2376 compose exec web sh", project, sources)?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+			]);
+			expect(measureNetworkProvenance("docker -H tcp://10.1.2.3:2376 compose exec web sh", project, sources)?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+			]);
+			// A docker-compose CLI's own globals come before its subcommand.
+			expect(measureNetworkProvenance("docker-compose -H tcp://prod.example:2376 -f compose.yaml exec web sh", project, sources)?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+			]);
+		} finally {
+			remove();
+		}
+	});
+
+	test("each segment's own daemon decides that segment's services", () => {
+		const { sources, project, remove } = fixture();
+		try {
+			expect(measureNetworkProvenance("docker -H tcp://prod.example:2376 compose exec web sh && docker compose exec db sh", project, sources)?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+				{ target: "db", kind: "compose-service", resolvesLocally: true },
+			]);
+		} finally {
+			remove();
+		}
+	});
+
+	test("a loopback or local-socket daemon still measures as this machine", () => {
+		const { sources, project, remove } = fixture();
+		try {
+			const local: DockerTarget[] = [{ target: "web", kind: "compose-service", resolvesLocally: true }];
+			expect(measureNetworkProvenance("docker -H tcp://127.0.0.1:2375 compose exec web sh", project, sources)?.dockerNetworks).toEqual(local);
+			expect(measureNetworkProvenance("docker -H tcp://localhost:2375 compose exec web sh", project, sources)?.dockerNetworks).toEqual(local);
+			expect(measureNetworkProvenance("docker -H unix:///var/run/docker.sock compose exec web sh", project, sources)?.dockerNetworks).toEqual(local);
+			// No daemon named at all is the CLI's own default local socket.
+			expect(measureNetworkProvenance("docker compose exec web sh", project, sources)?.dockerNetworks).toEqual(local);
+			// A `-c` after the subcommand is the shell's, not a context: it must
+			// not be read as one and silence the claim.
+			expect(measureNetworkProvenance("docker-compose -f compose.yaml exec web sh -c id", project, sources)?.dockerNetworks).toEqual(local);
+			expect(measureNetworkProvenance("docker compose -f compose.yaml exec web sh -c id", project, sources)?.dockerNetworks).toEqual(local);
+		} finally {
+			remove();
+		}
+	});
+
+	test("a daemon spelling this machine cannot read makes no local claim", () => {
+		const { sources, project, remove } = fixture();
+		try {
+			// No scheme: nothing here measures which machine that names, and an
+			// unmeasured daemon is never claimed as this machine's.
+			const measured = measureNetworkProvenance("docker -H prod.example:2376 compose exec web sh", project, sources);
+			expect(measured?.dockerNetworks).toEqual([{ target: "web", kind: "compose-service" }]);
+			expect(JSON.stringify(measured?.dockerNetworks)).not.toContain("resolvesLocally");
+		} finally {
+			remove();
+		}
+	});
+
+	test("DOCKER_HOST decides when the command names no daemon", () => {
+		const { sources, project, remove } = fixture();
+		try {
+			const withHost = (host: string) => measureNetworkProvenance("docker compose exec web sh", project, { ...sources, env: { DOCKER_HOST: host } })?.dockerNetworks;
+			expect(withHost("tcp://prod.example:2376")).toEqual([{ target: "web", kind: "compose-service", resolvesLocally: false }]);
+			expect(withHost("unix:///var/run/docker.sock")).toEqual([{ target: "web", kind: "compose-service", resolvesLocally: true }]);
+			expect(withHost("tcp://127.0.0.1:2375")).toEqual([{ target: "web", kind: "compose-service", resolvesLocally: true }]);
+			expect(withHost("prod.example:2376")).toEqual([{ target: "web", kind: "compose-service" }]);
+			// A `-H` the command carries still wins over the environment.
+			expect(
+				measureNetworkProvenance("docker -H unix:///var/run/docker.sock compose exec web sh", project, { ...sources, env: { DOCKER_HOST: "tcp://prod.example:2376" } })?.dockerNetworks,
+			).toEqual([{ target: "web", kind: "compose-service", resolvesLocally: true }]);
+		} finally {
+			remove();
+		}
+	});
+
+	test("the active docker context decides when nothing else names a daemon", () => {
+		const { sources, home, project, remove } = fixture();
+		try {
+			const dir = join(home, ".docker");
+			// The context `docker context use` made current names another host.
+			dockerContext(dir, "prod", "tcp://prod.example:2376");
+			expect(measureNetworkProvenance("docker compose exec web sh", project, { ...sources, dockerConfigDir: dir })?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+			]);
+			expect(measureNetworkProvenance("docker compose exec web sh", project, { ...sources, dockerConfigDir: dir, env: { DOCKER_CONTEXT: "prod" } })?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+			]);
+			// A context that names this machine's own socket is local.
+			dockerContext(dir, "local", "unix:///var/run/docker.sock");
+			expect(measureNetworkProvenance("docker compose exec web sh", project, { ...sources, dockerConfigDir: dir })?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: true },
+			]);
+			// `--context` names the context the daemon comes from, and a context
+			// whose endpoint cannot be read makes no claim.
+			expect(measureNetworkProvenance("docker --context prod compose exec web sh", project, { ...sources, dockerConfigDir: dir })?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service", resolvesLocally: false },
+			]);
+			writeFileSync(join(dir, "config.json"), JSON.stringify({ currentContext: "ghost" }));
+			expect(measureNetworkProvenance("docker compose exec web sh", project, { ...sources, dockerConfigDir: dir })?.dockerNetworks).toEqual([
+				{ target: "web", kind: "compose-service" },
+			]);
+		} finally {
+			remove();
+		}
+	});
+
+	test("the docker port table is this machine's only when this machine's daemon is local", () => {
+		const { sources, project, remove } = fixture();
+		try {
+			// The table is read from the gate's own daemon: when the machine's own
+			// environment points that daemon elsewhere, the containers it lists are
+			// not containers on this machine.
+			const remote = { ...sources, env: { DOCKER_HOST: "tcp://prod.example:2376" } };
+			expect(measureNetworkProvenance("curl -s http://localhost:8000/x", project, remote)).toEqual({ localPorts: [8000], knownHosts: [], dockerNetworks: [] });
+			expect(measureNetworkProvenance("curl -s http://localhost:8000/x", project, sources)?.dockerNetworks).toEqual([
+				{ target: "fixture-web", kind: "published-port", port: 8000, resolvesLocally: true },
+			]);
+		} finally {
+			remove();
 		}
 	});
 });
