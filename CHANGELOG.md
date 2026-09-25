@@ -15,7 +15,6 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 - Nothing about the battery or the policy moves: the endpoint answers probabilities, so the same `jevPolicy` floors read them, and one-hot handling stays reserved for a text bridge. A missing credential, an unreachable endpoint, a non-2xx, a malformed body, and a timeout are all `JevUnavailableError` → permission request.
 - Backend identity joins the config signature and both cache keys (`config.typesafeModel`, `judgeBackendFor(config.judgeBackend).id`), so a backend swap cannot serve a verdict the other judge produced — proven through the dry-run probe, the one cache read the signature deliberately leaves stale. A verdict cached under the host judge is no longer reported as an endpoint's.
 - `/classifier` shows the active backend as `judgeBackend: <id>` and `/classifier status` carries `backendId` (`typesafe/jev-latest`, `endpoint/http://127.0.0.1:8765#local-decide`). The shadow judgment asks the same backend as the live one. `/classifier reset` returns the key to the default; bad shapes (unknown kind, a non-URL baseUrl, a missing model, an env var name with a space) keep the default rather than half-applying an override.
->>>>>>> fix/84
 
 ## 2026-09-22
 
