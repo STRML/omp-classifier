@@ -124,6 +124,17 @@ describe("the body decides, wherever the file lives", () => {
 		expect(refusalOf(result).why).toContain("flags: rm");
 	});
 
+	test("redirected stdin carries the same body risk as an on-disk script", async () => {
+		writeScript(root, "installer", HARMFUL_SHELL);
+		const onDisk = await gate("bash installer");
+		expect(refusalOf(onDisk).why).toContain("flags: rm");
+
+		for (const command of ["bash < installer", "bash -s < installer"]) {
+			const redirected = await gate(command);
+			expect(refusalOf(redirected).why).toContain("flags: rm");
+		}
+	});
+
 	test("a runner subcommand's file is read", async () => {
 		writeScript(root, "x.ts", "rm -rf ./out\n");
 		const result = await gate("bun run x.ts");
@@ -253,6 +264,79 @@ describe("the reader itself", () => {
 		expect(read.refusal?.why).toContain("review limit");
 		expect(read.text).toBe("python3 probe.py");
 		expect(read.bodies).toEqual([]);
+	});
+});
+
+describe("redirected stdin", () => {
+	test("a redirected file is read as the interpreter body", () => {
+		writeScript(root, "installer", HARMFUL_SHELL);
+		for (const command of ["bash < installer", "bash -s < installer"]) {
+			const read = readInterpretedScriptBodies(command, root, 8000);
+			expect(read.refusal).toBeNull();
+			expect(read.bodies.map(body => body.operand)).toEqual(["installer"]);
+			expect(read.text).toContain("rm -rf ./out");
+		}
+	});
+
+	test("an expanded target is refused rather than guessed", () => {
+		const read = readInterpretedScriptBodies("bash < $INSTALLER", root, 8000);
+		expect(read.refusal?.why).toContain("expands $INSTALLER");
+		expect(read.bodies).toEqual([]);
+	});
+
+	test("a missing redirected file is refused", () => {
+		const read = readInterpretedScriptBodies("bash < missing-installer", root, 8000);
+		expect(read.refusal?.why).toContain("missing-installer");
+	});
+});
+
+describe("wrapper option arity", () => {
+	test("env -u consumes its value before locating the interpreter", async () => {
+		writeScript(root, "payload.py", HARMFUL_CODE);
+		const result = await gate("env -u FOO python3 payload.py");
+		expect(refusalOf(result).why).toContain("flags: python3 runs payload.py");
+		expect(String(stateOf(0).command)).toContain("subprocess.run(");
+	});
+
+	test("env --unset consumes its separated value", () => {
+		writeScript(root, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies("env --unset FOO python3 payload.py", root, 8000);
+		expect(read.refusal).toBeNull();
+		expect(read.bodies.map(body => body.operand)).toEqual(["payload.py"]);
+	});
+
+	test("an unknown env option makes the command opaque", () => {
+		writeScript(root, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies("env --unknown-option VALUE python3 payload.py", root, 8000);
+		expect(read.refusal?.why).toContain("unknown env option");
+		expect(read.bodies).toEqual([]);
+	});
+
+	test("an unknown timeout option makes the command opaque", () => {
+		writeScript(root, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies("timeout --unknown-option 5s python3 payload.py", root, 8000);
+		expect(read.refusal?.why).toContain("unknown timeout option");
+		expect(read.bodies).toEqual([]);
+	});
+});
+
+describe("heredocs inside shell script bodies", () => {
+	test("a body that writes and runs a heredoc payload is refused", async () => {
+		writeScript(root, "payload.sh", "cat <<'EOF' > x.sh\nrm -rf ./out\nEOF\nbash x.sh\n");
+		const result = await gate("bash payload.sh");
+		const payload = refusalOf(result);
+		expect(payload.layer).toBe("script-body");
+		expect(payload.why).toContain("heredoc");
+		expect(modelCalls.length).toBe(0);
+	});
+
+	test("a body that pipes a heredoc to an interpreter is refused", async () => {
+		writeScript(root, "payload.sh", "cat <<'EOF' | bash\nrm -rf ./out\nEOF\n");
+		const result = await gate("bash payload.sh");
+		const payload = refusalOf(result);
+		expect(payload.layer).toBe("script-body");
+		expect(payload.why).toContain("heredoc");
+		expect(modelCalls.length).toBe(0);
 	});
 });
 

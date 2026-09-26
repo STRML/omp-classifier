@@ -93,7 +93,7 @@ import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-codi
 import { getPluginsDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
 import { heredocShadowedAt, maskHeredocBodiesAndAnsiSpans, openQuoteBefore, segmentWorkingDirectories, SHELL_WORD_EXPANSION } from "./shell-cwd";
-import { substitutionSpans } from "./shell-ast";
+import { parseShell, substitutionSpans, type ShellCommand } from "./shell-ast";
 import {
 	DEFAULT_JUDGE_BACKEND,
 	judgeBackendFor,
@@ -1912,6 +1912,7 @@ const PHP_INLINE_FLAG = /^-{1,2}(?:r|R|run|a)$/u;
  *  skipped for not existing, and a word that is a file gets read. */
 const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	// POSIX shells: `bash -c '…'`, `bash -s < script`, `bash -o errexit x.sh`.
+	bash: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^[-+]O$|^--rcfile$|^--init-file$/u, stdinFlag: true },
 	sh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^[-+]O$|^--rcfile$|^--init-file$/u, stdinFlag: true },
 	zsh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
 	dash: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
@@ -2810,6 +2811,63 @@ export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
 // binary they name. env/nice/timeout/stdbuf take options or durations first.
 const WRAPPER_COMMANDS = new Set(["env", "nohup", "nice", "timeout", "stdbuf", "setsid", "command", "exec", "xargs"]);
 
+type WrapperOptionArity = "flag" | "value" | "opaque";
+interface WrapperOptionGrammar {
+	options: Record<string, WrapperOptionArity>;
+	assignments?: boolean;
+	positionalValues?: number;
+}
+
+/** Options each recognized wrapper consumes before its command operand. */
+const WRAPPER_OPTION_GRAMMAR: Record<string, WrapperOptionGrammar> = {
+	env: {
+		assignments: true,
+		options: {
+			"-i": "flag", "--ignore-environment": "flag", "-0": "flag", "--null": "flag",
+			"-v": "flag", "--debug": "flag", "--help": "flag", "--version": "flag",
+			"-u": "value", "--unset": "value", "-C": "value", "--chdir": "value",
+			"-a": "value", "--argv0": "value", "-S": "opaque", "--split-string": "opaque",
+		},
+	},
+	nohup: { options: { "--help": "flag", "--version": "flag" } },
+	nice: { options: { "-n": "value", "--adjustment": "value", "--help": "flag", "--version": "flag" } },
+	timeout: {
+		positionalValues: 1,
+		options: {
+			"-k": "value", "--kill-after": "value", "-s": "value", "--signal": "value",
+			"--preserve-status": "flag", "--foreground": "flag", "-v": "flag", "--verbose": "flag",
+			"--help": "flag", "--version": "flag",
+		},
+	},
+	stdbuf: {
+		options: {
+			"-i": "value", "--input": "value", "-o": "value", "--output": "value",
+			"-e": "value", "--error": "value", "--help": "flag", "--version": "flag",
+		},
+	},
+	setsid: {
+		options: {
+			"-c": "flag", "--ctty": "flag", "-f": "flag", "--fork": "flag",
+			"-w": "flag", "--wait": "flag", "-t": "flag", "--help": "flag", "--version": "flag",
+		},
+	},
+	command: { options: { "-p": "flag", "-v": "opaque", "-V": "opaque" } },
+	exec: { options: { "-a": "value", "-c": "flag", "-l": "flag" } },
+	xargs: {
+		options: {
+			"-0": "flag", "--null": "flag", "-r": "flag", "--no-run-if-empty": "flag",
+			"-t": "flag", "--verbose": "flag", "-p": "flag", "--interactive": "flag",
+			"-x": "flag", "--exit": "flag", "-o": "flag", "--open-tty": "flag",
+			"--show-limits": "flag", "--help": "flag", "--version": "flag",
+			"-n": "value", "--max-args": "value", "-s": "value", "--max-chars": "value",
+			"-P": "value", "--max-procs": "value", "-d": "value", "--delimiter": "value",
+			"-E": "value", "--eof": "value", "-I": "value", "-L": "value",
+			"--max-lines": "value", "-a": "value", "--arg-file": "value",
+			"--process-slot-var": "value", "--replace": "opaque",
+		},
+	},
+};
+
 // git global options that CONSUME a value: skip the option AND its value when
 // hunting for the subcommand (`git -C /repo push` must read push, not /repo).
 const GIT_VALUE_OPTIONS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-project"]);
@@ -3031,36 +3089,112 @@ function stdinExecutingInterpreters(stage: string): Array<{ verb: string; codeTe
 	return found;
 }
 
+/** The resolved command or the reason wrapper parsing stopped fail-closed. */
+type InterpreterInvocation = { verb: string; rest: string[] } | { opaque: string } | null;
+
+type WrapperOptionScan = { next: number } | { opaque: string };
+
+function scanWrapperOptions(wrapper: string, words: string[], start: number): WrapperOptionScan {
+	const grammar = WRAPPER_OPTION_GRAMMAR[wrapper];
+	if (!grammar) return { opaque: `script body blocked: unsupported wrapper ${wrapper}` };
+	let index = start;
+	let positionalValues = grammar.positionalValues ?? 0;
+	const unknown = (option: string): WrapperOptionScan => ({ opaque: `script body blocked: unknown ${wrapper} option ${option}` });
+	const missingValue = (option: string): WrapperOptionScan => ({ opaque: `script body blocked: ${wrapper} option ${option} is missing its value` });
+
+	while (index < words.length) {
+		const word = words[index];
+		if (word === "--") {
+			if (positionalValues > 0) {
+				positionalValues--;
+				index++;
+				continue;
+			}
+			return { next: index + 1 };
+		}
+		if (grammar.assignments && /^[a-z_][a-z0-9_]*=/iu.test(word)) {
+			index++;
+			continue;
+		}
+		if (positionalValues > 0 && (!word.startsWith("-") || word === "-")) {
+			positionalValues--;
+			index++;
+			continue;
+		}
+		if (!word.startsWith("-") || word === "-") return { next: index };
+		if (wrapper === "nice" && /^-\d+(?:\.\d+)?$/u.test(word)) {
+			index++;
+			continue;
+		}
+
+		if (word.startsWith("--")) {
+			const equal = word.indexOf("=");
+			const name = equal === -1 ? word : word.slice(0, equal);
+			const arity = grammar.options[name];
+			if (arity === undefined) return unknown(word);
+			if (arity === "opaque") return { opaque: `script body blocked: ${wrapper} option ${name} cannot be resolved` };
+			if (arity === "flag") {
+				if (equal !== -1) return unknown(word);
+				index++;
+				continue;
+			}
+			if (equal !== -1) {
+				index++;
+				continue;
+			}
+			if (index + 1 >= words.length) return missingValue(name);
+			index += 2;
+			continue;
+		}
+
+		let optionIndex = 1;
+		let consumed = false;
+		while (optionIndex < word.length) {
+			const name = `-${word[optionIndex]}`;
+			const arity = grammar.options[name];
+			if (arity === undefined) return unknown(word);
+			if (arity === "opaque") return { opaque: `script body blocked: ${wrapper} option ${name} cannot be resolved` };
+			if (arity === "value") {
+				const attached = word.slice(optionIndex + 1).replace(/^=/u, "");
+				if (attached !== "") index++;
+				else if (index + 1 < words.length) index += 2;
+				else return missingValue(name);
+				consumed = true;
+				break;
+			}
+			optionIndex++;
+		}
+		if (!consumed) index++;
+	}
+	return { next: index };
+}
+
 /**
  * The interpreter a segment's own verb names, with the words after it.
- *
- * Both interpreter scans start here: the pipe scan asks what that interpreter
- * will read from stdin, the script-file scan (issue #67) which file it will run.
- *
- * Wrappers are stepped through by position rather than by breaking at the first
- * non-flag word: `env`, `nice`, `timeout` and `stdbuf` take options or durations
- * first, so breaking early read `timeout 5 sh` as the verb `5`.
+ * Wrappers are parsed from their own option grammars: guessing that any number
+ * is an option value both loses `env -u FOO python3` and reads a command the
+ * wrapper will not execute.
  */
-function interpreterInvocation(segment: string[]): { verb: string; rest: string[] } | null {
+function interpreterInvocation(segment: string[]): InterpreterInvocation {
 	let i = 0;
-	let sawWrapper = false;
 	while (i < segment.length) {
 		const word = segment[i].toLowerCase();
-		// Grouping keeps the real command one token further in: `| { sh; }`.
 		if (word === "{" || word === "(") {
 			i++;
 			continue;
 		}
-		if (/^[a-z_][a-z0-9_]*=/u.test(word) || word.startsWith("-")) {
+		if (/^[a-z_][a-z0-9_]*=/u.test(word)) {
 			i++;
 			continue;
 		}
-		if (WRAPPER_COMMANDS.has(commandBasename(word))) {
-			sawWrapper = true;
-			i++;
+		const wrapper = commandBasename(word);
+		if (WRAPPER_COMMANDS.has(wrapper)) {
+			const options = scanWrapperOptions(wrapper, segment, i + 1);
+			if ("opaque" in options) return options;
+			i = options.next;
 			continue;
 		}
-		if (sawWrapper && /^\d+(\.\d+)?[smhd]?$/u.test(word)) {
+		if (word.startsWith("-")) {
 			i++;
 			continue;
 		}
@@ -3076,6 +3210,7 @@ function interpretersInSegment(segment: string[], rawStage: string): Array<{ ver
 
 	const invocation = interpreterInvocation(segment);
 	if (!invocation) return [];
+	if ("opaque" in invocation) return [{ verb: "opaque wrapper", codeText: null }];
 	const { verb, rest } = invocation;
 	// Inline code executes regardless of what else is on the line. The builtin
 	// INLINE_CODE_INTERPRETERS covers -c/-e for python/bash/sh/perl only, which
@@ -3215,26 +3350,13 @@ function heredocBody(text: string): string | null {
 	return closer ? tail.slice(0, closer.index) : tail;
 }
 
-/**
- * A file the command hands to an interpreter as its program (issue #67).
- *
- * `operand` says the word the command spelled; `arm` says how sure the scan is
- * that it IS the program:
- *   - "program": the interpreter's own operand (`python3 x.py`, `bash x.sh`).
- *     Strict — the interpreter will run this file and nothing else, so a word
- *     that is not a readable regular file (a directory python would open as
- *     `__main__.py`, an unreadable file, a glob the shell expands first) is a
- *     refusal, not a shrug.
- *   - "load": a word reached past a subcommand or behind a loader flag
- *     (`bun run x.ts`, `node -r ./pre.js main.js`). Best-effort — the same
- *     spelling can be a package.json script or a data argument, so only a
- *     readable file is read and anything else is passed over.
- */
+/** A file or redirected input body the command hands to an interpreter (issue #67). */
 interface InterpreterProgramRef {
 	verb: string;
 	/** The word as the command spelled it, for the flag text and the refusal. */
 	operand: string;
-	arm: "program" | "load";
+	/** `stdin` is a literal file the interpreter executes from redirected stdin. */
+	arm: "program" | "load" | "stdin";
 }
 
 /**
@@ -3277,6 +3399,7 @@ function splitAttachedFlagValue(word: string): { name: string; attached: string 
 function interpreterProgramRefs(segment: string[]): InterpreterProgramRef[] {
 	const invocation = interpreterInvocation(segment);
 	if (!invocation) return [];
+	if ("opaque" in invocation) return [];
 	const { verb, rest } = invocation;
 	const subcommands = INTERPRETER_SUBCOMMANDS[verb];
 	// `python3`/`python2` carry the version in the verb `interpreterName`
@@ -3365,6 +3488,19 @@ function interpreterProgramRefs(segment: string[]): InterpreterProgramRef[] {
 	return refs;
 }
 
+/** Whether an interpreter has no separate program and will execute stdin. */
+function interpreterReadsRedirectedStdin(segment: string[]): { verb: string } | null {
+	const invocation = interpreterInvocation(segment);
+	if (!invocation) return null;
+	if ("opaque" in invocation) return null;
+	const { verb, rest } = invocation;
+	if (rest.some(word => /^-{1,2}(c|e|E|eval|command)$/u.test(word))) return null;
+	if (verb.startsWith("python") && rest.some(word => word === "-m" || word === "--module")) return null;
+	const grammar = INTERPRETER_FLAG_GRAMMAR[verb] ?? INTERPRETER_FLAG_GRAMMAR[verb.replace(/[\d.]+$/u, "")];
+	if (rest.includes("-") || (grammar?.stdinFlag === true && rest.includes("-s"))) return { verb };
+	return interpreterProgramRefs(segment).length === 0 ? { verb } : null;
+}
+
 export interface InterpretedScriptBody {
 	/** The interpreter that will run it. */
 	verb: string;
@@ -3407,7 +3543,7 @@ function readScriptFile(ref: InterpreterProgramRef, cwd: string, budget: number)
 			kind: "refuse",
 			why:
 				`script body blocked: the shell expands ${ref.operand} before ${ref.verb} sees it, ` +
-				`so the program is not readable text`,
+				`so the ${ref.arm === "stdin" ? "stdin payload" : "program"} is not readable text`,
 		};
 	}
 	let file: string;
@@ -3416,12 +3552,14 @@ function readScriptFile(ref: InterpreterProgramRef, cwd: string, budget: number)
 		file = resolveToCwd(ref.operand, cwd);
 		stat = fs.statSync(file);
 	} catch (err) {
-		// A program that is not there runs nothing: the interpreter fails on it,
-		// or a sibling command of the same line writes it with a heredoc whose
-		// body already rides the command text. The other stat failures (EACCES on
-		// the directory, ELOOP, ENAMETOOLONG, an internal URL) mean the gate
-		// cannot see the program at all.
-		if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "skip" };
+		// A missing program runs nothing. A missing redirected stdin source is
+		// refused because the command's input cannot be read in full. Other stat
+		// failures (EACCES on the directory, ELOOP, ENAMETOOLONG, an internal URL)
+		// mean the gate cannot see the file at all.
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+			if (ref.arm !== "stdin") return { kind: "skip" };
+			return { kind: "refuse", why: `script body blocked: redirected stdin file ${ref.operand} does not exist` };
+		}
 		return {
 			kind: "refuse",
 			why: `script body blocked: ${ref.operand} could not be read (${err instanceof Error ? err.message : String(err)})`,
@@ -3438,7 +3576,7 @@ function readScriptFile(ref: InterpreterProgramRef, cwd: string, budget: number)
 			kind: "refuse",
 			why:
 				`script body blocked: ${ref.operand} is a ${stat.isDirectory() ? "directory" : "non-regular file"}, ` +
-				`and the classifier cannot read the program it runs`,
+				`and the classifier cannot read ${ref.arm === "stdin" ? "the input it executes" : "the program it runs"}`,
 		};
 	}
 	if (stat.size > budget) {
@@ -3469,6 +3607,16 @@ function readScriptFile(ref: InterpreterProgramRef, cwd: string, budget: number)
 	return { kind: "body", body: read.toString("utf8") };
 }
 
+/** A shell body's here-document payload may itself be executed; refuse rather than mask it as data. */
+function shellBodyHeredocRefusal(verb: string, body: string): string | null {
+	const grammar = INTERPRETER_FLAG_GRAMMAR[verb] ?? INTERPRETER_FLAG_GRAMMAR[verb.replace(/[\d.]+$/u, "")];
+	if (grammar?.stdinFlag !== true || !body.includes("<<")) return null;
+	const parsed = parseShell(body);
+	if (!parsed.ok) return `script body blocked: ${verb} body heredoc syntax could not be resolved`;
+	if (!parsed.commands.some(command => command.redirects.some(redirect => redirect.here))) return null;
+	return `script body blocked: ${verb} body contains a heredoc or here-string whose executed payload cannot be scanned safely`;
+}
+
 export function readInterpretedScriptBodies(command: string, cwd: string, limit: number): ReadScriptBodiesResult {
 	const bodies: InterpretedScriptBody[] = [];
 	let text = command;
@@ -3486,19 +3634,83 @@ export function readInterpretedScriptBodies(command: string, cwd: string, limit:
 	// a relative-looking path. The network tier resolves config paths with
 	// `node:path` and hands the same walk its own resolver instead.
 	const dirs = segmentWorkingDirectories(masked, cwd, segments, resolveToCwd);
+	const shellAst = command.includes("<") ? parseShell(command) : null;
+	const shellCommands: ShellCommand[] = shellAst !== null && shellAst.ok
+		? shellAst.commands.filter(candidate => !candidate.nested && candidate.words.length > 0)
+		: [];
+	let shellCommandIndex = 0;
 	for (let index = 0; index < segments.length; index++) {
 		const segment = segments[index];
 		if (segment.length === 0) continue;
-		for (const ref of interpreterProgramRefs(segment)) {
+
+		let headIndex = 0;
+		while (
+			headIndex < segment.length &&
+			(/^[a-z_][a-z0-9_]*=/iu.test(segment[headIndex]) || segment[headIndex] === "{" || segment[headIndex] === "(")
+		) {
+			headIndex++;
+		}
+		const head = segment[headIndex];
+		let shellCommand: ShellCommand | undefined;
+		if (head !== undefined && shellAst !== null && shellAst.ok) {
+			for (let candidateIndex = shellCommandIndex; candidateIndex < shellCommands.length; candidateIndex++) {
+				const candidate = shellCommands[candidateIndex];
+				if (commandBasename(candidate.words[0]?.value.toLowerCase() ?? "") !== commandBasename(head.toLowerCase())) continue;
+				shellCommand = candidate;
+				shellCommandIndex = candidateIndex + 1;
+				break;
+			}
+		}
+
+		const redirectAt = segment.findIndex(word => word === "<" || word === "<>");
+		if (redirectAt !== -1 && (shellAst === null || !shellAst.ok || shellCommand === undefined)) {
+			if (interpreterInvocation(segment.slice(0, redirectAt))) {
+				return {
+					text,
+					bodies,
+					refusal: { why: "script body blocked: redirected stdin could not be resolved from the shell command" },
+				};
+			}
+		}
+
+		const inputRedirects = shellCommand?.redirects.filter(
+			redirect => redirect.direction !== "out" && !redirect.here && !redirect.duplicate && (redirect.fd === "" || redirect.fd === "0"),
+		) ?? [];
+		const interpreterWords = inputRedirects.length > 0 && shellCommand
+			? shellCommand.words.map(word => word.value)
+			: segment;
+		const invocation = interpreterInvocation(interpreterWords);
+		if (invocation !== null && "opaque" in invocation) {
+			return { text, bodies, refusal: { why: invocation.opaque } };
+		}
+		const refs = interpreterProgramRefs(interpreterWords);
+		const stdin = inputRedirects.length > 0 ? interpreterReadsRedirectedStdin(interpreterWords) : null;
+		if (stdin !== null) {
+			if (inputRedirects.length !== 1) {
+				return {
+					text,
+					bodies,
+					refusal: { why: "script body blocked: multiple stdin redirects cannot be resolved" },
+				};
+			}
+			const target = inputRedirects[0].target;
+			if (!target.literal && !SHELL_WORD_EXPANSION.test(target.value)) {
+				return {
+					text,
+					bodies,
+					refusal: { why: `script body blocked: redirected stdin target ${target.source} is not literal` },
+				};
+			}
+			refs.push({ verb: stdin.verb, operand: target.value, arm: "stdin" });
+		}
+
+		for (const ref of refs) {
 			const dir = dirs[index];
 			if (dir === null) {
 				// The shell's directory at this segment is not in the text (a
 				// `cd $DIR`, `cd -`, a bare `cd`, `pushd`, or a separator this
-				// walk and the tokenizer read differently). Reading the program
-				// from a guessed directory would judge a different file than the
-				// interpreter runs, so a program word here refuses; a loader word
-				// that is not script-shaped may be a package.json script or an
-				// argument, and is passed over.
+				// walk and the tokenizer read differently). Reading from a guessed
+				// directory would judge a different file than the interpreter runs.
 				const scriptShaped = SCRIPT_FILE_EXTENSION.test(ref.operand) || ref.operand.includes("/");
 				if (ref.arm === "load" && !scriptShaped) continue;
 				return {
@@ -3511,19 +3723,15 @@ export function readInterpretedScriptBodies(command: string, cwd: string, limit:
 					},
 				};
 			}
-			// Label lines the section adds: shell comments, so a body's first line
-			// is never read as a command of this line's, and the judge can see that
-			// the text below is a FILE the interpreter will run.
-			const label = `\n# --- ${ref.verb} runs ${ref.operand}; body read from disk ---\n`;
+			const label = ref.arm === "stdin"
+				? `\n# --- ${ref.verb} reads stdin from ${ref.operand}; body read from disk ---\n`
+				: `\n# --- ${ref.verb} runs ${ref.operand}; body read from disk ---\n`;
 			const endLabel = `\n# --- end of ${ref.operand} ---`;
 			const result = readScriptFile(ref, dir, limit - text.length - label.length - endLabel.length);
 			if (result.kind === "skip") continue;
-			// A read refusal is a refusal on BOTH arms: the interpreter opens the
-			// file whatever the operand's grammatical role, and passing a loader's
-			// refusal over left `bun run huge.ts` with no body read, which a
-			// matching allow rule could then release. Only the "this word does not
-			// name a file" answers are skipped, and `readScriptFile` decides those.
 			if (result.kind === "refuse") return { text, bodies, refusal: { why: result.why } };
+			const heredocRefusal = shellBodyHeredocRefusal(ref.verb, result.body);
+			if (heredocRefusal !== null) return { text, bodies, refusal: { why: heredocRefusal } };
 			bodies.push({ verb: ref.verb, operand: ref.operand, body: result.body });
 			text += `${label}${result.body}${endLabel}`;
 		}
@@ -6589,7 +6797,7 @@ export default function (pi: ExtensionAPI) {
 				{ ...auditFields(), ...judgementAudit(judgement) },
 				judgement.late === undefined
 					? undefined
-					: { handle: judgement.late, priorRefusal: prior, riskFlags: matchModerateRiskTokens(command, cwd) },
+					: { handle: judgement.late, priorRefusal: prior, riskFlags: matchModerateRiskTokens(judgedCommand, cwd) },
 			);
 		} catch (err) {
 			// Unexpected plugin error: fail closed rather than wave the command
