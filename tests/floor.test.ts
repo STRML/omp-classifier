@@ -16,6 +16,9 @@
  */
 import { describe, expect, test } from "bun:test";
 import { evaluateFloor, type FloorEntry } from "../floor";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 const asks = (command: string, tainted: readonly string[] = []): boolean =>
 	evaluateFloor({ command, taintedVars: tainted }).asks;
@@ -477,15 +480,118 @@ describe("the floor reads the parser's view (plan 2026-09-22-real-shell-parser.m
 	});
 
 	test("a glob is read as the text it is written as (review round 3)", () => {
-		// What a glob matches is decided by the filesystem at run time, which a
-		// name check cannot see (plan: "What a name check cannot see"). So a
-		// literal secret suffix still asks and a wildcard over a name does not.
+		// Without a command cwd, no filesystem expansion is possible. The text
+		// check still asks on a literal secret suffix, but not a wildcard name.
 		expect(asks("cat *.pem")).toBe(true);
 		expect(asks("cat ~/.*/credentials")).toBe(true);
 		expect(asks("cat .e*")).toBe(false);
 		// And no glob, however malformed, throws instead of deciding.
 		for (const command of ["cat .e[z-a]", "cat [", "cat [!]", "cat @(a|.env)", "cat !(.env)", "cat +(x)y", "cat .en[v]", "cat {a..}", "cat {Z..a}", "cat {1..99999999999}"]) {
 			expect(() => evaluateFloor({ command })).not.toThrow();
+		}
+	});
+
+	test("a glob resolving to one readable secret file asks at the command cwd", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-glob-"));
+		try {
+			const envFile = path.join(cwd, ".env");
+			fs.writeFileSync(envFile, "token");
+			expect(evaluateFloor({ command: "cat .e*", cwd }).asks).toBe(true);
+			expect(evaluateFloor({ command: "cat *", cwd }).asks).toBe(false);
+
+			fs.writeFileSync(path.join(cwd, ".env.local"), "token");
+			expect(evaluateFloor({ command: "cat .e*", cwd }).asks).toBe(false);
+			expect(evaluateFloor({ command: "cat *.pem", cwd }).asks).toBe(true);
+			fs.unlinkSync(envFile);
+			fs.unlinkSync(path.join(cwd, ".env.local"));
+
+			const nested = path.join(cwd, "nested");
+			fs.mkdirSync(nested);
+			fs.writeFileSync(path.join(nested, ".env"), "token");
+			expect(evaluateFloor({ command: "echo 漢字; cd nested && cat .e*", cwd }).asks).toBe(true);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("active globs survive mixed quoting and parameter defaults", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-active-glob-"));
+		try {
+			fs.writeFileSync(path.join(cwd, ".env"), "token");
+			expect([
+				evaluateFloor({ command: 'cat ".e"*', cwd }).asks,
+				evaluateFloor({ command: "cat ${SAFE:-.e*}", cwd }).asks,
+				evaluateFloor({ command: 'cat ".e*"', cwd }).asks,
+			]).toEqual([true, true, false]);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a nested command substitution resolves after its own cd", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-nested-cwd-"));
+		try {
+			const secret = path.join(cwd, ".aws");
+			const nested = path.join(cwd, "nested");
+			fs.mkdirSync(secret);
+			fs.mkdirSync(nested);
+			fs.writeFileSync(path.join(secret, "credentials"), "token");
+			fs.symlinkSync(path.join(secret, "credentials"), path.join(nested, "notes.txt"));
+			expect(evaluateFloor({ command: 'echo "$(cd nested && cat notes.txt)"', cwd }).asks).toBe(true);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("shell operands keep leading dash, at-sign, and quoted tilde literal", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-literal-operands-"));
+		try {
+			const secret = path.join(cwd, ".aws");
+			fs.mkdirSync(secret);
+			fs.writeFileSync(path.join(secret, "credentials"), "token");
+			for (const operand of ["-notes", "@notes.txt", "~notes"]) {
+				fs.symlinkSync(path.join(secret, "credentials"), path.join(cwd, operand));
+			}
+			expect([
+				evaluateFloor({ command: "cat -- -notes", cwd }).asks,
+				evaluateFloor({ command: "cat @notes.txt", cwd }).asks,
+				evaluateFloor({ command: 'cat "~notes"', cwd }).asks,
+			]).toEqual([true, true, true]);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a glob scan beyond its entry bound asks without scanning the directory", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-glob-bound-"));
+		try {
+			for (let index = 0; index < 257; index += 1) fs.writeFileSync(path.join(cwd, `entry-${index}`), "ordinary");
+			expect(evaluateFloor({ command: "cat no-match-*", cwd }).asks).toBe(true);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a parser-resolved path and readable symlink reach the secret-file check", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-symlink-"));
+		try {
+			const secretDir = path.join(cwd, ".aws");
+			fs.mkdirSync(secretDir);
+			fs.writeFileSync(path.join(secretDir, "credentials"), "token");
+			fs.symlinkSync(path.join(secretDir, "credentials"), path.join(cwd, "notes.txt"));
+			fs.symlinkSync(path.join(secretDir, "credentials"), path.join(cwd, "expanded.txt"));
+			fs.writeFileSync(path.join(cwd, "key.txt"), "ordinary");
+
+			expect(evaluateFloor({ command: "cat notes.txt", cwd }).asks).toBe(true);
+			expect(evaluateFloor({ command: "cat ${SAFE:-expanded.txt}", cwd }).asks).toBe(true);
+			// Assignment state across words is not part of the shell-ast view; do
+			// not simulate `${x:=...}` to derive the second word's value.
+			expect(evaluateFloor({ command: "cat ${x:=key.txt} ${x/txt/pem}", cwd }).asks).toBe(false);
+			// Python string concatenation is the separate eval-kernel interception
+			// tracked by #13, not a shell expansion the floor may infer.
+			expect(evaluateFloor({ command: 'subprocess.run(["o" "p", "read", "op://v/i/c"])', language: "code", cwd }).asks).toBe(false);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
 		}
 	});
 

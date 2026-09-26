@@ -287,6 +287,8 @@ export interface ShellCommand {
 	 * would have read as a command that does nothing.
 	 */
 	unreadShape?: string;
+	/** JavaScript string offset where this parsed command begins. */
+	sourceOffset?: number;
 }
 
 export type ShellParse = { ok: true; commands: ShellCommand[] } | { ok: false; reason: string };
@@ -371,7 +373,7 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 		// Pushed before its words are read, so the command comes ahead of the
 		// commands in its substitutions: `echo "$(rm -rf build)"` lists echo,
 		// then rm.
-		const command: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested };
+		const command: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, sourceOffset: sourceOffsetOf(stmt, source) };
 		out.push(command);
 		if (type === "CallExpr") readCall(cmd, command, source, out);
 		else readDecl(cmd, command, source, out);
@@ -380,7 +382,7 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 	}
 	const expression = EXPRESSION_SHAPES[type];
 	if (expression !== undefined) {
-		const command: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, expression: expression.kind };
+		const command: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, expression: expression.kind, sourceOffset: sourceOffsetOf(stmt, source) };
 		out.push(command);
 		command.words = [literalWord(expression.verb), ...expressionWords(cmd, expression.kind === "arithmetic", source, out)];
 		command.redirects = redirs.map((redir: any) => readRedirect(redir, source, out));
@@ -394,7 +396,7 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 	// nothing at all.
 	const own: ShellCommand[] = [];
 	if (redirs.length > 0) {
-		const carrier: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested };
+		const carrier: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, sourceOffset: sourceOffsetOf(stmt, source) };
 		out.push(carrier);
 		own.push(carrier);
 		carrier.redirects = redirs.map((redir: any) => readRedirect(redir, source, out));
@@ -408,7 +410,7 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 	for (const stmt of inner) own.push(...collectStmt(stmt, join, nested, source, out));
 	// Nothing read at all is still a command that ran.
 	if (inner.length === 0 && substitutions.length === 0 && cmd) {
-		const marker: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, unreadShape: type };
+		const marker: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, unreadShape: type, sourceOffset: sourceOffsetOf(stmt, source) };
 		out.push(marker);
 		own.push(marker);
 	}
@@ -677,7 +679,6 @@ interface ParserRange {
 	End(): { Offset(): number };
 }
 
-
 /** Convert the parser's UTF-8 byte offset to the string index used by callers. */
 function stringIndexAt(source: string, offset: number): number {
 	if (sourceBytes(source).ascii) return offset;
@@ -690,6 +691,32 @@ function stringIndexAt(source: string, offset: number): number {
 		index += codePoint > 0xffff ? 2 : 1;
 	}
 	return index;
+}
+
+/** A node's start, as a string index, or undefined when the offset cannot be
+ *  trusted. Both sides of the merge added this conversion; the loop above is
+ *  main's, and these two wrappers keep this branch's callers on one
+ *  implementation instead of a second copy. */
+function sourceOffsetOf(node: unknown, source: string): number | undefined {
+	try {
+		const offset = (node as ParserRange).Pos().Offset();
+		const view = sourceBytes(source);
+		if (!Number.isInteger(offset) || offset < 0 || (view.bytes !== undefined && offset > view.bytes.byteLength)) return undefined;
+		return stringIndexAt(source, offset);
+	} catch {
+		return undefined;
+	}
+}
+
+function sourceEndOffsetOf(node: unknown, source: string): number | undefined {
+	try {
+		const offset = (node as ParserRange).End().Offset();
+		const view = sourceBytes(source);
+		if (!Number.isInteger(offset) || offset < 0 || (view.bytes !== undefined && offset > view.bytes.byteLength)) return undefined;
+		return stringIndexAt(source, offset);
+	} catch {
+		return undefined;
+	}
 }
 
 function sliceOf(node: unknown, source: string): string {
@@ -762,6 +789,45 @@ export function substitutionSpans(text: string): string[] {
 		return true;
 	});
 	return spans;
+}
+
+export interface ShellSubstitutionRange {
+	start: number;
+	innerStart: number;
+	innerEnd: number;
+	end: number;
+}
+
+/** Source offsets for executed substitutions, in outer-before-inner order. */
+export function shellSubstitutionRanges(text: string): ShellSubstitutionRange[] {
+	if (!/\$\(|`|<\(/u.test(text)) return [];
+	let tree: unknown;
+	try {
+		tree = parse(text);
+	} catch {
+		return [];
+	}
+	const ranges: ShellSubstitutionRange[] = [];
+	try {
+		walk(tree, (node: unknown) => {
+			if (!node) return true;
+			const type = nodeType(node);
+			if (type !== "CmdSubst" && type !== "ProcSubst") return true;
+			const start = sourceOffsetOf(node, text);
+			const end = sourceEndOffsetOf(node, text);
+			if (start === undefined || end === undefined) return true;
+			const source = sliceOf(node, text);
+			const opening = source.startsWith("$(") || source.startsWith("<(") ? 2 : source.startsWith("`") ? 1 : 0;
+			const closing = source.endsWith(")") || source.endsWith("`") ? 1 : 0;
+			if (opening === 0 || closing === 0 || end - start < opening + closing) return true;
+			ranges.push({ start, innerStart: start + opening, innerEnd: end - closing, end });
+			return true;
+		});
+	} catch {
+		return [];
+	}
+	ranges.sort((a, b) => a.start - b.start || b.end - a.end);
+	return ranges;
 }
 
 /**
