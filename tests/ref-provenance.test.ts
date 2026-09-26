@@ -324,6 +324,49 @@ describe("the measured ref state", () => {
 		}
 	});
 
+	test("a pipeline's exit does not end the list, and a negated pipeline fails it", () => {
+		const own = makeWorktreeFixture();
+		try {
+			// Same twin tip as the cases above: a and b are the only pointers to
+			// one commit, and the command deletes b.
+			gitIn(own.main, "git checkout -q --detach HEAD && git commit -q --allow-empty -m twin-only && git branch a && git branch b && git checkout -q main");
+			// A pipeline's stages run in children of the shell: `exit 1 | true`
+			// kills its own stage's child and the list keeps going, so the delete
+			// after the `;` certainly runs and drops refs/heads/b from the
+			// reading. Read as a list-ending `exit`, the delete would read
+			// uncertain and refs/heads/b would survive as the last pointer —
+			// `recoverable` where the command orphans the tip. The certain
+			// delete of `scratch` (a tip nothing else holds) excludes its own
+			// ref the same way, two shapes, one entry each.
+			expect(measureGitRefProvenance("git branch -D scratch; exit 1 | true; git branch -D b", own.main)?.map(shape => shape.containedIn)).toEqual([
+				[],
+				["refs/heads/a"],
+			]);
+			// The same through `&&`: the pipeline's status is its last stage's, so
+			// a succeeding tail passes the chain on.
+			expect(measureGitRefProvenance("exit 1 | true && git branch -D b", own.main)?.map(shape => shape.containedIn)).toEqual([["refs/heads/a"]]);
+			// ...and its mirror: the last stage's FAILURE passes too, and the
+			// or-arm certainly runs.
+			expect(measureGitRefProvenance("true | false || git branch -D b", own.main)?.map(shape => shape.containedIn)).toEqual([["refs/heads/a"]]);
+			// A list-level `exit` still ends the list: whatever joins the segment
+			// after it reads uncertain, and the second shape dedupes to one entry.
+			expect(measureGitRefProvenance("exit 1; git branch -D b", own.main)?.map(shape => shape.containedIn)).toEqual([["refs/heads/a", "refs/heads/b"]]);
+			// `! true | true` fails its pipeline — the `!` reads the WHOLE
+			// statement's exit status, and a pipeline's status is its last stage's
+			// — so the or-arm certainly runs and certainly deletes b. With the
+			// negation dropped or left on the head, the arm read uncertain and
+			// refs/heads/b survived as the last pointer.
+			expect(measureGitRefProvenance("! true | true || git branch -D b", own.main)?.map(shape => shape.containedIn)).toEqual([["refs/heads/a"]]);
+			// The and-arm mirror: the negated pipeline fails, so `&&` skips the
+			// delete and its own ref stays named.
+			expect(measureGitRefProvenance("! true | true && git branch -D b", own.main)?.map(shape => shape.containedIn)).toEqual([
+				["refs/heads/a", "refs/heads/b"],
+			]);
+		} finally {
+			removeFixture(own.root);
+		}
+	});
+
 	test("a restore measures dirtiness in the paths it names, not the whole tree", () => {
 		const own = makeWorktreeFixture();
 		try {

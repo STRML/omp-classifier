@@ -333,16 +333,36 @@ function parserMessage(err: unknown): string {
  * Collect one statement into `out` and return the commands it produced at its
  * own level. Commands inside its substitutions go into `out` too, marked
  * nested, but hang off the word that contains them rather than being returned.
+ * `inheritedNegated` carries a `!` read above this recursion: mvdan-sh puts the
+ * negation on the statement that wraps a `BinaryCmd`, so a `!` before a
+ * pipeline or an and/or chain sits one level above the commands it negates.
  */
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string, out: ShellCommand[]): ShellCommand[] {
+function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string, out: ShellCommand[], inheritedNegated = false): ShellCommand[] {
 	const cmd = stmt?.Cmd;
 	const type = cmd ? nodeType(cmd) : "";
 	// `! cmd` is a flag on the statement, not a word, so it is read here once and
-	// handed to every command this statement produced.
-	const negated = stmt?.Negated === true;
+	// handed to every command this statement produced. The parser puts the flag
+	// on the outer statement; a BinaryCmd recursion re-reads it one level down.
+	const negated = inheritedNegated || stmt?.Negated === true;
 	if (type === "BinaryCmd") {
-		return [...collectStmt(cmd.X, join, nested, source, out), ...collectStmt(cmd.Y, joinOf(cmd.Op), nested, source, out)];
+		// The `!` before `! a | b` is carried through this recursion: without it,
+		// a statement whose right side joins on the pipeline's status reads the
+		// pipeline's stages as un-negated, and `! true | true || git branch -D b`
+		// reads its or-arm as skipped when the shell certainly runs it.
+		const x = collectStmt(cmd.X, join, nested, source, out, negated);
+		const y = collectStmt(cmd.Y, joinOf(cmd.Op), nested, source, out, false);
+		// The shell reads a `!` against the WHOLE statement's exit status, and a
+		// pipeline's status is its last stage's — mvdan hangs the flag on the
+		// first stage, so a pipeline moves it to the tail: `! true | true` fails.
+		// The move only fits a right side that IS the pipeline's tail (every
+		// element pipe-joined); an and-or arm joins `and`/`or` and keeps its own
+		// flag, which is the arm-status reading the reach walk applies.
+		if (negated && y.length > 0 && y.every(command => command.join === "pipe")) {
+			for (const command of x) command.negated = false;
+			y[y.length - 1].negated = true;
+		}
+		return [...x, ...y];
 	}
 	const redirs = stmt?.Redirs ?? [];
 	if (type === "CallExpr" || type === "DeclClause") {
@@ -389,6 +409,18 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 		const marker: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, unreadShape: type };
 		out.push(marker);
 		own.push(marker);
+	}
+	// A `!` on a pipeline or and-or chain is read by the BinaryCmd recursion
+	// above as a flag on every arm, but the shell reads it against the WHOLE
+	// statement's status. For a pipeline that status is the last stage's, so
+	// the flag lands on the first stage by default (mvdan puts it on the head
+	// of the pipeline) and has to be moved to the tail: `! true | true ||
+	// git branch -D b` fails its pipeline and certainly runs its or-arm. An
+	// and-or chain needs no move — an arm that runs carries the status the `!`
+	// reads, one per arm is the reading the status walk applies.
+	if (negated && own.length > 1 && own.every(command => command.join === "pipe")) {
+		for (const command of own) command.negated = false;
+		own[own.length - 1].negated = true;
 	}
 	return own;
 }

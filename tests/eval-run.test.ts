@@ -20,7 +20,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_JEV_POLICY, deriveJevDecision, JEV_HAZARDS, type JevAnswers, type JevHazard } from "../jev";
+import { DEFAULT_JEV_POLICY, deriveJevDecision, JEV_HAZARDS, JEV_POLICY_VERSION, type JevAnswers, type JevHazard } from "../jev";
 import {
 	computeIntentMetrics,
 	parseArgs,
@@ -231,7 +231,7 @@ describe("computeIntentMetrics — driven by a fake judge (no network)", () => {
 describe("parseArgs", () => {
 	test("--battery selects the battery and rejects an unknown one", () => {
 		expect(parseArgs(["--battery", "jev-v3"]).battery).toBe("jev-v3");
-		expect(parseArgs([]).battery).toBe("jev-v2.8");
+		expect(parseArgs([]).battery).toBe(JEV_POLICY_VERSION);
 		expect(() => parseArgs(["--battery", "jev-v9"])).toThrow(/--battery must be one of/u);
 	});
 

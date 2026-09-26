@@ -62,7 +62,7 @@ import { parseShell, type ShellJoin } from "./shell-ast";
  * threshold changes: jevQuestionsHash folds it into the fingerprint that the
  * audit log records, so a replay can tell which policy produced a decision.
  */
-export const JEV_POLICY_VERSION = "jev-v2.8";
+export const JEV_POLICY_VERSION = "jev-v2.9";
 /**
  * The intent-aware battery. It runs in shadow beside JEV_POLICY_VERSION and
  * decides nothing until the flip; its questions differ from jev-v2 only where
@@ -866,8 +866,13 @@ function knownExit(segment: ShellSegment): KnownExit {
 /** `exit` ends the shell, so nothing after a reached `exit` runs — whatever its
  *  status. Read by verb rather than by status: a bare `exit` reuses the last
  *  command's status, and the list is over either way. Only a top-level `exit`
- *  reaches this: a nested one ends its own substitution and nothing else. */
-const endsTheList = (segment: ShellSegment): boolean => ((segment.tokens[0] ?? "").split("/").at(-1) ?? "") === "exit";
+ *  reaches this: a nested one ends its own substitution and nothing else. A
+ *  pipeline stage does not reach it either: a pipeline runs its stages in
+ *  children, so `exit 1 | true` ends its stage's subshell and the list keeps
+ *  going — unless `lastpipe` has moved the last stage into the shell itself,
+ *  which this cannot see, so a last-stage `exit` contributes an unknown status
+ *  rather than a certain end. */
+const endsTheList = (segment: ShellSegment): boolean => segment.join !== "pipe" && ((segment.tokens[0] ?? "").split("/").at(-1) ?? "") === "exit";
 
 /** Whether each segment is CERTAINLY run by the shell, in source order, from the
  *  joins and the exit statuses the spelling settles.
@@ -896,29 +901,70 @@ const endsTheList = (segment: ShellSegment): boolean => ((segment.tokens[0] ?? "
  *   `sequence` join its own list gave it — `false && echo "$(git branch -D b)"`
  *   skips the delete.
  *
+ * - A pipeline's status is its last stage's: each stage runs in a child of the
+ *   shell, so the chain before a `&&` or `||` following the pipeline reads the
+ *   last stage's status, not the head's — `exit 1 | true && git branch -D b`
+ *   deletes, and `exit 1 | true || git branch -D b` does not. The head's own
+ *   status is discarded, and the head is also never an `exit` that ends the
+ *   list: `exit 1 | true; git branch -D b` still deletes, because the head's
+ *   `exit` kills its own stage's child, not the shell. (Under bash's `lastpipe`
+ *   option the last stage would run in the shell itself and its `exit` WOULD
+ *   end the list; no version of bash turns that on by default, and a mode
+ *   switch in the middle of a one-liner is below what this tier reads.)
+ *
  * The uncertain direction is the one that does not claim a deletion happened:
  * a segment this cannot prove runs is reported not-certain, and a caller that
  * only names certain effects therefore names fewer of them.
  */
+/** The join of the next top-level segment after `from`, or undefined at the
+ *  end of the list. A nested segment runs inside the command before it, so a
+ *  pipeline head's next TOP-LEVEL neighbour names the head's shape, not its
+ *  text-neighbour: in `a "$(x)" | b`, the head `a` is followed by the nested
+ *  `x` in the flat list, and the pipe stage lies past it. */
+const nextTopJoin = (segments: ShellSegment[], from: number): ShellJoin | undefined => {
+	for (let index = from + 1; index < segments.length; index++) {
+		if (!segments[index].nested) return segments[index].join;
+	}
+	return undefined;
+};
+
 function certainReaches(segments: ShellSegment[]): boolean[] {
 	const reach: boolean[] = [];
 	// The status of the compound chain ending at the segment before, as far as
 	// the spelling settles it. `&&` reads it for "did the left side succeed",
-	// `||` for "did the left side fail", and a `pipe` stage leaves it alone when
-	// the pipeline itself was skipped — the failed left side is still the
-	// chain's status.
+	// `||` for "did the left side fail".
 	let outcome: KnownExit = "unknown";
+	// The status of a pipeline whose head was seen most recently, latched until
+	// the pipeline ends: each stage overwrites it, the last one wins, and the
+	// head's own status is discarded — a pipeline's status is its last stage's
+	// (each stage runs in a child, and its `exit` kills that child, not the
+	// list). Committed into `outcome` by the first top-level segment after the
+	// pipeline, which is why a `;`, `&&`, or `||` before the list can neither
+	// see past a pipeline head nor mistake its head's status for the chain's.
+	// A pipeline an `&&` skipped also keeps the failed left side's status.
+	let pipelineStatus: KnownExit | null = null;
+	// Whether the latched pipeline should have run at all: a pipeline whose
+	// head the chain skipped is skipped whole, and commits nothing.
+	let pipelineReached = true;
 	// A reached top-level `exit` ends the list.
 	let ended = false;
 	// The reach of the most recent top-level segment: a nested one runs no
 	// sooner and no later than the command that holds it.
 	let parentReached = true;
-	for (const segment of segments) {
+	for (const [index, segment] of segments.entries()) {
 		if (segment.nested) {
 			reach.push(!ended && parentReached);
 			continue;
 		}
 		const previousReached = reach.length === 0 ? true : reach[reach.length - 1];
+		const headOfPipeline = nextTopJoin(segments, index) === "pipe";
+		// The pipeline whose head was the segment before ends here: the chain's
+		// status settles from its last stage before this segment's own reach is
+		// decided from it.
+		if (segment.join !== "pipe" && pipelineStatus !== null && !headOfPipeline) {
+			outcome = pipelineReached ? pipelineStatus : outcome;
+			pipelineStatus = null;
+		}
 		let runs: boolean;
 		switch (segment.join) {
 			case "first":
@@ -943,9 +989,15 @@ function certainReaches(segments: ShellSegment[]): boolean[] {
 		parentReached = runs;
 		const exit = knownExit(segment);
 		if (segment.join === "pipe") {
-			// The pipeline's status is its last stage's when it ran, and the
-			// status of the failed left side when the pipeline was skipped.
-			outcome = runs ? exit : outcome;
+			pipelineStatus = exit;
+		} else if (headOfPipeline) {
+			// A pipeline head: the chain's status after it is the pipeline's, so
+			// the head's own status only seeds the latch until a stage
+			// overwrites it. Under `lastpipe` the last stage would run in the
+			// shell itself and its `exit` would end the list — an option this
+			// walk cannot see, and one no version of bash turns on by default.
+			pipelineStatus = exit;
+			pipelineReached = runs;
 		} else if (segment.join === "and") {
 			outcome = outcome === "nonzero" || exit === "nonzero" ? "nonzero" : outcome === "zero" && exit === "zero" ? "zero" : "unknown";
 		} else if (segment.join === "or") {
@@ -954,7 +1006,11 @@ function certainReaches(segments: ShellSegment[]): boolean[] {
 			// A fresh statement: `;`, a newline, `&`, or the head of the list.
 			outcome = exit;
 		}
-		if (runs && endsTheList(segment)) ended = true;
+		// A reached `exit` ends the list — a top-level one on a join of its own,
+		// never a pipeline stage or head: a pipeline runs its stages in
+		// children, and `exit 1 | true` kills its own stage's child while the
+		// list keeps going.
+		if (runs && !headOfPipeline && endsTheList(segment)) ended = true;
 	}
 	return reach;
 }

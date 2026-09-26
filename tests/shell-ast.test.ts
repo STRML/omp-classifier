@@ -94,6 +94,30 @@ describe("the shapes that cost a review round each", () => {
 			expect(wordsOf(`curl ${spelling} https://x`)[0]).toEqual(["curl", spelling, "https://x"]);
 		}
 	});
+
+	test("a `!` before a pipeline lands on its last stage", () => {
+		// mvdan puts the negation on the statement that wraps the pipeline, and
+		// the BinaryCmd recursion used to drop it or leave it on the head. The
+		// shell reads it against the WHOLE statement's exit status, and a
+		// pipeline's status is its last stage's — `! true | true || git branch
+		// -D b` certainly runs its or-arm, so the flag has to reach the tail.
+		const negatedPipeline = commands("! true | true || git status");
+		// The head and the or-arm carry no flag; the tail stage does.
+		expect(negatedPipeline.map(command => command.negated)).toEqual([false, true, false]);
+		expect(negatedPipeline.map(command => command.join)).toEqual(["first", "pipe", "or"]);
+		// A stage of one carries no flag of its own: `! true` at statement level
+		// keeps its flag exactly where it was.
+		expect(commands("! true")[0].negated).toBe(true);
+		// An and-or chain keeps one flag per arm the statement negates; an arm's
+		// own status is the status the negation reads there, so `! a && b` reads
+		// a's status inverted while b's success still passes the chain on.
+		expect(commands("! false && git status").map(command => command.negated)).toEqual([true, false]);
+		expect(commands("! false || git status").map(command => command.negated)).toEqual([true, false]);
+		expect(commands("true && ! false | false").map(command => command.negated)).toEqual([false, false, true]);
+		// `|&` is a pipe to the adapter, and a pipeline negation moves across it
+		// the same way.
+		expect(commands("! true |& cat").map(command => command.negated)).toEqual([false, true]);
+	});
 });
 
 describe("a word keeps every expansion inside it", () => {

@@ -370,7 +370,7 @@ surface. Kill switches layered, and never gated by the thing they switch off.
 
 | Identity | Value | Changes when |
 | --- | --- | --- |
-| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v2.8` | the meaning of a verdict or a policy knob changes |
+| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v2.9` | the meaning of a verdict or a policy knob changes |
 | `jevQuestionsHash()` (`CLASSIFIER_POLICY_HASH`) | sha256 over version + serialized battery + `DEFAULT_JEV_POLICY`, first 16 hex | the battery, its question ids, or the shipped default changes |
 | `QUESTIONS_CONTRACT` | `questions+probabilities` | the answer shape the parser accepts changes |
 
