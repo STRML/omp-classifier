@@ -285,6 +285,8 @@ export interface ShellCommand {
 	 * would have read as a command that does nothing.
 	 */
 	unreadShape?: string;
+	/** JavaScript string offset where this parsed command begins. */
+	sourceOffset?: number;
 }
 
 export type ShellParse = { ok: true; commands: ShellCommand[] } | { ok: false; reason: string };
@@ -369,7 +371,7 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 		// Pushed before its words are read, so the command comes ahead of the
 		// commands in its substitutions: `echo "$(rm -rf build)"` lists echo,
 		// then rm.
-		const command: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested };
+		const command: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, sourceOffset: sourceOffsetOf(stmt, source) };
 		out.push(command);
 		if (type === "CallExpr") readCall(cmd, command, source, out);
 		else readDecl(cmd, command, source, out);
@@ -378,7 +380,7 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 	}
 	const expression = EXPRESSION_SHAPES[type];
 	if (expression !== undefined) {
-		const command: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, expression: expression.kind };
+		const command: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, expression: expression.kind, sourceOffset: sourceOffsetOf(stmt, source) };
 		out.push(command);
 		command.words = [literalWord(expression.verb), ...expressionWords(cmd, expression.kind === "arithmetic", source, out)];
 		command.redirects = redirs.map((redir: any) => readRedirect(redir, source, out));
@@ -392,7 +394,7 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 	// nothing at all.
 	const own: ShellCommand[] = [];
 	if (redirs.length > 0) {
-		const carrier: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested };
+		const carrier: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, sourceOffset: sourceOffsetOf(stmt, source) };
 		out.push(carrier);
 		own.push(carrier);
 		carrier.redirects = redirs.map((redir: any) => readRedirect(redir, source, out));
@@ -406,7 +408,7 @@ function collectStmt(stmt: any, join: ShellJoin, nested: boolean, source: string
 	for (const stmt of inner) own.push(...collectStmt(stmt, join, nested, source, out));
 	// Nothing read at all is still a command that ran.
 	if (inner.length === 0 && substitutions.length === 0 && cmd) {
-		const marker: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, unreadShape: type };
+		const marker: ShellCommand = { words: [], assigns: [], redirects: [], join, negated, nested, unreadShape: type, sourceOffset: sourceOffsetOf(stmt, source) };
 		out.push(marker);
 		own.push(marker);
 	}
@@ -673,6 +675,19 @@ function sourceBytes(source: string): SourceBytes {
 interface ParserRange {
 	Pos(): { Offset(): number };
 	End(): { Offset(): number };
+}
+
+function sourceOffsetOf(node: unknown, source: string): number | undefined {
+	try {
+		const offset = (node as ParserRange).Pos().Offset();
+		const view = sourceBytes(source);
+		if (!Number.isInteger(offset) || offset < 0 || (view.bytes !== undefined && offset > view.bytes.byteLength)) return undefined;
+		if (view.ascii) return offset;
+		const bytes = view.bytes as Uint8Array;
+		return Buffer.from(bytes.buffer, bytes.byteOffset, offset).toString("utf8").length;
+	} catch {
+		return undefined;
+	}
 }
 
 function sliceOf(node: unknown, source: string): string {

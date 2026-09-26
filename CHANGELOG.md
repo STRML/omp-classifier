@@ -2,6 +2,12 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-09-26
+
+### Runtime shell secret-file resolution (#97)
+
+- The shell floor resolves readable secret-file targets through a supplied command cwd: a literal glob asks only for exactly one match, parser-computed alternate paths and readable symlink targets are checked by their resolved file. Zero/multiple glob matches keep the existing `.e*` quiet decision, `*.pem` still asks textually, cross-word assignment simulation stays out of scope, and Python spawn interception remains #13.
+
 ## 2026-09-25
 
 ### Statement-scope in the certain-reach walk (#126, b7fix5)

@@ -17,14 +17,17 @@
  * reaches the reviewer. That residual is stated in the plan's failure matrix
  * and pinned by a test.
  *
- * Purity: `evaluateFloor` reads its whole world from its argument and returns
- * everything it learned. Taint crosses commands because the caller carries
- * `tainted` forward into the next call, not because this module remembers
- * anything.
+ * Lifetime: evaluateFloor carries no module/session state. Secret-file checks
+ * consult the filesystem only when the caller supplies a working directory;
+ * session taint still crosses commands only through explicit input and output.
  */
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { isSecretName } from "./redact";
 import { parseShell, type ShellCommand, type ShellRedirect, type ShellWord, verbName, verbOf } from "./shell-ast";
+import { segmentCwdLookup } from "./shell-cwd";
 
 /** Which floor entry a finding came from. The numbers are the plan's, plus
  *  `unread-command` for a command the shell parser rejected or could not
@@ -45,6 +48,8 @@ export interface FloorInput {
 	 *  JavaScript, which the shell model cannot read, so only the text scans
 	 *  run over it. Defaults to shell. */
 	language?: "shell" | "code";
+	/** Starting directory for shell file resolution; omitted for text-only scans. */
+	cwd?: string;
 	/** The body of a script the command runs, when Phase 4 read one. */
 	scriptSource?: string | null;
 	/** Variables earlier commands in this session captured a secret into. */
@@ -142,17 +147,17 @@ const DECODE_INTO_EXEC = /\b(exec|eval|compile)\s*\(\s*[^)]*\b(b64decode|b64_dec
 const MARSHAL_LOAD = /\bmarshal\.loads?\b|\bpickle\.loads?\b|\bcPickle\.loads?\b/u;
 const HEX_ESCAPE_RUN = /(\\x[0-9a-fA-F]{2}){8,}/u;
 
-/** The floor. Pure: no I/O, no clock, no module state. */
+/** The floor. Optional filesystem resolution is read-only and uses the supplied cwd. */
 export function evaluateFloor(input: FloorInput): FloorResult {
 	const findings: FloorFinding[] = [];
 	const tainted: string[] = [];
 	if (input.language === "code") scanCode(input.command, findings);
-	else scanText(input.command, "command", input.taintedVars ?? [], findings, tainted);
+	else scanText(input.command, "command", input.taintedVars ?? [], findings, tainted, input.cwd);
 	if (input.scriptSource) {
 		// A script body is judged by the same entries as the command that runs
 		// it, so a name like `build.sh` stops mattering. Variables the body
 		// captures taint within this call only.
-		scanText(input.scriptSource, "script", [...(input.taintedVars ?? []), ...tainted], findings, tainted);
+		scanText(input.scriptSource, "script", [...(input.taintedVars ?? []), ...tainted], findings, tainted, input.cwd);
 	}
 	return { asks: findings.length > 0, findings, tainted };
 }
@@ -187,7 +192,7 @@ function scanCode(text: string, findings: FloorFinding[]): void {
 	scanObfuscation(text, "command", findings);
 }
 
-function scanText(text: string, source: FloorFinding["source"], tainted: readonly string[], findings: FloorFinding[], capturedOut: string[]): void {
+function scanText(text: string, source: FloorFinding["source"], tainted: readonly string[], findings: FloorFinding[], capturedOut: string[], cwd?: string): void {
 	if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(text))) {
 		findings.push({ entry: "critical", detail: "matches a built-in dangerous-command pattern", source });
 	}
@@ -199,7 +204,8 @@ function scanText(text: string, source: FloorFinding["source"], tainted: readonl
 		findings.push({ entry: "unread-command", detail: `a ${unread.unreadShape} the shell adapter could not read`, source });
 	}
 	if (parsed.ok) {
-		scanSecrets(parsed.commands, { shellTracing: SHELL_TRACING.test(text), tainted, captured: capturedOut, findings, source, visited: new Set() });
+		const cwdAt = cwd === undefined ? undefined : segmentCwdLookup(text, cwd);
+		scanSecrets(parsed.commands, { cwdAt, shellTracing: SHELL_TRACING.test(text), tainted, captured: capturedOut, findings, source, visited: new Set() });
 		if (shellEvalOfNonLiteral(parsed.commands)) {
 			findings.push({ entry: "obfuscated-code", detail: "shell eval runs a value rather than a literal", source });
 		}
@@ -222,6 +228,7 @@ interface SecretScan {
 	source: FloorFinding["source"];
 	/** Commands already read through the word that contains them. */
 	visited: Set<ShellCommand>;
+	cwdAt?: (offset: number) => string | null;
 }
 
 /**
@@ -259,25 +266,26 @@ function scanSecrets(commands: readonly ShellCommand[], scan: SecretScan): void 
  *  the secrets that reach its stdout are returned, because whoever receives
  *  that stdout decides the sink. */
 function commandSecrets(command: ShellCommand, scan: SecretScan): string[] {
+	const currentCwd = command.sourceOffset === undefined ? undefined : scan.cwdAt?.(command.sourceOffset);
 	scan.visited.add(command);
 	const tracing = scan.shellTracing || clientTracing(command);
 	const envIndexes = envAssignments(command);
 	for (const assign of command.assigns) capture(assign.name, [...(assign.value ? [assign.value] : []), ...assign.array], tracing, scan);
 	for (const index of envIndexes) capture(ASSIGNMENT_WORD.exec(command.words[index].value)?.[1] ?? "", [command.words[index]], tracing, scan);
-	if (command.expression !== undefined) return expressionSecrets(command, tracing, scan);
+	if (command.expression !== undefined) return expressionSecrets(command, tracing, scan, currentCwd);
 
 	const printed = storeReads(command);
 	const headerSink = HTTP_CLIENT.test(trustedVerb(command));
 	command.words.forEach((word, index) => {
 		if (envIndexes.includes(index)) return;
 		const sink = wordSink(command.words[index - 1]?.value ?? "", word.value, headerSink);
-		for (const label of wordSecrets(word, scan, true)) {
+		for (const label of wordSecrets(word, scan, true, currentCwd ?? undefined)) {
 			if (sink === "body") report(scan, `${label} reaches a request body or upload`);
 			else if (sink === "header" && tracing) report(scan, `${label} under a tracing flag, which prints every expansion`);
 			else if (sink === "output") printed.push(label);
 		}
 	});
-	for (const redirect of command.redirects) printed.push(...redirectSecrets(redirect, scan));
+	for (const redirect of command.redirects) printed.push(...redirectSecrets(redirect, scan, currentCwd ?? undefined));
 	return routeStdout(command, printed, scan);
 }
 
@@ -285,13 +293,13 @@ function commandSecrets(command: ShellCommand, scan: SecretScan): string[] {
  *  nothing, unless the shell is tracing, which prints the expanded test. Their
  *  redirects still count: `[[ … ]] < ~/.ssh/id_rsa` is not a thing anyone
  *  writes, but it is read like any other. */
-function expressionSecrets(command: ShellCommand, tracing: boolean, scan: SecretScan): string[] {
+function expressionSecrets(command: ShellCommand, tracing: boolean, scan: SecretScan, currentCwd: string | null | undefined): string[] {
 	for (const word of command.words) {
-		for (const label of wordSecrets(word, scan, true)) {
+		for (const label of wordSecrets(word, scan, true, currentCwd ?? undefined)) {
 			if (tracing) report(scan, `${label} under a tracing flag, which prints every expansion`);
 		}
 	}
-	return routeStdout(command, command.redirects.flatMap(redirect => redirectSecrets(redirect, scan)), scan);
+	return routeStdout(command, command.redirects.flatMap(redirect => redirectSecrets(redirect, scan, currentCwd ?? undefined)), scan);
 }
 
 /** `KEY=$(op read …)`, `export KEY="$(…)"` and `arr=("$API_KEY")`: the value
@@ -330,13 +338,13 @@ function storeReads(command: ShellCommand): string[] {
 }
 
 /** Every secret a word carries, including what its substitutions print. */
-function wordSecrets(word: ShellWord, scan: SecretScan, paths: boolean): string[] {
+function wordSecrets(word: ShellWord, scan: SecretScan, paths: boolean, cwd?: string): string[] {
 	const labels: string[] = STORE_READS.filter(([pattern]) => pattern.test(word.value)).map(([, label]) => label);
 	const live = [...scan.tainted, ...scan.captured];
 	for (const name of secretVariableNames(word, live)) {
 		labels.push(live.includes(name) ? `the captured secret in $${name}` : `the secret-named variable $${name}`);
 	}
-	const filePath = paths ? secretPathIn(word) : undefined;
+	const filePath = paths ? secretPathIn(word) ?? resolvedSecretPathIn(word, cwd) : undefined;
 	if (filePath !== undefined) labels.push(`the secret file ${filePath}`);
 	for (const command of word.commands) labels.push(...commandSecrets(command, scan));
 	return labels;
@@ -345,11 +353,11 @@ function wordSecrets(word: ShellWord, scan: SecretScan, paths: boolean): string[
 /** What a command reads through a redirect: `< ~/.ssh/id_rsa`, a here-string,
  *  a heredoc body. An output target is a destination, so a path there is not
  *  a read, but a secret expanded into its name still counts. */
-function redirectSecrets(redirect: ShellRedirect, scan: SecretScan): string[] {
+function redirectSecrets(redirect: ShellRedirect, scan: SecretScan, cwd?: string): string[] {
 	// `<>` opens its target for reading too, so it is read like `<`.
-	if (redirect.direction === "out") return wordSecrets(redirect.target, scan, false);
-	if (redirect.body !== undefined) return wordSecrets(redirect.body, scan, false);
-	return wordSecrets(redirect.target, scan, !redirect.here);
+	if (redirect.direction === "out") return wordSecrets(redirect.target, scan, false, cwd);
+	if (redirect.body !== undefined) return wordSecrets(redirect.body, scan, false, cwd);
+	return wordSecrets(redirect.target, scan, !redirect.here, cwd);
 }
 
 type WordSink = "body" | "header" | "output";
@@ -449,12 +457,9 @@ function report(scan: SecretScan, detail: string): void {
  * `${SAFE:-key.pem}` opens `key.pem` when SAFE is unset, and brace expansion
  * runs first because it is fixed by the text alone.
  *
- * This is a check on names, and a name check has a stated limit (plan
- * 2026-09-22-real-shell-parser.md, "What a name check cannot see"). A glob
- * matches whatever is on disk, an assignment inside one expansion changes the
- * next, and a symlink renames any file. Those are runtime values, and the
- * floor reads them as the text they are written as: `*.pem` asks, `.e*`
- * does not. The reviewer sees every one of them.
+ * This is only the text part of the check. `resolvedSecretPathIn` adds paths
+ * whose files are determinable from a supplied cwd; unknown globs and
+ * assignment state keep this result unchanged.
  */
 export function secretPathIn(word: ShellWord): string | undefined {
 	for (const text of new Set([word.value, word.alternate])) {
@@ -466,6 +471,72 @@ export function secretPathIn(word: ShellWord): string | undefined {
 		}
 	}
 	return undefined;
+}
+
+/** Resolve only file spellings the shell-ast view makes available. Globs are
+ *  limited to a literal pattern in one static, nonrecursive directory and only
+ *  when exactly one readable file matches. Parameter values come from
+ *  `alternate`, never from simulated assignments or language-specific parsing. */
+function resolvedSecretPathIn(word: ShellWord, cwd: string | undefined): string | undefined {
+	if (cwd === undefined) return undefined;
+	for (const text of word.literal ? [word.value] : [word.alternate]) {
+		const candidates = expandBraces(text);
+		if (candidates === undefined) continue;
+		for (const candidate of candidates) {
+			const hasGlob = hasPathGlob(candidate);
+			if (hasGlob && !word.literal) continue;
+			const glob = word.literal && word.source === word.value && hasGlob;
+			const resolved = glob ? oneGlobMatch(candidate, cwd) : shellPath(candidate, cwd);
+			if (resolved !== undefined && readableSecretFile(resolved)) return candidate;
+		}
+	}
+	return undefined;
+}
+
+function hasPathGlob(candidate: string): boolean {
+	return candidate.includes("*") || candidate.includes("?") || candidate.includes("[");
+}
+
+/** Match a simple basename glob; recursive and directory-glob scans stay text-only. */
+function oneGlobMatch(pattern: string, cwd: string): string | undefined {
+	if (pattern.includes("**") || /(?:^|\/)[!@+?*]\(/u.test(pattern)) return undefined;
+	const absolute = shellPath(pattern, cwd);
+	if (absolute === undefined) return undefined;
+	const directory = path.dirname(absolute);
+	const basename = path.basename(absolute);
+	if (basename === "" || hasPathGlob(directory)) return undefined;
+	try {
+		let match: string | undefined;
+		for (const candidate of new Bun.Glob(basename).scanSync({ cwd: directory, absolute: true, dot: basename.startsWith("."), onlyFiles: true })) {
+			if (match !== undefined) return undefined;
+			match = candidate;
+		}
+		return match;
+	} catch {
+		return undefined;
+	}
+}
+
+function shellPath(candidate: string, cwd: string): string | undefined {
+	if (candidate.length === 0 || candidate.startsWith("-")) return undefined;
+	const withoutPrefix = candidate.replace(/^@/u, "");
+	if (withoutPrefix.length === 0) return undefined;
+	try {
+		return resolveToCwd(withoutPrefix, cwd);
+	} catch {
+		return undefined;
+	}
+}
+
+function readableSecretFile(file: string): boolean {
+	try {
+		const resolved = fs.realpathSync(file);
+		if (!fs.statSync(resolved).isFile()) return false;
+		fs.accessSync(resolved, fs.constants.R_OK);
+		return isSecretPath(resolved);
+	} catch {
+		return false;
+	}
 }
 
 /**

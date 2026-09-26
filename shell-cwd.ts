@@ -759,6 +759,17 @@ export function segmentWorkingDirectories(
 	return dirs;
 }
 
+function cwdAtOffset(walked: readonly ShellSegmentDirectory[], offset: number, base: string): string | null {
+	let low = 0;
+	let high = walked.length;
+	while (low < high) {
+		const middle = (low + high) >>> 1;
+		if (walked[middle].start <= offset) low = middle + 1;
+		else high = middle;
+	}
+	return low === 0 ? base : walked[low - 1].cwd;
+}
+
 /**
  * The directory the segment containing `offset` runs in, or `null` when the
  * command text does not pin it.
@@ -777,10 +788,15 @@ export function segmentCwdAt(
 	base: string,
 	resolveCwd: CwdResolver = defaultCwdResolver,
 ): string | null {
-	let cwd: string | null = base;
-	for (const segment of walkedDirectories(shellWalk(text), base, resolveCwd)) {
-		if (segment.start > offset) break;
-		cwd = segment.cwd;
-	}
-	return cwd;
+	return cwdAtOffset(walkedDirectories(shellWalk(text), base, resolveCwd), offset, base);
+}
+
+/** Build one shell walk for callers resolving several command offsets. */
+export function segmentCwdLookup(
+	text: string,
+	base: string,
+	resolveCwd: CwdResolver = defaultCwdResolver,
+): (offset: number) => string | null {
+	const walked = walkedDirectories(shellWalk(text), base, resolveCwd);
+	return offset => cwdAtOffset(walked, offset, base);
 }
