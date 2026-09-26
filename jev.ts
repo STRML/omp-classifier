@@ -582,12 +582,11 @@ function parsePushRefs(command: string): { remote: string; lref: string; rref: s
 	if (segments === null) return null;
 	const pushes = segments.filter(segment => gitSubcommandIndex(segment.tokens, "push") !== -1);
 	if (pushes.length !== 1) return null;
-	const offsetTokens = [...command.matchAll(/\S+/gu)].map(m => ({ text: m[0], at: m.index }));
-	const offsetIdx = offsetTokens.findIndex((token, index) => token.text === "push" && offsetTokens.slice(0, index).filter(item => !item.text.startsWith("-")).at(-1)?.text === "git");
-	if (offsetIdx === -1) return null;
-	const tokens = pushes[0].tokens;
-	const idx = gitSubcommandIndex(tokens, "push");
+	const idx = gitSubcommandIndex(pushes[0].tokens, "push");
 	if (idx === -1) return null;
+	const pushAt = pushes[0].wordOffsets[idx];
+	if (pushAt === undefined || pushAt < 0) return null;
+	const tokens = pushes[0].tokens;
 	let remote: string | null = null;
 	let spec: string | null = null;
 	for (let i = idx + 1; i < tokens.length; i++) {
@@ -608,7 +607,7 @@ function parsePushRefs(command: string): { remote: string; lref: string; rref: s
 	const lref = colon === -1 ? plus : plus.slice(0, colon);
 	const rref = colon === -1 ? plus : plus.slice(colon + 1);
 	if (lref === "" || rref === "" || lref.includes("*") || rref.includes("*")) return null;
-	return { remote, lref, rref, at: offsetTokens[offsetIdx].at };
+	return { remote, lref, rref, at: pushAt };
 }
 
 export function measureGitPushProvenance(command: string, cwd: string): GitPushProvenance | undefined {
@@ -1573,6 +1572,8 @@ const GIT_REBASE_RESUME_FLAGS: Record<string, true> = {
 export interface ShellSegment {
 	/** The words the command carries, values only. */
 	tokens: string[];
+	/** Source offsets from the parser for those words. */
+	wordOffsets: Array<number | undefined>;
 	/** How this command was joined to the one before it, straight from the
 	 *  parser (`shell-ast.ts`): `first` opens the list, `and`/`sequence` mean
 	 *  the sequence continues regardless of the outcome — `;`, a newline, or
@@ -1597,7 +1598,7 @@ function shellSegments(text: string): ShellSegment[] | null {
 	const parsed = parseShell(text);
 	if (!parsed.ok) return null;
 	if (parsed.commands.some(command => command.unreadShape !== undefined)) return null;
-	return parsed.commands.map(command => ({ tokens: command.words.map(word => word.value), join: command.join, negated: command.negated, nested: command.nested }));
+	return parsed.commands.map(command => ({ tokens: command.words.map(word => word.value), wordOffsets: command.words.map(word => word.offset), join: command.join, negated: command.negated, nested: command.nested }));
 }
 
 /** A command's exit status when the spelling settles it without running it. */

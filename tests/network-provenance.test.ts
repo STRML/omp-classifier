@@ -358,6 +358,19 @@ describe("the daemon decides the local claim, not the local file (#121 review)",
 			expect(measureNetworkProvenance("docker --config $DOCKER_DIR compose exec web sh", project, { ...sources, dockerConfigDir: processConfig })?.dockerNetworks).toEqual([
 				{ target: "web", kind: "compose-service" },
 			]);
+
+		} finally {
+			remove();
+		}
+	});
+
+	test("a named-user tilde compose config is not expanded as the current user's home", () => {
+		const { sources, home, project, remove } = fixture();
+		try {
+			writeFileSync(join(project, "compose.yaml"), "services:\n  web:\n    image: wordpress\n");
+			const configured = dockerContext(join(home, ".docker"), "local", "unix:///var/run/docker.sock");
+			const measured = measureNetworkProvenance("docker --config ~root/.docker compose exec web sh", project, { ...sources, dockerConfigDir: configured });
+			expect(measured?.dockerNetworks).toEqual([{ target: "web", kind: "compose-service" }]);
 		} finally {
 			remove();
 		}
