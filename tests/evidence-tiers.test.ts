@@ -285,6 +285,57 @@ describe("collectUserEvidence", () => {
 	});
 });
 
+describe("the live collectors start after the latest /clear (#103)", () => {
+	const user = (id: string, content: string) => ({ type: "message", id, message: { id: `h-${id}`, role: "user", attribution: "user", content } });
+	const toolCall = (id: string, command: string) => ({
+		type: "message",
+		id,
+		message: { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: { command } }] },
+	});
+	// Issue #103's diagram: a request the user cleared away must never come
+	// back as evidence, because the host rebuilds model context only from
+	// after the latest reset_boundary (session-context.ts:404).
+	const branch = [
+		user("old1", "deploy production"),
+		{ type: "reset_boundary", id: "r1" },
+		user("new1", "look at the logs"),
+		user("new2", "ok"),
+	];
+
+	test("collectUserEvidence reads only post-boundary messages", () => {
+		expect(collectUserEvidence(branch, 5)).toEqual(["look at the logs", "ok"]);
+		// Only the latest boundary counts.
+		const twice = [user("a", "deploy"), { type: "reset_boundary" }, user("b", "merge it"), { type: "reset_boundary" }, user("c", "hi")];
+		expect(collectUserEvidence(twice, 5)).toEqual(["hi"]);
+	});
+
+	test("collectTaskEvidence reads only post-boundary messages", () => {
+		expect(collectTaskEvidence(branch, 5).ids).toEqual(["h-new1", "h-new2"]);
+		const twice = [user("a", "deploy"), { type: "reset_boundary" }, user("b", "merge it"), { type: "reset_boundary" }, user("c", "hi")];
+		expect(collectTaskEvidence(twice, 5).ids).toEqual(["h-c"]);
+		expect(collectTaskEvidence([user("a", "deploy"), { type: "reset_boundary", id: "r" }], 5)).toEqual({ messages: [], ids: [] });
+	});
+
+	test("collectToolEvidence reads only post-boundary tool activity", () => {
+		const tools = [
+			toolCall("t1", "kubectl rollout restart deploy/prod"),
+			{ type: "reset_boundary", id: "r1" },
+			toolCall("t2", "tail -n 5 /var/log/app.log"),
+		];
+		const evidence = collectToolEvidence(tools) ?? "";
+		expect(evidence).toContain("tail -n 5 /var/log/app.log");
+		expect(evidence).not.toContain("kubectl");
+		expect(collectToolEvidence([toolCall("t1", "rm -rf /"), { type: "reset_boundary" }])).toBeUndefined();
+	});
+
+	test("a branch with no reset_boundary behaves exactly as before", () => {
+		const plain = [user("m1", "deploy production"), user("m2", "look at the logs")];
+		expect(collectUserEvidence(plain, 5)).toEqual(["deploy production", "look at the logs"]);
+		expect(collectTaskEvidence(plain, 5).ids).toEqual(["h-m1", "h-m2"]);
+		expect(collectToolEvidence([toolCall("t1", "git status")])).toContain("git status");
+	});
+});
+
 describe("collectTaskEvidenceV3", () => {
 	const user = (id: string, content: string) => ({ type: "message", id, message: { role: "user", attribution: "user", content } });
 

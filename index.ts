@@ -92,6 +92,7 @@ import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 import { getPluginsDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
+import { heredocShadowedAt, maskHeredocBodiesAndAnsiSpans, openQuoteBefore, segmentWorkingDirectories, SHELL_WORD_EXPANSION } from "./shell-cwd";
 import { substitutionSpans } from "./shell-ast";
 import {
 	DEFAULT_JUDGE_BACKEND,
@@ -118,9 +119,11 @@ import {
 	type JevPolicy,
 	type JevAnswers,
 	type JevVerdict,
+	type NetworkProvenance,
 	measureGitPushProvenance,
 	measureGitRefProvenance,
 	measureGitWorktreeProvenance,
+	measureNetworkProvenance,
 } from "./jev";
 
 type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "UNAVAILABLE";
@@ -1595,6 +1598,16 @@ function textOf(content: unknown): string {
 }
 
 /**
+ * Index of the first entry after the latest `/clear` boundary, 0 when none.
+ * The host rebuilds model context only from after the latest
+ * `reset_boundary` (session-context.ts:404), so no live evidence collector
+ * may read past it — a cleared request cannot weigh as authorization. One
+ * implementation, shared by every collector (#103).
+ */
+const branchStartAfterLatestResetBoundary = (branch: ReadonlyArray<{ type: string }>): number =>
+	branch.findLastIndex(entry => entry.type === "reset_boundary") + 1;
+
+/**
  * The last `limit` user messages on a session branch, oldest first (issue
  * #31): the user-tier evidence a classify record may carry. Pure over the
  * branch entry array so tests pass a fixture instead of a live session. Only
@@ -1604,13 +1617,16 @@ function textOf(content: unknown): string {
  * out too (fail closed). Each is textOf-flattened and capped per
  * EVIDENCE_MESSAGE_MAX_CHARS by keeping its head and tail. The window is the
  * tail: when the branch holds more user messages than `limit`, the newest win.
+ * Like collectTaskEvidenceV3 (#101), it reads only what follows the latest
+ * `/clear` boundary (#103).
  */
 export function collectUserEvidence(
 	branch: ReadonlyArray<{ type: string; message?: { role?: string; attribution?: string; content?: unknown } }>,
 	limit: number,
 ): string[] {
 	const messages: string[] = [];
-	for (const entry of branch) {
+	for (let index = branchStartAfterLatestResetBoundary(branch); index < branch.length; index++) {
+		const entry = branch[index];
 		if (entry.type !== "message") continue;
 		const message = entry.message;
 		if (message?.role !== "user" || message.attribution !== "user") continue;
@@ -1652,7 +1668,7 @@ type EvidenceBranchEntry = {
 export function collectTaskEvidence(branch: ReadonlyArray<EvidenceBranchEntry>, limit: number): UserEvidenceSnapshot {
 	if (limit <= 0) return { messages: [], ids: [] };
 	const all: Array<{ text: string; id: string; index: number; anchored: boolean }> = [];
-	for (let index = 0; index < branch.length; index++) {
+	for (let index = branchStartAfterLatestResetBoundary(branch); index < branch.length; index++) {
 		const entry = branch[index];
 		if (entry.type !== "message") continue;
 		const message = entry.message;
@@ -1682,9 +1698,11 @@ export interface UserEvidenceSnapshotV3 extends UserEvidenceSnapshot {
 
 /**
  * The jev-v3 evidence builder (plan Phase 2 step 6). It differs from
- * collectTaskEvidence in two ways: it reads only what follows the latest
- * `/clear` (`reset_boundary`), the way the host rebuilds model context, and it
- * pins the first user message when the slice would drop it.
+ * collectTaskEvidence in two ways: it pins the first user message when the
+ * slice would drop it, and its collector name records that it feeds the
+ * jev-v3 battery. Both builders now read only what follows the latest
+ * `/clear` (`reset_boundary`), the way the host rebuilds model context
+ * (#103).
  *
  * The plan also asked for task verbs in the anchor pattern. Four review
  * rounds showed a verb list can't converge on intent (every fix traded one
@@ -1696,7 +1714,7 @@ export interface UserEvidenceSnapshotV3 extends UserEvidenceSnapshot {
 export function collectTaskEvidenceV3(branch: ReadonlyArray<EvidenceBranchEntry>, limit: number): UserEvidenceSnapshotV3 {
 	if (limit <= 0) return { messages: [], ids: [] };
 	const all: Array<{ text: string; id: string; index: number; anchored: boolean }> = [];
-	const start = branch.findLastIndex(entry => entry.type === "reset_boundary") + 1;
+	const start = branchStartAfterLatestResetBoundary(branch);
 	for (let index = start; index < branch.length; index++) {
 		const entry = branch[index];
 		if (entry.type !== "message") continue;
@@ -1761,7 +1779,7 @@ export function collectToolEvidence(
 	// Every digest covers redacted text. A hash of the raw text would let
 	// anyone holding the evidence test password guesses against it offline.
 	const digest = (value: string): string => createHash("sha256").update(value).digest("hex").slice(0, 16);
-	for (const entry of branch) {
+	for (const entry of branch.slice(branchStartAfterLatestResetBoundary(branch))) {
 		if (entry.type !== "message") continue;
 		if (typeof entry.message !== "object" || entry.message === null) continue;
 		const message = entry.message as Record<string, unknown>;
@@ -1839,6 +1857,130 @@ const MODERATE_RISK_TOKENS = new Set([
 // Interpreters that only matter when they execute inline code (-c/-e);
 // `bash script.sh` is an ordinary invocation.
 const INLINE_CODE_INTERPRETERS = new Set(["python", "python2", "python3", "bash", "sh", "perl"]);
+
+// How one interpreter spells the options that decide what its program operand
+// is, for the script-file scan (issue #67 review round 1). One global table
+// read every interpreter's flags through one lens, and a flag is only a flag
+// for the program that owns it: `-E` is inline code for perl and "ignore the
+// PYTHON* environment variables" for python, `-s` is "the program is on stdin"
+// for a shell and switch parsing for perl, `-c` is inline code for python and
+// a syntax check for perl and ruby. Reading a letter through the wrong
+// interpreter's grammar ended the operand scan, so the file the interpreter
+// then ran was never read — `python3 -E probe.py` judged the command text
+// alone.
+interface InterpreterFlagGrammar {
+	/** Flags whose value is the program (or stdin): the text travels with the
+	 *  command, so the scan stops and the file scan leaves the line alone. */
+	inline: RegExp;
+	/** Flags that take a SEPARATE value word which is not a program (a warning
+	 *  filter, an include directory, a shopt name, an output style). The value
+	 *  word is consumed so it cannot be mistaken for the program. A verb whose
+	 *  flags all take their value attached carries no entry. */
+	value?: RegExp;
+	/** Flags whose value IS a file the interpreter runs, not a setting (`bun
+	 *  --preload ./pre.ts`). The value is read like the interpreter's own
+	 *  operand — the interpreter opens that file whatever the operand's
+	 *  grammatical role — and the program slot is still open for the word after
+	 *  it, so `bun --preload ./pre.ts run main.ts` reads both files (round 2
+	 *  review). Every value a flag of this class can carry is read, in the
+	 *  ATTACHED spellings too: `--preload=./pre.ts` and `-r./pre.ts` name the
+	 *  same file in one word, and reading only the separated spelling left the
+	 *  preload's code unjudged (round 3 review). The name a caller tests is the
+	 *  flag WITHOUT its value (`splitAttachedFlagValue`). */
+	file?: RegExp;
+	/** True when `-s` means "the program comes from stdin" for this
+	 *  interpreter. Only the shells spell it that way: python's `-s`, perl's
+	 *  `-s`, ruby's `-s`, and php's `-s` are all something else. */
+	stdinFlag: boolean;
+}
+
+/** Flags every verb may carry: a lone `-` is the POSIX "read the program from
+ *  stdin" spelling for sh, python, perl and php alike, and `--stdin` says the
+ *  same thing where a verb has a long form for it. */
+const SHARED_INLINE_FLAG = /^-$|^--stdin$/u;
+
+/** php spells inline code `-r`/`-R` and its interactive shell `-a`. `php -f
+ *  x.php` names the script in the flag's VALUE, which is deliberately left to
+ *  the ordinary operand scan: the word after `-f` is read like any other
+ *  program, which is exactly right for a flag whose value IS the program. */
+const PHP_INLINE_FLAG = /^-{1,2}(?:r|R|run|a)$/u;
+
+/** The grammars, by verb. `python2`/`python3` share `python`'s entry through
+ *  the version-stripped lookup at the call site. A verb with no entry gets no
+ *  grammar, which claims nothing: every word after it is read as if it were
+ *  the program. That direction is the safe one — a word that is not a file is
+ *  skipped for not existing, and a word that is a file gets read. */
+const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
+	// POSIX shells: `bash -c '…'`, `bash -s < script`, `bash -o errexit x.sh`.
+	sh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^[-+]O$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	zsh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	dash: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	ksh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	fish: { inline: /^-c$|^--command$/u, value: /^-C$|^--init-command$|^--config$/u, stdinFlag: true },
+	csh: { inline: /^-c$/u, value: /^-f$/u, stdinFlag: true },
+	tcsh: { inline: /^-c$/u, value: /^-f$/u, stdinFlag: true },
+	// `python3 -W ignore`, `-X utf8`, `-Q warn`, `--check-hash-based-pycs
+	// always`: the value is a setting, never a program. `-m` is handled where
+	// the module lookup is (its arguments are not programs either).
+	python: { inline: /^-c$|^--command$/u, value: /^-W$|^-X$|^-Q$|^--check-hash-based-pycs$/u, stdinFlag: false },
+	// perl: `-e`/`-E` are code; `-I dir` (library path) and `-F pattern` are
+	// values; `-s` is switch parsing, `-c` is a syntax check.
+	perl: { inline: /^-e$|^-E$|^--eval$/u, value: /^-I$|^-F$|^-M$|^-m$/u, stdinFlag: false },
+	// ruby: `-e` is code; `-I dir` (load path) and `-E enc`/`-W level` are
+	// settings; `-c` is a syntax check, `-s` switch parsing.
+	ruby: { inline: /^-e$|^--eval$/u, value: /^-I$|^-E$/u, stdinFlag: false },
+	// node: `-e`/`-p` are code; `--input-type` and `-C`/`--conditions` are
+	// settings; `-r`/`--require` and `--import` preload a FILE and are read as
+	// one, in both spellings: the operand scan reads the word after `-r` today,
+	// but the attached `--require=./pre.js` names the same file in one word, and
+	// nothing read it (round 3 review). Node accepts the attached form for the
+	// long spelling only — the short `-r./pre.js` is a syntax error to node —
+	// which this table does not need to model, since reading a file the
+	// interpreter rejects is the safe direction.
+	node: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--input-type$|^-C$|^--conditions$|^--title$/u, file: /^-r$|^--require$|^--import$/u, stdinFlag: false },
+	deno: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--ext$|^--config$|^--import-map$|^--v8-flags$/u, stdinFlag: false },
+	// `bun --help` here: `-r, --preload=<val>` ("import a module before other
+	// modules are loaded") and its Node-compatibility aliases `--require` and
+	// `--import` name FILES bun runs, so they are read; `--loader` takes an
+	// `.ext:loader` spec (a setting, never a path) and `--cwd` a directory.
+	bun: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--cwd$|^--loader$/u, file: /^--preload$|^-r$|^--require$|^--import$/u, stdinFlag: false },
+	// php: the operand scan reads the word after `-f` (`php -f x.php`), and
+	// `-f` is the flag that names the script in its VALUE, so it belongs in the
+	// file class and is read in its attached spellings too (`php -f=x.php`,
+	// `php -fx.php` — both run that file on this machine; round 3 review).
+	php: { inline: PHP_INLINE_FLAG, value: /^-c$|^-d$|^-z$|^--php-ini$|^--define$/u, file: /^-f$|^--file$/u, stdinFlag: false },
+	// `lua -l mod` loads a module through the interpreter's own path and `-i`
+	// is interactive: neither takes a separate value word here, and `--` only
+	// ends the options — so no flag of lua's may consume the script operand
+	// (`lua -- payload.lua` runs payload.lua; round 2 review).
+	lua: { inline: /^-e$/u, stdinFlag: false },
+	// `tclsh -encoding utf-8 script.tcl` names the codec in a value.
+	tclsh: { inline: /^-e$/u, value: /^-encoding$|^--encoding$/u, stdinFlag: false },
+	// `osascript -e 'code'`, `-l language` and `-s style` take values. The
+	// synopsis on this machine — `osascript [-l language] [-i] [-s flags] [-e
+	// statement | programfile] [argument ...]` — has `-i` as a bare flag
+	// (interactive mode), so it must not eat the program file (round 2 review).
+	osascript: { inline: /^-e$|^-eosascript$/u, value: /^-l$|^-s$/u, stdinFlag: false },
+	// `Rscript -e 'code'`; `--encoding` names a codec.
+	rscript: { inline: /^-e$|^--expression$/u, value: /^--encoding$|^--default-packages$/u, stdinFlag: false },
+	// `julia -e 'code'`; `-p n`/`-t n` are worker and thread counts.
+	julia: { inline: /^-e$|^--eval$/u, value: /^-p$|^--procs$|^-t$|^--threads$|^-O$|^--optimize$/u, stdinFlag: false },
+};
+
+// The interpreters that put a subcommand between the verb and the program, and
+// the words that are one: `bun run x.ts` (the program is the NEXT word) and
+// `deno run x.ts`. `bun run build` resolves a package.json script instead of a
+// file, so a word in this position is read only when it IS a readable file.
+const INTERPRETER_SUBCOMMANDS: Record<string, Set<string>> = {
+	bun: new Set(["run", "x", "exec", "eval", "test", "build", "repl"]),
+	deno: new Set(["run", "eval", "test", "bench", "check", "serve", "task", "compile", "bundle", "doc", "fmt", "lint", "repl", "jupyter"]),
+};
+
+// Extensions that make a bare word a script even without a path separator: the
+// shape `node -r ./pre.js main.js` hides its program behind a flag, and the
+// program it loads is the second one. A word that only has the extension is
+// read best-effort — the same shape is also an ordinary data argument.
+const SCRIPT_FILE_EXTENSION = /\.(?:py|pyw|rb|js|mjs|cjs|ts|mts|cts|tsx|jsx|sh|bash|zsh|fish|dash|ksh|pl|pm|php|lua|tcl|r|jl|ps1|bat|cmd|awk)$/iu;
 
 // Obfuscation and second-execution markers inside inline interpreter code.
 // Inline code is fully visible to the classifier — `python3 -c 'print(1)'`
@@ -2889,8 +3031,17 @@ function stdinExecutingInterpreters(stage: string): Array<{ verb: string; codeTe
 	return found;
 }
 
-function interpretersInSegment(segment: string[], rawStage: string): Array<{ verb: string; codeText: string | null }> {
-
+/**
+ * The interpreter a segment's own verb names, with the words after it.
+ *
+ * Both interpreter scans start here: the pipe scan asks what that interpreter
+ * will read from stdin, the script-file scan (issue #67) which file it will run.
+ *
+ * Wrappers are stepped through by position rather than by breaking at the first
+ * non-flag word: `env`, `nice`, `timeout` and `stdbuf` take options or durations
+ * first, so breaking early read `timeout 5 sh` as the verb `5`.
+ */
+function interpreterInvocation(segment: string[]): { verb: string; rest: string[] } | null {
 	let i = 0;
 	let sawWrapper = false;
 	while (i < segment.length) {
@@ -2915,11 +3066,17 @@ function interpretersInSegment(segment: string[], rawStage: string): Array<{ ver
 		}
 		break;
 	}
-	if (i >= segment.length) return [];
-
+	if (i >= segment.length) return null;
 	const verb = interpreterName(segment[i]);
-	if (!verb) return [];
-	const rest = segment.slice(i + 1);
+	if (!verb) return null;
+	return { verb, rest: segment.slice(i + 1) };
+}
+
+function interpretersInSegment(segment: string[], rawStage: string): Array<{ verb: string; codeText: string | null }> {
+
+	const invocation = interpreterInvocation(segment);
+	if (!invocation) return [];
+	const { verb, rest } = invocation;
 	// Inline code executes regardless of what else is on the line. The builtin
 	// INLINE_CODE_INTERPRETERS covers -c/-e for python/bash/sh/perl only, which
 	// left node, deno, bun, ruby, php and the rest with no inline-code path.
@@ -2976,336 +3133,6 @@ function interpretersInSegment(segment: string[], rawStage: string): Array<{ ver
 const HEREDOC_DATA_WRITE =
 	/(?:^|(?<=[\n;|&(){}]))[ \t]*(?:cat|tee)(?![^\s;|&(){}<>])(?:[ \t]+-{1,2}[A-Za-z][A-Za-z-]*)*(?:[ \t]*(?:\d?>>?[ \t]*)?[^\s;|&<>'"`$#-][^\s;|&<>'"`$#]*)*[ \t]*<<(-?)[ \t]*(['"])([A-Za-z_][A-Za-z0-9_.-]*)\2[ \t]*$/gmu;
 
-/**
- * Every `<<` in `command` the shell would read as a heredoc operator, with
- * the delimiter word after it. Delimiters are words: quote runs contribute
- * their contents, a backslash contributes the escaped character, and a shell
- * metacharacter or whitespace ends the word. Digit and punctuation starts
- * are legal (`cat <<123`, `cat <<.OUT`). A word the walk cannot finish —
- * one containing a command or parameter substitution like `$(printf OUT)`,
- * which bash takes literally — comes back with `delim: null`, and the walk
- * treats an unknown delimiter as covering to EOF, which only over-flags.
- */
-function shadowOpeners(command: string): Array<{ index: number; bodyStart: number; tabs: boolean; delim: string | null }> {
-	const openers: Array<{ index: number; bodyStart: number; tabs: boolean; delim: string | null }> = [];
-	const re = /<<(-?)[ \t]*/gu;
-	re.lastIndex = 0;
-	let m: RegExpExecArray | null;
-	while ((m = re.exec(command)) !== null) {
-		let delim = "";
-		let unknown = false;
-		let i = m.index + m[0].length;
-		for (; i < command.length; i++) {
-			const ch = command[i];
-			if (ch === "\\" && i + 1 < command.length) {
-				delim += command[i + 1];
-				i++;
-				continue;
-			}
-			if (ch === "'" || ch === '"') {
-				const close = command.indexOf(ch, i + 1);
-				if (close === -1) break;
-				delim += command.slice(i + 1, close);
-				i = close;
-				continue;
-			}
-			if (/[\s;|&<>]/u.test(ch)) break;
-			if (ch === "(" || ch === ")" || ch === "$" || ch === "`") {
-				// Substitution syntax in the word: bash reads it literally,
-				// but this walk cannot know where the word ends, so no
-				// closer line can be trusted.
-				unknown = true;
-				break;
-			}
-			delim += ch;
-		}
-		const bodyStart = command.indexOf("\n", i) + 1;
-		if (bodyStart === 0) break;
-		openers.push({
-			index: m.index,
-			bodyStart,
-			tabs: m[1] === "-",
-			delim: unknown || delim === "" ? null : delim.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"),
-		});
-	}
-	return openers;
-}
-
-/**
- * True when `at` sits inside the body of an earlier heredoc in `command`: an
- * owner line found there is data to the outer cat or tee, never a command of
- * its own. Every opener counts, not just the strip-shape owners, because an
- * unquoted outer delimiter expands its body before the outer command reads
- * it, so text the strip would delete can be live shell. The walk follows
- * shell body order: openers on one line consume consecutive bodies, an
- * opener inside a consumed body is data and opens nothing, and an
- * unterminated body covers to EOF. This only ever over-flags, because the
- * caller keeps the region under scan either way.
- */
-function heredocShadowedAt(command: string, at: number): boolean {
-	const all = shadowOpeners(command);
-	let cursor = 0;
-	for (let i = 0; i < all.length; i++) {
-		const op = all[i];
-		if (op.bodyStart === 0) break;
-		if (op.bodyStart > at) return false;
-		if (op.index < cursor) continue;
-		// A closer is the whole delimiter line, exact; `<<-` strips leading
-		// tabs. Trailing whitespace disqualifies it here exactly as it does
-		// for stripping, or `OUT ` would end a body the shell keeps reading.
-		// Openers sharing a line consume consecutive bodies; a body with no
-		// closer covers to EOF, which only ever over-flags.
-		let edge = op.bodyStart;
-		for (let j = i; j < all.length && all[j].bodyStart === op.bodyStart; j++) {
-			const peer = all[j];
-			// An unknown delimiter covers everything to EOF.
-			if (peer.delim === null) return true;
-			const closer = new RegExp(`^${peer.tabs ? "\\t*" : ""}${peer.delim}$`, "mu").exec(command.slice(edge));
-			if (closer === null) return true;
-			const line = edge + closer.index;
-			const nl = command.indexOf("\n", line);
-			edge = nl === -1 ? command.length : nl + 1;
-		}
-		cursor = edge;
-		if (at < cursor) return true;
-	}
-	return false;
-}
-
-/**
- * Masked scan text for the risk-token matcher (issues #60, #61).
- *
- * `tokenizeShellSegments` models only `inSingle`/`inDouble`. Two shell
- * realities put it into a quote it never leaves, and everything after the
- * quote point disappears from every segment scan:
- *
- * 1. (#60) heredoc body text is DATA unless an unquoted delimiter expands
- *    it, so an unbalanced `"` inside a body swallows the closer and every
- *    later live command. Body boundaries are decidable from the delimiter
- *    alone, which `shadowOpeners` already computes; whether the body runs
- *    is NOT decidable and is not needed here.
- * 2. (#61) ANSI-C `$'...'` strings span lines and treat `\'` as an escaped
- *    quote. The plain `'` state machine closes at the first apostrophe, and
- *    the string's closing apostrophe then opens a phantom quote that eats
- *    the rest of the command.
- */
-export interface MaskedScanText {
-	masked: string;
-	/** Heredoc body regions, scanned as their own units by the caller. */
-	bodies: string[];
-	/**
-	 * Quote-span regions (`'...'`, `"..."`, `$'...'`) the tokenizer
-	 * mis-reads, with the opening quote dropped so the recursion
-	 * tokenizes the content as fresh text; the seen-set stops a repeat.
-	 */
-	quoted: string[];
-}
-
-export function maskHeredocBodiesAndAnsiSpans(command: string): MaskedScanText {
-	const bodies: string[] = [];
-	// 1. Heredoc bodies, in shell body order. Openers are reported on the
-	// original text; one line's openers consume consecutive bodies, so an
-	// opener whose body-start sits inside an already-consumed span is data
-	// to an outer heredoc and opens nothing. An opener with no body start
-	// (`<<EOF` ending the text) has no body at all. An UNKNOWN delimiter
-	// covers to EOF: the whole tail moves to the isolated-body scan, which
-	// only ever over-flags.
-	const spans: Array<{ start: number; end: number }> = [];
-	let cursor = 0;
-	for (const op of shadowOpeners(command)) {
-		if (op.bodyStart === 0) break;
-		if (op.index < cursor) continue;
-		if (op.delim === null) {
-			spans.push({ start: op.bodyStart, end: command.length });
-			bodies.push(command.slice(op.bodyStart));
-			cursor = command.length;
-			continue;
-		}
-		const closer = new RegExp(`^${op.tabs ? "\\t*" : ""}${op.delim}$`, "mu").exec(command.slice(op.bodyStart));
-		const bodyEnd = closer === null ? command.length : op.bodyStart + closer.index;
-		spans.push({ start: op.bodyStart, end: bodyEnd });
-		bodies.push(command.slice(op.bodyStart, bodyEnd));
-		cursor = bodyEnd;
-	}
-	// 2. Quote spans the tokenizer mis-READS, walked OUTSIDE the body
-	// regions (quotes inside a body are body data; the isolated-body
-	// recursion handles them):
-	//   a. ANSI-C `$'...'` — `\'` escapes, so the plain loop closes early;
-	//   b. a quote run crossed by a heredoc body — body bytes are DATA to
-	//      the shell's quote state too;
-	//   c. a quote never closed — the #61 swallowing shape; the span covers
-	//      to EOF.
-	// A properly closed plain `'...'` or `"..."` span is NOT masked: the
-	// tokenizer reads those correctly, and the quoted-piece scan changed
-	// release behavior the suite pins (an inline `-c 'payload'` must stay
-	// releasable). Only mis-read spans are blanked out of the plain read,
-	// and the recursion scans their content separately.
-	const quoteSpans: Array<{ start: number; end: number }> = [];
-	const inBody = (at: number): boolean => spans.some(s => at >= s.start && at < s.end);
-	let i = 0;
-	while (i < command.length) {
-		if (inBody(i)) {
-			// Jump past the current body region; its quotes are body data.
-			const region = spans.find(s => i >= s.start && i < s.end);
-			if (!region) break;
-			i = region.end;
-			continue;
-		}
-		const ch = command[i];
-		if (ch === "\\" && i + 1 < command.length) {
-			i += 2;
-			continue;
-		}
-		if (ch === "$" && command[i + 1] === "'") {
-			// ANSI-C open at i: `\'` escapes, plain `'` closes.
-			let j = i + 2;
-			let closed = false;
-			while (j < command.length) {
-				if (inBody(j)) break;
-				if (command[j] === "'") {
-					quoteSpans.push({ start: i, end: j + 1 });
-					i = j + 1;
-					closed = true;
-					break;
-				}
-				j++;
-			}
-			if (!closed) {
-				quoteSpans.push({ start: i, end: command.length });
-				i = command.length;
-			}
-			continue;
-		}
-		if (ch === "'") {
-			let j = i + 1;
-			let crossedBody = false;
-			let closed = false;
-			while (j < command.length) {
-				if (inBody(j)) {
-					crossedBody = true;
-					const region = spans.find(s => j >= s.start && j < s.end);
-					if (!region) break;
-					j = region.end;
-					continue;
-				}
-				if (command[j] === "'") {
-					if (crossedBody) quoteSpans.push({ start: i, end: j + 1 });
-					i = j + 1;
-					closed = true;
-					break;
-				}
-				j++;
-			}
-			if (!closed) {
-				quoteSpans.push({ start: i, end: command.length });
-				i = command.length;
-			}
-			continue;
-		}
-		if (ch === '"') {
-			let j = i + 1;
-			let crossedBody = false;
-			let closed = false;
-			while (j < command.length) {
-				if (inBody(j)) {
-					crossedBody = true;
-					const region = spans.find(s => j >= s.start && j < s.end);
-					if (!region) break;
-					j = region.end;
-					continue;
-				}
-				if (command[j] === "\\") {
-					j += 2;
-					continue;
-				}
-				if (command[j] === '"') {
-					if (crossedBody) quoteSpans.push({ start: i, end: j + 1 });
-					i = j + 1;
-					closed = true;
-					break;
-				}
-				j++;
-			}
-			if (!closed) {
-				quoteSpans.push({ start: i, end: command.length });
-				i = command.length;
-			}
-			continue;
-		}
-		i++;
-	}
-	// Apply ALL masks (heredoc bodies + mis-read quote spans) to a single
-	// output buffer. Every newline is kept so segment structure survives.
-	const all = [...spans, ...quoteSpans].sort((a, b) => a.start - b.start);
-	const chars = command.split("");
-	for (const span of all) {
-		for (let k = span.start; k < Math.min(span.end, chars.length); k++) {
-			if (chars[k] !== "\n") chars[k] = " ";
-		}
-	}
-	const masked = chars.join("");
-	// The queue gets each span's INNER text (opening quote dropped). For an
-	// unclosed quote — the #61 swallowing shape — the inner text is the
-	// whole tail after the opener, tokenized as fresh text exactly once;
-	// the seen-set stops any repeat.
-	const quoted = quoteSpans.map(s => command.slice(s.start + 1, s.end));
-	return { masked, bodies: bodies, quoted };
-}
-
-/**
- * True when a quote opened before `at` and stays open there, so the shell
- * reads everything in between as string text. Both quotes span newlines, a
- * backslash outside quotes escapes the next character, and ANSI-C `$'...'`
- * strings treat `\'` as an escaped quote where plain `'...'` would close.
- * Nothing else matters. An apostrophe in unquoted prose opens a quote that
- * never closes, which only ever blocks a strip that would have removed
- * text — the over-flag direction.
- */
-function openQuoteBefore(command: string, at: number): boolean {
-	let quote: "'" | '"' | undefined;
-	let ansi = false;
-	for (let i = 0; i < at; i++) {
-		const ch = command[i];
-		if (quote === "'") {
-			if (ch === "\\" && ansi) {
-				i++;
-				continue;
-			}
-			if (ch === "'") {
-				quote = undefined;
-				ansi = false;
-			}
-			continue;
-		}
-		if (quote === '"') {
-			if (ch === "\\") {
-				i++;
-				continue;
-			}
-			if (ch === '"') quote = undefined;
-			continue;
-		}
-		if (ch === "\\") {
-			i++;
-			continue;
-		}
-		if (ch === "'" || ch === '"') {
-			quote = ch;
-			ansi = ch === "'" && command[i - 1] === "$";
-		}
-	}
-	return quote !== undefined;
-}
-
-/**
- * `command` with the body and closing line of every matching heredoc removed.
- *
- * Runs on the RAW command: normalizing backslash-newline first let a `safe\`
- * line inside a body join the closing delimiter and delete the rest of the
- * command. A body whose closer is missing ends the stripping, because then
- * the parse cannot say where it ends and every later owner line sits inside
- * that body.
- */
 export function withoutWrittenHeredocBodies(command: string): string {
 	if (!command.includes("<<")) return command;
 	HEREDOC_DATA_WRITE.lastIndex = 0;
@@ -3386,6 +3213,322 @@ function heredocBody(text: string): string | null {
 	// may hide its second act behind an `EOF ` line.
 	const closer = new RegExp(`^${opener[1] === "-" ? "\\t*" : ""}${opener[3]}$`, "mu").exec(tail);
 	return closer ? tail.slice(0, closer.index) : tail;
+}
+
+/**
+ * A file the command hands to an interpreter as its program (issue #67).
+ *
+ * `operand` says the word the command spelled; `arm` says how sure the scan is
+ * that it IS the program:
+ *   - "program": the interpreter's own operand (`python3 x.py`, `bash x.sh`).
+ *     Strict — the interpreter will run this file and nothing else, so a word
+ *     that is not a readable regular file (a directory python would open as
+ *     `__main__.py`, an unreadable file, a glob the shell expands first) is a
+ *     refusal, not a shrug.
+ *   - "load": a word reached past a subcommand or behind a loader flag
+ *     (`bun run x.ts`, `node -r ./pre.js main.js`). Best-effort — the same
+ *     spelling can be a package.json script or a data argument, so only a
+ *     readable file is read and anything else is passed over.
+ */
+interface InterpreterProgramRef {
+	verb: string;
+	/** The word as the command spelled it, for the flag text and the refusal. */
+	operand: string;
+	arm: "program" | "load";
+}
+
+/**
+ * A flag word split into the flag's NAME and a value ATTACHED to it.
+ *
+ * Two spellings carry a value in the same word: the long form with `=`
+ * (`--preload=./pre.ts`, the one bun's own `--help` documents as
+ * `-r, --preload=<val>`) and the getopt short form (`-r./pre.ts`,
+ * `-Wignore`, `-Ilib`, `-dmemory_limit=64M`). Both are read by name so the
+ * value is not lost between the flag and the operand scan (round 3 review).
+ *
+ * `long` says which spelling this is, because the two are not equally
+ * trustworthy for a flag whose value is CODE: `--flag=value` is that flag's
+ * own value, while `-cvalue` is also how a cluster of short flags writes
+ * itself (`bash -cx ./script.sh`), so the caller keeps the operand slot open
+ * for the short spelling. A word carrying no attached value comes back with
+ * the whole word as its name, which is what every other check reads.
+ */
+function splitAttachedFlagValue(word: string): { name: string; attached: string | undefined; long: boolean } {
+	if (word.startsWith("--")) {
+		const eq = word.indexOf("=");
+		if (eq !== -1) return { name: word.slice(0, eq), attached: word.slice(eq + 1), long: true };
+		return { name: word, attached: undefined, long: false };
+	}
+	const short = /^-([A-Za-z])(.+)$/u.exec(word);
+	if (short !== null) {
+		// `-f=x` names `x`, not `=x`: the tool's own parser drops the `=` after
+		// a short flag (measured: `php -f=eq-marker.php` runs `eq-marker.php`
+		// while a file literally named `=eq-marker.php` sits beside it), so the
+		// `=` is a separator here rather than the first character of the name.
+		// Stripping it can only ever read the file the tool opens; the spelling
+		// that really passes `=x` is not one any interpreter in the table takes.
+		const tail = short[2].startsWith("=") ? short[2].slice(1) : short[2];
+		return { name: `-${short[1]}`, attached: tail, long: false };
+	}
+	return { name: word, attached: undefined, long: false };
+}
+
+/** The interpreter-program words one segment names, in command order. */
+function interpreterProgramRefs(segment: string[]): InterpreterProgramRef[] {
+	const invocation = interpreterInvocation(segment);
+	if (!invocation) return [];
+	const { verb, rest } = invocation;
+	const subcommands = INTERPRETER_SUBCOMMANDS[verb];
+	// `python3`/`python2` carry the version in the verb `interpreterName`
+	// reports, so the version-stripped spelling is tried before giving up.
+	const grammar = INTERPRETER_FLAG_GRAMMAR[verb] ?? INTERPRETER_FLAG_GRAMMAR[verb.replace(/[\d.]+$/u, "")];
+	const refs: InterpreterProgramRef[] = [];
+	let arm: "program" | "load" = "program";
+	for (let i = 0; i < rest.length; i++) {
+		const word = rest[i];
+		if (word === "") continue;
+		if (word.startsWith("-")) {
+			// A value the interpreter takes ATTACHED to its flag is the same
+			// value as the separated spelling, and reading the flag word alone
+			// loses it: `bun --preload=./payload.ts run safe.ts` read only
+			// safe.ts, so code in the preload ran unjudged (round 3 review).
+			// Split the word once and read the flag by its NAME from here on.
+			const flag = splitAttachedFlagValue(word);
+			// The program travels in a flag's value, or on stdin: those spellings
+			// keep their existing treatment (inline-code and pipe scans). The
+			// table is per verb because the letters are: `-E` is code for perl
+			// and environment control for python, `-s` is stdin for a shell and
+			// switch parsing for perl.
+			//
+			// `--flag=code` is that flag's own value and ends the scan like the
+			// separated spelling does. A SHORT word with characters after the
+			// letter is deliberately not read as that letter's value: `bash -cx
+			// ./script.sh` is a cluster whose `-c` still takes the next word as
+			// its code, so ending the scan there would stop reading a file the
+			// shell runs. The word falls through instead, which keeps the
+			// program slot open (round 3 review).
+			if (
+				SHARED_INLINE_FLAG.test(flag.name) ||
+				grammar?.inline.test(flag.name) ||
+				(grammar?.stdinFlag === true && flag.name === "-s")
+			) {
+				if (flag.attached === undefined || flag.long) return refs;
+			}
+			// A flag whose value IS a file the interpreter runs, not a setting:
+			// the interpreter opens that file whatever the operand's grammatical
+			// role, so the value is read like its own operand — and the program
+			// slot stays open for the word after it, which is what makes `bun
+			// --preload ./pre.ts run main.ts` read both files. Both spellings of
+			// that value are read here (`--preload ./pre.ts`, `--preload=./pre.ts`,
+			// `-r ./pre.ts`, `-r./pre.ts`), because the attached spelling hides a
+			// program just as well as the separated one (round 3 review). A value
+			// the shell expands is read as the operand it cannot be, so it
+			// refuses rather than passing over (round 2 review).
+			if (grammar?.file?.test(flag.name) === true) {
+				if (flag.attached !== undefined) {
+					if (flag.attached !== "") refs.push({ verb, operand: flag.attached, arm: "program" });
+					continue;
+				}
+				const value = rest[i + 1];
+				i++;
+				if (value !== undefined && value !== "") refs.push({ verb, operand: value, arm: "program" });
+				continue;
+			}
+			// A flag whose separate value word is NOT a program: consume that
+			// word here, so `python3 -W ignore payload` reads `payload` instead
+			// of treating the warning filter as the program and pushing the real
+			// one into the load arm, where an extensionless word is passed over.
+			// A value attached to the flag (`-Wextra`, `--input-type=module`,
+			// `-dmemory_limit=64M`) consumes no word of its own, so the next word
+			// is still read as the program it is.
+			if (grammar?.value?.test(flag.name) === true) {
+				if (flag.attached === undefined) i++;
+				continue;
+			}
+			// `python3 -m pkg` runs a module the interpreter resolves through its
+			// own import path. That is a lookup this scan does not model, and the
+			// module is not a file the command named, so the rest of the line is
+			// the module's ARGUMENTS, not a program.
+			if (verb.startsWith("python") && (flag.name === "-m" || flag.name === "--module")) return refs;
+			continue;
+		}
+		if (arm === "program" && subcommands?.has(word)) {
+			arm = "load";
+			continue;
+		}
+		if (arm === "load" && !SCRIPT_FILE_EXTENSION.test(word) && !word.includes("/")) continue;
+		refs.push({ verb, operand: word, arm });
+		// The program slot is filled: everything after it is an argument, and only
+		// a script-shaped word is read past it (a loader's second file).
+		arm = "load";
+	}
+	return refs;
+}
+
+export interface InterpretedScriptBody {
+	/** The interpreter that will run it. */
+	verb: string;
+	/** The program word, as the command spelled it. */
+	operand: string;
+	/** The file's contents, verbatim. */
+	body: string;
+}
+
+export interface ReadScriptBodiesResult {
+	/** The text the gate judges: `command`, plus one fenced section per body. */
+	text: string;
+	/** The bodies that were read, in command order. */
+	bodies: InterpretedScriptBody[];
+	/** Fail-closed stop: a program the classifier could not read in full. */
+	refusal: { why: string } | null;
+}
+
+/** One program word resolved against the disk: what to read, or why not. */
+type ScriptFileRead = { kind: "body"; body: string } | { kind: "skip" } | { kind: "refuse"; why: string };
+
+/** Resolve and read one program word. `budget` is what the review limit has
+ *  left for this body once the command and the section's labels are counted.
+ *
+ *  Only "this word is not a file the interpreter resolves" may be passed over,
+ *  and only for a loader operand. A word that names a file the scan could not
+ *  read in full is refused on either arm: the interpreter opens that file
+ *  whatever the operand's grammatical role, so `bun run huge.ts` over the
+ *  review limit is a program the gate could not read, not an argument it can
+ *  ignore. Passing it over left the call with no body read, and a matching
+ *  non-blanket allow rule could then release it (issue #67 review round 1). */
+function readScriptFile(ref: InterpreterProgramRef, cwd: string, budget: number): ScriptFileRead {
+	// An expanded word names nothing the gate can resolve. The interpreter's own
+	// operand slot cannot be spelled that way (the shell expands it into the
+	// program, so the program is not readable text); a loader's operand may
+	// legitimately be a package.json script or an argument, so it is passed over.
+	if (SHELL_WORD_EXPANSION.test(ref.operand)) {
+		if (ref.arm === "load") return { kind: "skip" };
+		return {
+			kind: "refuse",
+			why:
+				`script body blocked: the shell expands ${ref.operand} before ${ref.verb} sees it, ` +
+				`so the program is not readable text`,
+		};
+	}
+	let file: string;
+	let stat: fs.Stats;
+	try {
+		file = resolveToCwd(ref.operand, cwd);
+		stat = fs.statSync(file);
+	} catch (err) {
+		// A program that is not there runs nothing: the interpreter fails on it,
+		// or a sibling command of the same line writes it with a heredoc whose
+		// body already rides the command text. The other stat failures (EACCES on
+		// the directory, ELOOP, ENAMETOOLONG, an internal URL) mean the gate
+		// cannot see the program at all.
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "skip" };
+		return {
+			kind: "refuse",
+			why: `script body blocked: ${ref.operand} could not be read (${err instanceof Error ? err.message : String(err)})`,
+		};
+	}
+	if (!stat.isFile()) {
+		// A directory in a loader's position is not a program: `bun run dev`
+		// reads package.json, and a same-named directory must not turn the
+		// invocation into an unreadable program. In the interpreter's own
+		// operand slot a directory IS the program (python opens it as
+		// `__main__.py`), so there it refuses.
+		if (ref.arm === "load") return { kind: "skip" };
+		return {
+			kind: "refuse",
+			why:
+				`script body blocked: ${ref.operand} is a ${stat.isDirectory() ? "directory" : "non-regular file"}, ` +
+				`and the classifier cannot read the program it runs`,
+		};
+	}
+	if (stat.size > budget) {
+		return {
+			kind: "refuse",
+			why:
+				`script body blocked: ${ref.operand} is ${stat.size} bytes and the review limit ` +
+				`leaves ${Math.max(budget, 0)} for it`,
+		};
+	}
+	let read: Buffer;
+	try {
+		read = fs.readFileSync(file);
+	} catch (err) {
+		return {
+			kind: "refuse",
+			why: `script body blocked: ${ref.operand} could not be read (${err instanceof Error ? err.message : String(err)})`,
+		};
+	}
+	// A short read is a file that changed under the gate: the text in hand is not
+	// the program the interpreter will run.
+	if (read.byteLength !== stat.size) {
+		return {
+			kind: "refuse",
+			why: `script body blocked: ${ref.operand} changed while it was read (${read.byteLength} of ${stat.size} bytes)`,
+		};
+	}
+	return { kind: "body", body: read.toString("utf8") };
+}
+
+export function readInterpretedScriptBodies(command: string, cwd: string, limit: number): ReadScriptBodiesResult {
+	const bodies: InterpretedScriptBody[] = [];
+	let text = command;
+
+	// Discovery reads the MASKED text: a heredoc body is data to the shell (and a
+	// document written with one must not turn `python3 pkg` inside it into a
+	// program this scan insists on reading), while an ANSI-C or crossed quote
+	// span is text the shell never parses as a command either. The judged text
+	// below stays the whole command: masking is for the scan, not for the judge.
+	const masked = maskHeredocBodiesAndAnsiSpans(command).masked;
+	const segments = tokenizeShellSegments(masked);
+	// The walk resolves `cd` targets the way this reader resolves its operands:
+	// the host's `resolveToCwd` knows the internal URL schemes and the
+	// workspace-root alias that a plain `path.resolve` would silently turn into
+	// a relative-looking path. The network tier resolves config paths with
+	// `node:path` and hands the same walk its own resolver instead.
+	const dirs = segmentWorkingDirectories(masked, cwd, segments, resolveToCwd);
+	for (let index = 0; index < segments.length; index++) {
+		const segment = segments[index];
+		if (segment.length === 0) continue;
+		for (const ref of interpreterProgramRefs(segment)) {
+			const dir = dirs[index];
+			if (dir === null) {
+				// The shell's directory at this segment is not in the text (a
+				// `cd $DIR`, `cd -`, a bare `cd`, `pushd`, or a separator this
+				// walk and the tokenizer read differently). Reading the program
+				// from a guessed directory would judge a different file than the
+				// interpreter runs, so a program word here refuses; a loader word
+				// that is not script-shaped may be a package.json script or an
+				// argument, and is passed over.
+				const scriptShaped = SCRIPT_FILE_EXTENSION.test(ref.operand) || ref.operand.includes("/");
+				if (ref.arm === "load" && !scriptShaped) continue;
+				return {
+					text,
+					bodies,
+					refusal: {
+						why:
+							`script body blocked: the working directory ${ref.verb} would run ${ref.operand} ` +
+							`from cannot be resolved from the command text`,
+					},
+				};
+			}
+			// Label lines the section adds: shell comments, so a body's first line
+			// is never read as a command of this line's, and the judge can see that
+			// the text below is a FILE the interpreter will run.
+			const label = `\n# --- ${ref.verb} runs ${ref.operand}; body read from disk ---\n`;
+			const endLabel = `\n# --- end of ${ref.operand} ---`;
+			const result = readScriptFile(ref, dir, limit - text.length - label.length - endLabel.length);
+			if (result.kind === "skip") continue;
+			// A read refusal is a refusal on BOTH arms: the interpreter opens the
+			// file whatever the operand's grammatical role, and passing a loader's
+			// refusal over left `bun run huge.ts` with no body read, which a
+			// matching allow rule could then release. Only the "this word does not
+			// name a file" answers are skipped, and `readScriptFile` decides those.
+			if (result.kind === "refuse") return { text, bodies, refusal: { why: result.why } };
+			bodies.push({ verb: ref.verb, operand: ref.operand, body: result.body });
+			text += `${label}${result.body}${endLabel}`;
+		}
+	}
+	return { text, bodies, refusal: null };
 }
 
 /**
@@ -4619,6 +4762,7 @@ export default function (pi: ExtensionAPI) {
 			pushProvenance?: GitPushProvenance;
 			worktreeProvenance?: GitWorktreeProvenance;
 			refProvenance?: GitRefProvenance[];
+			networkProvenance?: NetworkProvenance;
 			recordExtras: Record<string, unknown>;
 		},
 	): Promise<ShadowV3> => {
@@ -4663,6 +4807,7 @@ export default function (pi: ExtensionAPI) {
 					...(input.pushProvenance !== undefined ? { gitPushProvenance: input.pushProvenance } : {}),
 					...(input.worktreeProvenance !== undefined ? { gitWorktreeProvenance: input.worktreeProvenance } : {}),
 					...(input.refProvenance !== undefined ? { gitRefProvenance: input.refProvenance } : {}),
+					...(input.networkProvenance !== undefined ? { networkProvenance: input.networkProvenance } : {}),
 					...(Object.keys(input.recordExtras).length > 0 ? { extra: input.recordExtras } : {}),
 				}),
 				authorizationState: buildAuthorizationState({ actions, ...userEvidence }),
@@ -4725,6 +4870,15 @@ export default function (pi: ExtensionAPI) {
 	 * failure (HTTP error, missing key, unreadable body) has no late answer to
 	 * offer and returns without a `late` handle, so its dialog is exactly what
 	 * it was before.
+	 *
+	 * `cwd` is the directory the command RUNS in — the judge's
+	 * `workingDirectory`. `startCwd` is the directory its text STARTS in, which
+	 * is a different directory exactly when the caller resolved a `cd` out of
+	 * the command's own text (the host's leading-`cd` extraction): the two
+	 * provenance measurements walk the command's `cd` chain themselves, so
+	 * they take `startCwd` with the unmodified text, or they apply the resolved
+	 * `cd` a second time (round 4 review). It defaults to `cwd`, which is the
+	 * same directory for a caller whose text carries no leading `cd`.
 	 */
 	const classify = async (
 		ctx: ExtensionContext,
@@ -4735,6 +4889,7 @@ export default function (pi: ExtensionAPI) {
 		operatorContext?: string,
 		evidenceSnapshot?: UserEvidenceSnapshot,
 		language: "shell" | "code" = "shell",
+		startCwd: string = cwd,
 	): Promise<Judgement> => {
 		const config = readClassifierConfig();
 		const policy = jevPolicyFor(config);
@@ -4747,12 +4902,13 @@ export default function (pi: ExtensionAPI) {
 		const userMessages = taskEvidence?.messages;
 		const hadUserEvidence = (userMessages?.length ?? 0) > 0;
 		// Gate-measured git push provenance (issue #63). Runs the plumbing in
-		// the target cwd; a non-push command, a push the repo does not track,
-		// or a plumbing failure leaves it undefined and the state carries no
-		// provenance — the criteria then fall back to the syntax-level read.
+		// the repository the command's own `cd` chain reaches from `startCwd`;
+		// a non-push command, a push the repo does not track, or a plumbing
+		// failure leaves it undefined and the state carries no provenance —
+		// the criteria then fall back to the syntax-level read.
 		let pushProvenance: GitPushProvenance | undefined;
 		try {
-			pushProvenance = measureGitPushProvenance(command, cwd);
+			pushProvenance = measureGitPushProvenance(command, startCwd);
 		} catch {
 			pushProvenance = undefined;
 		}
@@ -4777,6 +4933,19 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			refProvenance = undefined;
 		}
+		// Gate-measured network provenance (issue #65), measured the same way
+		// and in the same tier: the command's own URLs and remote-verb
+		// destinations looked up in THIS machine's own naming (SSH config,
+		// hosts file, compose file, docker config and docker port table). A
+		// command that names no destination this machine knows yields undefined
+		// and the state carries no field — absent is "nothing measured", never
+		// "trusted".
+		let networkProvenance: NetworkProvenance | undefined;
+		try {
+			networkProvenance = measureNetworkProvenance(command, startCwd);
+		} catch {
+			networkProvenance = undefined;
+		}
 		// Started before the live request so the two run in parallel; awaited
 		// on both return paths below, and it never throws.
 		const shadow = config.shadowV3
@@ -4790,6 +4959,7 @@ export default function (pi: ExtensionAPI) {
 					...(pushProvenance !== undefined ? { pushProvenance } : {}),
 					...(worktreeProvenance !== undefined ? { worktreeProvenance } : {}),
 					...(refProvenance !== undefined ? { refProvenance } : {}),
+					...(networkProvenance !== undefined ? { networkProvenance } : {}),
 				})
 			: undefined;
 		// Answers -> verdict, shared by the on-time and the late path: a late
@@ -4859,6 +5029,7 @@ export default function (pi: ExtensionAPI) {
 				...(pushProvenance !== undefined ? { gitPushProvenance: pushProvenance } : {}),
 				...(worktreeProvenance !== undefined ? { gitWorktreeProvenance: worktreeProvenance } : {}),
 				...(refProvenance !== undefined ? { gitRefProvenance: refProvenance } : {}),
+				...(networkProvenance !== undefined ? { networkProvenance } : {}),
 				...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
 			}),
 			// The host settings instance, not a plugin-local singleton copy:
@@ -5732,11 +5903,19 @@ export default function (pi: ExtensionAPI) {
 			// directory change it never saw. The measured worktree geometry
 			// rides here as it does on the bash path (issue #69 slice C): the
 			// judge read it off this cwd, so a worktree registered, removed, or
-			// detached between calls must invalidate the verdict, and the
-			// measured ref state (slice D) rides with it.
+			// detached between calls must invalidate the verdict; the measured
+			// ref state (slice D) and network tier (issue #65) ride with it too.
+			// Push provenance is a bash-path measurement: this payload is not a
+			// shell command.
 			const worktreeProvenanceForCache = measureGitWorktreeProvenance(cwd);
 			const refProvenanceForCache = measureGitRefProvenance(evalCode, cwd);
-			const cacheKey = JSON.stringify(["eval", config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, ctx.cwd, language, evalCode, reviewEvidenceFingerprint, worktreeProvenanceForCache ?? null, refProvenanceForCache ?? null]);
+			const networkProvenanceForCache = measureNetworkProvenance(evalCode, cwd);
+			const cacheKey = JSON.stringify([
+				"eval", config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, ctx.cwd, language, evalCode, reviewEvidenceFingerprint,
+				worktreeProvenanceForCache ?? null,
+				refProvenanceForCache ?? null,
+				networkProvenanceForCache ?? null,
+			]);
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
 			// session off, so it must hold here too, not only for bash. The
@@ -6008,12 +6187,49 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			const cwd = cwdInput ? resolveToCwd(cwdInput, ctx.cwd) : ctx.cwd;
+			// Issue #67: a command that runs a script file is judged by what the
+			// file HOLDS, not by its path. The body joins the text every layer
+			// below reads — critical patterns, the forced-dialog token scan, the
+			// verdict cache, the grants, the judge — so `python3 x.py` and
+			// `python3 /tmp/x.py` reach the same verdict, and a rename changes
+			// nothing. A body the classifier cannot read in full (over the review
+			// limit, unreadable, truncated, expanded by the shell before the
+			// interpreter sees it) fails closed here, before any static rule,
+			// grant, or dialog could approve text nobody read.
+			// The reader is handed the directory the command STARTS in, not the
+			// one the host extracted a leading `cd X &&` into: the reader applies
+			// the command's own `cd` chain itself, segment by segment, so a `cd`
+			// the host never strips (`cd /tmp; python3 payload.py`) still decides
+			// where payload.py is read from (issue #67 review round 1). Every
+			// other walker that re-reads the command's `cd` chain — the two
+			// provenance measurements below and inside `classify` — takes the
+			// same pairing, and for the same reason: handing them `cwd`, the
+			// directory the host's own extraction already moved to, applies the
+			// extracted `cd` a second time (round 4 review).
+			const startCwd = rawCwd ? resolveToCwd(rawCwd, ctx.cwd) : ctx.cwd;
+			const script = readInterpretedScriptBodies(command, startCwd, config.maxCommandLength);
+			if (script.refusal) {
+				const why = script.refusal.why;
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "script-body", why, cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+				addRefusal(ctx, command, why, { source: "cap", cwd });
+				return {
+					block: true,
+					reason: refusalPayload(
+						"bash",
+						"script-body",
+						why,
+						"Run the script's steps as individual commands, or keep the file inside the review limit and readable.",
+						"Do not rename, move or shrink the script to dodge the read.",
+					),
+				};
+			}
+			const judgedCommand = script.text;
 			const env = canonicalEnv(event.input.env);
 			const pty = event.input.pty === true;
 			const timeout = typeof event.input.timeout === "number" ? event.input.timeout : undefined;
 			const async = event.input.async === true;
 			const target = {
-				command,
+				command: judgedCommand,
 				cwd,
 				envKeys: env.keys,
 				pty,
@@ -6026,29 +6242,30 @@ export default function (pi: ExtensionAPI) {
 			// Judge identity is the model selector plus the question battery: a
 			// verdict earned under one policy must not be reused under another.
 			// (The config signature clears the whole cache when either changes;
-			// this keeps the key honest on its own.) The measured push
-			// provenance (issue #63) is what the judge read about the refs, so
-			// a ref move between calls must invalidate the cached verdict. The
-			// worktree geometry (issue #69 slice C) is the same kind of fact:
-			// registering, removing, or detaching a worktree changes it. So is
-			// the measured ref state (slice D): a branch that becomes merged, a
-			// tree that becomes dirty, or a rebase target that moves must not
-			// reuse a verdict earned before the change.
-			const pushProvenanceForCache = measureGitPushProvenance(command, cwd);
+			// this keeps the key honest on its own.) The judged text includes its
+			// spliced script bodies, so a rewrite is a different question. Every
+			// measured tier the judge reads must ride here too: a ref move, a
+			// worktree change, or a destination that stops being this machine's
+			// own invalidates the cached verdict. Push and network measurements
+			// take the command's own start directory with unmodified text; the
+			// walkers apply its `cd` chain themselves, matching `classify`.
+			const pushProvenanceForCache = measureGitPushProvenance(judgedCommand, startCwd);
 			const worktreeProvenanceForCache = measureGitWorktreeProvenance(cwd);
-			const refProvenanceForCache = measureGitRefProvenance(command, cwd);
+			const refProvenanceForCache = measureGitRefProvenance(judgedCommand, cwd);
+			const networkProvenanceForCache = measureNetworkProvenance(judgedCommand, startCwd);
 			const cacheKey = JSON.stringify([
-				config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, command,
+				config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, judgedCommand,
 				reviewEvidenceFingerprint,
 				pushProvenanceForCache ?? null,
 				worktreeProvenanceForCache ?? null,
 				refProvenanceForCache ?? null,
+				networkProvenanceForCache ?? null,
 			]);
 			// Refusal memory (issue #30): a reworded command meets its session's
 			// prior refusal. The record tells the model; the SAFE branch below
 			// stops trusting a bare SAFE for a refused target. Computed before
 			// the cache lookup so a cached SAFE cannot outvote a newer refusal.
-			const prior = priorRefusalFor(ctx, command, cwd, reviewEvidenceFingerprint);
+			const prior = priorRefusalFor(ctx, judgedCommand, cwd, reviewEvidenceFingerprint);
 			const recordExtras: Record<string, unknown> = prior
 				? { priorRefusal: { target: prior.normalizedTarget, why: prior.why, when: new Date(prior.ts).toISOString() } }
 				: {};
@@ -6063,13 +6280,13 @@ export default function (pi: ExtensionAPI) {
 			// approval mode: the mode cannot be trusted to imply a human, because
 			// a per-session `autoApprove` (wrapper.ts:189-192) forces `yolo`
 			// without appearing in settings at all.
-			if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command))) {
-				const replay = replayDecision({ tool: "bash", command, cwd, riskFlags: ["critical"], headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "critical pattern: matches a built-in dangerous-command pattern", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+			if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(judgedCommand))) {
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, riskFlags: ["critical"], headless: !ctx.hasUI });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "critical pattern: matches a built-in dangerous-command pattern", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				// A critical hit is a refusal (issue #30) however the dialog below
 				// ends: the pattern itself is the memory. An approval lifts it via
 				// requestPermission.
-				addRefusal(ctx, command, "matches a built-in dangerous-command pattern", { source: "critical", cwd });
+				addRefusal(ctx, judgedCommand, "matches a built-in dangerous-command pattern", { source: "critical", cwd });
 				return await requestPermission(
 					ctx,
 					target,
@@ -6087,8 +6304,8 @@ export default function (pi: ExtensionAPI) {
 			// prompt/narrow-allow rule that only judged the command string. Env
 			// values are not shown to the classifier — they can hold secrets.
 			if (env.key !== "") {
-				const replay = replayDecision({ tool: "bash", command, cwd, envKeys: env.keys, headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "environment override: command runs with caller-supplied env; not classified", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, envKeys: env.keys, headless: !ctx.hasUI });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "environment override: command runs with caller-supplied env; not classified", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				return await requestPermission(
 					ctx,
 					target,
@@ -6106,7 +6323,7 @@ export default function (pi: ExtensionAPI) {
 			// `tools.approval.bash` policy in native resolveApproval, so apply the
 			// user prompt only when no pattern rule decided the call.
 			if (rule?.approval === "prompt") {
-				const replay = replayDecision({ tool: "bash", command, cwd: ctx.cwd, staticRule: "prompt", headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd: ctx.cwd, staticRule: "prompt", headless: !ctx.hasUI });
 				if (dryRun) {
 					return dryRunStop({
 						would: "allow",
@@ -6117,13 +6334,18 @@ export default function (pi: ExtensionAPI) {
 				}
 				return;
 			}
-			if (rule?.approval === "allow" && !isBlanketPattern(rule.match)) {
-				const replay = replayDecision({ tool: "bash", command, cwd, staticRule: "allow", headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: `rule: ${rule.match}`, cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+			// A host allow rule matched the command TEXT the user wrote it for.
+			// When a script body was read (#67) that text is not the text the gate
+			// is judging: the file decides what runs, and its contents change per
+			// call. The rule can say nothing about the file, so the call classifies
+			// as if no rule had matched.
+			if (rule?.approval === "allow" && !isBlanketPattern(rule.match) && script.bodies.length === 0) {
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, staticRule: "allow", headless: !ctx.hasUI });
+				logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: `rule: ${rule.match}`, cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				return;
 			}
 			if (!rule && policy.bashPolicy === "prompt") {
-				const replay = replayDecision({ tool: "bash", command, cwd: ctx.cwd, staticRule: "prompt", headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd: ctx.cwd, staticRule: "prompt", headless: !ctx.hasUI });
 				if (dryRun) {
 					return dryRunStop({
 						would: "allow",
@@ -6176,10 +6398,14 @@ export default function (pi: ExtensionAPI) {
 			// critical-pattern and env-override checks above, which rank the
 			// command itself, and below host static rules, which were configured
 			// explicitly.
-			if (matchingGrant(ctx, grantKeyForCommand(command), cwd, userScopeFingerprint)) {
-				const replay = replayDecision({ tool: "bash", command, cwd, grant: "session" });
+			// A grant is authorization for the text the human approved. The judged
+			// text carries the script bodies (#67), so a grant recorded for one
+			// body never covers a rewrite of that file: grantKeyForCommand sees the
+			// spliced newlines and falls back to its exact-text key.
+			if (matchingGrant(ctx, grantKeyForCommand(judgedCommand), cwd, userScopeFingerprint)) {
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, grant: "session" });
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "session grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "session grant", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 					return;
 				}
 			}
@@ -6195,10 +6421,10 @@ export default function (pi: ExtensionAPI) {
 			// multi-segment command, so `cd X && script` could otherwise never be
 			// remembered), which also means an env-prefixed spelling, a different
 			// cwd, or any edit to the text intentionally does NOT match.
-			if (matchingPersistentGrant(command, cwd)) {
-				const replay = replayDecision({ tool: "bash", command, cwd, grant: "persistent" });
+			if (matchingPersistentGrant(judgedCommand, cwd)) {
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, grant: "persistent" });
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "persistent grant", cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "persistent grant", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 					return;
 				}
 			}
@@ -6210,7 +6436,7 @@ export default function (pi: ExtensionAPI) {
 			// Dry-run probe (issue #32): with nothing cached, the classifier model
 			// would run — report that instead of paying the call.
 			if (dryRun && !cached) {
-				const replay = replayDecision({ tool: "bash", command, cwd, judgement: undefined, priorRefusal: Boolean(prior), headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, judgement: undefined, priorRefusal: Boolean(prior), headless: !ctx.hasUI });
 				return dryRunStop({
 					would: "classify",
 					layer: "classifier",
@@ -6219,7 +6445,7 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			let classifyError = "";
-			const judgement = cached ? withoutShadow(cached) : (await classify(ctx, command, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot).catch((err: unknown) => {
+			const judgement = cached ? withoutShadow(cached) : (await classify(ctx, judgedCommand, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot, "shell", startCwd).catch((err: unknown) => {
 				// Provider errors (quota exhausted, auth, HTTP failures) previously
 				// vanished into an opaque "unavailable". Keep the message so the
 				// permission dialog says WHY.
@@ -6258,7 +6484,7 @@ export default function (pi: ExtensionAPI) {
 			// line: a `--password` value on the continued line is otherwise on a
 			// marker-less line of its own, and flattening it back onto the flag
 			// would strand the real value after the REDACTED marker.
-			const logCommand = truncated(redactSecrets(command.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120);
+			const logCommand = truncated(redactSecrets(judgedCommand.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120);
 			if (!dryRun) pi.logger.info(
 				`classifier: verdict=${judgement.verdict}` +
 					` cached=${cached ? 1 : 0} reason="${judgement.reason}" cmd="${logCommand}"`,
@@ -6271,10 +6497,18 @@ export default function (pi: ExtensionAPI) {
 				// and a judge that answers SAFE on a payload carrying an injected
 				// instruction must not auto-run rm/dd/mkfs-class commands the
 				// builtin critical list does not cover.
-				const flags = matchModerateRiskTokens(command, cwd);
+				const flags = matchModerateRiskTokens(judgedCommand, cwd);
+				// Issue #67: a script body is code the classifier read verbatim —
+				// the same class of payload as an inline `-c` argument — so the
+				// same second-execution markers apply. A SAFE cannot vouch for a
+				// script that re-execs or decodes its real work, and that must not
+				// depend on the judge noticing which file it is reading.
+				for (const body of script.bodies) {
+					if (INTERPRETER_CODE_RISK.test(body.body)) flags.push(`${body.verb} runs ${body.operand}`);
+				}
 				const replay = replayDecision({
 					tool: "bash",
-					command,
+					command: judgedCommand,
 					cwd,
 					judgement,
 					priorRefusal: Boolean(prior),
@@ -6282,7 +6516,7 @@ export default function (pi: ExtensionAPI) {
 					headless: !ctx.hasUI,
 				});
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: command, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
 					return;
 				}
 				// A SAFE on a target this session already refused is not a clean
@@ -6297,7 +6531,7 @@ export default function (pi: ExtensionAPI) {
 						: `classifier-safe despite prior refusal of "${priorTarget}"`;
 				const foot = trashFootnote(flags);
 				const dialogWhy = foot === "" ? why : `${why}\n${foot}`;
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", why, cmd: command, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", why, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
 				return await requestPermission(
 					ctx,
 					target,
@@ -6321,7 +6555,7 @@ export default function (pi: ExtensionAPI) {
 				decision: "block",
 				layer: "verdict",
 				why: `${detail}: ${judgement.reason}`,
-				cmd: command,
+				cmd: judgedCommand,
 				cwd,
 				verdict,
 				cached: cached ? 1 : 0,
@@ -6339,7 +6573,7 @@ export default function (pi: ExtensionAPI) {
 			// makes an undecided command a refusal — requestPermission records
 			// that itself.
 			if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
-				addRefusal(ctx, command, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
+				addRefusal(ctx, judgedCommand, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
 			}
 			// The dialog is offered the still-running judgment, with the guards a
 			// late SAFE would still have to clear (see GuardedLateJudgement): the

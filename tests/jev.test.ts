@@ -342,42 +342,18 @@ describe("jevQuestionsHash", () => {
 	});
 
 	test("the jev-v2 battery is pinned byte for byte until the flip", () => {
-		// The jev-v3 shadow week measures against this baseline. The pin moves
-		// only when the live battery moves on purpose: jev-v2.4 taught both
-		// verdict texts the gate-measured worktree geometry (issue #69 slice C)
-		// and the measured ref state (slice D), so the pair moved
-		// 29ed2ae6375f9d54… / 87c99bf634aa9c64 -> 448d9fb26e53ce35… /
-		// 6e233a887462f5fc -> ac741ac9a706dd3b… / 1661d83b37a8bdd9 ->
-		// 16f3631cec009278… / f4c1fb458277b954 -> jev-v2.5's
-		// 9cdcd371a1a52c47… / 939e91c5ad3f962c, whose criteria read
-		// `gitRefProvenance` as the list of effects it is (one entry per
-		// segment), exclude the ref a delete removes in every namespace, and
-		// measure a restore's dirtiness over the paths it names -> jev-v2.6's
-		// 608c617f11cbc174… / 03b6c52b62745145, whose paragraph excludes the
-		// refs the command's other deletes remove too, so a delete whose only
-		// companions are dropped by the same command reads unrecoverable ->
-		// jev-v2.7's d7860a1730364502… / 6bdde1f421b4e52c, whose paragraph keeps
-		// that exclusion but conditions it on the join: only deletes on
-		// unconditional joins (`&&`, `;`, a pipeline stage) drop each other's
-		// refs from the list, while an `||` delete may be skipped, so its refs
-		// stays in the list and read as survivors -> jev-v2.8's
-		// e9898fcfab3e211c… / 9e1f234b1933aa3d, whose paragraph conditions the
-		// exclusion on the WHOLE chain before a delete instead of its own join:
-		// only deletes the shell certainly reaches drop each other's refs, so a
-		// delete behind a command that certainly fails (`false`, a nonzero
-		// `exit`, `! true`) or an `||` arm drops nothing from the list — its own
-		// ref included, because the shell may skip it and leave that ref as the
-		// last pointer to the work -> jev-v2.9's e9898fcfab3e211c… /
-		// 25072b90bb61e591, whose reach walk reads a pipeline's status as its
-		// LAST stage's (`exit 1 | true && git branch -D b` deletes; the head's
-		// own status and its list-ending `exit` die with the stage's child) and
-		// a `!` before a pipeline against the whole statement's status
-		// (`! true | true || git branch -D b` certainly runs its or-arm). Only
-		// the version moved: the battery text is byte-identical, and every
-		// cached verdict is cleared by design.
+		// The jev-v3 shadow week measures against this baseline, so every
+		// question change has to be deliberate and recorded. Main's #65/#121
+		// network criteria moved the digest/hash from the pre-network
+		// 29ed2ae6375f9d54… / 87c99bf634aa9c64 through
+		// 40377ca248dffb53… / ab5086da2469c722 to
+		// 14b1fbfbe041a60a… / 9471947eb279787d. Batch7's measured worktree
+		// and ref criteria then advanced through jev-v2.4–v2.9, ending at
+		// e9898fcfab3e211c… / 25072b90bb61e591. This merge keeps both sets of
+		// criteria; the merged jev-v2.10 digest and hash are pinned below.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("e9898fcfab3e211cbdcce3e4994eb6580d3c186b86d8d7a562c8695bf8d85687");
-		expect(jevQuestionsHash()).toBe("25072b90bb61e591");
+		expect(digest).toBe("8f2645eea104daf5bb32bbadb69ee298cb78c04e14d85ad08558788a7cb7054a");
+		expect(jevQuestionsHash()).toBe("6b7ceb2369a51b21");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 
