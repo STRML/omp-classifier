@@ -360,18 +360,24 @@ describe("jevQuestionsHash", () => {
 		// that exclusion but conditions it on the join: only deletes on
 		// unconditional joins (`&&`, `;`, a pipeline stage) drop each other's
 		// refs from the list, while an `||` delete may be skipped, so its refs
-		// stay in the list and read as survivors -> jev-v2.8's
+		// stays in the list and read as survivors -> jev-v2.8's
 		// e9898fcfab3e211c… / 9e1f234b1933aa3d, whose paragraph conditions the
 		// exclusion on the WHOLE chain before a delete instead of its own join:
 		// only deletes the shell certainly reaches drop each other's refs, so a
 		// delete behind a command that certainly fails (`false`, a nonzero
 		// `exit`, `! true`) or an `||` arm drops nothing from the list — its own
 		// ref included, because the shell may skip it and leave that ref as the
-		// last pointer to the work. Every cached verdict is invalidated by that,
-		// which is the intent.
+		// last pointer to the work -> jev-v2.9's e9898fcfab3e211c… /
+		// 25072b90bb61e591, whose reach walk reads a pipeline's status as its
+		// LAST stage's (`exit 1 | true && git branch -D b` deletes; the head's
+		// own status and its list-ending `exit` die with the stage's child) and
+		// a `!` before a pipeline against the whole statement's status
+		// (`! true | true || git branch -D b` certainly runs its or-arm). Only
+		// the version moved: the battery text is byte-identical, and every
+		// cached verdict is cleared by design.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
 		expect(digest).toBe("e9898fcfab3e211cbdcce3e4994eb6580d3c186b86d8d7a562c8695bf8d85687");
-		expect(jevQuestionsHash()).toBe("9e1f234b1933aa3d");
+		expect(jevQuestionsHash()).toBe("25072b90bb61e591");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 
