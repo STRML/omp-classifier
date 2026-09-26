@@ -881,10 +881,23 @@ describe("the remaining wrapper and stdin boundaries", () => {
 });
 
 describe("syntax-only interpreter modes do not execute file contents", () => {
-	test("shell and Python syntax checks do not append non-executed source bodies", () => {
+	test("syntax-only modes, including bundled short flags, do not append non-executed source bodies", () => {
 		writeScript(root, "installer", HARMFUL_SHELL);
 		writeScript(root, "payload.py", HARMFUL_CODE);
-		for (const command of ["bash -n < installer", "sh -n < installer", "bash -n installer", "sh -n installer", "python -m py_compile payload.py"]) {
+		writeScript(root, "payload.pl", 'print "executed\\n";\n');
+		writeScript(root, "payload.rb", 'puts "executed"\n');
+		for (const command of [
+			"bash -n < installer",
+			"sh -n < installer",
+			"bash -n installer",
+			"sh -n installer",
+			"bash -vn installer",
+			"sh -vn installer",
+			"perl -cw payload.pl",
+			"ruby -wc payload.rb",
+			"perl -c payload.pl",
+			"python -m py_compile payload.py",
+		]) {
 			const read = readInterpretedScriptBodies(command, root, 8000);
 			expect({ command, refusal: read.refusal, bodies: read.bodies, text: read.text }).toEqual({
 				command,

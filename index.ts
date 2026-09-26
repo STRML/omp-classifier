@@ -1928,7 +1928,7 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	python: { inline: /^-c$|^--command$/u, value: /^-W$|^-X$|^-Q$|^--check-hash-based-pycs$/u, stdinFlag: false },
 	// perl: `-e`/`-E` are code; `-I dir` (library path) and `-F pattern` are
 	// values; `-s` is switch parsing, `-c` is a syntax check.
-	perl: { inline: /^-e$|^-E$|^--eval$/u, value: /^-I$|^-F$|^-M$|^-m$/u, stdinFlag: false },
+	perl: { inline: /^-e$|^-E$|^--eval$/u, syntaxOnly: /^-c$/u, value: /^-I$|^-F$|^-M$|^-m$/u, stdinFlag: false },
 	// ruby: `-e` is code; `-I dir` (load path) and `-E enc`/`-W level` are
 	// settings; `-c` is a syntax check, `-s` switch parsing.
 	ruby: { inline: /^-e$|^--eval$/u, syntaxOnly: /^-c$/u, value: /^-I$|^-E$/u, stdinFlag: false },
@@ -3504,6 +3504,19 @@ function interpreterProgramRefs(segment: string[]): InterpreterProgramRef[] {
 	return refs;
 }
 
+/** Syntax-only flags may appear inside a short-option bundle (`-vn`, `-cw`). */
+function hasBundledSyntaxOnlyFlag(word: string, grammar: InterpreterFlagGrammar | undefined): boolean {
+	if (!grammar?.syntaxOnly || !/^-[^-].+/u.test(word)) return false;
+	for (const letter of word.slice(1)) {
+		const name = `-${letter}`;
+		if (grammar.syntaxOnly.test(name)) return true;
+		// A value-taking or code-taking short option owns the rest of the bundle;
+		// later letters are its value, not independently active flags.
+		if (grammar.value?.test(name) || grammar.file?.test(name) || grammar.inline.test(name)) return false;
+	}
+	return false;
+}
+
 /** True when the interpreter's main file is only parsed, not executed. */
 function interpreterSyntaxOnly(segment: string[]): boolean {
 	const invocation = interpreterInvocation(segment);
@@ -3515,6 +3528,7 @@ function interpreterSyntaxOnly(segment: string[]): boolean {
 		if (word === "--") return false;
 		if (!word.startsWith("-") || word === "-") return false;
 		const flag = splitAttachedFlagValue(word);
+		if (hasBundledSyntaxOnlyFlag(word, grammar)) return true;
 		if (grammar?.syntaxOnly?.test(flag.name)) return true;
 		if (verb.startsWith("python") && (flag.name === "-m" || flag.name === "--module")) {
 			return rest[i + 1] === "py_compile";
