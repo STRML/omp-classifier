@@ -93,6 +93,26 @@ describe("summarizeShadow", () => {
 		expect(report.calls).toBe(0);
 		expect(report.regressions).toEqual([]);
 	});
+
+	test("a late SAFE's dismissal is an auto-allow, and a late block is not a call (#62)", () => {
+		const report = summarizeShadow(
+			[
+				// Late SAFE: the dialog dismissed itself and the command ran. No
+				// human answered, so this IS the call's outcome.
+				line({ decision: "allow", layer: "late-verdict", verdict: "SAFE", why: "unavailable → late SAFE: dialog dismissed, command allowed", v3: { ...v3("UNSAFE", 5), live: "SAFE" } }),
+				// Late UNSAFE: the dialog stayed open for the human, whose own line
+				// carries the outcome.
+				line({ decision: "block", layer: "late-verdict", verdict: "UNSAFE", v3: { ...v3("SAFE", 4), live: "UNSAFE" } }),
+				line({ decision: "allow", approval: "allow-once", cmd: "trash build", v3: { ...v3("SAFE", 4), live: "UNSAFE" } }),
+			],
+			NOW - 24 * 3_600_000,
+		);
+		// Two calls: the dismissal and the human's allow. The late block line is
+		// the same call as the allow line below it.
+		expect(report.calls).toBe(2);
+		expect(report.matrix["auto-allowed"]).toEqual({ v3Allow: 0, v3Ask: 1 });
+		expect(report.matrix["user-approved"]).toEqual({ v3Allow: 1, v3Ask: 0 });
+	});
 });
 
 describe("readDecisionLog", () => {

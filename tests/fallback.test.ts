@@ -77,6 +77,9 @@ afterEach(() => {
 	process.env.OMP_JEV_CONFIG = useTempConfigFile();
 	fs.rmSync(dir, { recursive: true, force: true });
 });
+// Producer-side cleanup (issue #107): this file writes the config file, so it
+// removes it after itself instead of relying on the next consumer's reset.
+afterEach(removeConfigFile);
 
 /** One gate run in a fresh session; unique commands where re-judging matters. */
 const gate = async (command: string, opts: Parameters<typeof makeCtx>[0] = {}): Promise<string> => {

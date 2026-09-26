@@ -27,12 +27,14 @@ Calls walk this order:
 | Longer than 8,000 characters | Blocked outright. Nothing that long can be reviewed in full. |
 
 A normal gate prompt is a four-choice selector — **Allow once**, **Allow for session**, **Always allow**, **Deny** — showing the full command, the gate's reason, and only the details that differ from their defaults: working directory (when it differs from the session cwd), timeout, env, pty, async. The reason is assembled from Jev's numbers — the probability floor it missed, or the hazard ids that tripped it — because Jev returns typed answers and no prose to quote. Critical-pattern and env-override prompts show only choices the gate can honor (**Allow once**/**Deny**), so an authorization cannot appear to succeed and then re-prompt on the next call. Canceling or timing out counts as Deny.
-**Allow for session** records a grant: this action, in this exact directory, runs ungated for the rest of the session — no Jev call, no dialog. Rewordings of a simple action match the grant through a strict key that keeps flags (split, sorted short bundles) and the first argument; compounds and command substitutions use an exact-text key, so an edited segment or payload never rides the grant. Answering with it also lifts any refusal recorded for that action in that directory. Grants stay below critical patterns, caller-supplied `env`, and your static rules, and they die with the session or a classifier config change (up to 50 per session).
+**Allow for session** records a grant: this action, in this exact directory, runs ungated for the rest of the session — no Jev call, no dialog. Rewordings of a simple action match the grant through a strict key that keeps flags (split, sorted short bundles) and the first argument; compounds and command substitutions use an exact-text key, so an edited segment or payload never rides the grant. Answering with it also lifts any refusal recorded for that action in that directory. Refusal memory keys on that same identity, plus the directory: a refused operation does not pin its whole verb class, its host, or its container. Grants stay below critical patterns, caller-supplied `env`, and your static rules, and they die with the session or a classifier config change (up to 50 per session).
 **Always allow** (bash only) writes a persistent grant: this exact command text, in this exact directory, runs ungated everywhere for 30 days — no Jev call, no dialog, one audit line. The key is the whole command text, compounds included, so multi-segment commands host rules can never match are covered; grants are stored in `omp-classifier-grants.json` beside `omp-classifier.json` (`OMP_JEV_CONFIG` relocates both), capped at 500 entries, pruned on a 30-day TTL, and toggled off wholesale with `persistentGrants: false` (the existing file stays on disk). A live persistent grant also keeps refusal memory from re-prompting for its exact text.
 
 ## Eval code that spawns
 
 The `eval` tool runs kernel code directly, so a host `eval: allow` would otherwise bypass every bash check. The plugin scans each payload for subprocess entry points (`child_process`, `Bun.spawn`, `Bun.$`, Python's `subprocess`/`os.system`, `exec`/`__import__`/`importlib` escapes). Expression-only code — compute, parse, format, local reads — passes with zero cost. Spawn-bearing code is classified like a bash command: judged by what the spawned command would do, SAFE auto-runs, UNSAFE or unsure raises a request. The scan is a marker list, not a parser: string-splitting evasion (`"child_pro" + "cess"`) gets through, the same way obfuscated shell gets past the bash gate. Kernel-level interception is the structural fix (issue #13).
+
+A spawn that passes its own working directory is judged in that directory, not the session's: `exec("rm -rf .", { cwd: "/" })` runs in `/`, so the dialog names `/` and the verdict is cached for `/` alone. The payload's own spawn directory is resolved against the session cwd for relative paths (`cwd="../.."`, Ruby `Dir.chdir("/tmp") do … end`, `system(…, chdir: …)`) and recorded as `spawnCwd` beside the resolved `cwd`. When the scan cannot read it — `{ cwd }`, `cwd=os.environ["X"]`, an options object built by spread, two spawns that disagree — the payload asks instead of classifying: there is no single directory to judge it in, and a verdict earned against the session cwd would be answering a different question.
 
 ## Fails closed
 
@@ -53,7 +55,7 @@ Even a SAFE verdict is gated. It auto-runs only when the command avoids the forc
   security add-generic-password -s jev -w '<your-api-key>'
   ```
 
-  The plugin reads the env var first, then the keychain. With neither, every classification fails closed to a permission request — the gate never runs a command on a guess.
+  The plugin reads the env var first, then the keychain. With neither, every classification fails closed to a permission request — the gate never runs a command on a guess. (Only the default `judgeBackend` needs this: an endpoint backend reads its own named env var.)
 - **The model** is `jev-latest` unless you pin another id in `typesafeModel`. TypeSafe resolves `jev-latest` server-side to its current dated build (`jev-1.13.0` at the time of writing); pin a dated id when you need reproducibility across a behavior change.
 - Bun >= 1.3.14 for development. There is no runtime dependency, no SDK, and no build step: `jev.ts` speaks HTTP with `fetch`.
 
@@ -72,12 +74,13 @@ Uninstall: `omp plugin uninstall omp-classifier`. Coming from the parent? Uninst
 
 Your existing `bash.patterns` and `tools.approval` keep working. A narrow `allow` rule doubles as the opt-out from classification for a trusted shape; blanket patterns never qualify.
 
-Plugin settings live in `~/.omp/omp-classifier.json`. View or change them with `/classifier`:
+Plugin settings live in `omp-classifier.json` at the config root the host resolves — `~/.omp/omp-classifier.json` by default, and otherwise where that session's files go: the profile root under `--profile work` (`~/.omp/profiles/work/omp-classifier.json`), `PI_CONFIG_DIR` in place of the `.omp` segment, or `$XDG_DATA_HOME/omp` once `omp config init-xdg` has created it (darwin/linux). So a profile (or an XDG-migrated root) has its own classifier config instead of sharing the default one. `OMP_JEV_CONFIG` overrides the path outright. View or change them with `/classifier`:
 
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | `false` turns off Jev classification only. Critical-pattern and env checks still enforce. |
 | `typesafeModel` | `"jev-latest"` | Model id sent with every request. `jev-latest` resolves server-side to the current dated build. |
+| `judgeBackend` | `{"kind":"typesafe"}` | Which judge answers. `{"kind":"typesafe"}` is the default (the host's TypeSafe judge). `{"kind":"endpoint","baseUrl":"http://127.0.0.1:8765","model":"local-decide","apiKeyEnv":"LOCAL_JUDGE_KEY"}` sends the same battery to any server speaking System One's wire contract. File-only — there is no `/classifier` setter; `/classifier reset` returns it to the default. See [Alternative judge backends](#alternative-judge-backends). |
 | `jevPolicy` | see [Judgment: Jev](#judgment-jev) | Thresholds that turn returned probabilities into a verdict. Never a constant to hardcode elsewhere: they are policy. |
 | `timeoutMs` | `8000` | Whole classification budget for the single Jev request. A timeout fails closed to a permission request. (`/classifier` dialogs pause the host's handler budget, so a human is never on this clock.) |
 | `maxCommandLength` | `8000` | Commands longer than this are blocked (bounds 64-100000; values outside fall back to the default). |
@@ -95,6 +98,30 @@ An existing config file that pins `maxCommandLength: 2000` keeps 2000 after upgr
 ```json
 { "would": "allow", "layer": "granted", "why": "session grant" }
 ```
+
+## Alternative judge backends
+
+The default judge is the host's TypeSafe path, credentials and all. The `judgeBackend` config key can point the gate at any other server that speaks the same wire contract — a self-hosted or local judge (a structured classifier answering with per-option probabilities works as-is):
+
+```json
+{
+  "judgeBackend": {
+    "kind": "endpoint",
+    "baseUrl": "http://127.0.0.1:8765",
+    "model": "local-decide",
+    "apiKeyEnv": "LOCAL_JUDGE_KEY"
+  }
+}
+```
+
+- **The wire contract is System One's**: `POST {baseUrl}/v1/systemone` with `{state, model, questions}` and a `{model, answers}` reply, where every asked question comes back with an answer of that question's type (`choice` with `probabilities` + `confidence`, `noul`, `score`). The host's own client makes the call, so retries, timeouts, and the error taxonomy are the same ones the default path uses — with one change: the redirect policy is forced to `manual`, so a 3xx from the endpoint fails the call instead of being followed to a second server with the state and the key in hand.
+- **`apiKeyEnv` is a NAME, not a key.** The value is read from that environment variable on each call and sent as `Authorization: Bearer …`. No credential is ever written to the config file, the audit log, or `/classifier status`. A variable that is unset (or a value pasted into `apiKeyEnv` instead of a variable name) fails closed: no request, no verdict, a permission request.
+- **Fail closed, unchanged.** An unreachable `baseUrl`, a non-2xx, an unparseable body, a missing answer field, or a timeout is an outage, never a verdict — exactly as the TypeSafe path behaves.
+- **Answers are read as probabilities**, not as a one-hot parse: the floors in `jevPolicy` apply exactly as they do to Jev, so a low-confidence "safe" still asks.
+- **Backend identity is part of the cache.** The active backend's id joins the config signature and every cache key, so switching backends (or endpoints, or models) can never serve a verdict produced by the other judge. `/classifier` and `/classifier status` show it as `backendId` (`typesafe/jev-latest`, `endpoint/http://127.0.0.1:8765#local-decide`).
+- **`shadowV3` follows the backend**, because a shadow that measured a different judge than the live one would report transport differences as policy disagreements.
+
+The `typesafe` kind ignores the endpoint fields and stays on the host path with TypeSafe's own credential resolution (env var, then keychain).
 
 ## Judgment: Jev
 
@@ -144,7 +171,7 @@ The state can carry an `evidence` object whose fields have different authors, an
 
 ## Limits
 
-- **Spawn-bearing eval code only.** Expression-only eval passes unread, and the payload scan is a marker list: string-splitting evasion gets through. `hub op: "start"` and other exec-tier tools still auto-run under `yolo`. An attacker who picks the tool picks around this.
+- **Spawn-bearing eval code only.** Expression-only eval passes unread, and the payload scan is a marker list: string-splitting evasion gets through. The spawn-cwd scan reads the `cwd`/`chdir` forms the issue lists; a quoted option key (`{"cwd": …}`), a Ruby `"chdir" => …` hash key, and an alias it cannot follow all leave the spawn reading as "no cwd", so the session directory stands. `hub op: "start"` and other exec-tier tools still auto-run under `yolo`. An attacker who picks the tool picks around this.
 - **Later handlers win.** Another extension's `tool_call` handler can revise the command after this one judges it; the host applies the last revision. Input-mutating extensions alongside this plugin are unsupported.
 - **Internal-URL working directories are blocked.** `skill://` and similar cwds expand from session state the plugin cannot see. Pass the resolved filesystem path.
 - **Command contents are not inspected.** `npm test` and `make` are judged as the routine commands they look like. Package scripts and hooks go unread.
@@ -152,7 +179,7 @@ The state can carry an `evidence` object whose fields have different authors, an
 
 ## Privacy
 
-The state — the command text up to 8,000 characters, its resolved working directory, the session's recent user messages when `evidenceUserMessages` is non-zero, and the requesting agent's operator context — goes to TypeSafe's System One API (`api.typesafe.ai`), under TypeSafe's logging and retention policies. Command text can hold private paths, proprietary snippets, inline env assignments, or secrets in flags. Caller-supplied `env` values are never sent; that path asks the human instead.
+The state — the command text up to 8,000 characters, its resolved working directory, the session's recent user messages when `evidenceUserMessages` is non-zero, and the requesting agent's operator context — goes to TypeSafe's System One API (`api.typesafe.ai`) by default. An `endpoint` `judgeBackend` sends exactly the same state to that endpoint instead: it is the operator's own server, with its own logging and retention. TypeSafe's logging and retention policies apply to the default path. Command text can hold private paths, proprietary snippets, inline env assignments, or secrets in flags. Caller-supplied `env` values are never sent; that path asks the human instead.
 
 ## Development
 
@@ -189,5 +216,17 @@ bun eval/live-report.ts --hours 168 --counts-only # the same with no command tex
 `eval/weekly-report.sh` runs it every Monday through a launchd agent
 (`eval/launchd/`, install steps in the plist) and posts the counts to the
 shadow-week issue. The full report stays in `~/.omp/omp-classifier/`.
+
+The routine recognizer from #34 is measurement-only, and its measurement is a
+report of its own: the share of a corpus it can prove inert, where the rest of
+the volume goes, and what the decision log says happened to every row it would
+have cleared. It clears 1.2% of the mined history's volume against the issue's
+>30% gate, so nothing calls it from the gate.
+
+```bash
+bun eval/mine-history.ts                                      # rebuild the gate corpus
+bun eval/recognizer-measure.ts                                # measure it, both variants
+bun eval/recognizer-measure.ts --corpus eval/corpus/adversarial.jsonl --rows
+```
 
 MIT licensed.

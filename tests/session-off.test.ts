@@ -48,6 +48,9 @@ beforeEach(async () => {
 afterEach(() => {
 	fs.rmSync(dir, { recursive: true, force: true });
 });
+// Producer-side cleanup (issue #107): this file writes the config file, so it
+// removes it after itself instead of relying on the next consumer's reset.
+afterEach(removeConfigFile);
 
 const nextSession = (): string => `pause-${(seq += 1)}`;
 

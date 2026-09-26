@@ -41,10 +41,14 @@
  *     is never classified — its values can hold secrets — it goes straight to a
  *     permission request.
  *   - Every gate decision appends one JSON line to
- *     <agentDir>/omp-classifier/decisions.jsonl (issue #33): tool,
+ *     <config root>/omp-classifier/decisions.jsonl (issue #33): tool,
  *     decision, layer, why, command, verdict, cache provenance, timing. The
  *     write is fire-and-forget: a failure drops the log line, never the
  *     command.
+ *   - The plugin's own files — config, decisions.jsonl, status.json — resolve
+ *     through the host's directory resolver, so a named profile,
+ *     `PI_CONFIG_DIR` and an XDG-migrated config root each get their own file
+ *     instead of every profile sharing `~/.omp/omp-classifier.json` (issue #9).
  *   - Settings are read through `pi.pi.settings` (the HOST module instance); a
  *     plugin-local `import { settings }` is a second, uninitialized copy that
  *     throws. An SDK/isolated session may have no global settings at all, so an
@@ -60,7 +64,13 @@
  *     the plugin passes a deadline and receives a probability vector, and
  *     every deterministic check that surrounded the old judge (static rules,
  *     moderate-risk tokens, the eval spawn scan, forced dialogs, grants,
- *     refusal memory) is unchanged.
+ *     refusal memory) is unchanged. Which transport answers is one seam
+ *     (`JudgeBackend`, issue #84): the default is that host path, and the
+ *     `judgeBackend` config key can point the gate at any server speaking the
+ *     same System One contract (`POST {state, model, questions}`) with its
+ *     credential in a named environment variable. The backend's id joins the
+ *     config signature and the cache key, so a verdict is only ever served
+ *     under the judge that produced it.
  *
  * Fail-closed points: a command too long to display is blocked outright; an
  * `env` override and a judgment that fails, times out, or answers with a
@@ -80,10 +90,17 @@ import type { ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
-import { getConfigRootDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
+import { getPluginsDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
 import { substitutionSpans } from "./shell-ast";
-import { judgeBattery, judgeJevV3 } from "./jev-judge";
+import {
+	DEFAULT_JUDGE_BACKEND,
+	judgeBackendFor,
+	judgeBatteryUnderDeadline,
+	judgeJevV3,
+	parseJudgeBackend,
+	type JudgeBackendConfig,
+} from "./jev-judge";
 import { buildAuthorizationState, DEFAULT_AUTHORIZATION_POLICY, deriveAuthorization, summarizeActions, type ActionSummaryEntry, type JevAuthorizationLevel } from "./authorization";
 import { deriveDecisionOrder, type DecisionBranch } from "./decision-order";
 import { literalMatch } from "./literal-match";
@@ -99,6 +116,7 @@ import {
 	type GitWorktreeProvenance,
 	type JevHazard,
 	type JevPolicy,
+	type JevAnswers,
 	type JevVerdict,
 	measureGitPushProvenance,
 	measureGitRefProvenance,
@@ -133,6 +151,37 @@ export type ShadowV3 = (
 	 *  that followed a real verdict from one that followed an outage. */
 	live?: JevVerdict;
 };
+
+/** A judgment whose deadline fired while its request was still running (issue
+ *  #62). The verdict the request eventually produces can refine the dialog the
+ *  deadline opened — and only that: it cannot bypass a dialog, and a late
+ *  UNSAFE never re-blocks a command a human already allowed. `cancel` is what
+ *  the human's own answer calls: nobody is listening any more. */
+interface LateJudgement {
+	/** The late verdict, or undefined when the request was cancelled or the
+	 *  listen window closed. Never rejects. */
+	answer: Promise<Judgement | undefined>;
+	cancel(): void;
+}
+
+/** The timed-out judgment offered to a dialog, WITH the guards a late SAFE
+ *  still has to answer for (issue #62). One object on purpose: the guards are
+ *  not optional context, and a caller that handed the dialog a bare handle
+ *  would be letting a late SAFE auto-run a command the verdict path would have
+ *  asked about. The late path recovers the answer the deadline took away; it
+ *  never skips a guard the on-time path applies. */
+interface GuardedLateJudgement {
+	/** The still-running judgment. */
+	handle: LateJudgement;
+	/** The refusal this session already holds for this exact target, which rode
+	 *  into the judge state as `priorRefusal`. A SAFE on a refused target still
+	 *  asks, because a refusal is a human's (or a critical pattern's) stop. */
+	priorRefusal: Refusal | undefined;
+	/** The deterministic risk overlay for this command
+	 *  (`matchModerateRiskTokens`, `evalRiskFlags`): a SAFE on a command
+	 *  carrying a destructive token still asks. */
+	riskFlags: readonly string[];
+}
 
 interface Judgement {
 	verdict: Verdict;
@@ -175,6 +224,11 @@ interface Judgement {
 	persistRefusal?: boolean;
 	/** The jev-v3 shadow for this classification, when it ran. */
 	v3?: ShadowV3;
+	/** Present only when the deadline fired and the request is still running
+	 *  (issue #62): the timed-out judgment, whose late answer may dismiss or
+	 *  refine the dialog the deadline opened. Never cached — UNAVAILABLE sets
+	 *  `noCache` — so a handle with live promises never outlives its call. */
+	late?: LateJudgement;
 }
 
 /** A cached judgement minus its shadow. The shadow ran for the call that
@@ -251,6 +305,16 @@ const REFUSAL_CAP = 20;
 interface Grant {
 	normalizedTarget: string;
 	cwd: string;
+	/** The session's own directory at approval time, for the targets that can
+	 *  act in a second directory of their own (eval, issue #14): `cwd` above is
+	 *  the payload's spawn directory then, and this is where the payload's own
+	 *  process runs, reads and writes. The judge's cache key carries both
+	 *  directories for exactly that reason — a verdict earned under one pair
+	 *  must not be reused under another — and the grant is the same
+	 *  authorization over the same pair, so it carries both too. Absent for
+	 *  bash, whose one directory is `cwd` already (the host runs the whole
+	 *  command there). */
+	scopeCwd?: string;
 	ts: number;
 	/** User scope at approval time. A later restriction/revocation invalidates
 	 *  the grant, while ordinary tool evidence remains non-authorizing. */
@@ -592,6 +656,21 @@ interface ClassifierConfig {
 	 * key in a pre-existing config file is tolerated and ignored.
 	 */
 	typesafeModel: string;
+	/**
+	 * Which transport answers the battery (issue #84). `{kind: "typesafe"}` —
+	 * the default — is the host's judge resolution, unchanged; `{kind:
+	 * "endpoint", baseUrl, model, apiKeyEnv}` points the gate at any server
+	 * speaking the System One wire contract, with the credential read from the
+	 * named environment variable (a name, never the key itself: a key pasted
+	 * here is looked up as a variable and fails closed).
+	 *
+	 * Part of the config signature and of every cache key, as `typesafeModel` is:
+	 * a verdict earned from one judge must never be served under another. It is
+	 * file-only — no `/classifier` setter — because a nested object has no
+	 * round-trip through one command argument; `/classifier reset` returns it to
+	 * the default.
+	 */
+	judgeBackend: JudgeBackendConfig;
 	/** Threshold overrides over DEFAULT_JEV_POLICY; absent keys keep the
 	 *  shipped default. These are policy, not facts from vendor docs: measured
 	 *  Jev probabilities move with the question set and the state shape (the
@@ -651,6 +730,7 @@ const JEV_POLICY_RANGES: Record<keyof JevPolicy, { min: number; max: number }> =
  *  snapshot can go stale when `TYPESAFE_DEFAULT_MODEL` changes. */
 const CLASSIFIER_CONFIG_DEFAULTS: Omit<ClassifierConfig, "typesafeModel"> = {
 	enabled: true,
+	judgeBackend: DEFAULT_JUDGE_BACKEND,
 	jevPolicy: {},
 	timeoutMs: DEFAULT_TIMEOUT_MS,
 	maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH,
@@ -666,8 +746,28 @@ export function jevPolicyFor(config: ClassifierConfig): JevPolicy {
 	return { ...DEFAULT_JEV_POLICY, ...config.jevPolicy };
 }
 
-function classifierConfigPath(): string {
-	return process.env.OMP_JEV_CONFIG ?? path.join(getConfigRootDir(), "omp-classifier.json");
+/**
+ * The config root the host places a plugin's own file in (issue #9).
+ *
+ * `getConfigRootDir()` answers the profile and `PI_CONFIG_DIR` halves of the
+ * question but not the XDG half: the host resolves a top-level file at the
+ * config root through its `data` category (`getMarketplacesRegistryPath()`,
+ * `getAutoQaDbPath()`), which redirects to `$XDG_DATA_HOME/omp` on darwin/linux
+ * once the user has migrated. `dirname(getPluginsDir())` is the exported handle
+ * on that same base — `getPluginsDir()` is `rootSubdir("plugins", "data")` — so
+ * every directory input (profile, `PI_CONFIG_DIR`, XDG) is answered by the
+ * host's resolver instead of being re-derived from `process.env` here. With no
+ * XDG migration the two bases are identical, so no existing file moves.
+ */
+function pluginRootDir(): string {
+	return path.dirname(getPluginsDir());
+}
+
+/** Exported as a test seam (issue #9): the resolution is only observable in a
+ *  process that started with the environment under test, so the regression
+ *  test spawns one and asks for this path. */
+export function classifierConfigPath(): string {
+	return process.env.OMP_JEV_CONFIG ?? path.join(pluginRootDir(), "omp-classifier.json");
 }
 
 interface ClassifierConfigCache {
@@ -691,6 +791,13 @@ function normalizeClassifierConfig(raw: Record<string, unknown>): ClassifierConf
 	if (typeof raw.enabled === "boolean") config.enabled = raw.enabled;
 	if (typeof raw.persistentGrants === "boolean") config.persistentGrants = raw.persistentGrants;
 	if (typeof raw.shadowV3 === "boolean") config.shadowV3 = raw.shadowV3;
+	// `judgeBackend` follows the same rule as every other key: a shape the
+	// loader does not understand (a string, an unknown kind, an endpoint with no
+	// model or a non-URL baseUrl) keeps the default rather than half-applying an
+	// override that would fail closed on every command. The parse also
+	// canonicalizes the base URL, so one endpoint has exactly one identity.
+	const backend = parseJudgeBackend(raw.judgeBackend);
+	if (backend !== undefined) config.judgeBackend = backend;
 	if (typeof raw.timeoutMs === "number" && Number.isFinite(raw.timeoutMs) && raw.timeoutMs > 0) {
 		config.timeoutMs = raw.timeoutMs;
 	}
@@ -747,7 +854,7 @@ export function readClassifierConfig(): ClassifierConfig {
 function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig {
 	const before = readClassifierConfig();
 	const raw: Record<string, unknown> = {};
-	for (const key of ["enabled", "jevPolicy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "persistentGrants", "shadowV3"] as const) {
+	for (const key of ["enabled", "judgeBackend", "jevPolicy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "persistentGrants", "shadowV3"] as const) {
 		if (key in patch) raw[key] = patch[key];
 	}
 	const next = normalizeClassifierConfig({ ...before, ...raw });
@@ -760,18 +867,21 @@ function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig
 // ---------------------------------------------------------------------------
 // Decision audit log (issue #33)
 //
-// One JSON line per gate decision at <agentDir>/omp-classifier/
+// One JSON line per gate decision at <config root>/omp-classifier/
 // decisions.jsonl. The directory mirrors classifierConfigPath()'s resolution —
 // dirname(OMP_JEV_CONFIG) when the test override is set,
-// <agentDir>/omp-classifier otherwise — so tests point one env var at a
+// <config root>/omp-classifier otherwise — so tests point one env var at a
 // temp dir and find every artifact there. Append-only; the writer is
 // fire-and-forget (see logDecision inside the plugin factory).
 // ---------------------------------------------------------------------------
 
-/** Directory holding every plugin artifact: config, decisions.jsonl, status.json. */
-function classifierDataDir(): string {
+/** Directory holding every plugin artifact: config, decisions.jsonl, status.json.
+ *  Resolved from the same host root as the config file, so a profile or an XDG
+ *  migration never splits the config from its audit log. Exported alongside
+ *  classifierConfigPath() as the same test seam. */
+export function classifierDataDir(): string {
 	const override = process.env.OMP_JEV_CONFIG;
-	return override ? path.dirname(override) : path.join(getConfigRootDir(), PLUGIN_NAME);
+	return override ? path.dirname(override) : path.join(pluginRootDir(), PLUGIN_NAME);
 }
 
 export function decisionsLogPath(): string {
@@ -792,8 +902,11 @@ function statusReportPath(): string {
  *  rebuilding the session transcript. There is no `branch`/decision-path
  *  field: `layer` already names the path that decided (critical,
  *  environment, rule, granted, verdict, cached, unclassified, dialog,
- *  headless, cap, cwd, internal-error), so a second field would only
- *  duplicate it under different spelling. */
+ *  headless, cap, cwd, internal-error, late-verdict), so a second field would
+ *  only duplicate it under different spelling. `late-verdict` is the one that
+ *  arrived after its deadline had already opened a dialog (issue #62): it
+ *  says which of the three late outcomes happened, in `why`, and carries the
+ *  answer's own `verdict`/`jev` the way an on-time verdict line would. */
 export interface DecisionRecord {
 	ts: string;
 	/** Unique line/action id for joining verdict and interaction entries. */
@@ -837,6 +950,13 @@ export interface DecisionRecord {
 	why: string;
 	cmd: string;
 	cwd: string;
+	/** The eval payload's OWN spawn directory (issue #14), when the payload
+	 *  named one: `cwd` above is the directory this decision judged in, and for
+	 *  a payload whose spawns declare their own directory that is where the
+	 *  judged command would run, not where the payload's own process runs. Kept
+	 *  as its own field so a reader can tell a directory the payload chose from
+	 *  one the session supplied without re-reading the (truncated) `cmd`. */
+	spawnCwd?: string;
 	verdict: Verdict | null;
 	cached: 0 | 1;
 	ms: number;
@@ -859,6 +979,9 @@ export interface StatusReport {
 	config: ClassifierConfig;
 	policyVersion: string;
 	policyHash: string;
+	/** The judge identity a verdict is cached under: which backend, and the
+	 *  model or endpoint that answers it. The id the cache key trusts. */
+	backendId: string;
 	/** Which output contract the live battery + derivation implement. */
 	contract: string;
 	cacheSizes: Record<string, number>;
@@ -894,10 +1017,12 @@ export function buildStatusReport(): StatusReport {
 		// No audit log yet: zero counts.
 	}
 	const allow = recent.filter(record => record.decision === "allow").length;
+	const config = readClassifierConfig();
 	return {
-		config: readClassifierConfig(),
+		config,
 		policyVersion: CLASSIFIER_POLICY_VERSION,
 		policyHash: CLASSIFIER_POLICY_HASH,
+		backendId: judgeBackendFor(config.judgeBackend).id,
 		contract: QUESTIONS_CONTRACT,
 		cacheSizes,
 		pausedSessions: [...sessionOff].sort(),
@@ -1060,6 +1185,7 @@ export function formatClassifierConfig(config: ClassifierConfig): string {
 	return [
 		`enabled: ${config.enabled}`,
 		`typesafeModel: ${config.typesafeModel}`,
+		`judgeBackend: ${judgeBackendFor(config.judgeBackend).id}`,
 		`timeoutMs: ${config.timeoutMs}`,
 		`maxCommandLength: ${config.maxCommandLength}`,
 		`evidenceUserMessages: ${config.evidenceUserMessages}`,
@@ -1827,6 +1953,715 @@ export function evalSubprocessMarkers(code: string, language: string): string[] 
 	// hit costs one dialog; a miss passes a spawn silently.
 	const union = [...EVAL_SPAWN_MARKERS_JS, ...EVAL_SPAWN_MARKERS_RB_JL];
 	return scan(union);
+}
+
+// ---------------------------------------------------------------------------
+// The directory an eval payload's spawn runs in (issue #14)
+//
+// A spawn can pass its own working directory — `subprocess.run(cmd, cwd=…)`,
+// `exec(cmd, { cwd: … })`, Ruby `Dir.chdir` and `system(…, chdir: …)`. That
+// directory is part of the identity of a judgement: `rm -rf .` in the session
+// directory and `rm -rf .` in `/` are different questions, and the same payload
+// re-run against a different directory must not reuse the other's verdict. The
+// gates below therefore read the payload's own text and judge it in the
+// directory the spawns actually run in.
+//
+// Three outcomes, and the third is the whole point:
+//   - a literal, resolved the way the bash path resolves a leading `cd`;
+//   - nothing readable at all, which leaves the session directory in force;
+//   - UNREADABLE (a computed value, `{ cwd }` shorthand, sites that disagree
+//     with each other, an internal-URL directory, an argument list that never
+//     closes). That is not a reason to guess: a payload judged against a
+//     directory it does not run in was judged on the wrong question, so it
+//     asks a human instead of classifying.
+//
+// The scan is site-scoped where the marker scan is not — a `cwd=` inside a
+// string, a comment, or a nested call's arguments must not be read as the
+// spawn's directory, which is the same mislabelling error as the issue's,
+// pointing the other way. It is still a scan, not a parser: a quoted option key
+// (`{ "cwd": … }`) or an alias the scan cannot follow leaves the site reading as
+// "no cwd argument", and that is the session directory's answer, not this one.
+// Kernel-level interception (issue #13) is the structural fix for that class.
+// ---------------------------------------------------------------------------
+
+/** One call whose directory the scan can read. `spawn` sites take an options
+ *  key or keyword (`cwd=`/`cwd:`/`chdir:`) that overrides the directory for that
+ *  child; `chdir` sites (Ruby `Dir.chdir`) move the payload's OWN directory for
+ *  everything after them, which is why the scan walks sites in source order.
+ *
+ *  The tables below hold the shapes that can NAME a directory — the ones the
+ *  issue lists — plus the cwd-less call of the same family. That second part
+ *  matters: a payload that declares `/` for one spawn and lets another inherit
+ *  the session directory runs in two directories, and the scan has to see both
+ *  to say so. Shapes that cannot name one (`os.system`, `pty.spawn`,
+ *  `Function()`) are not sites: there is no directory argument to read, and
+ *  listing every spawn marker here would dialog every payload that shells out
+ *  twice. */
+interface EvalCwdSite {
+	pattern: RegExp;
+	name: string;
+	kind: "spawn" | "chdir";
+	/** The FIRST argument IS the directory (`Dir.chdir("/tmp")`,
+	 *  `` `ls`.cwd("/tmp") ``), not an options key. */
+	positional?: true;
+	/** Ruby calls parenthesize optionally, so the argument list may be the rest
+	 *  of the line (`system "ls", chdir: "/tmp"`). Only Ruby sites set this:
+	 *  a parenthesized-looking member access in JS/Python (`subprocess.PIPE`)
+	 *  is not a call at all and must not be read as one. */
+	parenless?: true;
+}
+
+/** JS: the child_process methods (bare after a destructured import, qualified
+ *  otherwise) and Bun's shell `cwd()`. `Bun.$` itself is not a site: it takes
+ *  its directory from a `.cwd()` chain, which is. */
+const EVAL_CWD_SITES_JS: EvalCwdSite[] = [
+	{ pattern: /(?:^|[^\w.$])(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|fork)\b/u, name: "spawn/exec", kind: "spawn" },
+	{ pattern: /\.\s*(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|fork)\b/u, name: "child_process", kind: "spawn" },
+	{ pattern: /\.\s*cwd\b/u, name: "shell cwd()", kind: "spawn", positional: true },
+];
+
+/** PY: the subprocess family, asyncio's subprocess helpers, and the bare names
+ *  a `from subprocess import run` leaves behind. Every entry here can NAME a
+ *  directory (`cwd=`); `os.system`/`os.popen`/`pty.spawn` cannot, and a shape
+ *  that cannot name one has nothing for this scan to read — see the site-table
+ *  note above. */
+const EVAL_CWD_SITES_PY: EvalCwdSite[] = [
+	{ pattern: /\bsubprocess\s*\.\s*\w+/u, name: "subprocess", kind: "spawn" },
+	{ pattern: /\basyncio\s*\.\s*create_subprocess\w*/u, name: "asyncio.create_subprocess", kind: "spawn" },
+	{ pattern: /(?:^|[^\w.$])(?:run|Popen|call|check_call|check_output)\b/u, name: "subprocess", kind: "spawn" },
+];
+
+/** RB: the shell-literal surfaces those kernels use, plus the two chdir forms.
+ *  `chdir:` is handled by the keyed read; `Dir.chdir` by the positional one. */
+const EVAL_CWD_SITES_RB: EvalCwdSite[] = [
+	{ pattern: /(?:^|[^\w.$])(?:system|spawn|popen|open3)\b/u, name: "system/spawn", kind: "spawn", parenless: true },
+	{ pattern: /\b(?:Dir\s*\.\s*chdir|FileUtils\s*\.\s*cd)\b/u, name: "Dir.chdir", kind: "chdir", positional: true, parenless: true },
+];
+
+/** What a masked string body becomes. NOT a space: the scan skips whitespace to
+ *  find the argument list after a callee, and a string sitting there must stop
+ *  that walk instead of being walked through. Not a bracket, delimiter or word
+ *  character either, so balance, value boundaries and token matches all behave
+ *  as if the text were never there. */
+const MASK_FILL = "\u0001";
+
+/** End (exclusive) of the string literal starting at `start`, or -1 when it
+ *  never closes. Escapes are respected, a quoted string may not span lines in
+ *  any of these languages (backticks and Python's triple quotes may). */
+function scanStringEnd(text: string, start: number): number {
+	const quote = text[start];
+	if (text[start + 1] === quote && text[start + 2] === quote) {
+		for (let i = start + 3; i < text.length; i += 1) {
+			if (text[i] === "\\") {
+				i += 1;
+				continue;
+			}
+			if (text.startsWith(quote.repeat(3), i)) return i + 3;
+		}
+		return -1;
+	}
+	for (let i = start + 1; i < text.length; i += 1) {
+		const char = text[i];
+		if (char === "\\") {
+			i += 1;
+			continue;
+		}
+		if (char === "\n" && quote !== "`") return -1;
+		if (char === quote) return i + 1;
+	}
+	return -1;
+}
+
+/** Blank the parts of a payload that are text, not code: every string body,
+ *  and every comment. Length is preserved so indices map straight back to the
+ *  original, which is where values are read from.
+ *
+ *  Without this, `subprocess.run(["sh", "-c", "cwd=/tmp"])` reads as a spawn in
+ *  /tmp and `cwd="/tmp"  # cwd="/evil"` reads as /evil — false directories of
+ *  exactly the kind this scan exists to stop reporting. */
+function maskCodeText(code: string): string {
+	let masked = "";
+	let i = 0;
+	while (i < code.length) {
+		const char = code[i];
+		if (char === '"' || char === "'" || char === "`") {
+			const end = scanStringEnd(code, i);
+			const stop = end === -1 ? code.length : end;
+			masked += MASK_FILL.repeat(stop - i);
+			i = stop;
+			continue;
+		}
+		if (char === "#" || (char === "/" && code[i + 1] === "/")) {
+			while (i < code.length && code[i] !== "\n") {
+				masked += " ";
+				i += 1;
+			}
+			continue;
+		}
+		if (char === "/" && code[i + 1] === "*") {
+			const end = code.indexOf("*/", i + 2);
+			const stop = end === -1 ? code.length : end + 2;
+			masked += code.slice(i, stop).replace(/[^\n]/gu, " ");
+			i = stop;
+			continue;
+		}
+		masked += char;
+		i += 1;
+	}
+	return masked;
+}
+
+/** Index of the bracket that closes the group opening at `open`, or -1 when the
+ *  payload's structure runs out first. */
+function scanGroupEnd(masked: string, open: number): number {
+	let depth = 0;
+	for (let i = open; i < masked.length; i += 1) {
+		const char = masked[i];
+		if (char === "(" || char === "[" || char === "{") depth += 1;
+		else if (char === ")" || char === "]" || char === "}") {
+			depth -= 1;
+			if (depth === 0) return i;
+		}
+	}
+	return -1;
+}
+
+/** End (exclusive) of a cwd VALUE: the first delimiter at the value's own
+ *  nesting depth. `subprocess.run(["ls"], cwd=join(a, b))` ends at the call's
+ *  closing paren, not at the comma inside `join`. */
+function scanValueEnd(masked: string, start: number, end: number): number {
+	let depth = 0;
+	for (let i = start; i < end; i += 1) {
+		const char = masked[i];
+		if (char === "(" || char === "[" || char === "{") depth += 1;
+		else if (char === ")" || char === "]" || char === "}") {
+			if (depth === 0) return i;
+			depth -= 1;
+		} else if (depth === 0 && (char === "," || char === ";" || char === "\n")) return i;
+	}
+	return end;
+}
+
+/** The directory text of a cwd argument, or null when it is not a plain string
+ *  literal. Everything else — a variable, a call, an f-string, an interpolated
+ *  Ruby string, a concatenation, a value with an escape this does not model —
+ *  is unreadable on purpose: the caller turns that into a permission request
+ *  rather than a directory it guessed. */
+function cwdLiteralText(raw: string): string | null {
+	// The body may not contain an unescaped copy of its own quote: without that
+	// `"/tmp/a" + "/b"` (and Python's implicit `"/tmp/a" "/b"`) reads as one
+	// string whose text is `/tmp/a" + "/b`, a directory that exists nowhere.
+	const match = /^([A-Za-z]{0,2})(["'])((?:(?!\2)[\s\S])*)\2$/u.exec(raw);
+	if (!match) return null;
+	const [, prefix, , body] = match;
+	// f-strings interpolate; a prefix that could interpolate is not a literal.
+	if (/[fF]/u.test(prefix)) return null;
+	if (body.includes("#{") || body.includes("${")) return null;
+	let text = "";
+	for (let i = 0; i < body.length; i += 1) {
+		if (body[i] !== "\\") {
+			text += body[i];
+			continue;
+		}
+		// Only the escapes that cannot change which directory is named are
+		// modeled; `\t`, `\x41` and friends stay unreadable.
+		if (body[i + 1] !== "\\") return null;
+		text += "\\";
+		i += 1;
+	}
+	return text;
+}
+
+/**
+ * Read a spawn's cwd literal (issue #14) into the absolute directory the
+ * payload would run in, or null when it cannot be resolved.
+ *
+ * `resolveToCwd` is the bash path's resolver for a leading `cd`, so a relative
+ * literal resolves against the directory in effect exactly as bash resolves one
+ * against the session directory. A BARE `/` is the one exception: resolveToCwd
+ * treats it as a workspace-root alias (its doc comment says so, "for tool
+ * inputs"), while a spawned child has no such alias — `cwd="/"` really is the
+ * filesystem root, and reading it as the session directory would UNDERSTATE
+ * what `rm -rf .` does there, the one direction this gate may never fail in.
+ * An internal URL and an empty string are not directories a child can run in,
+ * so both are unreadable rather than approximated.
+ */
+function resolveSpawnCwdLiteral(raw: string, base: string): string | null {
+	if (raw === "" || raw.includes("://") || raw.includes("local:/")) return null;
+	const resolved = /^\/+$/u.test(raw) ? "/" : resolveToCwd(raw, base);
+	return resolved === "" ? null : resolved;
+}
+
+/** One cwd argument found in a call's arguments. `value` is the argument's
+ *  SOURCE text (quotes and all) and `detail` the source text of an unreadable
+ *  one, for the dialog: the human decides what to do with a directory the scan
+ *  refused to guess. Whether that source text is a literal, and what directory
+ *  it names, is decided in one place — see evalSpawnCwd. */
+type EvalCwdArgument = { kind: "none" } | { kind: "value"; value: string } | { kind: "dynamic"; detail: string };
+
+/** One `cwd`/`chdir` key found in a call's own arguments, with the bracket
+ *  depth it sits at (so the outermost is the one that counts) and its offset in
+ *  the masked text (so an object spread written after it can be told apart from
+ *  one written before it). */
+interface EvalCwdKey {
+	depth: number;
+	at: number;
+	argument: EvalCwdArgument;
+}
+
+/** The same key narrowed to a readable literal: the shape a value check leaves
+ *  behind, for callers that need `.value` without asserting it. */
+interface EvalCwdLiteralKey extends EvalCwdKey {
+	argument: { kind: "value"; value: string };
+}
+
+/** The directory argument of a positional site (`Dir.chdir("/tmp")`,
+ *  `` `ls`.cwd("/tmp") ``): the call's FIRST argument, read as one token. */
+function readPositionalCwd(masked: string, code: string, start: number, end: number): EvalCwdArgument {
+	let i = start;
+	while (i < end && (masked[i] === " " || masked[i] === "\t")) i += 1;
+	if (i >= end) return { kind: "none" };
+	const quote = code[i];
+	if (quote === '"' || quote === "'" || quote === "`") {
+		const quoted = scanStringEnd(code, i);
+		if (quoted === -1) return { kind: "dynamic", detail: truncated(code.slice(i), 60) };
+		// A quoted string is the directory only when the call ends there or a
+		// block follows (`Dir.chdir "/tmp" do … end`). Anything else can extend
+		// the value past what was read — `Dir.chdir "/a" "/b"` is not /a.
+		const rest = code.slice(quoted).trimStart();
+		if (rest === "" || /^[),;{}\n]/u.test(rest) || /^(?:do|then|end)\b/u.test(rest)) {
+			return { kind: "value", value: code.slice(i, quoted) };
+		}
+	}
+	return { kind: "dynamic", detail: truncated(code.slice(i, Math.max(i + 1, scanValueEnd(masked, i, end))).trim(), 60) };
+}
+
+/** The cwd an options object or keyword argument names, as far as the scan can
+ *  read it. Only the OUTERMOST `cwd`/`chdir` reference in the call counts: a
+ *  `cwd` inside a nested call's arguments (`env=build(cwd=…)`) is that call's,
+ *  not this spawn's. A bare `cwd` in key position — `{ cwd }`, the shorthand the
+ *  issue lists — is a variable, so it is unreadable, not absent. */
+function readKeyedCwd(masked: string, code: string, start: number, end: number): EvalCwdArgument {
+	// Bracket depth AND the group enclosing each offset, so a `cwd` can be told
+	// apart from one that belongs to a nested call: `env=make(cwd=…)` is make's
+	// keyword, not this spawn's, while `{ cwd: … }` IS this spawn's options
+	// object — a property one level down, inside the call's own brace. Without
+	// the distinction the nested value wins whenever it is the only one, and the
+	// spawn is judged in a directory only its environment builder runs in.
+	const depth: number[] = [];
+	const opener: string[] = [];
+	const stack: string[] = [];
+	for (let i = start; i < end; i += 1) {
+		const char = masked[i];
+		if (char === ")" || char === "]" || char === "}") stack.pop();
+		depth.push(stack.length);
+		opener.push(stack[stack.length - 1] ?? "");
+		if (char === "(" || char === "[" || char === "{") stack.push(char);
+	}
+	const ownArgument = (at: number): { depth: number; inBrace: boolean } | undefined => {
+		const relative = at - start;
+		if (relative < 0 || relative >= depth.length) return undefined;
+		const atDepth = depth[relative];
+		const inBrace = opener[relative] === "{";
+		// Depth 0 is a keyword of this call (`cwd="/tmp"`); depth 1 inside the
+		// call's own brace is a property of its options object (`{ cwd: "/tmp" }`).
+		return atDepth === 0 || (atDepth === 1 && inBrace) ? { depth: atDepth, inBrace } : undefined;
+	};
+	const found: EvalCwdKey[] = [];
+	for (const match of masked.slice(start, end).matchAll(/(?<![\w.$])(?:cwd|chdir)\b/gu)) {
+		const at = start + (match.index ?? 0);
+		const own = ownArgument(at);
+		if (own === undefined) continue;
+		const after = at + match[0].length;
+		let cursor = after;
+		while (cursor < end && (masked[cursor] === " " || masked[cursor] === "\t")) cursor += 1;
+		const separator = masked[cursor];
+		if (separator === ":" || (separator === "=" && masked[cursor + 1] !== "=")) {
+			let valueStart = cursor + 1;
+			while (valueStart < end && (masked[valueStart] === " " || masked[valueStart] === "\t")) valueStart += 1;
+			const raw = code.slice(valueStart, Math.max(valueStart, scanValueEnd(masked, valueStart, end))).trim();
+			found.push({ depth: own.depth, at, argument: raw === "" ? { kind: "dynamic", detail: `${match[0]}=` } : { kind: "value", value: raw } });
+			continue;
+		}
+		// Key position only: `{ cwd }` is the shorthand form of the option,
+		// while a `cwd` after `:` or `(` is some other expression's value.
+		let before = at - 1;
+		while (before >= start && (masked[before] === " " || masked[before] === "\t")) before -= 1;
+		const previous = before < start ? "" : masked[before];
+		const closer = masked[cursor] ?? "";
+		if (match[0] === "cwd" && own.inBrace && (previous === "{" || previous === ",") && (closer === "," || closer === "}")) {
+			found.push({ depth: own.depth, at, argument: { kind: "dynamic", detail: `{ ${match[0]} }` } });
+		}
+	}
+	if (found.length === 0) {
+		// No `cwd` token at all is "this call names no directory" — except when
+		// the options came from somewhere else entirely: `{ ...opts }` (JS) and
+		// `**opts` (Python) name their keys in no text this scan can read. Then
+		// the keys are unknown, which is unreadable, not absent: reporting the
+		// session directory there would be a guess wearing a fact's clothes.
+		const args = masked.slice(start, end);
+		const spread = /\{\s*\.\.\.[^}]*\}/u.exec(args)?.[0] ?? /\*\*[\w$]*/u.exec(args)?.[0];
+		return spread ? { kind: "dynamic", detail: spread } : { kind: "none" };
+	}
+	// A spread can carry this call's own `cwd` key out of text the scan never
+	// reads, so a literal found first is not the last word: `cp.exec("x", {
+	// cwd: "/tmp", ...opts })` runs wherever `opts` says, and reporting the
+	// literal it saw first would name a directory this call does not run in —
+	// the one direction this scan may never fail in. The read is
+	// order-sensitive in the one language that has object spread (the last
+	// write wins), so only a spread AFTER the key can beat it; a `**`
+	// expansion is not readable either way (`f(cwd="/tmp", **opts)` is a
+	// TypeError when `opts` carries cwd and "/tmp" when it does not, and no
+	// text here says which). Only this call's own level counts: a spread
+	// inside a nested call's arguments (`env=build({ ...opts })`) is that
+	// call's, not this one's.
+	const spreads: Array<{ at: number; kwargs: boolean; detail: string }> = [];
+	for (const match of masked.slice(start, end).matchAll(/\.{3}|\*{2}/gu)) {
+		const at = start + (match.index ?? 0);
+		if (ownArgument(at) === undefined) continue;
+		// `2 ** 8` is an operator, not an expansion: an expansion starts where
+		// a value may start, never right after an operand.
+		const head = masked.slice(start, at).trimEnd();
+		const previous = head === "" ? "" : (head.at(-1) ?? "");
+		if (previous !== "" && !/[(\[{,;=]/u.test(previous)) continue;
+		const detail = masked.slice(at, Math.max(at + match[0].length, scanValueEnd(masked, at + match[0].length, end))).trim();
+		spreads.push({ at, kwargs: match[0] === "**", detail: truncated(detail === "" ? match[0] : detail, 60) });
+	}
+	const outermost = Math.min(...found.map(entry => entry.depth));
+	const atOutermost = found.filter(entry => entry.depth === outermost);
+	const values = atOutermost.filter((entry): entry is EvalCwdLiteralKey => entry.argument.kind === "value");
+	if (values.length === atOutermost.length && new Set(values.map(entry => entry.argument.value)).size === 1) {
+		const chosen = atOutermost[0];
+		const overriding = spreads.find(spread => spread.kwargs || spread.at > chosen.at);
+		return overriding ? { kind: "dynamic", detail: overriding.detail } : chosen.argument;
+	}
+	// A computed value, or the same option set twice: either way there is no
+	// single directory this call is known to run in.
+	const dynamic = atOutermost.find(entry => entry.argument.kind === "dynamic");
+	return dynamic ? dynamic.argument : { kind: "dynamic", detail: "cwd set more than once" };
+}
+
+/** One spawn/chdir call the tables matched: its name and kind, the span of its
+ *  argument list (`argEnd` is -1 when that list never closes), where the call's
+ *  own text starts (for ordering it against the block spans around it), and
+ *  where a Ruby block opener after its arguments can sit. */
+interface EvalCwdSiteMatch {
+	name: string;
+	kind: "spawn" | "chdir";
+	positional: boolean;
+	argStart: number;
+	argEnd: number;
+	at: number;
+	/** For a parenthesized call, right after its closing paren; for a parenless
+	 *  one, the call's first argument token, because its `do` sits on the same
+	 *  line inside that span. -1 when the argument list does not close. */
+	blockFrom: number;
+}
+
+/** Every spawn/chdir call site the tables match, in source order, with the span
+ *  of its argument list. Matched against the MASKED text so only code can match,
+ *  with spans that index the original, which is where values are read.
+ *
+ *  The tables are scanned as a UNION rather than by the payload's `language`
+ *  label. That label is model-written and shared across tool schemas, the marker
+ *  scan already refuses to trust it, and the forms overlap — `exec(cmd, { cwd })`
+ *  is JavaScript, while a payload labeled `py` can carry `exec(` and still be a
+ *  spawn to the marker scan. Reading it with the wrong table would report the
+ *  session directory for a spawn that names its own, which is the error this
+ *  whole section exists to stop; a stray match costs one question instead. */
+function evalCwdSites(masked: string): EvalCwdSiteMatch[] {
+	const table = [...EVAL_CWD_SITES_JS, ...EVAL_CWD_SITES_PY, ...EVAL_CWD_SITES_RB];
+	const sites = new Map<number, EvalCwdSiteMatch>();
+	for (const site of table) {
+		for (const match of masked.matchAll(new RegExp(site.pattern.source, `${site.pattern.flags.replace("g", "")}g`))) {
+			const at = match.index ?? 0;
+			let open = at + match[0].length;
+			while (open < masked.length && (masked[open] === " " || masked[open] === "\t")) open += 1;
+			if (masked[open] !== "(") {
+				if (site.parenless !== true) continue;
+				const lineEnd = masked.indexOf("\n", open);
+				const argEnd = lineEnd === -1 ? masked.length : lineEnd;
+				// A call whose first token is its block (`Dir.chdir do … end`)
+				// wrote no argument at all — the block IS the argument list, and
+				// an empty span says so instead of reading `do` as a directory.
+				const argStart = /^(?:do|then|end|\{)/u.test(masked.slice(open, argEnd).trimStart()) ? argEnd : open;
+				if (!sites.has(open))
+					sites.set(open, { name: site.name, kind: site.kind, positional: site.positional === true, argStart, argEnd, at, blockFrom: open });
+				continue;
+			}
+			if (sites.has(open)) continue;
+			const close = scanGroupEnd(masked, open);
+			sites.set(open, {
+				name: site.name,
+				kind: site.kind,
+				positional: site.positional === true,
+				argStart: open + 1,
+				argEnd: close === -1 ? -1 : close,
+				at,
+				blockFrom: close === -1 ? -1 : close + 1,
+			});
+		}
+	}
+	return [...sites.values()].sort((a, b) => a.argStart - b.argStart);
+}
+
+/** The headline the eval gate asks under when a spawn's own directory cannot be
+ *  read (issue #14). Named once because two things key on it: the dialog title,
+ *  and the rule that this layer offers no grant (see requestPermission). */
+const EVAL_SPAWN_CWD_HEADLINE = "unreadable spawn cwd";
+
+/** The directory an eval payload's spawns run in (issue #14), or why the scan
+ *  cannot tell. Exported for the test seam: the gate asks once per payload. */
+export type EvalSpawnCwd = { kind: "session" } | { kind: "literal"; cwd: string } | { kind: "opaque"; why: string };
+
+/** Ruby keywords that open a block of their own, whose closing token is an
+ *  `end`. `end` is in the list because the balance has to see closers too. */
+const RUBY_BLOCK_KEYWORD = /^(?:do|if|unless|while|until|case|begin|def|class|module|for|end)$/u;
+
+/**
+ * End (exclusive) of the Ruby block opening at `at` — the `do` keyword, or the
+ * `{` of a brace block — or -1 when this scan cannot place it.
+ *
+ * `end` is balanced against the keywords that open a block, so a nested `if` or
+ * `each do` inside the block does not close it early. A keyword opens a block
+ * only where a statement can start: a mid-expression `puts x if y` is a
+ * modifier that needs no `end`, and counting those would run the block past its
+ * real end and hand a spawn after it the wrong directory. The trailing `do` of
+ * `while x do`/`for x in y do` is that statement's own opener, not a second
+ * one. Anything the balance cannot place — an `end` with nothing open, or a
+ * keyword that never closes before the payload ends — reports -1, and the
+ * caller asks rather than guess a directory.
+ */
+/** True when the `def` at `defAt` is Ruby 3's endless method definition —
+ *  `def helper = 1`, `def helper() = 1`, `def self.helper = 1` — which is a
+ *  complete statement on its own line: it opens no block and its `end`-less
+ *  body is the expression after the `=`. Counting it as an opener would run
+ *  the enclosing block past its real `end` (a spawn written after it would be
+ *  judged against a directory Ruby has already restored) or leave the balance
+ *  unable to close at all.
+ *
+ *  The endless `=` is the one that follows the COMPLETE header — the name and,
+ *  when present, its parenthesized parameter list. A `=` Ruby binds to the
+ *  name token is not it: the setter `def value=(v)`, the element setter
+ *  `def []=(k, v)`, and the operators `def ==(other)`/`def <=>(other)` all
+ *  carry their `=` inside the name, and a `=` in a parameter list is a default
+ *  value (`def helper(x = 1)`, the parenless `def helper x = 1`). Every one of
+ *  those is a regular def, an opener whose `end` the balance must count.
+ *  Reading the name's `=` as the endless marker was the shipped defect: the
+ *  setter's own `end` then closed the enclosing chdir block, and a spawn
+ *  written inside the block was judged against the directory Ruby had already
+ *  restored — with the two spawn sites agreeing, so nothing asked. The scan
+ *  walks the header shape first and only then looks for the standalone `=`,
+ *  so those spellings can never reach the marker check. A header this scan
+ *  cannot read stays a plain opener, the fail-closed side: an unbalanced
+ *  block asks, it does not guess. Text the Ruby grammar rejects outright —
+ *  the endless setter `def value=(v) = 1`, a SyntaxError on every Ruby that
+ *  has endless methods (Feature #16746) — reads past the name's `=` to the
+ *  body one and is skipped; such payloads never run, so no live behavior
+ *  turns on that reading. */
+function isRubyEndlessDef(masked: string, defAt: number): boolean {
+	// The receiver, if any: `self.`, `X.`, `A::B.` — an identifier followed by
+	// `.` or `::`, spaces around it allowed. Each round consumes the
+	// identifier and the separator, so the loop advances or stops.
+	let i = defAt + 3;
+	for (;;) {
+		while (i < masked.length && /\s/u.test(masked[i])) i += 1;
+		const word = /^[A-Za-z_]\w*/u.exec(masked.slice(i));
+		if (!word) break;
+		let j = i + word[0].length;
+		while (j < masked.length && /\s/u.test(masked[j])) j += 1;
+		if (masked[j] === ".") i = j + 1;
+		else if (masked.startsWith("::", j)) i = j + 2;
+		else break;
+	}
+	// The name: an identifier with its `?`/`!` and a setter's trailing `=`,
+	// the element forms `[]`/`[]=`, or an operator (`==`, `===`, `<=`, `<=>`,
+	// `!=`, `<<`, `>>`, `**`, the single-char set with `@` for `+@`/`-@`). The
+	// longest forms come first so `<=` never leaves a dangling `=` for the
+	// marker check below to read; in particular the setter's `=` is consumed
+	// HERE, as part of the name, and can never read as a body marker.
+	const name = /^(?:[A-Za-z_]\w*[?!]?=?|\[\]=?|===|<=>|!=|==|<=|>=|<<|>>|\*\*|[+\-*/%&|^~<!]@?)/u.exec(masked.slice(i));
+	// An unreadable name is not a shape this scan knows: stay a plain opener
+	// and let the balance ask when it cannot close.
+	if (!name) return false;
+	i += name[0].length;
+	// An optional parenthesized parameter list, skipped WHOLE (`scanGroupEnd`
+	// tracks all bracket pairs, so `def helper(k = {})` survives): the `=` of
+	// a default value inside it is a parameter's, never a body marker.
+	while (i < masked.length && /\s/u.test(masked[i])) i += 1;
+	if (masked[i] === "(") {
+		const close = scanGroupEnd(masked, i);
+		if (close === -1) return false;
+		i = close + 1;
+		while (i < masked.length && /\s/u.test(masked[i])) i += 1;
+	}
+	// Only past the complete header can a standalone `=` introduce the body.
+	// Anything else — a newline, a `;`, a parenless parameter list, the
+	// payload's end — spells a regular def.
+	return masked[i] === "=";
+}
+
+function scanRubyBlockEnd(masked: string, at: number): number {
+	if (masked[at] === "{") {
+		const close = scanGroupEnd(masked, at);
+		return close === -1 ? -1 : close + 1;
+	}
+	let depth = 0;
+	for (const match of masked.slice(at).matchAll(/[A-Za-z_]\w*/gu)) {
+		const word = match[0];
+		if (!RUBY_BLOCK_KEYWORD.test(word)) continue;
+		const position = at + (match.index ?? 0);
+		if (word === "end") {
+			depth -= 1;
+			if (depth <= 0) return position + word.length;
+			continue;
+		}
+		// `while x do`/`for x in y do` spell one block two ways: the trailing
+		// `do` of such a line is that statement's own opener, not a second one.
+		const before = masked.slice(masked.lastIndexOf("\n", position - 1) + 1, position).trimEnd();
+		if (word === "do" && /^(?:while|until|for)\b/u.test(before)) continue;
+		if (word === "def" && isRubyEndlessDef(masked, position)) continue;
+		// Every other `do` opens a block wherever it is written — `items.each do
+		// |item|`, and a block-taking call's own `do` after its `)`. The other
+		// keywords open one only where a statement can start: a mid-expression
+		// `puts x if y` is a modifier that needs no `end`, and counting those
+		// would run the block past its real end and hand a spawn written after
+		// it the directory of a block that is already over.
+		if (word !== "do" && before !== "" && !/[(,=;|&[{]$/u.test(before)) continue;
+		depth += 1;
+	}
+	return -1;
+}
+
+/** How a Ruby chdir call's directory change ends: for the rest of the payload
+ *  (`Dir.chdir("/tmp")`, no block), or for the block alone — Ruby restores the
+ *  previous directory when the block returns, so a spawn after the block runs
+ *  where the payload started, not where the block did. `unreadable` is the
+ *  fail-closed case: the block is there but its end cannot be placed, and a
+ *  directory this scan cannot bound is one it must not report. */
+type EvalChdirScope = { kind: "process" } | { kind: "block"; end: number } | { kind: "unreadable"; why: string };
+
+/**
+ * Read which directory state a Ruby chdir call leaves behind. The block opener
+ * is looked for on the call's own line and after its arguments: Ruby's `do` and
+ * `{` bind to the call they follow, and a bare hash argument cannot be mistaken
+ * for one here because the only caller is a chdir, which takes its directory as
+ * a single positional argument.
+ */
+function evalChdirScope(masked: string, site: EvalCwdSiteMatch): EvalChdirScope {
+	if (site.blockFrom === -1) return { kind: "unreadable", why: "the argument list does not close" };
+	// The call's own statement ends at its line, or at a `;`: a block opener
+	// written after either one belongs to the next statement, not to this call
+	// (`Dir.chdir("/tmp"); items.each do … end` moves the payload's directory
+	// for good, and that `do` is `each`'s).
+	const cuts = [masked.indexOf("\n", site.blockFrom), masked.indexOf(";", site.blockFrom), masked.length].filter(at => at !== -1);
+	const header = masked.slice(site.blockFrom, Math.min(...cuts));
+	const doAt = /(?<![\w$])do(?=[\s|]|$)/u.exec(header);
+	const braceAt = header.indexOf("{");
+	const doOffset = doAt === null ? -1 : site.blockFrom + (doAt.index ?? 0);
+	const braceOffset = braceAt === -1 ? -1 : site.blockFrom + braceAt;
+	if (doOffset === -1 && braceOffset === -1) return { kind: "process" };
+	const opener = braceOffset === -1 || (doOffset !== -1 && doOffset < braceOffset) ? doOffset : braceOffset;
+	const end = scanRubyBlockEnd(masked, opener);
+	return end === -1 ? { kind: "unreadable", why: "the block's end cannot be read" } : { kind: "block", end };
+}
+
+/**
+ * Read the directory an eval payload spawns in, resolved against the session
+ * directory it starts from. The payload's `language` label does not take part:
+ * see evalCwdSites.
+ *
+ * Sites are walked in source order because a chdir moves the directory for the
+ * sites after it, and a relative literal resolves against whatever directory is
+ * in effect at that point. A Ruby `Dir.chdir("…") do … end` moves it for the
+ * block alone, so what it moved is kept for the sites the block contains and
+ * dropped at the first site past it; a `Dir.chdir("…")` with no block moves it
+ * for the rest of the payload. Every spawn site is counted, not just the ones
+ * that name a directory: a site with no cwd runs in the directory in effect,
+ * which is a fact about the payload, not a guess. When those facts disagree —
+ * one spawn in the session directory, another in `/` — there is no single
+ * directory this payload runs in, and the answer is "ask", not one of the two.
+ */
+export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
+	const masked = maskCodeText(code);
+	const sites = evalCwdSites(masked);
+	if (sites.length === 0) return { kind: "session" };
+	let current = sessionCwd;
+	/** The chdir blocks still open at this point in the walk, innermost last. */
+	const blocks: Array<{ end: number; saved: string }> = [];
+	const perSite: string[] = [];
+	let opaque = "";
+	for (const site of sites) {
+		// The block is over once the walk reaches a site it does not contain:
+		// that site — and every one after it — runs in the directory the chdir
+		// found in place, not the one it moved to.
+		while (blocks.length > 0) {
+			const open = blocks[blocks.length - 1];
+			if (open.end > site.at) break;
+			blocks.pop();
+			current = open.saved;
+		}
+		if (site.argEnd === -1) {
+			if (opaque === "") opaque = `${site.name}: the argument list does not close`;
+			continue;
+		}
+		const argument = site.positional ? readPositionalCwd(masked, code, site.argStart, site.argEnd) : readKeyedCwd(masked, code, site.argStart, site.argEnd);
+		if (argument.kind === "none") {
+			// `Dir.chdir()` with nothing in it goes to the home directory, which
+			// is not a directory this scan can name.
+			if (site.kind === "chdir") {
+				if (opaque === "") opaque = `${site.name}: no directory argument`;
+				continue;
+			}
+			perSite.push(current);
+			continue;
+		}
+		if (argument.kind === "dynamic") {
+			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${argument.detail})`;
+			continue;
+		}
+		const literal = cwdLiteralText(argument.value);
+		if (literal === null) {
+			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${truncated(argument.value, 60)})`;
+			continue;
+		}
+		const resolved = resolveSpawnCwdLiteral(literal, current);
+		if (resolved === null) {
+			if (opaque === "") opaque = `${site.name}: ${truncated(argument.value, 60)} does not name a directory`;
+			continue;
+		}
+		if (site.kind === "chdir") {
+			const scope = evalChdirScope(masked, site);
+			if (scope.kind === "unreadable") {
+				if (opaque === "") opaque = `${site.name}: ${scope.why}`;
+				continue;
+			}
+			if (scope.kind === "block") blocks.push({ end: scope.end, saved: current });
+			current = resolved;
+		} else perSite.push(resolved);
+	}
+	if (opaque !== "") return { kind: "opaque", why: opaque };
+	// A chdir block the payload is still inside where its text ends is the
+	// directory of the spawns this table does not model — `Dir.chdir("/tmp") do
+	// \`ls\` end` is that payload — which is what the fallback below reads. A
+	// block that closed with code after it did not leave the payload there: the
+	// payload's own directory is the restored one, so `Dir.chdir("/tmp") { }`
+	// followed by \`ls\` spawns in the session directory, not in the empty
+	// block's. Trailing whitespace is not code, so the common `… end\n` spelling
+	// of a block that wraps the payload keeps its directory.
+	while (blocks.length > 0) {
+		const open = blocks[blocks.length - 1];
+		if (masked.slice(open.end).trim() === "") break;
+		blocks.pop();
+		current = open.saved;
+	}
+	// A chdir that moved the payload's own directory is also the directory of
+	// every spawn this table does not model (`Dir.chdir("/tmp") do \`ls\` end`):
+	// when no site named one, the payload's own directory is the answer.
+	const effective = perSite.length === 0 ? [current] : perSite;
+	const distinct = [...new Set(effective)];
+	if (distinct.length > 1) return { kind: "opaque", why: `spawn sites run in different directories (${distinct.join(", ")})` };
+	return samePath(distinct[0], sessionCwd) ? { kind: "session" } : { kind: "literal", cwd: distinct[0] };
 }
 
 // Commands whose ARGUMENT is the program that runs: look through them to the
@@ -3192,29 +4027,6 @@ function remember(scoped: Map<string, Judgement>, key: string, judgement: Judgem
 	scoped.set(key, judgement);
 }
 
-/**
- * Normalized refusal target (issue #30): the stable identity of a command
- * across rewording. Lowercase, whitespace-collapsed, leading `cd <path> &&`
- * stripped, `./` argument spellings canonicalized to bare paths ("./x" and
- * "x" are the same file), flag tokens dropped, then the verb and its first
- * argument word are kept ("rm -rf ./x" -> "rm x"; git's verb is two words, so
- * "git push --force origin main" -> "git push origin"). Imperfect by design
- * and biased to OVER-match: two different commands sharing a target cost one
- * extra prompt-line, never a silent run. Force flags leave the KEY but stay
- * in the command text the model and the dialog see — force-ness is judged
- * there, not here.
- */
-export function normalizeRefusalTarget(command: string): string {
-	const collapsed = command.replace(/\s+/gu, " ").trim().toLowerCase();
-	const stripped = extractLeadingCdTarget(collapsed)?.rest || collapsed;
-	const words = stripped
-		.split(" ")
-		.map(word => word.replace(/^\.\//u, ""))
-		.filter(word => word !== "" && !word.startsWith("-"));
-	if (words.length === 0) return "";
-	return words.slice(0, words[0] === "git" ? 3 : 2).join(" ");
-}
-
 function sessionRefusals(sessionId: string): Refusal[] {
 	let list = refusals.get(sessionId);
 	if (!list) {
@@ -3239,7 +4051,7 @@ function addRefusal(
 	// Dry-run probe (issue #32): records nothing.
 	if (dryRun) return;
 	try {
-		const target = normalizeRefusalTarget(command);
+		const target = normalizeGrantTarget(command);
 		if (target === "") return;
 		const list = sessionRefusals(ctx.sessionManager.getSessionId());
 		const refusalCwd = meta.cwd ?? "";
@@ -3262,11 +4074,13 @@ function addRefusal(
 	}
 }
 
-/** A user approval of a target erases the memory that it was refused. */
+/** A user approval of a target erases the memory that it was refused. Approving
+ *  and refusing use one identity, so the lift covers exactly what the refusal
+ *  remembered (issue #64). */
 function liftRefusals(ctx: ExtensionContext, command: string, cwd = ""): void {
 	try {
 		const sessionId = ctx.sessionManager.getSessionId();
-		const target = normalizeRefusalTarget(command);
+		const target = normalizeGrantTarget(command);
 		if (target === "") return;
 		const list = refusals.get(sessionId);
 		if (!list) return;
@@ -3277,15 +4091,24 @@ function liftRefusals(ctx: ExtensionContext, command: string, cwd = ""): void {
 }
 
 /**
- * Strict authorization key for a session grant (issue #32). Grants are
- * authorization, so unlike normalizeRefusalTarget — whose over-match is the
- * SAFE direction for refusal memory — this key must NOT collapse distinct
- * actions: flag tokens are KEPT (combined short flags split, then sorted and
- * deduped, so "-rf" and "-r -f" produce the same key) and only the first
- * non-flag argument survives. Lowercased, whitespace-collapsed, leading
- * `cd <path> &&` stripped, `./` argument spellings canonicalized.
+ * The strict identity of one action, shared by session grants (issue #32) and
+ * refusal memory (issue #64). Authorization and memory must agree on what
+ * "this action" is: flag tokens are KEPT (combined short flags split, then
+ * sorted and deduped, so "-rf" and "-r -f" produce the same key) and only the
+ * first non-flag argument survives. Lowercased, whitespace-collapsed, leading
+ * `cd <path> &&` stripped, `./` argument spellings canonicalized. Force flags
+ * leave the KEY but stay in the command text the model and the dialog see —
+ * force-ness is judged there, not here.
+ *
+ * Grants are authorization, so this key must NOT collapse distinct actions:
  * "git push origin main" and "git push --force origin main" differ here;
  * refusing to notice that difference turned a grant into an overgrant.
+ *
+ * Refusal memory keys the same way. Its own old two-word key ("ssh raw-ovh",
+ * "docker exec") made one refused remote cleanup a session-length trip wire
+ * for every later read from that host: 152 of the blocks in the 2026-09-12
+ * log window carried `prior refusal` as a reason. A refusal now covers the
+ * action it names and nothing wider, and an approval lifts exactly that.
  */
 export function normalizeGrantTarget(command: string): string {
 	const collapsed = command.replace(/\s+/gu, " ").trim().toLowerCase();
@@ -3293,8 +4116,8 @@ export function normalizeGrantTarget(command: string): string {
 	const words = stripped.split(" ").filter(word => word !== "");
 	if (words.length === 0) return "";
 	const lead = [words[0]];
-	// git is the one two-word verb (mirrors normalizeRefusalTarget); the
-	// subverb must be a word, not a flag.
+	// git is the one two-word verb: the subverb is part of the identity. It
+	// must be a word, not a flag.
 	if (words[0] === "git" && words[1] !== undefined && !words[1].startsWith("-")) lead.push(words[1]);
 	const flags = new Set<string>();
 	let firstArg = "";
@@ -3353,31 +4176,48 @@ function sessionGrants(sessionId: string): Grant[] {
 }
 
 /** Record a session grant: this command's target, in this exact directory,
- *  may run ungated for the rest of the session. */
-function addGrant(ctx: ExtensionContext, key: string, cwd: string, evidenceFingerprint?: string): void {
+ *  may run ungated for the rest of the session. `scopeCwd` is the second
+ *  directory the human's dialog put on screen for eval payloads that name a
+ *  spawn directory of their own; it is part of the grant's identity, so a
+ *  session that moves workspaces (`/move` rewrites ctx.cwd) cannot reuse an
+ *  authorization the human gave while looking at the old one. */
+function addGrant(ctx: ExtensionContext, key: string, cwd: string, evidenceFingerprint?: string, scopeCwd?: string): void {
 	try {
 		if (key === "") return;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const list = sessionGrants(sessionId);
-		// One grant per (target, directory): re-approving refreshes ts and moves
-		// the grant to newest instead of stacking duplicates.
-		const existing = list.findIndex(grant => grant.normalizedTarget === key && grant.cwd === cwd);
+		// One grant per (target, directory, scope directory): re-approving
+		// refreshes ts and moves the grant to newest instead of stacking
+		// duplicates.
+		const existing = list.findIndex(grant => grant.normalizedTarget === key && grant.cwd === cwd && grant.scopeCwd === scopeCwd);
 		if (existing !== -1) list.splice(existing, 1);
 		while (list.length >= GRANT_CAP) list.shift();
-		list.push({ normalizedTarget: key, cwd, ts: Date.now(), evidenceFingerprint });
+		list.push({ normalizedTarget: key, cwd, ts: Date.now(), evidenceFingerprint, ...(scopeCwd === undefined ? {} : { scopeCwd }) });
 	} catch {
 		// No session id, no grant; the caller's decision below is unchanged.
 	}
 }
 
-/** The session's grant for this command's target and directory, if any. */
-function matchingGrant(ctx: ExtensionContext, key: string, cwd: string, evidenceFingerprint?: string): Grant | undefined {
+/** The session's grant for this command's target and directories, if any. */
+function matchingGrant(
+	ctx: ExtensionContext,
+	key: string,
+	cwd: string,
+	evidenceFingerprint?: string,
+	scopeCwd?: string,
+): Grant | undefined {
 	try {
 		if (key === "") return undefined;
 		const cwdInput = cwd ?? "";
 		return grants
 			.get(ctx.sessionManager.getSessionId())
-			?.find(grant => grant.normalizedTarget === key && grant.cwd === cwdInput && grant.evidenceFingerprint === evidenceFingerprint);
+			?.find(
+				grant =>
+					grant.normalizedTarget === key &&
+					grant.cwd === cwdInput &&
+					grant.scopeCwd === scopeCwd &&
+					grant.evidenceFingerprint === evidenceFingerprint,
+			);
 	} catch {
 		return undefined;
 	}
@@ -3522,7 +4362,7 @@ function priorRefusalFor(
 	evidenceFingerprint?: string,
 ): Refusal | undefined {
 	try {
-		const target = normalizeRefusalTarget(command);
+		const target = normalizeGrantTarget(command);
 		if (target === "") return undefined;
 		return refusals.get(ctx.sessionManager.getSessionId())?.find(refusal => {
 			if (refusal.normalizedTarget !== target || refusal.cwd !== cwd) return false;
@@ -3615,7 +4455,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (key === "reset") {
-				writeClassifierConfig({ enabled: true, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, persistentGrants: true, shadowV3: true });
+				writeClassifierConfig({ enabled: true, judgeBackend: DEFAULT_JUDGE_BACKEND, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, persistentGrants: true, shadowV3: true });
 				notify(`omp-classifier reset to defaults (${classifierConfigPath()})`);
 				return;
 			}
@@ -3828,6 +4668,10 @@ export default function (pi: ExtensionAPI) {
 				authorizationState: buildAuthorizationState({ actions, ...userEvidence }),
 				context: ctx,
 				settings,
+				// The shadow measures the judge that actually decides: same backend,
+				// same credential path. Anything else would report a disagreement
+				// between two judges as a policy disagreement.
+				backend: config.judgeBackend,
 			});
 			const authorization = deriveAuthorization(judgment.authorization, DEFAULT_AUTHORIZATION_POLICY);
 			const literal = shell
@@ -3872,10 +4716,15 @@ export default function (pi: ExtensionAPI) {
 	 * and becomes an UNAVAILABLE verdict, which the caller turns into a
 	 * permission request — never a silent allow.
 	 *
-	 * `timeoutMs` is the caller's deadline, passed as an AbortSignal so a slow
-	 * judge cannot exceed the plugin's own budget: the old path needed deadline
-	 * arithmetic of its own because it could make two sequential provider
-	 * calls inside one handler budget, while one signal covers this one.
+	 * `timeoutMs` is the deadline, and since #62 it is a race the plugin owns
+	 * rather than an abort on the request (judgeBatteryUnderDeadline): the
+	 * deadline still yields UNAVAILABLE and still opens the dialog right away,
+	 * but the request keeps running, so the verdict that lands a beat late
+	 * rides back on `Judgement.late` and can dismiss or refine that dialog
+	 * instead of being discarded. Only the deadline gets that treatment: a real
+	 * failure (HTTP error, missing key, unreadable body) has no late answer to
+	 * offer and returns without a `late` handle, so its dialog is exactly what
+	 * it was before.
 	 */
 	const classify = async (
 		ctx: ExtensionContext,
@@ -3943,25 +4792,11 @@ export default function (pi: ExtensionAPI) {
 					...(refProvenance !== undefined ? { refProvenance } : {}),
 				})
 			: undefined;
-		try {
-			const answers = await judgeBattery(AbortSignal.timeout(timeoutMs), {
-				state: buildJevState({
-					command,
-					workingDirectory: cwd,
-					...(userMessages ? { userMessages } : {}),
-					...(taskEvidence?.ids.length ? { userMessageIds: taskEvidence.ids } : {}),
-					...(operatorContext ? { operatorContext } : {}),
-					...(pushProvenance !== undefined ? { gitPushProvenance: pushProvenance } : {}),
-					...(worktreeProvenance !== undefined ? { gitWorktreeProvenance: worktreeProvenance } : {}),
-					...(refProvenance !== undefined ? { gitRefProvenance: refProvenance } : {}),
-					...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
-				}),
-				// The host settings instance, not a plugin-local singleton copy:
-				// the native resolver reads providers.judgmentProvider and the
-				// credential store through it (see the header note on settings).
-				context: ctx,
-				settings,
-			});
+		// Answers -> verdict, shared by the on-time and the late path: a late
+		// SAFE is the same battery with the same evidence weight as an on-time
+		// one, so it must be read by the same code, never by a shortcut written
+		// for the late case (issue #62).
+		const judgementFrom = async (answers: JevAnswers): Promise<Judgement> => {
 			const decision = deriveJevDecision(answers, policy);
 			// `decision.hazards` carries only the hazards that reached
 			// hazardReview, so "fired" is presence, not a threshold re-check.
@@ -4012,19 +4847,71 @@ export default function (pi: ExtensionAPI) {
 					latencyMs: answers.latencyMs,
 				},
 			});
-		} catch (err) {
-			// Fail closed, name the failure, and never cache it: a timeout, a
-			// missing key, a non-2xx, or a body whose answers do not match the
-			// battery says nothing about the command, and a cached non-answer
-			// would keep the session from re-asking once the endpoint recovers.
+		};
+		const outcome = await judgeBatteryUnderDeadline({
+			timeoutMs,
+			state: buildJevState({
+				command,
+				workingDirectory: cwd,
+				...(userMessages ? { userMessages } : {}),
+				...(taskEvidence?.ids.length ? { userMessageIds: taskEvidence.ids } : {}),
+				...(operatorContext ? { operatorContext } : {}),
+				...(pushProvenance !== undefined ? { gitPushProvenance: pushProvenance } : {}),
+				...(worktreeProvenance !== undefined ? { gitWorktreeProvenance: worktreeProvenance } : {}),
+				...(refProvenance !== undefined ? { gitRefProvenance: refProvenance } : {}),
+				...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
+			}),
+			// The host settings instance, not a plugin-local singleton copy:
+			// the native resolver reads providers.judgmentProvider and the
+			// credential store through it (see the header note on settings).
+			context: ctx,
+			settings,
+			// Which transport answers (issue #84). Omitted, it is the host
+			// path; an endpoint backend ignores `settings`/`context` entirely.
+			backend: config.judgeBackend,
+		});
+		if (outcome.kind === "answered") return await judgementFrom(outcome.answers);
+		if (outcome.kind === "failed") {
+			// Fail closed, name the failure, and never cache it: a missing key,
+			// a non-2xx, or a body whose answers do not match the battery says
+			// nothing about the command, and a cached non-answer would keep the
+			// session from re-asking once the endpoint recovers.
 			const v3 = shadow ? { ...(await shadow), live: "UNAVAILABLE" as const } : undefined;
 			return annotateJudgement({
 				verdict: "UNAVAILABLE",
-				reason: `Jev unavailable: ${truncated(err instanceof Error ? err.message : String(err), 160)}`,
+				reason: `Jev unavailable: ${truncated(outcome.error instanceof Error ? outcome.error.message : String(outcome.error), 160)}`,
 				noCache: true,
 				...(v3 ? { v3 } : {}),
 			});
 		}
+		// The deadline fired. UNAVAILABLE and the dialog are what they always
+		// were, but the request is still running: the reason names the deadline
+		// instead of implying the gate broke, and requestPermission adds the
+		// dialog's own line about the answer that may still arrive.
+		const v3 = shadow ? { ...(await shadow), live: "UNAVAILABLE" as const } : undefined;
+		const late = outcome.late;
+		return annotateJudgement({
+			verdict: "UNAVAILABLE",
+			reason: `Jev unavailable: judgment timed out after ${timeoutMs}ms`,
+			noCache: true,
+			...(v3 ? { v3 } : {}),
+			late: {
+				answer: (async (): Promise<Judgement | undefined> => {
+					const answers = await late.answers;
+					if (answers === undefined) return undefined;
+					try {
+						return await judgementFrom(answers);
+					} catch (err) {
+						// A late answer this process cannot read is no answer: the
+						// dialog stays exactly as the deadline left it. Warned, never
+						// thrown — this runs after the tool call was decided.
+						pi.logger.warn(`classifier: late judgment unreadable: ${err instanceof Error ? err.message : String(err)}`);
+						return undefined;
+					}
+				})(),
+				cancel: late.cancel,
+			},
+		});
 	};
 
 	/**
@@ -4053,6 +4940,10 @@ export default function (pi: ExtensionAPI) {
 		target: {
 			command: string;
 			cwd: string;
+			/** The directory the payload named for its own spawns (issue #14),
+			 *  present only when it named one: `cwd` above IS that directory
+			 *  then, and the dialog says so on the working-directory line. */
+			spawnCwd?: string;
 			envKeys: string[];
 			pty: boolean;
 			timeout: number | undefined;
@@ -4079,7 +4970,21 @@ export default function (pi: ExtensionAPI) {
 		// "/workspace" prints a line saying the cwd is the cwd, which is exactly
 		// the noise this is meant to remove.
 		if (target.cwd && !samePath(target.cwd, sessionCwd)) {
-			details.push(`working directory: ${detailValue(target.cwd)}`);
+			// An eval payload can name its own spawn directory (issue #14) — the
+			// case the whole field exists for — and a reader who cannot tell that
+			// directory from the session's is reading a detail row that lies by
+			// omission about who chose it. A literal that resolves OUTSIDE the
+			// session directory is shown exactly as resolved: never folded back.
+			details.push(`working directory: ${detailValue(target.cwd)}${target.spawnCwd === undefined ? "" : " (declared by the payload's spawn call)"}`);
+			// The second directory of an eval payload (issue #14): with a spawn
+			// directory declared, `working directory` above is that one, and the
+			// session's own directory is where the payload's own process reads
+			// and writes, so a relative write still lands there. It is part of
+			// what "Allow for session" covers, so it is on the line: a grant
+			// whose scope the human cannot see is a grant nobody approved.
+			if (target.spawnCwd !== undefined && sessionCwd !== undefined && !samePath(target.spawnCwd, sessionCwd)) {
+				details.push(`session directory: ${detailValue(sessionCwd)} (what this payload's own code runs in)`);
+			}
 		}
 		// 0 disables the deadline (host schema, tools/bash.ts), so "0s" would
 		// read as the exact opposite of what it does.
@@ -4263,6 +5168,10 @@ export default function (pi: ExtensionAPI) {
 		target: {
 			command: string;
 			cwd: string;
+			/** The directory the payload named for its own spawns (issue #14),
+			 *  present only when it named one: `cwd` above IS that directory
+			 *  then, and the dialog says so on the working-directory line. */
+			spawnCwd?: string;
 			envKeys: string[];
 			pty: boolean;
 			timeout: number | undefined;
@@ -4279,7 +5188,13 @@ export default function (pi: ExtensionAPI) {
 		 *  as the verdict line it follows. One object rather than one parameter
 		 *  per field: this list grew a field per phase, and each time a caller
 		 *  was missed the log came out half-filled. */
-		auditExtras: Pick<DecisionRecord, "userMessageIds" | "authorization" | "v3" | "floor"> = {},
+		auditExtras: Pick<DecisionRecord, "userMessageIds" | "authorization" | "v3" | "floor" | "spawnCwd"> = {},
+		/** The still-running judgment behind a timed-out classification (issue
+		 *  #62), with the guards a late SAFE must still clear. Present only
+		 *  where classify hit its deadline: the dialog then races the late
+		 *  verdict, which may dismiss it or refine its reason — never bypass it,
+		 *  and never re-block what a human allowed. */
+		late?: GuardedLateJudgement,
 	): Promise<{ block: true; reason: string } | undefined> => {
 		const subject = tool === "eval" ? "eval code" : "bash command";
 		const detail = reason ? `${headline}: ${reason}` : headline;
@@ -4317,6 +5232,7 @@ export default function (pi: ExtensionAPI) {
 				...(auditExtras.authorization ? { authorization: auditExtras.authorization } : {}),
 				...(auditExtras.v3 ? { v3: auditExtras.v3 } : {}),
 				...(auditExtras.floor ? { floor: auditExtras.floor } : {}),
+				...(auditExtras.spawnCwd ? { spawnCwd: auditExtras.spawnCwd } : {}),
 			});
 		const block = (whyOverride?: string, approval: DecisionRecord["approval"] = ctx.hasUI ? "deny" : "headless"): { block: true; reason: string } => {
 			// Verdict-driven callers pass "follows verdict" so the dialog/headless
@@ -4327,6 +5243,40 @@ export default function (pi: ExtensionAPI) {
 				reason: refusalPayload(tool, layer, detail, guidance[layer].next, guidance[layer].notThis),
 			};
 		};
+		/**
+		 * One line per late verdict (issue #62), on a layer of its own so the
+		 * three cases are separable in the log by machine: `late-verdict` says a
+		 * judgment arrived after its deadline, `why` opens with the decision
+		 * pair (`unavailable → late SAFE`), and `verdict`/`jev`/`reasonCode`
+		 * describe the answer itself, exactly as they would have on a verdict
+		 * line. No approval field: nobody answered this dialog, the verdict did.
+		 */
+		const auditLate = (judgement: Judgement, why: string, decision: "allow" | "block"): void =>
+			logDecisionFor(ctx, {
+				tool,
+				decision,
+				layer: "late-verdict",
+				why,
+				cmd: target.command,
+				cwd: target.cwd,
+				verdict: judgement.verdict,
+				cached: 0,
+				ms: Date.now() - began,
+				...(judgement.modelId ? { modelId: judgement.modelId } : {}),
+				...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}),
+				...(judgement.jev ? { jev: judgement.jev } : {}),
+				...(judgement.authorization ? { authorization: judgement.authorization } : {}),
+				...(judgement.v3 ? { v3: judgement.v3 } : {}),
+				...(stale === "" ? {} : { staleCode: 1 as const }),
+				...(auditExtras.userMessageIds && auditExtras.userMessageIds.length > 0 ? { userMessageIds: auditExtras.userMessageIds } : {}),
+				...(auditExtras.floor ? { floor: auditExtras.floor } : {}),
+				// Same fields as the `audit` line above, spawn directory
+				// included: a late line is read as the verdict line that
+				// answered a dialog, and an audit reader must not have to guess
+				// which directory the payload named from the one it is in.
+				...(auditExtras.spawnCwd ? { spawnCwd: auditExtras.spawnCwd } : {}),
+			});
+
 		// Dry-run probe (issue #32): never open a dialog, never audit. When a
 		// decision was logged before reaching here (critical, env, a verdict),
 		// that record already won; the unclassified path arrives with none, so
@@ -4340,31 +5290,149 @@ export default function (pi: ExtensionAPI) {
 			});
 			return { block: true, reason: "dry-run probe: decision captured, nothing executed" };
 		}
-		if (!ctx.hasUI) return block();
+		if (!ctx.hasUI) {
+			// Headless: nobody can be asked and nobody can be refined. The
+			// deadline's dialog does not exist here, so end the listening the
+			// deadline started rather than leak a request nobody will read.
+			late?.handle.cancel();
+			return block();
+		}
 		// A grant is only OFFERED when the resolver below can honor it. Critical
 		// patterns and env overrides outrank grants, so showing a grant choice
 		// there would promise an authorization that the next call can never use.
 		// Compounds/substitutions have an exact-text key; changed payloads still
 		// miss it.
 		const grantKey = tool === "eval" ? normalizeEvalGrantTarget(target.command) : grantKeyForCommand(target.command);
-		const grantsHonoredAtLayer = headline !== "critical pattern" && headline !== "environment override";
+		// A grant is only OFFERED when the resolver below can honor it. Critical
+		// patterns and env overrides outrank grants, so showing a grant choice
+		// there would promise an authorization that the next call can never use.
+		// `unreadable spawn cwd` is on that list for its own reason: the eval path
+		// asks before the grant check, because a grant for this payload was scoped
+		// to a directory the payload never named — offering one would promise a
+		// scope the gate cannot honestly write down.
+		const grantsHonoredAtLayer =
+			headline !== "critical pattern" && headline !== "environment override" && headline !== EVAL_SPAWN_CWD_HEADLINE;
 		const sessionGrantAvailable = grantKey !== "" && grantsHonoredAtLayer;
 		const persistentGrantAvailable = tool === "bash" && readClassifierConfig().persistentGrants && grantsHonoredAtLayer;
-		const choice = await ctx.ui.select(
-			`Run ${subject}? (${headline}${stale})\n${buildPermissionBody(target, reason, ctx.cwd)}`,
+		// An eval payload that declared a spawn directory of its own has two
+		// directories on the Details above, and its session grant covers both:
+		// "this directory" there would name half of what the human is agreeing
+		// to, so the option says which pair it means.
+		const sessionGrantDescription =
+			tool === "eval" && target.spawnCwd !== undefined && !samePath(target.spawnCwd, ctx.cwd)
+				? "This action, in both directories above, for the rest of the session"
+				: "This action, in this directory, for the rest of the session";
+		// The late-answer race (issue #62). The dialog the deadline opened keeps
+		// the judgment request alive, so a verdict that lands while the human is
+		// reading can still improve the answer in front of them:
+		//   SAFE   -> dismiss the dialog and let the command run. That is the
+		//             answer the deadline had no right to take away, and a late
+		//             SAFE carries the same evidence (same battery, same state)
+		//             as an on-time one.
+		//   UNSAFE -> the dialog is now backed by a real reason: keep it open,
+		//             say what arrived, and let the human decide with it in hand.
+		//   UNSURE -> leave the dialog exactly as it is; the answer goes on the
+		//             record so calibration sees it whatever the human answers.
+		// Fail-closed is untouched by all three. A late verdict can only refine a
+		// dialog that is already open (the dismissal is an abort of OUR dialog,
+		// and the signal is only passed when there is a late handle at all); a
+		// late UNSAFE never re-blocks a command a human allowed, it is logged
+		// beside that allow; and a dismissal is honored only when the dialog
+		// settled with no answer of the human's (see `dismissedForLateSafe`).
+		const dismissal = new AbortController();
+		let lateRefinement: Judgement | undefined;
+		let dismissedForLateSafe = false;
+		let dialogSettled = false;
+		// The dialog says what is actually happening: the judgment is still
+		// running, and the dialog may resolve itself before the human answers.
+		const shownReason =
+			late === undefined ? reason : `${reason}\nThe judgment is still running: it may dismiss this dialog before you answer it.`;
+		const dialog = ctx.ui.select(
+			`Run ${subject}? (${headline}${stale})\n${buildPermissionBody(target, shownReason, ctx.cwd)}`,
 			[
 				{ label: "Allow once", description: "This call only" },
-				...(sessionGrantAvailable
-					? [{ label: "Allow for session", description: "This action, in this directory, for the rest of the session" }]
-					: []),
+				...(sessionGrantAvailable ? [{ label: "Allow for session", description: sessionGrantDescription }] : []),
 				...(persistentGrantAvailable
 					? [{ label: "Always allow", description: "This exact command, in this directory, for 30 days (stored alongside omp-classifier.json)" }]
 					: []),
 				{ label: "Deny" },
 			],
-			// The old confirm default was approve; keep the cursor on it.
-			{ initialIndex: 0 },
+			// The old confirm default was approve; keep the cursor on it. The
+			// signal is what dismisses the dialog on a late SAFE: the host hides
+			// it and resolves `undefined` (extension-ui-controller.ts:1290).
+			{ initialIndex: 0, ...(late ? { signal: dismissal.signal } : {}) },
 		);
+		// Recorded so a late verdict that runs after the human answered can see
+		// that the race is already over and do nothing at all.
+		void dialog.then(() => {
+			dialogSettled = true;
+		});
+		if (late) {
+			const lateHandle = late.handle;
+			void lateHandle.answer.then(judgement => {
+				if (judgement === undefined || dialogSettled) return;
+				lateRefinement = judgement;
+				// The pair calibration reads: the dialog was opened by an
+				// UNAVAILABLE, and this is what the answer turned out to be.
+				const pair = `unavailable → late ${judgement.verdict}`;
+				if (judgement.verdict === "SAFE") {
+					// A late SAFE may dismiss the dialog only where an on-time SAFE
+					// would have auto-run. This dialog exists because of the deadline,
+					// not because the verdict asked to be here, so the guards the
+					// verdict path applies still apply: the destructive-token
+					// overlay, and a refusal this session already holds for the
+					// target. Anything else keeps the dialog open with the answer
+					// recorded beside it.
+					const lateReplay = replayDecision({
+						tool,
+						command: target.command,
+						cwd: target.cwd,
+						judgement,
+						priorRefusal: late.priorRefusal !== undefined,
+						riskFlags: late.riskFlags,
+						headless: false,
+					});
+					if (lateReplay.decision !== "allow") {
+						const guardWhy =
+							late.riskFlags.length > 0
+								? `classifier-safe but flags: ${late.riskFlags.join(", ")}`
+								: `classifier-safe despite prior refusal of "${late.priorRefusal?.normalizedTarget ?? ""}"`;
+						auditLate(judgement, `${pair}: dialog kept open — ${guardWhy}`, "block");
+						ctx.ui.notify(`classifier: judgment answered late (${guardWhy})\nThe dialog still needs your answer.`, "warning");
+						return;
+					}
+					dismissedForLateSafe = true;
+					auditLate(judgement, `${pair}: dialog dismissed, command allowed`, "allow");
+					dismissal.abort();
+					return;
+				}
+				if (judgement.verdict === "UNSAFE") {
+					// The dialog cannot be re-titled once it is on screen, so the
+					// real reason reaches the human as a warning beside it, and the
+					// dialog's own outcome line carries the pair afterwards.
+					auditLate(judgement, `${pair}: dialog kept open with the judgment's reason`, "block");
+					ctx.ui.notify(
+						`classifier: judgment answered late: ${truncated(judgement.reason, 160)}\n` +
+							"The dialog is still open and now backed by that reason.",
+						"warning",
+					);
+					return;
+				}
+				// UNSURE, and any other non-answer the battery could produce: the
+				// dialog stays exactly as it is and the answer only goes on the
+				// record.
+				auditLate(judgement, `${pair}: answer attached to this dialog's record`, "block");
+			});
+		}
+		const choice = await dialog;
+		// The human answered, so nothing is left to refine: stop the request
+		// rather than let it run for the rest of the window. A verdict that was
+		// already in hand is kept — it refines the outcome line below — and one
+		// that lands after this point finds `dialogSettled` and does nothing.
+		late?.handle.cancel();
+		// The race, on the human's own line: calibration has to read the late
+		// answer next to the human's, and that means the same line.
+		const lateSuffix = lateRefinement === undefined ? "" : ` (unavailable → late ${lateRefinement.verdict})`;
 		if (choice === "Allow once" || choice === "Allow for session" || choice === "Always allow") {
 			// The user said yes to this action (issue #30): erase the memory
 			// that its target was refused, so rewordings run clean again. A
@@ -4372,17 +5440,30 @@ export default function (pi: ExtensionAPI) {
 			// is live, refusal memory never fires for this text+cwd — the human
 			// outvoted the model, once, for every session.
 			liftRefusals(ctx, target.command, target.cwd);
-			if (choice === "Allow for session") addGrant(ctx, grantKey, target.cwd, userScopeFingerprint);
+			// An eval grant covers BOTH directories: the payload's own spawn
+			// directory (target.cwd) and the session directory its own process
+			// runs in (ctx.cwd). Both were on the dialog the human answered, and
+			// both are part of the identity the next call has to match, so a
+			// session that moves workspaces cannot ride this grant into a
+			// directory nobody approved.
+			if (choice === "Allow for session") addGrant(ctx, grantKey, target.cwd, userScopeFingerprint, tool === "eval" ? ctx.cwd : undefined);
 			if (choice === "Always allow") addPersistentGrant(target.command, target.cwd);
 			audit(
 				"allow",
-				choice === "Allow for session"
+				(choice === "Allow for session"
 					? "approved by user (session grant)"
 					: choice === "Always allow"
 						? "approved by user (persistent grant)"
-						: "approved by user",
+						: "approved by user") + lateSuffix,
 				choice === "Allow for session" ? "allow-session" : choice === "Always allow" ? "always-allow" : "allow-once",
 			);
+			return undefined;
+		}
+		if (dismissedForLateSafe) {
+			// The dialog resolved with no answer because the late SAFE dismissed
+			// it, which is an allow, not a canceled prompt. Registered after the
+			// human's own answer above so a denial or an allow that the host
+			// managed to deliver anyway still wins.
 			return undefined;
 		}
 		// A human denial is the one decision a rewording cannot launder:
@@ -4394,7 +5475,13 @@ export default function (pi: ExtensionAPI) {
 			source: "human",
 			cwd: target.cwd,
 		});
-		return block(choice === undefined ? `prompt canceled: ${detail}` : undefined);
+		return block(
+			choice === undefined
+				? `prompt canceled: ${detail}${lateSuffix}`
+				: lateSuffix === ""
+					? undefined
+					: `${logWhyPrefix === "" ? detail : `${logWhyPrefix}: ${detail}`}${lateSuffix}`,
+		);
 	};
 
 	/** End a dry-run probe at a decision point the gate itself passes through
@@ -4479,10 +5566,13 @@ export default function (pi: ExtensionAPI) {
 		// The merged policy is in the signature, not just the override set: two
 		// different overrides that merge to the same effective thresholds are
 		// the same trust state, and any policy change must invalidate every
-		// cached verdict.
+		// cached verdict. The judge's own identity (the backend plus the model
+		// that answers it) is in there for the same reason: a verdict about one
+		// judge is not a verdict about another.
 		const configSignature = [
 			config.enabled,
 			config.typesafeModel,
+			judgeBackendFor(config.judgeBackend).id,
 			JSON.stringify(jevPolicyFor(config)),
 			config.timeoutMs,
 			config.maxCommandLength,
@@ -4567,7 +5657,6 @@ export default function (pi: ExtensionAPI) {
 
 		if (isEval) {
 			const language = typeof event.input?.language === "string" ? event.input.language : "";
-			const cwd = ctx.cwd;
 			const markers = evalSubprocessMarkers(evalCode, language);
 			// Expression-only payload: the host's `eval` approval applies, the
 			// gate adds nothing (posture A's whole point).
@@ -4576,14 +5665,25 @@ export default function (pi: ExtensionAPI) {
 			// a per-session `/classifier off` pause does the same for just this
 			// session. Neither touches trust state, so cached verdicts survive.
 			if (!config.enabled || sessionOff.has(ctx.sessionManager.getSessionId())) return;
+			// The payload's own spawn directory (issue #14): a spawn that passes
+			// one runs there, not in the session directory, and the directory is
+			// part of what was judged. `declaredCwd` is the directory the payload
+			// named; `cwd` is the one everything below judges in.
+			const spawn = evalSpawnCwd(evalCode, ctx.cwd);
+			const declaredCwd = spawn.kind === "literal" ? spawn.cwd : undefined;
+			const cwd = declaredCwd ?? ctx.cwd;
+			// Rides every line this call writes, so an audit reader can tell a
+			// directory the payload declared from the session's without going
+			// back to the payload text — which the `cmd` field truncates.
+			const spawnField = declaredCwd === undefined ? {} : { spawnCwd: declaredCwd };
 			// Over-bound spawn-bearing code is blocked unseen, like bash: no
 			// classifier or dialog may approve text it did not read.
 			if (evalCode.length > config.maxCommandLength) {
 				const why =
 					`eval code blocked: ${evalCode.length} chars exceeds the ` +
 					`${config.maxCommandLength}-character review limit`;
-				const replay = replayDecision({ tool: "eval", command: evalCode, cwd: ctx.cwd, maxCommandLength: config.maxCommandLength, headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: replay.layer, why, cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, maxCommandLength: config.maxCommandLength, headless: !ctx.hasUI });
+				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: replay.layer, why, cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields(), ...spawnField });
 				addRefusal(ctx, evalCode, why, { source: "cap", cwd });
 				return {
 					block: true,
@@ -4597,25 +5697,56 @@ export default function (pi: ExtensionAPI) {
 					),
 				};
 			}
-			const target = { command: evalCode, cwd, envKeys: [], pty: false, timeout: undefined as number | undefined, async: false };
+			const target = { command: evalCode, cwd, envKeys: [], pty: false, timeout: undefined as number | undefined, async: false, ...spawnField };
+			// A spawn directory this scan could not read is not a reason to
+			// classify anyway: a payload judged against a directory it does not
+			// run in was judged on the wrong question, and a verdict earned that
+			// way is worth less than a human's answer. Ask, and say what could
+			// not be read — the code text on the dialog carries the rest.
+			if (spawn.kind === "opaque") {
+				const headline = EVAL_SPAWN_CWD_HEADLINE;
+				// No `spawnCwd` on these lines: the whole reason this path exists
+				// is that no directory could be read from the payload.
+				logDecisionFor(ctx, {
+					tool: "eval",
+					decision: "block",
+					layer: "cwd",
+					why: `${headline}: ${spawn.why}`,
+					cmd: evalCode,
+					cwd,
+					verdict: null,
+					cached: 0,
+					ms: Date.now() - started,
+					...auditFields(),
+				});
+				return await requestPermission(ctx, target, headline, spawn.why, "eval", "", userScopeFingerprint, auditFields());
+			}
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
 			// Judge identity is the model selector plus the question battery: a
 			// verdict earned under one policy must not be reused under another.
 			// (The config signature clears the whole cache when either changes;
-			// this keeps the key honest on its own.) The measured worktree
-			// geometry rides here as it does on the bash path (issue #69 slice
-			// C): the judge read it off this cwd, so a worktree registered,
-			// removed, or detached between calls must invalidate the verdict.
+			// this keeps the key honest on its own.) Both directories are in the
+			// key: the spawn's own, which is where the judged command runs, and
+			// the session's, which is where the payload's own process still runs
+			// and reads and writes. Dropping either would let a verdict cross a
+			// directory change it never saw. The measured worktree geometry
+			// rides here as it does on the bash path (issue #69 slice C): the
+			// judge read it off this cwd, so a worktree registered, removed, or
+			// detached between calls must invalidate the verdict, and the
+			// measured ref state (slice D) rides with it.
 			const worktreeProvenanceForCache = measureGitWorktreeProvenance(cwd);
 			const refProvenanceForCache = measureGitRefProvenance(evalCode, cwd);
-			const cacheKey = JSON.stringify(["eval", config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, language, evalCode, reviewEvidenceFingerprint, worktreeProvenanceForCache ?? null, refProvenanceForCache ?? null]);
+			const cacheKey = JSON.stringify(["eval", config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, ctx.cwd, language, evalCode, reviewEvidenceFingerprint, worktreeProvenanceForCache ?? null, refProvenanceForCache ?? null]);
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
-			// session off, so it must hold here too, not only for bash.
-			if (matchingGrant(ctx, normalizeEvalGrantTarget(evalCode), cwd, userScopeFingerprint)) {
+			// session off, so it must hold here too, not only for bash. The
+			// session directory rides along: the grant identity is the pair the
+			// judge's cache key uses, so the payload's relative work in ctx.cwd
+			// is authorized only in the workspace the human was shown.
+			if (matchingGrant(ctx, normalizeEvalGrantTarget(evalCode), cwd, userScopeFingerprint, ctx.cwd)) {
 				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, grant: "session" });
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: replay.layer, why: "session grant", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+					logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: replay.layer, why: "session grant", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields(), ...spawnField });
 					return;
 				}
 			}
@@ -4633,9 +5764,13 @@ export default function (pi: ExtensionAPI) {
 			// prior refusal. The record tells the model; the SAFE branch below
 			// stops trusting a bare SAFE for a refused target.
 			const prior = priorRefusalFor(ctx, evalCode, cwd, reviewEvidenceFingerprint);
-			const recordExtras: Record<string, unknown> = prior
-				? { priorRefusal: { target: prior.normalizedTarget, why: prior.why, when: new Date(prior.ts).toISOString() } }
-				: {};
+			const recordExtras: Record<string, unknown> = {
+				// The judge is told which directory the payload named for itself,
+				// because `cwd` arrives as the working directory and a spawn's own
+				// directory is a second fact about the same payload.
+				...spawnField,
+				...(prior ? { priorRefusal: { target: prior.normalizedTarget, why: prior.why, when: new Date(prior.ts).toISOString() } } : {}),
+			};
 			try {
 				let classifyError = "";
 				const judgement = cached ? withoutShadow(cached) : (await classify(ctx, evalCode, cwd, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, reviewOperatorContext, evidenceSnapshot, "code").catch(
@@ -4646,7 +5781,7 @@ export default function (pi: ExtensionAPI) {
 					},
 				));
 				if (!judgement) {
-					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", userScopeFingerprint, auditFields());
+					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", userScopeFingerprint, { ...auditFields(), ...spawnField });
 				}
 				if (!cached && judgement.verdict !== "UNAVAILABLE" && !judgement.noCache) remember(scoped, cacheKey, judgement);
 				const logCode = truncated(evalCode.replace(/\s+/gu, " ").trim(), 120);
@@ -4673,7 +5808,7 @@ export default function (pi: ExtensionAPI) {
 					if (replay.decision === "allow") {
 						// Fresh SAFE auto-run logs layer "verdict"; a replayed cached
 						// verdict logs "cached" — provenance, same allow.
-						logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
+						logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
 						return;
 					}
 					// A SAFE on a target this session already refused is not a
@@ -4686,8 +5821,8 @@ export default function (pi: ExtensionAPI) {
 						flagList.length > 0
 							? `classifier-safe but flags: ${flagList.join(", ")}`
 							: replay.why;
-					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
-					return await requestPermission(ctx, target, "flagged for approval", why, "eval", flagList.length > 0 ? "follows verdict" : "despite prior refusal", userScopeFingerprint, { ...auditFields(), ...judgementAudit(judgement) });
+					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
+					return await requestPermission(ctx, target, "flagged for approval", why, "eval", flagList.length > 0 ? "follows verdict" : "despite prior refusal", userScopeFingerprint, { ...auditFields(), ...judgementAudit(judgement), ...spawnField });
 				}
 				const detail =
 					judgement.verdict === "UNSAFE"
@@ -4712,6 +5847,7 @@ export default function (pi: ExtensionAPI) {
 					...(judgement.jev ? { jev: judgement.jev } : {}),
 					...auditFields(),
 					...judgementAudit(judgement),
+					...spawnField,
 				});
 				// A refusal record (issue #30) needs a verdict that judged the
 				// content, and with Jev that means UNSAFE outright: UNSURE is
@@ -4722,10 +5858,26 @@ export default function (pi: ExtensionAPI) {
 				if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
 					addRefusal(ctx, evalCode, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
 				}
-				return await requestPermission(ctx, target, detail, judgement.reason, "eval", "follows verdict", userScopeFingerprint, { ...auditFields(), ...judgementAudit(judgement) });
+				// The dialog is offered the still-running judgment, with the guards
+				// a late SAFE would still have to clear (see GuardedLateJudgement): the
+				// same `prior` and spawn-scan flags the SAFE branch above judges with,
+				// and the spawn cwd the payload declared (issue #14).
+				return await requestPermission(
+					ctx,
+					target,
+					detail,
+					judgement.reason,
+					"eval",
+					"follows verdict",
+					userScopeFingerprint,
+					{ ...auditFields(), ...judgementAudit(judgement), ...spawnField },
+					judgement.late === undefined
+						? undefined
+						: { handle: judgement.late, priorRefusal: prior, riskFlags: evalRiskFlags(evalCode) },
+				);
 			} catch (err) {
 				pi.logger.error(`classifier: ${err instanceof Error ? err.message : String(err)}`);
-				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "internal-error", why: "classifier failed; eval code not run", cmd: evalCode, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "internal-error", why: "classifier failed; eval code not run", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields(), ...spawnField });
 				return {
 					block: true,
 					reason: refusalPayload(
@@ -4886,7 +6038,7 @@ export default function (pi: ExtensionAPI) {
 			const worktreeProvenanceForCache = measureGitWorktreeProvenance(cwd);
 			const refProvenanceForCache = measureGitRefProvenance(command, cwd);
 			const cacheKey = JSON.stringify([
-				config.typesafeModel, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, command,
+				config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, command,
 				reviewEvidenceFingerprint,
 				pushProvenanceForCache ?? null,
 				worktreeProvenanceForCache ?? null,
@@ -5189,7 +6341,22 @@ export default function (pi: ExtensionAPI) {
 			if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
 				addRefusal(ctx, command, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
 			}
-			return await requestPermission(ctx, target, detail, judgement.reason, "bash", "follows verdict", userScopeFingerprint, { ...auditFields(), ...judgementAudit(judgement) });
+			// The dialog is offered the still-running judgment, with the guards a
+			// late SAFE would still have to clear (see GuardedLateJudgement): the
+			// same `prior` and overlay the SAFE branch above judges with.
+			return await requestPermission(
+				ctx,
+				target,
+				detail,
+				judgement.reason,
+				"bash",
+				"follows verdict",
+				userScopeFingerprint,
+				{ ...auditFields(), ...judgementAudit(judgement) },
+				judgement.late === undefined
+					? undefined
+					: { handle: judgement.late, priorRefusal: prior, riskFlags: matchModerateRiskTokens(command, cwd) },
+			);
 		} catch (err) {
 			// Unexpected plugin error: fail closed rather than wave the command
 			// through on a path we cannot vouch for.
