@@ -396,6 +396,25 @@ describe("a judgment that answers after its deadline (issue #62)", () => {
 		expect(lines.map(line => line.layer)).toEqual(["verdict", "late-verdict", "dialog"]);
 		expect(lines[2].why).toBe("approved by user (unavailable → late SAFE)");
 	});
+	test("a late SAFE cannot dismiss a dialog for a flagged script body", async () => {
+		seq += 1;
+		const bodyFile = path.join(dir, `late-body-${seq}.sh`);
+		fs.writeFileSync(bodyFile, `rm -rf ./late-body-${seq}\n`);
+		const { dialog, tool } = await timeoutRun(`bash ${bodyFile}`, `late-body-guard-${seq}`, [jevSafeAnswer()], LATE_ANSWER_MS);
+
+		jest.advanceTimersByTime(20);
+		await until(() => lateLines().length > 0);
+
+		expect(dialog.state()).toBe("open");
+		expect(lateLines()[0]).toMatchObject({
+			decision: "block",
+			layer: "late-verdict",
+			verdict: "SAFE",
+			why: "unavailable → late SAFE: dialog kept open — classifier-safe but flags: rm",
+		});
+		dialog.answer(ALLOW_ONCE);
+		expect(await tool).toBeUndefined();
+	});
 
 	test("a late SAFE cannot dismiss a dialog for a target this session refused", async () => {
 		seq += 1;

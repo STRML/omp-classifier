@@ -138,6 +138,17 @@ describe("the body decides, wherever the file lives", () => {
 		expect(refusalOf(result).why).toContain("flags: rm");
 	});
 
+	test("redirected stdin carries the same body risk as an on-disk script", async () => {
+		writeScript(root, "installer", HARMFUL_SHELL);
+		const onDisk = await gate("bash installer");
+		expect(refusalOf(onDisk).why).toContain("flags: rm");
+
+		for (const command of ["bash < installer", "bash -s < installer"]) {
+			const redirected = await gate(command);
+			expect(refusalOf(redirected).why).toContain("flags: rm");
+		}
+	});
+
 	test("a runner subcommand's file is read", async () => {
 		writeScript(root, "x.ts", "rm -rf ./out\n");
 		const result = await gate("bun run x.ts");
@@ -267,6 +278,79 @@ describe("the reader itself", () => {
 		expect(read.refusal?.why).toContain("review limit");
 		expect(read.text).toBe("python3 probe.py");
 		expect(read.bodies).toEqual([]);
+	});
+});
+
+describe("redirected stdin", () => {
+	test("a redirected file is read as the interpreter body", () => {
+		writeScript(root, "installer", HARMFUL_SHELL);
+		for (const command of ["bash < installer", "bash -s < installer"]) {
+			const read = readInterpretedScriptBodies(command, root, 8000);
+			expect(read.refusal).toBeNull();
+			expect(read.bodies.map(body => body.operand)).toEqual(["installer"]);
+			expect(read.text).toContain("rm -rf ./out");
+		}
+	});
+
+	test("an expanded target is refused rather than guessed", () => {
+		const read = readInterpretedScriptBodies("bash < $INSTALLER", root, 8000);
+		expect(read.refusal?.why).toContain("expands $INSTALLER");
+		expect(read.bodies).toEqual([]);
+	});
+
+	test("a missing redirected file is refused", () => {
+		const read = readInterpretedScriptBodies("bash < missing-installer", root, 8000);
+		expect(read.refusal?.why).toContain("missing-installer");
+	});
+});
+
+describe("wrapper option arity", () => {
+	test("env -u consumes its value before locating the interpreter", async () => {
+		writeScript(root, "payload.py", HARMFUL_CODE);
+		const result = await gate("env -u FOO python3 payload.py");
+		expect(refusalOf(result).why).toContain("flags: python3 runs payload.py");
+		expect(String(stateOf(0).command)).toContain("subprocess.run(");
+	});
+
+	test("env --unset consumes its separated value", () => {
+		writeScript(root, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies("env --unset FOO python3 payload.py", root, 8000);
+		expect(read.refusal).toBeNull();
+		expect(read.bodies.map(body => body.operand)).toEqual(["payload.py"]);
+	});
+
+	test("an unknown env option makes the command opaque", () => {
+		writeScript(root, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies("env --unknown-option VALUE python3 payload.py", root, 8000);
+		expect(read.refusal?.why).toContain("unknown env option");
+		expect(read.bodies).toEqual([]);
+	});
+
+	test("an unknown timeout option makes the command opaque", () => {
+		writeScript(root, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies("timeout --unknown-option 5s python3 payload.py", root, 8000);
+		expect(read.refusal?.why).toContain("unknown timeout option");
+		expect(read.bodies).toEqual([]);
+	});
+});
+
+describe("heredocs inside shell script bodies", () => {
+	test("a body that writes and runs a heredoc payload is refused", async () => {
+		writeScript(root, "payload.sh", "cat <<'EOF' > x.sh\nrm -rf ./out\nEOF\nbash x.sh\n");
+		const result = await gate("bash payload.sh");
+		const payload = refusalOf(result);
+		expect(payload.layer).toBe("script-body");
+		expect(payload.why).toContain("heredoc");
+		expect(modelCalls.length).toBe(0);
+	});
+
+	test("a body that pipes a heredoc to an interpreter is refused", async () => {
+		writeScript(root, "payload.sh", "cat <<'EOF' | bash\nrm -rf ./out\nEOF\n");
+		const result = await gate("bash payload.sh");
+		const payload = refusalOf(result);
+		expect(payload.layer).toBe("script-body");
+		expect(payload.why).toContain("heredoc");
+		expect(modelCalls.length).toBe(0);
 	});
 });
 
@@ -688,5 +772,145 @@ describe("sibling commands of this fix stay as they were", () => {
 		// The human approved the text the gate judged, body included: the dialog
 		// renders target.command, and that is the spliced text.
 		expect(dialogText(ctx)).toContain("rm -rf ./out");
+	});
+});
+describe("the remaining wrapper and stdin boundaries", () => {
+	test("timeout consumes the duration after an option terminator", () => {
+		writeScript(root, "installer", HARMFUL_SHELL);
+		const commands = [
+			"timeout 5s bash < installer",
+			"timeout -- 5s bash < installer",
+			"timeout -k 2s 5s bash < installer",
+			"timeout -k2s -- 5s bash < installer",
+		];
+		for (const command of commands) {
+			const read = readInterpretedScriptBodies(command, root, 8000);
+			expect({ command, refusal: read.refusal, operands: read.bodies.map(body => body.operand), text: read.text }).toEqual({
+				command,
+				refusal: null,
+				operands: ["installer"],
+				text: expect.stringContaining("rm -rf ./out"),
+			});
+		}
+	});
+
+	test("stdin follows a file descriptor opened before it is duplicated", () => {
+		writeScript(root, "installer", HARMFUL_SHELL);
+		for (const command of ["bash 3< installer <&3", "bash 3< installer 0<&3"]) {
+			const read = readInterpretedScriptBodies(command, root, 8000);
+			expect({ command, refusal: read.refusal, operands: read.bodies.map(body => body.operand), text: read.text }).toEqual({
+				command,
+				refusal: null,
+				operands: ["installer"],
+				text: expect.stringContaining("rm -rf ./out"),
+			});
+		}
+		for (const command of ["bash 3< installer", "bash 3<&-", "bash 0<&-"]) {
+			const read = readInterpretedScriptBodies(command, root, 8000);
+			expect({ refusal: read.refusal, bodies: read.bodies }).toEqual({ refusal: null, bodies: [] });
+		}
+	});
+
+	test("an unresolved stdin descriptor refuses instead of skipping script input", () => {
+		const read = readInterpretedScriptBodies("bash <&3", root, 8000);
+		expect(read.refusal).not.toBeNull();
+		expect(read.refusal?.why ?? "").toContain("stdin");
+	});
+
+	test("env chdir resolves interpreter operands from its child directory", () => {
+		const subdir = path.join(root, "subdir");
+		fs.mkdirSync(subdir);
+		writeScript(subdir, "payload.py", HARMFUL_CODE);
+		const commands = [
+			"env -C subdir python3 payload.py",
+			"env -Csubdir python3 payload.py",
+			"env --chdir subdir python3 payload.py",
+			"env --chdir=subdir python3 payload.py",
+		];
+		for (const command of commands) {
+			const read = readInterpretedScriptBodies(command, root, 8000);
+			expect({ command, refusal: read.refusal, operands: read.bodies.map(body => body.operand), text: read.text }).toEqual({
+				command,
+				refusal: null,
+				operands: ["payload.py"],
+				text: expect.stringContaining("subprocess.run("),
+			});
+		}
+		const dynamic = readInterpretedScriptBodies("env -C $SUBDIR python3 payload.py", root, 8000);
+		expect(dynamic.refusal?.why).toContain("working directory");
+	});
+
+	test("env chdir does not relocate shell-owned stdin redirects", () => {
+		fs.mkdirSync(path.join(root, "subdir"));
+		writeScript(root, "installer", HARMFUL_SHELL);
+		const read = readInterpretedScriptBodies("env -C subdir bash < installer", root, 8000);
+		expect({ refusal: read.refusal, operands: read.bodies.map(body => body.operand), text: read.text }).toEqual({
+			refusal: null,
+			operands: ["installer"],
+			text: expect.stringContaining("rm -rf ./out"),
+		});
+	});
+
+	test("the last env chdir option replaces earlier options from the original cwd", () => {
+		const subdir = path.join(root, "subdir");
+		fs.mkdirSync(subdir);
+		writeScript(subdir, "payload.py", 'print("first chdir")\n');
+		writeScript(root, "payload.py", 'print("last chdir")\n');
+		const read = readInterpretedScriptBodies("env -C subdir -C . python3 payload.py", root, 8000);
+		expect(read.bodies.map(body => body.body)).toEqual(['print("last chdir")\n']);
+	});
+
+	test("xargs retains stdin as its argument stream with its own options", () => {
+		writeScript(root, "installer", HARMFUL_SHELL);
+		for (const command of [
+			"xargs bash -s < installer",
+			"xargs -n 1 bash -s < installer",
+			"xargs -n1 bash -s < installer",
+			"xargs -I '{}' bash -s < installer",
+			"xargs -I{} bash -s < installer",
+		]) {
+			const read = readInterpretedScriptBodies(command, root, 8000);
+			expect({ command, refusal: read.refusal, bodies: read.bodies, text: read.text }).toEqual({
+				command,
+				refusal: null,
+				bodies: [],
+				text: command,
+			});
+		}
+	});
+});
+
+describe("syntax-only interpreter modes do not execute file contents", () => {
+	test("shell and Python syntax checks do not append non-executed source bodies", () => {
+		writeScript(root, "installer", HARMFUL_SHELL);
+		writeScript(root, "payload.py", HARMFUL_CODE);
+		for (const command of ["bash -n < installer", "sh -n < installer", "bash -n installer", "sh -n installer", "python -m py_compile payload.py"]) {
+			const read = readInterpretedScriptBodies(command, root, 8000);
+			expect({ command, refusal: read.refusal, bodies: read.bodies, text: read.text }).toEqual({
+				command,
+				refusal: null,
+				bodies: [],
+				text: command,
+			});
+		}
+	});
+
+	test("ruby -c does not append its syntax-checked file", () => {
+		const command = "ruby -c payload.rb";
+		writeScript(root, "payload.rb", 'system("rm -rf ./out")\n');
+		const read = readInterpretedScriptBodies(command, root, 8000);
+		expect({ refusal: read.refusal, bodies: read.bodies, text: read.text }).toEqual({ refusal: null, bodies: [], text: command });
+	});
+
+	test("node --check skips only its main file and keeps executable preloads", () => {
+		writeScript(root, "payload.js", 'console.log("main ran");\n');
+		writeScript(root, "preload.js", 'console.log("preload ran");\n');
+		const command = "node --check payload.js";
+		const read = readInterpretedScriptBodies(command, root, 8000);
+		expect({ refusal: read.refusal, bodies: read.bodies, text: read.text }).toEqual({ refusal: null, bodies: [], text: command });
+		const withPreload = readInterpretedScriptBodies("node --check --require preload.js payload.js", root, 8000);
+		expect(withPreload.refusal).toBeNull();
+		expect(withPreload.bodies.map(body => body.operand)).toEqual(["preload.js"]);
+		expect(withPreload.text).toContain('console.log("preload ran")');
 	});
 });

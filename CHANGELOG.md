@@ -4,6 +4,12 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-26
 
+### Judged script-body reader (#132)
+
+- The late-SAFE guard now checks the same `judgedCommand` text as the verdict, including spliced script-body risk flags. Files redirected into interpreters are read as code; unreadable or expanded stdin targets fail closed. Recognized wrappers consume options from per-wrapper arity tables, and unknown options make the command opaque.
+- Shell-script bodies containing here-documents or here-strings are refused rather than scanned as executed text: the reader cannot safely distinguish inert input data from a nested payload that the script later runs.
+- The reader follows `timeout --`'s duration, `env -C`'s child directory for interpreter operands, and literal stdin descriptor copies; shell-opened redirects remain relative to the shell's cwd. It does not treat `xargs` argument input or a syntax-checked main file as executed code; unknown descriptor flows and unresolvable `env` directories fail closed. Node preloads remain scanned under `--check`, and Perl `-c` remains scanned because compile-time blocks can run.
+
 ### Provenance measurement fixes (#133)
 
 - Named-user tilde paths (`~user/...`) now remain unmeasured instead of being resolved under the current user's home. This applies to script operands, `cd` directory walks, and Docker compose `--config` paths.

@@ -174,7 +174,7 @@ The state can carry an `evidence` object whose fields have different authors, an
 - **Spawn-bearing eval code only.** Expression-only eval passes unread, and the payload scan is a marker list: string-splitting evasion gets through. The spawn-cwd scan reads the `cwd`/`chdir` forms the issue lists; a quoted option key (`{"cwd": …}`), a Ruby `"chdir" => …` hash key, and an alias it cannot follow all leave the spawn reading as "no cwd", so the session directory stands. `hub op: "start"` and other exec-tier tools still auto-run under `yolo`. An attacker who picks the tool picks around this.
 - **Later handlers win.** Another extension's `tool_call` handler can revise the command after this one judges it; the host applies the last revision. Input-mutating extensions alongside this plugin are unsupported.
 - **Internal-URL working directories are blocked.** `skill://` and similar cwds expand from session state the plugin cannot see. Pass the resolved filesystem path.
-- **Command contents are not inspected.** `npm test` and `make` are judged as the routine commands they look like. Package scripts and hooks go unread.
+- **Arbitrary command contents are not inspected.** The gate reads script bodies for recognized interpreter operands and literal redirected stdin, but does not resolve package scripts or hooks: `npm test` and `make` are judged as the commands they look like.
 - **Refusal memory is session-local.** A refused action follows reworded commands within that session only and dies with it; subagent inheritance is a host gap (`parentAgentId` is not exposed to extensions).
 
 ## Privacy
