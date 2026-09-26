@@ -10,6 +10,8 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 - Shell-script bodies containing here-documents or here-strings are refused rather than scanned as executed text: the reader cannot safely distinguish inert input data from a nested payload that the script later runs.
 - The reader follows `timeout --`'s duration, `env -C`'s child directory for interpreter operands, and literal stdin descriptor copies; shell-opened redirects remain relative to the shell's cwd. It does not treat `xargs` argument input or a syntax-checked main file as executed code; unknown descriptor flows and unresolvable `env` directories fail closed. Node preloads remain scanned under `--check`, and Perl `-c` remains scanned because compile-time blocks can run.
 
+- Short-option bundles that include shell `-n` or Ruby `-c` are recognized as syntax-only (`bash/sh -vn`, `ruby -wc`), so their main-file bodies are not appended; Perl `-c` remains scanned because compilation can execute `BEGIN` blocks.
+
 ### Provenance measurement fixes (#133)
 
 - Named-user tilde paths (`~user/...`) now remain unmeasured instead of being resolved under the current user's home. This applies to script operands, `cd` directory walks, and Docker compose `--config` paths.

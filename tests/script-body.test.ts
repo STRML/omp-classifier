@@ -884,7 +884,6 @@ describe("syntax-only interpreter modes do not execute file contents", () => {
 	test("syntax-only modes, including bundled short flags, do not append non-executed source bodies", () => {
 		writeScript(root, "installer", HARMFUL_SHELL);
 		writeScript(root, "payload.py", HARMFUL_CODE);
-		writeScript(root, "payload.pl", 'print "executed\\n";\n');
 		writeScript(root, "payload.rb", 'puts "executed"\n');
 		for (const command of [
 			"bash -n < installer",
@@ -893,9 +892,7 @@ describe("syntax-only interpreter modes do not execute file contents", () => {
 			"sh -n installer",
 			"bash -vn installer",
 			"sh -vn installer",
-			"perl -cw payload.pl",
 			"ruby -wc payload.rb",
-			"perl -c payload.pl",
 			"python -m py_compile payload.py",
 		]) {
 			const read = readInterpretedScriptBodies(command, root, 8000);
@@ -906,6 +903,14 @@ describe("syntax-only interpreter modes do not execute file contents", () => {
 				text: command,
 			});
 		}
+	});
+
+	test("Perl syntax checks retain source that may execute during compilation", () => {
+		const body = 'BEGIN { system("echo compile-time") }\nprint "runtime";\n';
+		writeScript(root, "payload.pl", body);
+		const read = readInterpretedScriptBodies("perl -cw payload.pl", root, 8000);
+		expect(read.refusal).toBeNull();
+		expect(read.bodies.map(entry => entry.body)).toEqual([body]);
 	});
 
 	test("ruby -c does not append its syntax-checked file", () => {

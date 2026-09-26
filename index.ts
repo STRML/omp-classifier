@@ -1928,7 +1928,7 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	python: { inline: /^-c$|^--command$/u, value: /^-W$|^-X$|^-Q$|^--check-hash-based-pycs$/u, stdinFlag: false },
 	// perl: `-e`/`-E` are code; `-I dir` (library path) and `-F pattern` are
 	// values; `-s` is switch parsing, `-c` is a syntax check.
-	perl: { inline: /^-e$|^-E$|^--eval$/u, syntaxOnly: /^-c$/u, value: /^-I$|^-F$|^-M$|^-m$/u, stdinFlag: false },
+	perl: { inline: /^-e$|^-E$|^--eval$/u, value: /^-I$|^-F$|^-M$|^-m$/u, stdinFlag: false },
 	// ruby: `-e` is code; `-I dir` (load path) and `-E enc`/`-W level` are
 	// settings; `-c` is a syntax check, `-s` switch parsing.
 	ruby: { inline: /^-e$|^--eval$/u, syntaxOnly: /^-c$/u, value: /^-I$|^-E$/u, stdinFlag: false },
