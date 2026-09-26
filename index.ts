@@ -113,12 +113,16 @@ import {
 	JEV_POLICY_VERSION,
 	jevQuestionsHash,
 	type GitPushProvenance,
+	type GitRefProvenance,
+	type GitWorktreeProvenance,
 	type JevHazard,
 	type JevPolicy,
 	type JevAnswers,
 	type JevVerdict,
 	type NetworkProvenance,
 	measureGitPushProvenance,
+	measureGitRefProvenance,
+	measureGitWorktreeProvenance,
 	measureNetworkProvenance,
 } from "./jev";
 
@@ -4756,6 +4760,8 @@ export default function (pi: ExtensionAPI) {
 			timeoutMs: number;
 			operatorContext?: string;
 			pushProvenance?: GitPushProvenance;
+			worktreeProvenance?: GitWorktreeProvenance;
+			refProvenance?: GitRefProvenance[];
 			networkProvenance?: NetworkProvenance;
 			recordExtras: Record<string, unknown>;
 		},
@@ -4799,6 +4805,8 @@ export default function (pi: ExtensionAPI) {
 					...userEvidence,
 					...(input.operatorContext ? { operatorContext: input.operatorContext } : {}),
 					...(input.pushProvenance !== undefined ? { gitPushProvenance: input.pushProvenance } : {}),
+					...(input.worktreeProvenance !== undefined ? { gitWorktreeProvenance: input.worktreeProvenance } : {}),
+					...(input.refProvenance !== undefined ? { gitRefProvenance: input.refProvenance } : {}),
 					...(input.networkProvenance !== undefined ? { networkProvenance: input.networkProvenance } : {}),
 					...(Object.keys(input.recordExtras).length > 0 ? { extra: input.recordExtras } : {}),
 				}),
@@ -4904,12 +4912,34 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			pushProvenance = undefined;
 		}
+		// Gate-measured worktree geometry (issue #69 slice C). Three side-effect
+		// free plumbing calls in the target cwd; a cwd outside any working tree
+		// (or a bare repository) leaves it undefined and the state carries no
+		// geometry — the criteria then read the command's paths alone.
+		let worktreeProvenance: GitWorktreeProvenance | undefined;
+		try {
+			worktreeProvenance = measureGitWorktreeProvenance(cwd);
+		} catch {
+			worktreeProvenance = undefined;
+		}
+		// Gate-measured ref state (issue #69 slice D): whether a branch delete
+		// would orphan its commits, whether a path restore has anything to
+		// discard, what a rebase would replay onto. Read-only plumbing; a command
+		// that is none of the three shapes leaves it undefined and the criteria
+		// read the syntax alone.
+		let refProvenance: GitRefProvenance[] | undefined;
+		try {
+			refProvenance = measureGitRefProvenance(command, cwd);
+		} catch {
+			refProvenance = undefined;
+		}
 		// Gate-measured network provenance (issue #65), measured the same way
 		// and in the same tier: the command's own URLs and remote-verb
 		// destinations looked up in THIS machine's own naming (SSH config,
-		// hosts file, compose file, docker port table). A command that names
-		// no destination this machine knows yields undefined and the state
-		// carries no field — absent is "nothing measured", never "trusted".
+		// hosts file, compose file, docker config and docker port table). A
+		// command that names no destination this machine knows yields undefined
+		// and the state carries no field — absent is "nothing measured", never
+		// "trusted".
 		let networkProvenance: NetworkProvenance | undefined;
 		try {
 			networkProvenance = measureNetworkProvenance(command, startCwd);
@@ -4927,6 +4957,8 @@ export default function (pi: ExtensionAPI) {
 					recordExtras,
 					...(operatorContext ? { operatorContext } : {}),
 					...(pushProvenance !== undefined ? { pushProvenance } : {}),
+					...(worktreeProvenance !== undefined ? { worktreeProvenance } : {}),
+					...(refProvenance !== undefined ? { refProvenance } : {}),
 					...(networkProvenance !== undefined ? { networkProvenance } : {}),
 				})
 			: undefined;
@@ -4995,6 +5027,8 @@ export default function (pi: ExtensionAPI) {
 				...(taskEvidence?.ids.length ? { userMessageIds: taskEvidence.ids } : {}),
 				...(operatorContext ? { operatorContext } : {}),
 				...(pushProvenance !== undefined ? { gitPushProvenance: pushProvenance } : {}),
+				...(worktreeProvenance !== undefined ? { gitWorktreeProvenance: worktreeProvenance } : {}),
+				...(refProvenance !== undefined ? { gitRefProvenance: refProvenance } : {}),
 				...(networkProvenance !== undefined ? { networkProvenance } : {}),
 				...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
 			}),
@@ -5866,14 +5900,21 @@ export default function (pi: ExtensionAPI) {
 			// key: the spawn's own, which is where the judged command runs, and
 			// the session's, which is where the payload's own process still runs
 			// and reads and writes. Dropping either would let a verdict cross a
-			// directory change it never saw. The measured network tier (issue
-			// #65) is part of the input the judge read here too, so a
-			// destination that stops being this machine's own invalidates the
-			// cached verdict. (Push provenance is a bash-path measurement: this
-			// payload is not a shell command.)
+			// directory change it never saw. The measured worktree geometry
+			// rides here as it does on the bash path (issue #69 slice C): the
+			// judge read it off this cwd, so a worktree registered, removed, or
+			// detached between calls must invalidate the verdict; the measured
+			// ref state (slice D) and network tier (issue #65) ride with it too.
+			// Push provenance is a bash-path measurement: this payload is not a
+			// shell command.
+			const worktreeProvenanceForCache = measureGitWorktreeProvenance(cwd);
+			const refProvenanceForCache = measureGitRefProvenance(evalCode, cwd);
+			const networkProvenanceForCache = measureNetworkProvenance(evalCode, cwd);
 			const cacheKey = JSON.stringify([
 				"eval", config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, ctx.cwd, language, evalCode, reviewEvidenceFingerprint,
-				measureNetworkProvenance(evalCode, cwd) ?? null,
+				worktreeProvenanceForCache ?? null,
+				refProvenanceForCache ?? null,
+				networkProvenanceForCache ?? null,
 			]);
 			// Session grant (issue #32): same user-tier authorization as the bash
 			// path — "Allow for session" on this payload's dialog promised the
@@ -6201,24 +6242,23 @@ export default function (pi: ExtensionAPI) {
 			// Judge identity is the model selector plus the question battery: a
 			// verdict earned under one policy must not be reused under another.
 			// (The config signature clears the whole cache when either changes;
-			// this keeps the key honest on its own.) The judged text is the
-			// command with its script bodies spliced in (#67), so a rewrite of
-			// the file is a different question and can never ride the previous
-			// body's verdict. The measured push provenance (issue #63) and
-			// network provenance (issue #65) are what the judge read about the
-			// refs and the destinations, so a ref move, a body rewrite, or a
-			// destination that stops being this machine's own between calls
-			// must invalidate the cached verdict. Both measurements take the
-			// command's own start directory with the unmodified text, the same
-			// pairing `classify` measures with: the key describes the state the
-			// judge was asked about, and a differently-measured copy would let a
-			// cached verdict outlive the state it was earned under.
+			// this keeps the key honest on its own.) The judged text includes its
+			// spliced script bodies, so a rewrite is a different question. Every
+			// measured tier the judge reads must ride here too: a ref move, a
+			// worktree change, or a destination that stops being this machine's
+			// own invalidates the cached verdict. Push and network measurements
+			// take the command's own start directory with unmodified text; the
+			// walkers apply its `cd` chain themselves, matching `classify`.
 			const pushProvenanceForCache = measureGitPushProvenance(judgedCommand, startCwd);
+			const worktreeProvenanceForCache = measureGitWorktreeProvenance(cwd);
+			const refProvenanceForCache = measureGitRefProvenance(judgedCommand, cwd);
 			const networkProvenanceForCache = measureNetworkProvenance(judgedCommand, startCwd);
 			const cacheKey = JSON.stringify([
 				config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, judgedCommand,
 				reviewEvidenceFingerprint,
 				pushProvenanceForCache ?? null,
+				worktreeProvenanceForCache ?? null,
+				refProvenanceForCache ?? null,
 				networkProvenanceForCache ?? null,
 			]);
 			// Refusal memory (issue #30): a reworded command meets its session's

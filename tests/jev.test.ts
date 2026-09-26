@@ -341,23 +341,19 @@ describe("jevQuestionsHash", () => {
 		expect(hash).toBe(expected);
 	});
 
-	test("the jev-v2 battery is pinned byte for byte, and the one deliberate move is recorded", () => {
-		// The pin is a detector, not a promise that the text never moves: the
-		// jev-v3 shadow week measures against this baseline, so an accidental
-		// move has to show up here. It has moved twice, both deliberately and
-		// both before `jev-v2.3` was released. Once for #65: the egress and
-		// remote-endpoint criteria now name the gate-measured `networkProvenance`
-		// field. Once more for the #121 review: those same criteria no longer say
-		// a compose service this machine's compose file declares runs on this
-		// machine, because the daemon decides that, not the file. The pairs
-		// recorded here are the ones that were pinned before each move:
-		// 29ed2ae6375f9d549d7c7631589406764759f7c2a2e68e5f039be815e232d680 /
-		// 87c99bf634aa9c64 under `jev-v2.2`, and then
-		// 40377ca248dffb53114b8269d7bdd7f8899ca38c54510fba100859231282cbac /
-		// ab5086da2469c722 under the first `jev-v2.3` text.
+	test("the jev-v2 battery is pinned byte for byte until the flip", () => {
+		// The jev-v3 shadow week measures against this baseline, so every
+		// question change has to be deliberate and recorded. Main's #65/#121
+		// network criteria moved the digest/hash from the pre-network
+		// 29ed2ae6375f9d54… / 87c99bf634aa9c64 through
+		// 40377ca248dffb53… / ab5086da2469c722 to
+		// 14b1fbfbe041a60a… / 9471947eb279787d. Batch7's measured worktree
+		// and ref criteria then advanced through jev-v2.4–v2.9, ending at
+		// e9898fcfab3e211c… / 25072b90bb61e591. This merge keeps both sets of
+		// criteria; the merged jev-v2.10 digest and hash are pinned below.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("14b1fbfbe041a60ac0dee7e251930dbad8cd8b8409205fa2f2699270fad8ea25");
-		expect(jevQuestionsHash()).toBe("9471947eb279787d");
+		expect(digest).toBe("8f2645eea104daf5bb32bbadb69ee298cb78c04e14d85ad08558788a7cb7054a");
+		expect(jevQuestionsHash()).toBe("6b7ceb2369a51b21");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 

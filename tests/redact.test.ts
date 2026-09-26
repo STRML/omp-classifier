@@ -304,11 +304,11 @@ describe("redaction reaches every judge state", () => {
 		expect(entry?.targets).toContain(REDACTED);
 	});
 
-	test("the policy version records the deliberate cache invalidation", () => {
-		// v2.2 was the redaction landing this file documents; v2.3 is the
-		// network-provenance change (#65). Either way the version moves on
-		// purpose, because a cached verdict earned under the old state means
-		// something different under the new one.
-		expect(JEV_POLICY_VERSION).toBe("jev-v2.3");
+	test("the policy version marks the change", () => {
+		// The redaction change landed as jev-v2.2; the version has moved on with
+		// later changes to what a state means (the measured git tiers), which is
+		// the point of pinning it: a state read under one version means
+		// something else under the next.
+		expect(JEV_POLICY_VERSION).toBe("jev-v2.10");
 	});
 });

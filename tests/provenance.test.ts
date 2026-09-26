@@ -84,6 +84,28 @@ describe("gate-measured git push provenance (#63)", () => {
 		}
 	});
 
+	test("a compound command measures the one push it makes, and nothing when it makes two", () => {
+		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
+		const origin = join(dir, "origin.git");
+		const repo = join(dir, "repo");
+		try {
+			git(`git init -q --bare -b main ${JSON.stringify(origin)}`, dir);
+			git(`git init -q -b main ${JSON.stringify(repo)}`, dir);
+			git(`git commit -q --allow-empty -m base && git remote add origin ${JSON.stringify(origin)} && git push -q origin main`, repo);
+			// One push in the command: it is the push the record describes.
+			const after = measureGitPushProvenance("git stash push -m wip && git push origin main", repo);
+			expect(after?.forwardOnly).toBe(true);
+			// The separator is a separator: `main;` is not a ref name.
+			expect(measureGitPushProvenance("git push origin main; git status", repo)?.forwardOnly).toBe(true);
+			// Two pushes name two pairs of refs, and one measurement cannot stand
+			// in for both: the force push below would otherwise be judged by the
+			// forward-only numbers of the push before it.
+			expect(measureGitPushProvenance("git push origin main && git push --force origin side", repo)).toBeUndefined();
+			expect(measureGitPushProvenance("git push origin main; git push origin main", repo)).toBeUndefined();
+		} finally {
+			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
+		}
+	});
 	// Round 3 review, as the neighbouring spelling of the compose `--config`
 	// class: `git` runs in the command's OWN segment directory, so a `cd`
 	// before the push decides which repository is measured. Reading the

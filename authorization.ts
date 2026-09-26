@@ -19,13 +19,21 @@
  * not determine is reported as `other` rather than dropped: the model has to
  * answer over the whole command or the answer means nothing.
  *
+ * The option grammar behind the targets is the tools' own: `arity.ts` reads
+ * what each CLI says about its commands and flags, and `tools/generate-arity.ts`
+ * is how those tables are generated. What is left in this file is this
+ * repository's policy — which subcommands reach the network, which flags widen
+ * an action, what each kind means — because that is a decision no tool can
+ * answer.
+ *
  * Purity: no I/O, no clock, no module state. `summarizeActions` reads its whole
  * world from the command string.
  */
 import { createHash } from "node:crypto";
+import { toolGrammar, type FlagGrammar, type ToolGrammar } from "./arity";
 import { secretPathIn, secretStoreRead, secretVariableNames } from "./floor";
 import { REDACTED, redactSecrets } from "./redact";
-import { parseShell, type ShellCommand, type ShellWord } from "./shell-ast";
+import { parseShell, substitutionSpans, type ShellCommand, type ShellWord } from "./shell-ast";
 
 /**
  * The vocabulary. Every segment of every command lands on exactly one of these
@@ -130,10 +138,16 @@ function readsAsSentence(parts: readonly string[]): boolean {
 }
 
 /** A target as the state carries it: its own text when that text is a name, a
- *  stable hash of it when it is long, carries a word aimed at a reviewer, or is
- *  written as a sentence. The hash is unsalted on purpose — two segments naming
- *  one target have to look like one target. */
-function presentTarget(raw: string): string {
+ *  stable hash of it when it is long, carries a word aimed at a reviewer, is
+ *  written as a sentence, or is a value the shell computes at run time. The
+ *  hash is unsalted on purpose — two segments naming one target have to look
+ *  like one target.
+ *
+ *  `computed` marks a value the shell produces rather than a name the command
+ *  wrote: a substitution's own text is a command, so it is never a name
+ *  whatever its shape. Hashing it keeps command text out of the state and
+ *  still tells one computed value from another. */
+function presentTarget(raw: string, computed = false): string {
 	// Shell punctuation that rode along on the edge of a word: `"$(cat
 	// ~/.ssh/id_rsa)"` arrives as one token, and `id_rsa)` matches nothing the
 	// user wrote. A target with nothing but punctuation left, such as the `$`
@@ -155,7 +169,7 @@ function presentTarget(raw: string): string {
 	// word can carry a whole command: the tokenizer strips the quotes, so
 	// `echo "$(rm -rf build)"` handed `$(rm -rf build` straight to the model.
 	const isName =
-		value.length <= TARGET_MAX_LENGTH && !carriesCommandText && !parts.some(part => REVIEWER_WORD.test(part)) && !readsAsSentence(parts);
+		!computed && value.length <= TARGET_MAX_LENGTH && !carriesCommandText && !parts.some(part => REVIEWER_WORD.test(part)) && !readsAsSentence(parts);
 	// A secret-shaped target is redacted, never hashed: an unsalted hash of a
 	// secret lets anyone holding the state test guesses against it offline.
 	if (redactSecrets(value) !== value) return REDACTED;
@@ -178,12 +192,14 @@ interface RawAction {
 //
 // What the summary claims is narrowed on purpose (real-shell-parser plan,
 // section 2). Bash gives correct words but not option grammar: it does not
-// know that `ssh -p` takes a value, so the port is not the host. Targets are
-// named only where this repository has the grammar: git, gh and glab, the
-// delete verbs, deploy scripts, every URL host in any word, and the files a
-// redirect writes. Every other action carries `unnamed-arguments` instead of
-// a target, which costs a `goal` judgment some precision. A wrong target would
-// be an authorization argument built from a misparse.
+// know that `ssh -p` takes a value, so the port is not the host. So an option
+// grammar is read only where a tool states its own, in the generated tables
+// (`arity.ts`: npm, yarn, gh, docker, kubectl, git, brew), and by name where
+// this repository's own vocabulary reaches: the delete verbs, deploy scripts,
+// every URL host in any word, and the files a redirect writes. Every other
+// action carries `unnamed-arguments` instead of a target, which costs a `goal`
+// judgment some precision. A wrong target would be an authorization argument
+// built from a misparse.
 // ---------------------------------------------------------------------------
 
 /** Stands in for the arguments of an action whose grammar this module does
@@ -244,18 +260,168 @@ const GIT_AMBIGUOUS_SUBCOMMAND = /^(config|remote)$/u;
 const GIT_READING_FLAG = /^(--get|--get-all|--get-regexp|--get-urls|--list|-l|-v|--verbose|show)$/u;
 
 /**
- * The grammars this module has: the flags that take their value as the next
- * word. `git -C /repo push origin main` names `/repo` for the `-C`, not as the
- * subcommand, and `git push -o ci.skip origin main` pushes `main`, not a ref
- * called `ci.skip`. A verb absent from this table gets no targets from its
- * operands at all.
+ * The grammar this module reads a command with: the tool's own, from the
+ * generated tables (`arity.ts`), plus the policy that does not belong to any
+ * tool. Bash gives correct words but not option grammar — it does not know that
+ * `ssh -p` takes a value, so the port is not the host — and a hand-written table
+ * of option grammars is what #94's three review rounds kept breaking, each one in
+ * a new spelling. The tables are generated from each tool's own help and
+ * completion now, so the summary never guesses at a tool's spelling again.
+ *
+ * The tool grammar of a verb, or undefined for a command this repository has no
+ * table for (`ssh`, `./deploy.sh`, `glab`). A command spelled as a path is the
+ * tool it names: `/usr/local/bin/npm` is npm.
  */
-const FLAG_TAKING_VALUE: Record<string, RegExp> = {
-	git: /^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix)$/u,
-	"git-push": /^(-o|--push-option|--repo|--receive-pack|--exec)$/u,
-	gh: /^(-R|--repo|-F|-f|-H|--field|--raw-field|--jq|--template|-t|--title|-b|--body|--body-file|-B|--base|--head|--subject|--match-head-commit|--author-email|-X|--method)$/u,
-	glab: /^(-R|--repo)$/u,
-};
+function grammarOf(verb: string): ToolGrammar | undefined {
+	return toolGrammar(basename(verb));
+}
+
+/** One flag word, as the tool's own grammar reads it. */
+interface FlagReading {
+	/** The names this word carries into the summary. A value written into the
+	 *  same word is one: `-of` is `-o` with the value `f`, and the summary names
+	 *  what the user wrote. */
+	targets: string[];
+	/** The long name of a valued flag whose value is the NEXT word, when the
+	 *  tool's grammar says the value is separate (`gh api -X GET`). */
+	takesNext?: string;
+	/** Widening names, in the order the spellings appear, each once. */
+	widening: string[];
+}
+
+/** The name of a flag's value as a target: `method=GET`. A flag whose tool
+ *  prints no long form has no name to give the value, so the value stands on
+ *  its own (`git -C /repo` names `/repo`). */
+const valueTarget = (name: string, value: string): string => (name === "" ? value : `${name}=${value}`);
+
+/** The widening name of a long spelling, or undefined. Long spellings are policy
+ *  (`WIDENING_LONG`), not grammar: `--prod` widens a deploy script this module
+ *  has no table for at all. */
+function longWidening(word: string): string | undefined {
+	const match = WIDENING_LONG.exec(word);
+	return match === null ? undefined : match[1].replace(/-with-lease$|-if-includes$/u, "");
+}
+
+/** Read one flag word with the tool's grammar at this path. Undefined means the
+ *  grammar does not print this spelling: an unknown flag stays unclaimed, so the
+ *  action keeps saying its arguments are unnamed. */
+function readFlagWord(word: string, grammar: FlagGrammar | undefined): FlagReading | undefined {
+	if (word.startsWith("--")) {
+		const at = word.indexOf("=");
+		const spelling = at < 0 ? word : word.slice(0, at);
+		const attached = at < 0 ? undefined : word.slice(at + 1);
+		const name = grammar?.valued(spelling);
+		const widening = longWidening(word);
+		if (name === undefined && widening === undefined) return undefined;
+		return {
+			targets: attached === undefined || name === undefined ? [] : [valueTarget(name, attached)],
+			takesNext: attached === undefined ? name : undefined,
+			widening: widening === undefined ? [] : [widening],
+		};
+	}
+	// A short spelling, or a cluster of them. Splitting one needs every
+	// spelling's arity, which is the tool's own knowledge: `-fdx` is three
+	// flags, `-of` is `-o` and its value `f`, and a cluster holding a spelling
+	// the tool does not print stays unnamed.
+	const letters = [...word.slice(1)];
+	const reading: FlagReading = { targets: [], widening: [] };
+	for (let at = 0; at < letters.length; at += 1) {
+		const spelling = `-${letters[at]}`;
+		const widening = grammar?.widening(spelling);
+		if (widening !== undefined) reading.widening.push(widening);
+		const name = grammar?.valued(spelling);
+		if (name !== undefined) {
+			// A valued spelling takes the rest of the cluster as its value, and
+			// the next word when there is no rest.
+			const rest = letters.slice(at + 1).join("");
+			if (rest === "") reading.takesNext = name;
+			else reading.targets.push(valueTarget(name, rest));
+			return reading;
+		}
+		if (grammar?.boolean(spelling) !== true) return undefined;
+	}
+	return reading;
+}
+
+/** What one pass over a command's words reads. */
+interface WordWalk {
+	/** The plain words that lead the arguments, capped for the label. */
+	path: string[];
+	/** The indexes of those words. */
+	pathIndexes: number[];
+	/** The words of the path the tool's own table confirms as its commands. */
+	confirmed: string[];
+	/** Indexes of the words that are neither a flag nor a flag's value. */
+	operands: number[];
+	/** Widening names the command's flags carry, each once. */
+	widening: string[];
+}
+
+/**
+ * Read a command's words under its tool's own grammar.
+ *
+ * One pass, because each answer feeds the next: the path grows word by word and
+ * a flag's grammar is the grammar of the path it sits under. The arity the table
+ * carries is what tells `npm --silent audit` (a subcommand past a flag) from
+ * `npm --prefix foo audit` (that flag's value), and what splits `-of` into `-o`
+ * and its value rather than reading it as a forced push.
+ *
+ * A tool with a table also anchors the path: it starts at the first word that
+ * tool's own tree confirms, so a plain word sitting before that one is an
+ * argument rather than a subcommand. A tool without a table has nothing to
+ * anchor on and every plain word leads, as it did before there were tables.
+ *
+ * Every word the walk recognizes in the tool's own grammar is claimed: the path
+ * words, the flags, and the value of a valued flag, which is named because the
+ * tool says that is what it is. Words the grammar does not know are left
+ * unclaimed on purpose: an argument the summary could not name has to keep
+ * saying it could not.
+ */
+function walkWords(words: readonly string[], taken: Taken, grammar: ToolGrammar | undefined, depth: number, from = 1): WordWalk {
+	const path: string[] = [];
+	const pathIndexes: number[] = [];
+	const confirmed: string[] = [];
+	const operands: number[] = [];
+	const widening: string[] = [];
+	for (let index = from; index < words.length; index += 1) {
+		const word = words[index];
+		// Past `--` every word is an operand, flags included.
+		if (word === "--") {
+			for (let rest = index + 1; rest < words.length; rest += 1) operands.push(rest);
+			break;
+		}
+		if (word.startsWith("-") && word !== "-") {
+			const reading = readFlagWord(word, grammar?.flags(path));
+			if (reading === undefined) continue;
+			taken.set(index, reading.targets.length === 0 ? undefined : reading.targets[0]);
+			for (const name of reading.widening) if (!widening.includes(name)) widening.push(name);
+			if (reading.takesNext !== undefined) {
+				// The value is the next word, whatever it looks like: the tool's
+				// own grammar said this flag takes one.
+				const value = words[index + 1];
+				if (value !== undefined && value !== "--") {
+					taken.set(index + 1, valueTarget(reading.takesNext, value));
+					index += 1;
+				}
+			}
+			continue;
+		}
+		operands.push(index);
+		if (path.length >= depth || !SUBCOMMAND_WORD.test(word)) continue;
+		const parent = path.slice();
+		const names = grammar === undefined || grammar.names(parent, word) === true;
+		// With a tool's own tree, the path starts where that tree says a command
+		// is: a plain word before the first of them is an argument, and
+		// `npm --prefix pkg install` installs. Without a tree there is nothing
+		// to anchor on, so every plain word leads, as it always did.
+		if (grammar !== undefined && confirmed.length === 0 && !names) continue;
+		path.push(word);
+		pathIndexes.push(index);
+		taken.set(index, undefined);
+		if (names) confirmed.push(word);
+	}
+	return { path, pathIndexes, confirmed, operands, widening };
+}
 
 /** A deploy, publish or release step, recognized by the name of the thing being
  *  run. Phase 4 reads script bodies; until then the name is all there is, and a
@@ -264,25 +430,10 @@ const FLAG_TAKING_VALUE: Record<string, RegExp> = {
 const DEPLOY_NAME = /^(deploy|publish|release|ship)/u;
 const DEPLOY_SCRIPT = /(deploy|publish|release)[^/]*\.(sh|ts|js|mjs|py|rb)$/u;
 /** Flags that widen an action, worth carrying into the summary because the user
- *  has to have asked for the wide version. */
+ *  has to have asked for the wide version. Policy, not grammar: a tool's own
+ *  long name for a short spelling is what `walkWords` reads, and this list says
+ *  which of those names widen. */
 const WIDENING_LONG = /^--(admin|force|force-with-lease|force-if-includes|no-verify|hard|prod|production|yes|all|mirror|delete|delete-branch|tags|prune)(=.*)?$/u;
-
-/**
- * Short widening spellings, per grammar. A short flag's meaning is its tool's
- * own: `-f` is force to `git push`, a config file to `git config`, a field to
- * `gh api`. So a short spelling counts only where this table says what it
- * means, and everywhere else it is an unnamed argument.
- */
-type ShortWidening = ReadonlyArray<readonly [RegExp, string]>;
-const NO_SHORT: ShortWidening = [];
-/** Exact spellings only. A cluster such as `-fdx` could carry a flag that
- *  takes a value (`git push -of` is `-o f`), and splitting one needs each
- *  flag's arity, so a cluster is an unnamed argument. */
-const SHORT_WIDENING: Record<string, ShortWidening> = {
-	"git-push": [[/^-f$/u, "force"], [/^-d$/u, "delete"]],
-	"git-clean": [[/^-f$/u, "force"]],
-	"gh-pr-merge": [[/^-d$/u, "delete"]],
-};
 
 /** CLIs whose first words are a subcommand path: `kubectl delete pod`, `aws s3
  *  rm`, `npm publish`, `docker push`. Their path is what separates a read from
@@ -311,7 +462,9 @@ function classifyCommand(command: ShellCommand, tainted: readonly string[]): Raw
 	// A redirect belongs to the command, not to the verb's arguments, and the
 	// parser keeps them apart: `rm -rf build > log` deletes build and writes log.
 	const outputs = command.redirects.filter(redirect => redirect.direction !== "in" && !redirect.duplicate && redirect.target.value !== "/dev/null");
-	if (outputs.length > 0) actions.push({ kind: "write", targets: outputs.map(redirect => redirect.target.value) });
+	if (outputs.length > 0) {
+		actions.push(withComputedValues({ kind: "write", targets: outputs.map(redirect => redirect.target.value) }, outputs.map(redirect => redirect.target)));
+	}
 	// `[[ … ]]` and `(( … ))` evaluate and print nothing.
 	if (command.expression !== undefined) return [...actions, { kind: "read", targets: [] }];
 	// An assignment with no command, or a compound's redirect carrier, has no
@@ -324,9 +477,34 @@ function classifyCommand(command: ShellCommand, tainted: readonly string[]): Raw
 	// store read has already named it. Privilege does NOT stand in for it:
 	// `sudo frobnicate` must still report the verb nobody recognized.
 	const namedBySecret = actions.some(action => action.kind === "secret-read");
-	if (!(main.kind === "other" && namedBySecret)) actions.push(main);
+	if (!(main.kind === "other" && namedBySecret)) actions.push(withComputedValues(main, words));
 	actions.push(...inPlaceWrites(words));
 	return actions;
+}
+
+/**
+ * An action plus the values the command computes rather than names: the text of
+ * every `$(…)`, `<(...)` and backtick substitution in `words`, read from the
+ * parsed AST, rendered as a hash.
+ *
+ * `curl $(cat url.txt)` reaches a host only that file names, and the summary
+ * said nothing about the value at all: a word the verb's grammar claimed was
+ * dropped once `presentTarget` refused it (`rm -rf $(cat list.txt)` reported a
+ * delete with no targets, and `curl https://$(cat host.txt)/x` a network action
+ * with no targets), and elsewhere it was covered by `unnamed-arguments` with no
+ * way to tell one computed value from another. That is #95's first residual: a
+ * value the model could not see was a value the model could not judge. The host
+ * is still not named — no summary reads the file — but the value is now a
+ * target, and two commands that compute different values read differently.
+ *
+ * The text of a substitution is a command, so it is hashed rather than named: it
+ * never enters the state as prose, and one substitution still hashes the same
+ * way twice. Quoting is the parser's to decide, so a `'$(cat url.txt)'` the
+ * shell never runs contributes nothing.
+ */
+function withComputedValues(action: RawAction, words: readonly ShellWord[]): RawAction {
+	const computed = words.flatMap(word => substitutionSpans(word.source)).map(span => presentTarget(span, true)).filter(target => target !== "");
+	return computed.length === 0 ? action : { kind: action.kind, targets: [...action.targets, ...computed] };
 }
 
 /** `sed -i` and `yq -i` rewrite the files they were handed. The program itself
@@ -416,59 +594,6 @@ function unnamedTargets(words: readonly string[]): string[] {
 	return claimTargets(words, new Map());
 }
 
-/** Positions of a command's operands under a grammar this module has, from
- *  `from` on. A flag in `valued` takes the next word; past `--`, every word
- *  is an operand. */
-function operandIndexes(words: readonly string[], valued: RegExp | undefined, from = 1): number[] {
-	const found: number[] = [];
-	for (let index = from; index < words.length; index += 1) {
-		const word = words[index];
-		if (word === "--") return [...found, ...words.map((_, at) => at).slice(index + 1)];
-		if (!word.startsWith("-") || word === "-") {
-			found.push(index);
-			continue;
-		}
-		// `--flag=value` carries its own value; only the spaced form eats the
-		// next word.
-		if (valued?.test(word) && !word.includes("=")) index += 1;
-	}
-	return found;
-}
-
-/** Every widening flag from `from` on, long spellings always and short ones
- *  only as `short` defines them, each name once. Their positions are marked
- *  taken, and the names are returned for claimTargets to place. */
-function takeWidening(words: readonly string[], short: ShortWidening, taken: Taken, from = 1): string[] {
-	const names: string[] = [];
-	for (let index = from; index < words.length; index += 1) {
-		if (taken.has(index)) continue;
-		const long = WIDENING_LONG.exec(words[index]);
-		const name = long !== null ? long[1].replace(/-with-lease$|-if-includes$/u, "") : short.find(([pattern]) => pattern.test(words[index]))?.[1];
-		if (name === undefined) continue;
-		taken.set(index, undefined);
-		if (!names.includes(name)) names.push(name);
-	}
-	return names;
-}
-
-/**
- * A subcommand CLI's path: the verb and the plain words that lead its
- * arguments, up to two: `kubectl-delete-pod`, `npm-audit`. The first flag
- * ends it. Past a flag, whether the next word is a subcommand or that flag's
- * value is the CLI's own grammar (`npm --prefix foo audit`), which this
- * module does not have. So `npm --silent audit` names only `npm`, and its
- * arguments are marked unnamed (plan section 2, "Opposed requests").
- */
-function subcommandPath(words: readonly string[], taken: Taken): string[] {
-	const path: string[] = [];
-	for (let index = 1; index < words.length && path.length < SUBCOMMAND_DEPTH; index += 1) {
-		if (!SUBCOMMAND_WORD.test(words[index])) break;
-		path.push(words[index]);
-		taken.set(index, undefined);
-	}
-	return path;
-}
-
 function urlHosts(words: readonly string[]): string[] {
 	return words.flatMap(word => {
 		const match = URL.exec(word);
@@ -504,28 +629,37 @@ function classifyVerb(command: readonly ShellWord[]): RawAction {
  *  complete: every flag is accounted for and every operand is a path. */
 function pathDeleteTargets(words: readonly string[]): string[] {
 	const taken: Taken = new Map();
-	const operands = operandIndexes(words, undefined);
+	const operands = walkWords(words, taken, undefined, 0).operands;
 	for (let index = 1; index < words.length; index += 1) taken.set(index, operands.includes(index) ? words[index] : undefined);
 	return claimTargets(words, taken);
 }
 
-/** A subcommand CLI. `network` lists the subcommands that reach the network;
- *  undefined means every one does. Only long widening spellings count here:
- *  `-f` is force to `docker rm` and a manifest to `kubectl delete`. */
+/**
+ * A subcommand CLI. `network` lists the subcommands that reach the network;
+ *  undefined means every one does.
+ *
+ * Which word decides the kind is the tool's own grammar where the table has it:
+ * `yarn npm publish` publishes, because yarn's own tree says `publish` sits
+ * under `npm`, and `npm run publish` runs a local script called publish,
+ * because npm's tree says `run` has no children. A tool with no table keeps the
+ * first-subcommand-word rule, and only long widening spellings count for the
+ * rest, because `-f` is force to one tool and a filename to another.
+ */
 function subcommandAction(words: readonly string[], network: RegExp | undefined): RawAction {
 	const taken: Taken = new Map();
-	const path = subcommandPath(words, taken);
-	// The first subcommand word decides: `npm run publish` runs a local script
-	// called publish, and `publish` in second place is its name.
-	const kind: ActionKind = network === undefined || network.test(path[0] ?? "") ? "network" : "run-code";
-	const widening = takeWidening(words, NO_SHORT, taken);
-	return { kind, targets: [[basename(words[0]), ...path].join("-"), ...claimTargets(words, taken, widening)] };
+	const grammar = grammarOf(words[0]);
+	const walk = walkWords(words, taken, grammar, SUBCOMMAND_DEPTH);
+	const species = grammar === undefined ? walk.path[0] : walk.confirmed[walk.confirmed.length - 1];
+	const kind: ActionKind = network === undefined || network.test(species ?? "") ? "network" : "run-code";
+	return { kind, targets: [[basename(words[0]), ...walk.path].join("-"), ...claimTargets(words, taken, walk.widening)] };
 }
 
 function gitAction(words: readonly string[]): RawAction {
 	const taken: Taken = new Map();
-	const args = operandIndexes(words, FLAG_TAKING_VALUE.git);
-	const subIndex = args[0];
+	// git's own grammar: the root flags and their values come first, and what
+	// follows them is the subcommand.
+	const walk = walkWords(words, taken, grammarOf(words[0]), 1);
+	const subIndex = walk.operands[0];
 	const sub = subIndex === undefined ? "" : words[subIndex];
 	if (subIndex !== undefined) taken.set(subIndex, sub === "push" ? undefined : `git-${sub}`);
 	// A bare `git push` names no ref: the remote and branch come from the
@@ -533,11 +667,10 @@ function gitAction(words: readonly string[]): RawAction {
 	// name in the summary that the command never said. The widening rides
 	// along, because `git push origin main --force` is a different request.
 	if (sub === "push") {
-		for (const index of operandIndexes(words, FLAG_TAKING_VALUE["git-push"], subIndex + 1)) taken.set(index, words[index]);
-		const widening = takeWidening(words, SHORT_WIDENING["git-push"], taken, subIndex + 1);
-		return { kind: "git-publish", targets: claimTargets(words, taken, widening) };
+		for (const index of walk.operands.slice(1)) taken.set(index, words[index]);
+		return { kind: "git-publish", targets: claimTargets(words, taken, walk.widening) };
 	}
-	const rest = args.slice(1);
+	const rest = walk.operands.slice(1);
 	if (sub === "branch" && words.some(word => /^(-d|-D|--delete)$/u.test(word))) {
 		// `-D` deletes a branch that was never merged, which is the widening.
 		taken.set(subIndex, undefined);
@@ -550,8 +683,7 @@ function gitAction(words: readonly string[]): RawAction {
 	// Past the subcommand, git's per-subcommand grammar is not one this module
 	// has: refs, paths and flags are unnamed, and the widening is named, so
 	// `git reset --hard` and `git clean -fdx` are not a plain reset and clean.
-	const widening = takeWidening(words, SHORT_WIDENING[`git-${sub}`] ?? NO_SHORT, taken, (subIndex ?? 0) + 1);
-	const targets = claimTargets(words, taken, widening);
+	const targets = claimTargets(words, taken, walk.widening);
 	if (GIT_NETWORK_SUBCOMMAND.test(sub)) return { kind: "network", targets };
 	if (GIT_AMBIGUOUS_SUBCOMMAND.test(sub)) {
 		const reading = words.some(word => GIT_READING_FLAG.test(word)) || rest.length === 0;
@@ -564,23 +696,19 @@ function gitAction(words: readonly string[]): RawAction {
 
 function ghAction(words: readonly string[], verb: string): RawAction {
 	const taken: Taken = new Map();
-	const args = operandIndexes(words, FLAG_TAKING_VALUE[verb]);
-	const [first, second] = [args[0], args[1]].map(index => (index === undefined ? "" : words[index]));
+	const walk = walkWords(words, taken, grammarOf(verb), SUBCOMMAND_DEPTH);
+	const [first, second] = [walk.operands[0], walk.operands[1]].map(index => (index === undefined ? "" : words[index]));
 	if (first === "pr" && second === "merge") {
-		taken.set(args[0], undefined);
-		taken.set(args[1], undefined);
-		for (const index of args.slice(2)) if (/^\d+$/u.test(words[index])) taken.set(index, words[index]);
-		const widening = takeWidening(words, SHORT_WIDENING["gh-pr-merge"], taken);
-		return { kind: "merge", targets: claimTargets(words, taken, widening) };
+		taken.set(walk.operands[0], undefined);
+		taken.set(walk.operands[1], undefined);
+		for (const index of walk.operands.slice(2)) if (/^\d+$/u.test(words[index])) taken.set(index, words[index]);
+		return { kind: "merge", targets: claimTargets(words, taken, walk.widening) };
 	}
 	// `gh repo view` and `gh repo delete` are opposite requests, so the
 	// subcommand path is named to its second word.
-	const depth = SUBCOMMAND_WORD.test(second) ? 2 : 1;
-	const pathIndexes = args.slice(0, depth);
-	pathIndexes.forEach((index, at) => taken.set(index, at === 0 ? [verb, ...pathIndexes.map(i => words[i])].join("-") : undefined));
-	const widening = takeWidening(words, NO_SHORT, taken);
-	const targets = claimTargets(words, taken, widening);
-	return { kind: "network", targets: pathIndexes.length === 0 ? [verb, ...targets] : targets };
+	if (walk.pathIndexes.length > 0) taken.set(walk.pathIndexes[0], [verb, ...walk.path].join("-"));
+	const targets = claimTargets(words, taken, walk.widening);
+	return { kind: "network", targets: walk.pathIndexes.length === 0 ? [verb, ...targets] : targets };
 }
 
 /** `find` and `fd` run other commands when asked, and `find` deletes when
@@ -598,11 +726,11 @@ function findAction(words: readonly string[], verb: string): RawAction {
  *  flags are the script's grammar, so only long widening spellings count. */
 function deployTargets(words: readonly string[], verb: string): string[] {
 	const taken: Taken = new Map();
-	const argument = operandIndexes(words, undefined)[0];
+	const walk = walkWords(words, taken, undefined, 0);
+	const argument = walk.operands[0];
 	if (argument !== undefined) taken.set(argument, words[argument]);
-	const widening = takeWidening(words, NO_SHORT, taken);
-	const targets = claimTargets(words, taken, widening);
-	const named = argument !== undefined || widening.length > 0;
+	const targets = claimTargets(words, taken, walk.widening);
+	const named = argument !== undefined || walk.widening.length > 0;
 	return named ? targets : [verb.replace(/\.(sh|ts|js|mjs|py|rb)$/u, ""), ...targets];
 }
 
@@ -617,7 +745,7 @@ function collect(raw: readonly RawAction[]): ActionSummaryEntry[] {
 		let count = 0;
 		let overflow = 0;
 		for (const action of mine) {
-			const presented = action.targets.map(presentTarget).filter(target => target.length > 0);
+			const presented = action.targets.map(target => presentTarget(target)).filter(target => target.length > 0);
 			// One classified action is one action, however many targets it
 			// names. Counting targets turned `git push origin main` into two
 			// publishes and `gh pr merge 42 --admin` into two merges, which
