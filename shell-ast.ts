@@ -216,6 +216,8 @@ export interface ShellWord {
 	variables: string[];
 	/** True when the word contains a command substitution. */
 	substitution: boolean;
+	/** UTF-16 source offset of this word, matching JavaScript string indexes. */
+	offset?: number;
 	/**
 	 * The commands whose output this word takes in, through `$(…)` or `<(…)`.
 	 * Only the substitution's own level: a command nested deeper hangs off a
@@ -595,7 +597,7 @@ function readWord(word: any, source: string, out: ShellCommand[]): ShellWord {
 	// One walk per word visits each node once, as one walk per call did: the
 	// words of a call are disjoint subtrees.
 	const commands = collectSubstitutions(word, source, out);
-	return { source: sliceOf(word, source), value, alternate, literal: flags.literal, variables, substitution: flags.substitution, commands };
+	return { source: sliceOf(word, source), offset: stringIndexAt(source, word.Pos().Offset()), value, alternate, literal: flags.literal, variables, substitution: flags.substitution, commands };
 }
 
 /**
@@ -677,14 +679,30 @@ interface ParserRange {
 	End(): { Offset(): number };
 }
 
+/** Convert the parser's UTF-8 byte offset to the string index used by callers. */
+function stringIndexAt(source: string, offset: number): number {
+	if (sourceBytes(source).ascii) return offset;
+	let bytes = 0;
+	let index = 0;
+	while (bytes < offset) {
+		const codePoint = source.codePointAt(index);
+		if (codePoint === undefined) return index;
+		bytes += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+		index += codePoint > 0xffff ? 2 : 1;
+	}
+	return index;
+}
+
+/** A node's start, as a string index, or undefined when the offset cannot be
+ *  trusted. Both sides of the merge added this conversion; the loop above is
+ *  main's, and these two wrappers keep this branch's callers on one
+ *  implementation instead of a second copy. */
 function sourceOffsetOf(node: unknown, source: string): number | undefined {
 	try {
 		const offset = (node as ParserRange).Pos().Offset();
 		const view = sourceBytes(source);
 		if (!Number.isInteger(offset) || offset < 0 || (view.bytes !== undefined && offset > view.bytes.byteLength)) return undefined;
-		if (view.ascii) return offset;
-		const bytes = view.bytes as Uint8Array;
-		return Buffer.from(bytes.buffer, bytes.byteOffset, offset).toString("utf8").length;
+		return stringIndexAt(source, offset);
 	} catch {
 		return undefined;
 	}
@@ -695,9 +713,7 @@ function sourceEndOffsetOf(node: unknown, source: string): number | undefined {
 		const offset = (node as ParserRange).End().Offset();
 		const view = sourceBytes(source);
 		if (!Number.isInteger(offset) || offset < 0 || (view.bytes !== undefined && offset > view.bytes.byteLength)) return undefined;
-		if (view.ascii) return offset;
-		const bytes = view.bytes as Uint8Array;
-		return Buffer.from(bytes.buffer, bytes.byteOffset, offset).toString("utf8").length;
+		return stringIndexAt(source, offset);
 	} catch {
 		return undefined;
 	}

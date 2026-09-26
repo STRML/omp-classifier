@@ -134,6 +134,23 @@ describe("gate-measured git push provenance (#63)", () => {
 			for (const dir of [session, target]) execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
 		}
 	});
+	test("a heredoc push word does not steer the executable push repository", async () => {
+		const session = mkdtempSync(join(tmpdir(), "jev63-heredoc-session-"));
+		const repoB = mkdtempSync(join(tmpdir(), "jev63-heredoc-b-"));
+		const repoC = mkdtempSync(join(tmpdir(), "jev63-heredoc-c-"));
+		try {
+			git("git init -q -b main && git commit -q --allow-empty -m base && git update-ref refs/remotes/origin/main HEAD && git commit -q --allow-empty -m local", repoB);
+			git("git init -q -b main && git commit -q --allow-empty -m base && git checkout -q --detach HEAD && git commit -q --allow-empty -m remote-only && git update-ref refs/remotes/origin/main HEAD && git checkout -q main && git commit -q --allow-empty -m local-only", repoC);
+			const command = `echo "漢字"; cd ${repoB}; cat <<'EOF'\ngit push origin main\nEOF\ncd ${repoC}; git push origin main --force`;
+			expect(measureGitPushProvenance(command, session)).toMatchObject({ ahead: 1, behind: 1, forwardOnly: false });
+			await loadPlugin(makeSettings([]));
+			setJevAnswer(jevSafeAnswer());
+			await fire("tool_call", makeEvent(command), makeCtx({ sessionId: "prov-heredoc-offset", cwd: session }));
+			expect(stateOf(0).gitPushProvenance).toMatchObject({ ahead: 1, behind: 1, forwardOnly: false });
+		} finally {
+			for (const dir of [session, repoB, repoC]) execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
+		}
+	});
 });
 
 // Round 4 review, as the caller half of the same class: the handler resolves a
