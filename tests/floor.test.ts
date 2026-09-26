@@ -514,6 +514,64 @@ describe("the floor reads the parser's view (plan 2026-09-22-real-shell-parser.m
 		}
 	});
 
+	test("active globs survive mixed quoting and parameter defaults", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-active-glob-"));
+		try {
+			fs.writeFileSync(path.join(cwd, ".env"), "token");
+			expect([
+				evaluateFloor({ command: 'cat ".e"*', cwd }).asks,
+				evaluateFloor({ command: "cat ${SAFE:-.e*}", cwd }).asks,
+				evaluateFloor({ command: 'cat ".e*"', cwd }).asks,
+			]).toEqual([true, true, false]);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a nested command substitution resolves after its own cd", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-nested-cwd-"));
+		try {
+			const secret = path.join(cwd, ".aws");
+			const nested = path.join(cwd, "nested");
+			fs.mkdirSync(secret);
+			fs.mkdirSync(nested);
+			fs.writeFileSync(path.join(secret, "credentials"), "token");
+			fs.symlinkSync(path.join(secret, "credentials"), path.join(nested, "notes.txt"));
+			expect(evaluateFloor({ command: 'echo "$(cd nested && cat notes.txt)"', cwd }).asks).toBe(true);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("shell operands keep leading dash, at-sign, and quoted tilde literal", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-literal-operands-"));
+		try {
+			const secret = path.join(cwd, ".aws");
+			fs.mkdirSync(secret);
+			fs.writeFileSync(path.join(secret, "credentials"), "token");
+			for (const operand of ["-notes", "@notes.txt", "~notes"]) {
+				fs.symlinkSync(path.join(secret, "credentials"), path.join(cwd, operand));
+			}
+			expect([
+				evaluateFloor({ command: "cat -- -notes", cwd }).asks,
+				evaluateFloor({ command: "cat @notes.txt", cwd }).asks,
+				evaluateFloor({ command: 'cat "~notes"', cwd }).asks,
+			]).toEqual([true, true, true]);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a glob scan beyond its entry bound asks without scanning the directory", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-glob-bound-"));
+		try {
+			for (let index = 0; index < 257; index += 1) fs.writeFileSync(path.join(cwd, `entry-${index}`), "ordinary");
+			expect(evaluateFloor({ command: "cat no-match-*", cwd }).asks).toBe(true);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("a parser-resolved path and readable symlink reach the secret-file check", () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-symlink-"));
 		try {

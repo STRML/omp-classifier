@@ -690,6 +690,19 @@ function sourceOffsetOf(node: unknown, source: string): number | undefined {
 	}
 }
 
+function sourceEndOffsetOf(node: unknown, source: string): number | undefined {
+	try {
+		const offset = (node as ParserRange).End().Offset();
+		const view = sourceBytes(source);
+		if (!Number.isInteger(offset) || offset < 0 || (view.bytes !== undefined && offset > view.bytes.byteLength)) return undefined;
+		if (view.ascii) return offset;
+		const bytes = view.bytes as Uint8Array;
+		return Buffer.from(bytes.buffer, bytes.byteOffset, offset).toString("utf8").length;
+	} catch {
+		return undefined;
+	}
+}
+
 function sliceOf(node: unknown, source: string): string {
 	try {
 		const range = node as ParserRange; // untyped parser AST, per the interface note above
@@ -760,6 +773,45 @@ export function substitutionSpans(text: string): string[] {
 		return true;
 	});
 	return spans;
+}
+
+export interface ShellSubstitutionRange {
+	start: number;
+	innerStart: number;
+	innerEnd: number;
+	end: number;
+}
+
+/** Source offsets for executed substitutions, in outer-before-inner order. */
+export function shellSubstitutionRanges(text: string): ShellSubstitutionRange[] {
+	if (!/\$\(|`|<\(/u.test(text)) return [];
+	let tree: unknown;
+	try {
+		tree = parse(text);
+	} catch {
+		return [];
+	}
+	const ranges: ShellSubstitutionRange[] = [];
+	try {
+		walk(tree, (node: unknown) => {
+			if (!node) return true;
+			const type = nodeType(node);
+			if (type !== "CmdSubst" && type !== "ProcSubst") return true;
+			const start = sourceOffsetOf(node, text);
+			const end = sourceEndOffsetOf(node, text);
+			if (start === undefined || end === undefined) return true;
+			const source = sliceOf(node, text);
+			const opening = source.startsWith("$(") || source.startsWith("<(") ? 2 : source.startsWith("`") ? 1 : 0;
+			const closing = source.endsWith(")") || source.endsWith("`") ? 1 : 0;
+			if (opening === 0 || closing === 0 || end - start < opening + closing) return true;
+			ranges.push({ start, innerStart: start + opening, innerEnd: end - closing, end });
+			return true;
+		});
+	} catch {
+		return [];
+	}
+	ranges.sort((a, b) => a.start - b.start || b.end - a.end);
+	return ranges;
 }
 
 /**

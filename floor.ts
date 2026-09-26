@@ -276,10 +276,13 @@ function commandSecrets(command: ShellCommand, scan: SecretScan): string[] {
 
 	const printed = storeReads(command);
 	const headerSink = HTTP_CLIENT.test(trustedVerb(command));
+	let afterEndOfOptions = false;
 	command.words.forEach((word, index) => {
+		const allowDashLeadingPath = afterEndOfOptions;
+		if (index > 0 && word.value === "--") afterEndOfOptions = true;
 		if (envIndexes.includes(index)) return;
 		const sink = wordSink(command.words[index - 1]?.value ?? "", word.value, headerSink);
-		for (const label of wordSecrets(word, scan, true, currentCwd ?? undefined)) {
+		for (const label of wordSecrets(word, scan, true, currentCwd ?? undefined, allowDashLeadingPath)) {
 			if (sink === "body") report(scan, `${label} reaches a request body or upload`);
 			else if (sink === "header" && tracing) report(scan, `${label} under a tracing flag, which prints every expansion`);
 			else if (sink === "output") printed.push(label);
@@ -338,13 +341,13 @@ function storeReads(command: ShellCommand): string[] {
 }
 
 /** Every secret a word carries, including what its substitutions print. */
-function wordSecrets(word: ShellWord, scan: SecretScan, paths: boolean, cwd?: string): string[] {
+function wordSecrets(word: ShellWord, scan: SecretScan, paths: boolean, cwd?: string, allowDashLeadingPath = false): string[] {
 	const labels: string[] = STORE_READS.filter(([pattern]) => pattern.test(word.value)).map(([, label]) => label);
 	const live = [...scan.tainted, ...scan.captured];
 	for (const name of secretVariableNames(word, live)) {
 		labels.push(live.includes(name) ? `the captured secret in $${name}` : `the secret-named variable $${name}`);
 	}
-	const filePath = paths ? secretPathIn(word) ?? resolvedSecretPathIn(word, cwd) : undefined;
+	const filePath = paths ? secretPathIn(word) ?? resolvedSecretPathIn(word, cwd, allowDashLeadingPath) : undefined;
 	if (filePath !== undefined) labels.push(`the secret file ${filePath}`);
 	for (const command of word.commands) labels.push(...commandSecrets(command, scan));
 	return labels;
@@ -357,7 +360,117 @@ function redirectSecrets(redirect: ShellRedirect, scan: SecretScan, cwd?: string
 	// `<>` opens its target for reading too, so it is read like `<`.
 	if (redirect.direction === "out") return wordSecrets(redirect.target, scan, false, cwd);
 	if (redirect.body !== undefined) return wordSecrets(redirect.body, scan, false, cwd);
-	return wordSecrets(redirect.target, scan, !redirect.here, cwd);
+	return wordSecrets(redirect.target, scan, !redirect.here, cwd, true);
+}
+
+/** Resolve file spellings supplied by the shell parser. Active pathname
+ *  metacharacters are checked in source so quoting and escaping stay intact. */
+function resolvedSecretPathIn(word: ShellWord, cwd: string | undefined, allowDashLeadingPath = false): string | undefined {
+	if (cwd === undefined) return undefined;
+	for (const text of word.literal ? [word.value] : [word.alternate]) {
+		const candidates = expandBraces(text);
+		if (candidates === undefined) continue;
+		for (const candidate of candidates) {
+			const glob = (candidate.includes("*") || candidate.includes("?") || candidate.includes("[")) && hasActivePathGlob(word.source);
+			const resolved = glob
+				? oneGlobMatch(candidate, cwd, word, allowDashLeadingPath)
+				: shellPath(candidate, cwd, word, allowDashLeadingPath);
+			if (resolved === null) return candidate;
+			if (resolved !== undefined && readableSecretFile(resolved)) return candidate;
+		}
+	}
+	return undefined;
+}
+
+/** True when pathname metacharacters occur outside shell quotes and escapes. */
+function hasActivePathGlob(source: string): boolean {
+	let quote: "'" | '"' | undefined;
+	for (let index = 0; index < source.length; index += 1) {
+		const ch = source[index];
+		if (quote === "'") {
+			if (ch === "'") quote = undefined;
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === "\\" && index + 1 < source.length) {
+				const next = source[index + 1];
+				if (next === '"' || next === "\\" || next === "$" || next === "`") index += 1;
+				continue;
+			}
+			if (ch === '"') quote = undefined;
+			continue;
+		}
+		if (ch === "\\") {
+			index += 1;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			continue;
+		}
+		if (ch === "*" || ch === "?" || ch === "[") return true;
+	}
+	return false;
+}
+
+/** A fixed cap bounds synchronous directory work per path-resolution attempt. */
+const MAX_GLOB_SCAN_ENTRIES = 256;
+
+/** Match a simple basename glob; recursive and directory-glob scans stay text-only. */
+function oneGlobMatch(pattern: string, cwd: string, word: ShellWord, allowDashLeadingPath: boolean): string | null | undefined {
+	if (pattern.includes("**") || /(?:^|\/)[!@+?*]\(/u.test(pattern)) return undefined;
+	const absolute = shellPath(pattern, cwd, word, allowDashLeadingPath);
+	if (absolute === null) return null;
+	if (absolute === undefined) return undefined;
+	const directory = path.dirname(absolute);
+	const basename = path.basename(absolute);
+	if (basename === "" || directory.includes("*") || directory.includes("?") || directory.includes("[")) return undefined;
+	try {
+		const matcher = new Bun.Glob(basename);
+		const entries = fs.opendirSync(directory);
+		try {
+			let match: string | undefined;
+			let scanned = 0;
+			while (scanned < MAX_GLOB_SCAN_ENTRIES) {
+				const entry = entries.readSync();
+				if (entry === null) return match;
+				scanned += 1;
+				if (!basename.startsWith(".") && entry.name.startsWith(".")) continue;
+				if (!matcher.match(entry.name)) continue;
+				try {
+					if (!fs.statSync(path.join(directory, entry.name)).isFile()) continue;
+				} catch {
+					continue;
+				}
+				if (match !== undefined) return undefined;
+				match = path.join(directory, entry.name);
+			}
+			// A lookahead distinguishes a complete scan of 256 entries from
+			// a directory whose unexamined remainder must remain unresolved.
+			return entries.readSync() === null ? match : null;
+		} finally {
+			try {
+				entries.closeSync();
+			} catch {
+				// Closing after an early exit does not change the resolution result.
+			}
+		}
+	} catch {
+		return undefined;
+	}
+}
+
+function shellPath(candidate: string, cwd: string, word: ShellWord, allowDashLeadingPath: boolean): string | null | undefined {
+	if (candidate.length === 0 || (!allowDashLeadingPath && candidate.startsWith("-"))) return undefined;
+	try {
+		if (candidate.startsWith("~") && word.source.startsWith("~")) {
+			if (candidate !== "~" && !candidate.startsWith("~/")) return null;
+			return resolveToCwd(candidate, cwd);
+		}
+		return path.resolve(cwd, candidate);
+	} catch {
+		return undefined;
+	}
 }
 
 type WordSink = "body" | "header" | "output";
@@ -471,61 +584,6 @@ export function secretPathIn(word: ShellWord): string | undefined {
 		}
 	}
 	return undefined;
-}
-
-/** Resolve only file spellings the shell-ast view makes available. Globs are
- *  limited to a literal pattern in one static, nonrecursive directory and only
- *  when exactly one readable file matches. Parameter values come from
- *  `alternate`, never from simulated assignments or language-specific parsing. */
-function resolvedSecretPathIn(word: ShellWord, cwd: string | undefined): string | undefined {
-	if (cwd === undefined) return undefined;
-	for (const text of word.literal ? [word.value] : [word.alternate]) {
-		const candidates = expandBraces(text);
-		if (candidates === undefined) continue;
-		for (const candidate of candidates) {
-			const hasGlob = hasPathGlob(candidate);
-			if (hasGlob && !word.literal) continue;
-			const glob = word.literal && word.source === word.value && hasGlob;
-			const resolved = glob ? oneGlobMatch(candidate, cwd) : shellPath(candidate, cwd);
-			if (resolved !== undefined && readableSecretFile(resolved)) return candidate;
-		}
-	}
-	return undefined;
-}
-
-function hasPathGlob(candidate: string): boolean {
-	return candidate.includes("*") || candidate.includes("?") || candidate.includes("[");
-}
-
-/** Match a simple basename glob; recursive and directory-glob scans stay text-only. */
-function oneGlobMatch(pattern: string, cwd: string): string | undefined {
-	if (pattern.includes("**") || /(?:^|\/)[!@+?*]\(/u.test(pattern)) return undefined;
-	const absolute = shellPath(pattern, cwd);
-	if (absolute === undefined) return undefined;
-	const directory = path.dirname(absolute);
-	const basename = path.basename(absolute);
-	if (basename === "" || hasPathGlob(directory)) return undefined;
-	try {
-		let match: string | undefined;
-		for (const candidate of new Bun.Glob(basename).scanSync({ cwd: directory, absolute: true, dot: basename.startsWith("."), onlyFiles: true })) {
-			if (match !== undefined) return undefined;
-			match = candidate;
-		}
-		return match;
-	} catch {
-		return undefined;
-	}
-}
-
-function shellPath(candidate: string, cwd: string): string | undefined {
-	if (candidate.length === 0 || candidate.startsWith("-")) return undefined;
-	const withoutPrefix = candidate.replace(/^@/u, "");
-	if (withoutPrefix.length === 0) return undefined;
-	try {
-		return resolveToCwd(withoutPrefix, cwd);
-	} catch {
-		return undefined;
-	}
 }
 
 function readableSecretFile(file: string): boolean {

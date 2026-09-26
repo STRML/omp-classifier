@@ -1,21 +1,19 @@
 /**
- * The text-level shell model two readers share: which text the shell actually
- * runs, and where each of its command segments runs.
+ * The text-level working-directory model shared by the gate's readers.
  *
- * `shell-ast.ts` answers questions about a command through `mvdan-sh` and owns
- * that parser. This module answers the two text questions the gate needs before
- * an AST is even useful, and it owns no parser:
+ * `shell-ast.ts` owns mvdan-sh and provides the source ranges of executed
+ * substitutions. This module owns the cwd walk and uses those ranges to enter
+ * nested shell text without guessing which parentheses are syntax.
  *
  * 1. `maskHeredocBodiesAndAnsiSpans` — the text the shell reads as COMMANDS.
  *    A heredoc body is data, and an ANSI-C or unclosed quote span swallows the
- *    rest of a line-oriented scan, so both are blanked (length-preserving, so
- *    offsets still address the original command).
- * 2. `shellWalk` / `segmentWorkingDirectories` / `segmentCwdAt` — where each
- *    top-level segment runs. The join around a segment decides whether a `cd`
- *    reaches it, and a directory the text cannot pin is `null`, never a guess.
+ *    rest of a line-oriented scan, so both are blanked without shifting offsets.
+ * 2. `shellWalk` / `segmentWorkingDirectories` / `segmentCwdAt` — where shell
+ *    segments run. Joins decide whether a `cd` reaches the next segment; a
+ *    directory the text cannot pin is `null`, never a guess.
  *
- * Both readers used to answer question 2 for themselves, and both were wrong in
- * a spelling the other had already fixed: the script-body reader learned to
+ * Both readers used to answer cwd question for themselves, and both were wrong
+ * in a spelling the other had already fixed: the script-body reader learned to
  * apply the command's own `cd` chain per segment while the network tier still
  * resolved a relative `--config` against the command's starting directory, and
  * the walk itself read heredoc body lines as commands unless the caller masked
@@ -32,6 +30,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { shellSubstitutionRanges, type ShellSubstitutionRange } from "./shell-ast";
 
 /** A word carrying one of these is expanded by the shell before the reader
  *  ever sees it, so the path it names is not readable text. `{` and `[` are
@@ -645,7 +644,7 @@ export interface ShellSegmentDirectory {
  * leave the shell exactly where the command started. The conditional segment
  * only doubts the directory when running it could have changed it.
  */
-function walkedDirectories(events: ShellWalkEvent[], base: string, resolveCwd: CwdResolver): ShellSegmentDirectory[] {
+function walkedDirectories(events: ShellWalkEvent[], base: string | null, resolveCwd: CwdResolver): ShellSegmentDirectory[] {
 	const walked: ShellSegmentDirectory[] = [];
 	// The directories the next segment can start in, when it runs.
 	let pending: DirectorySet = [base];
@@ -759,7 +758,7 @@ export function segmentWorkingDirectories(
 	return dirs;
 }
 
-function cwdAtOffset(walked: readonly ShellSegmentDirectory[], offset: number, base: string): string | null {
+function cwdAtOffset(walked: readonly ShellSegmentDirectory[], offset: number, base: string | null): string | null {
 	let low = 0;
 	let high = walked.length;
 	while (low < high) {
@@ -791,12 +790,33 @@ export function segmentCwdAt(
 	return cwdAtOffset(walkedDirectories(shellWalk(text), base, resolveCwd), offset, base);
 }
 
-/** Build one shell walk for callers resolving several command offsets. */
+/** Build one shell walk for all command offsets, including nested substitutions. */
 export function segmentCwdLookup(
 	text: string,
 	base: string,
 	resolveCwd: CwdResolver = defaultCwdResolver,
 ): (offset: number) => string | null {
-	const walked = walkedDirectories(shellWalk(text), base, resolveCwd);
-	return offset => cwdAtOffset(walked, offset, base);
+	const rootWalked = walkedDirectories(shellWalk(text), base, resolveCwd);
+	const allWalked = [...rootWalked];
+	const contexts: Array<{ range: ShellSubstitutionRange; base: string | null; walked: ShellSegmentDirectory[] }> = [];
+	for (const range of shellSubstitutionRanges(text)) {
+		let parent: (typeof contexts)[number] | undefined;
+		for (let index = contexts.length - 1; index >= 0; index -= 1) {
+			const context = contexts[index];
+			if (context.range.innerStart <= range.start && range.end <= context.range.innerEnd) {
+				parent = context;
+				break;
+			}
+		}
+		const parentBase = parent === undefined ? base : parent.base;
+		const parentWalked = parent?.walked ?? rootWalked;
+		const offset = parent === undefined ? range.start : range.start - parent.range.innerStart;
+		const inheritedCwd = cwdAtOffset(parentWalked, offset, parentBase);
+		const inner = text.slice(range.innerStart, range.innerEnd);
+		const nestedWalked = walkedDirectories(shellWalk(inner), inheritedCwd, resolveCwd);
+		for (const segment of nestedWalked) allWalked.push({ start: range.innerStart + segment.start, cwd: segment.cwd });
+		contexts.push({ range, base: inheritedCwd, walked: nestedWalked });
+	}
+	allWalked.sort((a, b) => a.start - b.start);
+	return offset => cwdAtOffset(allWalked, offset, base);
 }
