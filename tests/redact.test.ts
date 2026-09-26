@@ -304,7 +304,11 @@ describe("redaction reaches every judge state", () => {
 		expect(entry?.targets).toContain(REDACTED);
 	});
 
-	test("the policy version marks the change", () => {
-		expect(JEV_POLICY_VERSION).toBe("jev-v2.2");
+	test("the policy version records the deliberate cache invalidation", () => {
+		// v2.2 was the redaction landing this file documents; v2.3 is the
+		// network-provenance change (#65). Either way the version moves on
+		// purpose, because a cached verdict earned under the old state means
+		// something different under the new one.
+		expect(JEV_POLICY_VERSION).toBe("jev-v2.3");
 	});
 });
