@@ -310,6 +310,39 @@ describe("what counts as the user's words", () => {
 		}
 	});
 
+	test("a fullwidth-fenced negation still cancels (NFKC must not manufacture a fence)", () => {
+		// Issue #88: NFKC ran before the inline-code stripper and mapped the
+		// fullwidth grave U+FF40 to a backtick, so the stripper then deleted
+		// the negation as "inline code".
+		expect(matched("rm -rf build", ["｀don’t｀ delete build"])).toBe(false);
+		// The other code point NFKC maps to a backtick (Greek varia U+1FEF).
+		expect(matched("rm -rf build", ["`don’t` delete build"])).toBe(false);
+		// Fullwidth double quote U+FF02 also becomes a quote under NFKC; it is
+		// not a fence marker, so the negation must survive it too.
+		expect(matched("rm -rf build", ["＂don’t＂ delete build"])).toBe(false);
+	});
+
+	test("every typographic variant the NFKC pass covered still normalizes", () => {
+		// The fix moves NFKC after the fence strippers; these enumerate the
+		// classes NFKC provided so dropping it cannot silently lose a case.
+		// Word-shape classes survive because NFKC still runs on the stripped
+		// text; the fence-marker classes are asserted not needed BEFORE the
+		// stripper (they cannot become one).
+		// Fullwidth letters: an all-fullwidth imperative still authorizes.
+		expect(matched("rm -rf build", ["delete ｔｈｅ ｂｕｉｌｄ ｎｏｗ"])).toBe(true);
+		// Fullwidth apostrophe U+FF07 still cancels.
+		expect(matched("rm -rf build", ["ｄｏｎ＇ｔ delete build"])).toBe(false);
+		// Fullwidth double quote U+FF02 (NFKC -> U+0022) is a joiner, not a
+		// fence: the words inside it still count.
+		expect(matched("rm -rf build", ["＂delete＂ build now"])).toBe(true);
+		// Fullwidth digits: NFKC folds ｖ４ to v4 inside a target name.
+		expect(matched("git branch -D release/v4", ["delete release/ｖ４"])).toBe(true);
+		// Superscripts: NFKC folds ² to 2.
+		expect(matched("rm -rf build2", ["delete build² now"])).toBe(true);
+		// Ligature ﬁ decomposes to fi.
+		expect(matched("rm -rf build", ["ﬁnally, delete build"])).toBe(true);
+	});
+
 	test("a typed apostrophe cancels the same as an ASCII one", () => {
 		// What a Mac and a phone actually type.
 		expect(matched("rm -rf build", ["don’t delete build"])).toBe(false);

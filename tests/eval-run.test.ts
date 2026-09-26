@@ -17,8 +17,19 @@
  *     for a judge without a network dependency.
  */
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DEFAULT_JEV_POLICY, deriveJevDecision, JEV_HAZARDS, type JevAnswers, type JevHazard } from "../jev";
-import { computeIntentMetrics, type Case, type Decision, type IntentSampleRow, validateCase, parseArgs } from "../eval/run";
+import {
+	computeIntentMetrics,
+	parseArgs,
+	parseJsonl,
+	type Case,
+	type Decision,
+	type IntentSampleRow,
+	validateCase,
+} from "../eval/run";
 
 const baseCase = (overrides: Partial<Case> = {}): Case => ({
 	command: "echo hi",
@@ -257,5 +268,56 @@ describe("parseArgs", () => {
 
 	test("--help still answers before any validation", () => {
 		expect(parseArgs(["--help", "--battery", ""]).help).toBe(true);
+	});
+});
+
+/**
+ * A hand-edited corpus line used to die as a bare `JSON.parse` SyntaxError
+ * naming neither the corpus file nor the line, so a one-character typo in a
+ * thousand-line file was a hunt. The loaders now share `parseJsonl`, which
+ * reports `file:line` (1-based, the real line in the file) and keeps the
+ * blank-line and trailing-newline tolerance the loaders always had.
+ */
+describe("parseJsonl — a malformed corpus line names its file and line", () => {
+	const writeCorpus = (lines: readonly string[]): string => {
+		const path = join(mkdtempSync(join(tmpdir(), "omp-corpus-")), "corpus.jsonl");
+		writeFileSync(path, lines.join("\n"));
+		return path;
+	};
+
+	test("a malformed line reports the corpus path and its 1-based line number", async () => {
+		const path = writeCorpus(['{"command":"echo ok","label":"allow","family":"f"}', "{oops, not json"]);
+		const error = await parseJsonl(path).then(
+			() => null,
+			(caught: unknown) => caught as Error,
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect(error?.message).toContain("corpus.jsonl:2:");
+		expect(error?.message).toContain(path);
+	});
+
+	test("the reported line is the real line in the file, not the index among parsed lines", async () => {
+		// Blank and whitespace-only lines are skipped, so the malformed row is the
+		// fourth line of the file but the second row parsed.
+		const path = writeCorpus(['{"command":"echo ok","label":"allow","family":"f"}', "", "   ", "{oops, not json"]);
+		const error = await parseJsonl(path).then(
+			() => null,
+			(caught: unknown) => caught as Error,
+		);
+		expect(error?.message).toContain("corpus.jsonl:4:");
+	});
+
+	test("blank lines and a trailing newline stay tolerated, and the parsed rows are unchanged", async () => {
+		const path = writeCorpus([
+			'{"command":"echo a","label":"allow","family":"f"}',
+			"",
+			"   ",
+			'{"command":"rm -rf /","label":"ask","family":"f"}',
+			"",
+		]);
+		expect(await parseJsonl(path)).toEqual([
+			{ command: "echo a", label: "allow", family: "f" },
+			{ command: "rm -rf /", label: "ask", family: "f" },
+		]);
 	});
 });

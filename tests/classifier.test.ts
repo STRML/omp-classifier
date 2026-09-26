@@ -28,9 +28,9 @@ import {
 	setJevAnswer,
 	ALLOW_ONCE,
 	removeConfigFile,
+	makeSessionId,
 } from "./fixtures";
 
-let seq = 0;
 
 beforeEach(async () => {
 	removeConfigFile();
@@ -38,10 +38,7 @@ beforeEach(async () => {
 	setJevAnswer(jevSafeAnswer());
 });
 
-const fresh = (opts: Parameters<typeof makeCtx>[0] = {}) => {
-	seq += 1;
-	return makeCtx({ sessionId: `classify-${seq}`, ...opts });
-};
+const fresh = (opts: Parameters<typeof makeCtx>[0] = {}) => makeCtx({ sessionId: makeSessionId("classify"), ...opts });
 
 const gate = async (command: string, ctxOptions: Parameters<typeof makeCtx>[0] = {}, input: Record<string, unknown> = {}) =>
 	resultText(await fire("tool_call", makeEvent(command, input), fresh(ctxOptions)));
@@ -314,6 +311,36 @@ describe("matcher unit spec", () => {
 		expect(matchModerateRiskTokens('echo "$(rm important)"')).toContain("rm");
 		expect(matchModerateRiskTokens("echo $(rm")).toContain("rm");
 		expect(matchModerateRiskTokens("`rm -rf /tmp/x`")).toContain("rm");
+	});
+
+	// Issue #119: the span scan was a quote-blind regex, so a verb inside a
+	// QUOTED, inert substitution still flagged. The parser decides where a
+	// substitution is, so `'…'` reads as data and `<(...)` is seen too.
+	test("a quoted substitution is inert; an executed one still flags", () => {
+		// Single quotes: the shell never expands these, so nothing runs.
+		expect(matchModerateRiskTokens("echo '$(rm -rf /tmp/x)'")).toEqual([]);
+		expect(matchModerateRiskTokens("echo '$(dd if=/dev/zero of=/dev/disk2)'")).toEqual([]);
+		// Double quotes and bare forms EXECUTE, which is not a judgement call.
+		expect(matchModerateRiskTokens('echo "$(rm -rf /tmp/x)"')).toEqual(["rm"]);
+		expect(matchModerateRiskTokens("echo $(rm -rf /tmp/x)")).toEqual(["rm"]);
+		expect(matchModerateRiskTokens("echo `rm -rf /tmp/x`")).toEqual(["rm"]);
+		// The graceful path: a benign span is not a risk verb.
+		expect(matchModerateRiskTokens("grep $(git rev-parse HEAD) file")).toEqual([]);
+		// Nested spans are read at every depth.
+		expect(matchModerateRiskTokens("echo $(echo $(rm -rf /tmp/x))")).toEqual(["rm"]);
+		// Process substitution is a substitution too, and it runs.
+		expect(matchModerateRiskTokens("cat <(rm -rf /tmp/x)")).toEqual(["rm"]);
+	});
+
+	// The gate on #119 found the span text itself arriving truncated once
+	// non-ASCII text preceded the substitution: the parser's byte offsets were
+	// being used as string indexes, so `echo 漢字 $(rm important)` read as
+	// `[" important"]` and flagged nothing. Same class as the quote-blindness
+	// above, one layer down, so it is pinned here too.
+	test("a flag survives non-ASCII text before the substitution", () => {
+		expect(matchModerateRiskTokens("echo 漢字 $(rm important)")).toEqual(["rm"]);
+		expect(matchModerateRiskTokens("echo 🚗💨 $(dd if=/dev/zero of=/dev/disk2)")).toEqual(["dd"]);
+		expect(matchModerateRiskTokens("echo 漢字 '$(rm -rf /tmp/x)'")).toEqual([]);
 	});
 });
 describe("rm/unlink shape scoping", () => {

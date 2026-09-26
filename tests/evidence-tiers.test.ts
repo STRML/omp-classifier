@@ -11,7 +11,7 @@
  * survive the move from the old prompt into the question battery. That is
  * what the "tier meaning" block below asserts.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { collectTaskEvidence, collectTaskEvidenceV3, collectToolEvidence, collectUserEvidence } from "../index";
 import {
 	evidenceOf,
@@ -36,6 +36,9 @@ beforeEach(async () => {
 	await loadPlugin(makeSettings([]));
 	setJevAnswer(jevSafeAnswer());
 });
+// Producer-side cleanup (issue #107): this file writes the config file, so it
+// removes it after itself instead of relying on the next consumer's reset.
+afterEach(removeConfigFile);
 
 let seq = 0;
 /** Fresh session id per test; the plugin's stores are module-level. */
