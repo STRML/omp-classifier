@@ -87,6 +87,20 @@ afterEach(() => {
 	fs.rmSync(outside, { recursive: true, force: true });
 });
 
+test("a named-user tilde operand refuses instead of passing over the program", () => {
+	const result = readInterpretedScriptBodies("python3 ~root/payload.py", root, 8000);
+	expect(result.bodies).toEqual([]);
+	expect(result.refusal).not.toBeNull();
+	expect(result.refusal?.why).toContain("shell expands ~root/payload.py");
+});
+
+test("a named-user tilde cd leaves the later program directory unknown", () => {
+	writeScript(root, "payload.py", BENIGN);
+	const result = readInterpretedScriptBodies("cd ~root; python3 payload.py", root, 8000);
+	expect(result.bodies).toEqual([]);
+	expect(result.refusal?.why).toContain("working directory");
+});
+
 describe("the body decides, wherever the file lives", () => {
 	test("a shell body carrying rm -rf is refused from the session's directory", async () => {
 		writeScript(root, "probe.sh", HARMFUL_SHELL);

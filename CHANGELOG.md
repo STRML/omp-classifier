@@ -10,6 +10,11 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 - Shell-script bodies containing here-documents or here-strings are refused rather than scanned as executed text: the reader cannot safely distinguish inert input data from a nested payload that the script later runs.
 - The reader follows `timeout --`'s duration, `env -C`'s child directory for interpreter operands, and literal stdin descriptor copies; shell-opened redirects remain relative to the shell's cwd. It does not treat `xargs` argument input or a syntax-checked main file as executed code; unknown descriptor flows and unresolvable `env` directories fail closed. Node preloads remain scanned under `--check`, and Perl `-c` remains scanned because compile-time blocks can run.
 
+### Provenance measurement fixes (#133)
+
+- Named-user tilde paths (`~user/...`) now remain unmeasured instead of being resolved under the current user's home. This applies to script operands, `cd` directory walks, and Docker compose `--config` paths.
+- Git push provenance takes the push token offset from the shell parser's executable word list, so a `push` string in a heredoc cannot steer the cwd walk to another repository. Source offsets are converted from parser UTF-8 byte positions to JavaScript string indexes.
+
 ## 2026-09-25
 
 ### Statement-scope in the certain-reach walk (#126, b7fix5)
