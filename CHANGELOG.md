@@ -2,6 +2,13 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-09-26
+
+### Provenance measurement fixes (#133)
+
+- Named-user tilde paths (`~user/...`) now remain unmeasured instead of being resolved under the current user's home. This applies to script operands, `cd` directory walks, and Docker compose `--config` paths.
+- Git push provenance takes the push token offset from the shell parser's executable word list, so a `push` string in a heredoc cannot steer the cwd walk to another repository. Source offsets are converted from parser UTF-8 byte positions to JavaScript string indexes.
+
 ## 2026-09-25
 
 ### Statement-scope in the certain-reach walk (#126, b7fix5)

@@ -36,7 +36,7 @@ import * as path from "node:path";
 /** A word carrying one of these is expanded by the shell before the reader
  *  ever sees it, so the path it names is not readable text. `{` and `[` are
  *  brace expansion and globs; a `$` or a backtick is a substitution. */
-export const SHELL_WORD_EXPANSION = /[$`*?[\]{}]/u;
+export const SHELL_WORD_EXPANSION = /^(?:~[^/]+(?:\/|$))|[$`*?[\]{}]/u;
 
 /**
  * Every `<<` in `command` the shell would read as a heredoc operator, with
