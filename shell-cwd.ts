@@ -595,6 +595,10 @@ const addDirectory = (cwds: DirectorySet, cwd: string | null): void => {
 	cwds.push(cwd);
 };
 
+/** Whether two sets name the same directories. A set is read whole, so the
+ *  order the walk built them in carries no meaning here. */
+const sameDirectories = (a: DirectorySet, b: DirectorySet): boolean => a.length === b.length && a.every(cwd => b.includes(cwd));
+
 /** Every directory either set carries, in the same shape. */
 const mergeDirectories = (a: DirectorySet, b: DirectorySet): DirectorySet => {
 	const merged: DirectorySet = [];
@@ -634,6 +638,12 @@ export interface ShellSegmentDirectory {
  * /var/tmp when it is not. The branch of a `cd` therefore runs where that `cd`
  * found the shell, and the segment after the chain inherits both paths — the
  * `&&` here gates the whole `||` chain, not the last `cd` in it.
+ *
+ * Round 4 review found the doubt asked for too often: a segment reached only
+ * when the earlier chain succeeded was treated as unpinned even when it cannot
+ * move the shell, so `: && :; python3 payload.py` refused although both `:`
+ * leave the shell exactly where the command started. The conditional segment
+ * only doubts the directory when running it could have changed it.
  */
 function walkedDirectories(events: ShellWalkEvent[], base: string, resolveCwd: CwdResolver): ShellSegmentDirectory[] {
 	const walked: ShellSegmentDirectory[] = [];
@@ -704,10 +714,16 @@ function walkedDirectories(events: ShellWalkEvent[], base: string, resolveCwd: C
 		}
 		// `;`, a newline, or the command's own end: the next segment runs
 		// whatever this one did. A segment that may not have run at all (a
-		// chain that is not continued by `&&`) leaves the directory unpinned;
-		// a branch's `combined` already carries both of its outcomes.
+		// chain that is not continued by `&&`) leaves the directory unpinned
+		// only when running it could have MOVED the shell: a segment that
+		// leaves every candidate directory where it found it (`: && :; python3
+		// payload.py` is `:; python3 payload.py` to the shell) leaves the shell
+		// in the same place whether it ran or not, so the chain's own
+		// directories still stand (round 4 review). A segment that moves — and
+		// whose move may therefore not have happened — keeps the doubt. A
+		// branch's `combined` already carries both of its outcomes.
 		const conditional = event.join === "on-success" || event.join === "on-failure";
-		pending = conditional && !isBranch ? [null] : combined;
+		pending = conditional && !isBranch && !sameDirectories(from, after) ? [null] : combined;
 	}
 	return walked;
 }

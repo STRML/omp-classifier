@@ -594,6 +594,38 @@ describe("the directory the shell will be in", () => {
 		expect(read.bodies.map(b => b.operand)).toEqual(["payload.py"]);
 		expect(read.text).toContain('print("scratch probe ok")');
 	});
+
+	// Round 4 review: the doubt was asked for too often. A `&&` arm may not
+	// run, but when it cannot MOVE the shell it leaves the shell in the same
+	// place either way — `: && :; python3 payload.py` has exactly one possible
+	// directory, and the reader refused it (and the gate blocked before any
+	// classification) for a doubt the text does not carry.
+	test("a conditional chain that cannot move the shell keeps the known directory", () => {
+		writeScript(root, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies(": && :; python3 payload.py", root, 8000);
+		expect(read.bodies.map(b => b.operand)).toEqual(["payload.py"]);
+		expect(read.text).toContain('print("scratch probe ok")');
+	});
+
+	test("the gate reads the body of a chain that cannot move it", async () => {
+		writeScript(root, "payload.py", HARMFUL_CODE);
+		const result = await gate(": && :; python3 payload.py");
+		// The flag can only come from the body, which is what the refusal proves
+		// was read: before the fix this blocked as an unresolvable directory.
+		expect(refusalOf(result).why).toContain("python3 runs payload.py");
+	});
+
+	test("a conditional arm that CAN move the shell keeps its doubt", () => {
+		// The boundary the round-4 fix must not cross, as the neighbouring
+		// spelling of the case it fixes: here the `&&` arm moves the directory,
+		// and whether it ran — its condition is a program that can fail —
+		// decides where the program runs.
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(outside, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies(`make build && cd ${outside}; python3 payload.py`, root, 8000);
+		expect(read.bodies).toEqual([]);
+		expect(read.refusal?.why).toContain("cannot be resolved from the command text");
+	});
 });
 
 describe("sibling commands of this fix stay as they were", () => {
