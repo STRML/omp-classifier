@@ -4862,6 +4862,15 @@ export default function (pi: ExtensionAPI) {
 	 * failure (HTTP error, missing key, unreadable body) has no late answer to
 	 * offer and returns without a `late` handle, so its dialog is exactly what
 	 * it was before.
+	 *
+	 * `cwd` is the directory the command RUNS in — the judge's
+	 * `workingDirectory`. `startCwd` is the directory its text STARTS in, which
+	 * is a different directory exactly when the caller resolved a `cd` out of
+	 * the command's own text (the host's leading-`cd` extraction): the two
+	 * provenance measurements walk the command's `cd` chain themselves, so
+	 * they take `startCwd` with the unmodified text, or they apply the resolved
+	 * `cd` a second time (round 4 review). It defaults to `cwd`, which is the
+	 * same directory for a caller whose text carries no leading `cd`.
 	 */
 	const classify = async (
 		ctx: ExtensionContext,
@@ -4872,6 +4881,7 @@ export default function (pi: ExtensionAPI) {
 		operatorContext?: string,
 		evidenceSnapshot?: UserEvidenceSnapshot,
 		language: "shell" | "code" = "shell",
+		startCwd: string = cwd,
 	): Promise<Judgement> => {
 		const config = readClassifierConfig();
 		const policy = jevPolicyFor(config);
@@ -4884,12 +4894,13 @@ export default function (pi: ExtensionAPI) {
 		const userMessages = taskEvidence?.messages;
 		const hadUserEvidence = (userMessages?.length ?? 0) > 0;
 		// Gate-measured git push provenance (issue #63). Runs the plumbing in
-		// the target cwd; a non-push command, a push the repo does not track,
-		// or a plumbing failure leaves it undefined and the state carries no
-		// provenance — the criteria then fall back to the syntax-level read.
+		// the repository the command's own `cd` chain reaches from `startCwd`;
+		// a non-push command, a push the repo does not track, or a plumbing
+		// failure leaves it undefined and the state carries no provenance —
+		// the criteria then fall back to the syntax-level read.
 		let pushProvenance: GitPushProvenance | undefined;
 		try {
-			pushProvenance = measureGitPushProvenance(command, cwd);
+			pushProvenance = measureGitPushProvenance(command, startCwd);
 		} catch {
 			pushProvenance = undefined;
 		}
@@ -4901,7 +4912,7 @@ export default function (pi: ExtensionAPI) {
 		// carries no field — absent is "nothing measured", never "trusted".
 		let networkProvenance: NetworkProvenance | undefined;
 		try {
-			networkProvenance = measureNetworkProvenance(command, cwd);
+			networkProvenance = measureNetworkProvenance(command, startCwd);
 		} catch {
 			networkProvenance = undefined;
 		}
@@ -6148,7 +6159,12 @@ export default function (pi: ExtensionAPI) {
 			// one the host extracted a leading `cd X &&` into: the reader applies
 			// the command's own `cd` chain itself, segment by segment, so a `cd`
 			// the host never strips (`cd /tmp; python3 payload.py`) still decides
-			// where payload.py is read from (issue #67 review round 1).
+			// where payload.py is read from (issue #67 review round 1). Every
+			// other walker that re-reads the command's `cd` chain — the two
+			// provenance measurements below and inside `classify` — takes the
+			// same pairing, and for the same reason: handing them `cwd`, the
+			// directory the host's own extraction already moved to, applies the
+			// extracted `cd` a second time (round 4 review).
 			const startCwd = rawCwd ? resolveToCwd(rawCwd, ctx.cwd) : ctx.cwd;
 			const script = readInterpretedScriptBodies(command, startCwd, config.maxCommandLength);
 			if (script.refusal) {
@@ -6192,9 +6208,13 @@ export default function (pi: ExtensionAPI) {
 			// network provenance (issue #65) are what the judge read about the
 			// refs and the destinations, so a ref move, a body rewrite, or a
 			// destination that stops being this machine's own between calls
-			// must invalidate the cached verdict.
-			const pushProvenanceForCache = measureGitPushProvenance(judgedCommand, cwd);
-			const networkProvenanceForCache = measureNetworkProvenance(judgedCommand, cwd);
+			// must invalidate the cached verdict. Both measurements take the
+			// command's own start directory with the unmodified text, the same
+			// pairing `classify` measures with: the key describes the state the
+			// judge was asked about, and a differently-measured copy would let a
+			// cached verdict outlive the state it was earned under.
+			const pushProvenanceForCache = measureGitPushProvenance(judgedCommand, startCwd);
+			const networkProvenanceForCache = measureNetworkProvenance(judgedCommand, startCwd);
 			const cacheKey = JSON.stringify([
 				config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, judgedCommand,
 				reviewEvidenceFingerprint,
@@ -6385,7 +6405,7 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			let classifyError = "";
-			const judgement = cached ? withoutShadow(cached) : (await classify(ctx, judgedCommand, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot).catch((err: unknown) => {
+			const judgement = cached ? withoutShadow(cached) : (await classify(ctx, judgedCommand, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot, "shell", startCwd).catch((err: unknown) => {
 				// Provider errors (quota exhausted, auth, HTTP failures) previously
 				// vanished into an opaque "unavailable". Keep the message so the
 				// permission dialog says WHY.

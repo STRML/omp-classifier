@@ -582,4 +582,36 @@ describe("the gate measures it before the battery is asked (#65)", () => {
 			cleanup(dir);
 		}
 	});
+
+	// Round 4 review, as the caller half of the round-3 class: the handler
+	// resolves a leading `cd X &&` into the directory the host runs the command
+	// in, and then handed the measurements that RESOLVED directory together
+	// with the command text that still contains the `cd`. The walk applied it a
+	// second time and looked for the compose file and the `--config` context one
+	// directory too deep — where this fixture has neither, so the whole tier
+	// came back absent for a command that does reach a stack, and a context
+	// naming another machine went unmeasured.
+	test("a leading cd is not applied twice to the measured invocation", async () => {
+		const session = mkdtempSync(join(tmpdir(), "jev65-caller-"));
+		const child = join(session, "child");
+		// The directory a second application of the `cd` lands in: it exists, so
+		// the walk has somewhere to look, and it holds none of the files the
+		// invocation reads.
+		mkdirSync(join(child, "child"), { recursive: true });
+		writeFileSync(join(child, "compose.yaml"), "services:\n  web:\n    image: wordpress\n");
+		// The context the CLI reads for this invocation names another machine.
+		dockerContext(join(child, ".docker"), "prod", "tcp://prod.example:2376");
+		try {
+			seq += 1;
+			await fire(
+				"tool_call",
+				makeEvent("cd child && docker --config ./.docker --context prod compose exec web sh"),
+				makeCtx({ sessionId: `net-prov-cd-${seq}`, cwd: session }),
+			);
+			const provenance = stateOf(0).networkProvenance as { dockerNetworks: DockerTarget[] } | undefined;
+			expect(provenance?.dockerNetworks).toEqual([{ target: "web", kind: "compose-service", resolvesLocally: false }]);
+		} finally {
+			cleanup(session);
+		}
+	});
 });
