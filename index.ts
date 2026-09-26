@@ -93,7 +93,7 @@ import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-codi
 import { getPluginsDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
 import { heredocShadowedAt, maskHeredocBodiesAndAnsiSpans, openQuoteBefore, segmentWorkingDirectories, SHELL_WORD_EXPANSION } from "./shell-cwd";
-import { parseShell, substitutionSpans, type ShellCommand } from "./shell-ast";
+import { parseShell, substitutionSpans, type ShellCommand, type ShellRedirect } from "./shell-ast";
 import {
 	DEFAULT_JUDGE_BACKEND,
 	judgeBackendFor,
@@ -1877,6 +1877,8 @@ interface InterpreterFlagGrammar {
 	 *  word is consumed so it cannot be mistaken for the program. A verb whose
 	 *  flags all take their value attached carries no entry. */
 	value?: RegExp;
+	/** Flags that only parse the interpreter's main program. */
+	syntaxOnly?: RegExp;
 	/** Flags whose value IS a file the interpreter runs, not a setting (`bun
 	 *  --preload ./pre.ts`). The value is read like the interpreter's own
 	 *  operand — the interpreter opens that file whatever the operand's
@@ -1912,8 +1914,8 @@ const PHP_INLINE_FLAG = /^-{1,2}(?:r|R|run|a)$/u;
  *  skipped for not existing, and a word that is a file gets read. */
 const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	// POSIX shells: `bash -c '…'`, `bash -s < script`, `bash -o errexit x.sh`.
-	bash: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^[-+]O$|^--rcfile$|^--init-file$/u, stdinFlag: true },
-	sh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^[-+]O$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	bash: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^[-+]O$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	sh: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^[-+]O$|^--rcfile$|^--init-file$/u, stdinFlag: true },
 	zsh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
 	dash: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
 	ksh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
@@ -1929,7 +1931,7 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	perl: { inline: /^-e$|^-E$|^--eval$/u, value: /^-I$|^-F$|^-M$|^-m$/u, stdinFlag: false },
 	// ruby: `-e` is code; `-I dir` (load path) and `-E enc`/`-W level` are
 	// settings; `-c` is a syntax check, `-s` switch parsing.
-	ruby: { inline: /^-e$|^--eval$/u, value: /^-I$|^-E$/u, stdinFlag: false },
+	ruby: { inline: /^-e$|^--eval$/u, syntaxOnly: /^-c$/u, value: /^-I$|^-E$/u, stdinFlag: false },
 	// node: `-e`/`-p` are code; `--input-type` and `-C`/`--conditions` are
 	// settings; `-r`/`--require` and `--import` preload a FILE and are read as
 	// one, in both spellings: the operand scan reads the word after `-r` today,
@@ -1938,7 +1940,7 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	// long spelling only — the short `-r./pre.js` is a syntax error to node —
 	// which this table does not need to model, since reading a file the
 	// interpreter rejects is the safe direction.
-	node: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--input-type$|^-C$|^--conditions$|^--title$/u, file: /^-r$|^--require$|^--import$/u, stdinFlag: false },
+	node: { inline: /^-e$|^--eval$|^-p$|^--print$/u, syntaxOnly: /^--check$/u, value: /^--input-type$|^-C$|^--conditions$|^--title$/u, file: /^-r$|^--require$|^--import$/u, stdinFlag: false },
 	deno: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--ext$|^--config$|^--import-map$|^--v8-flags$/u, stdinFlag: false },
 	// `bun --help` here: `-r, --preload=<val>` ("import a module before other
 	// modules are loaded") and its Node-compatibility aliases `--require` and
@@ -3090,27 +3092,29 @@ function stdinExecutingInterpreters(stage: string): Array<{ verb: string; codeTe
 }
 
 /** The resolved command or the reason wrapper parsing stopped fail-closed. */
-type InterpreterInvocation = { verb: string; rest: string[] } | { opaque: string } | null;
+type InterpreterInvocation = { verb: string; rest: string[]; cwdChanges?: string[]; stdinOwner?: "wrapper" } | { opaque: string } | null;
 
-type WrapperOptionScan = { next: number } | { opaque: string };
+type WrapperOptionScan = { next: number; cwdChange?: string } | { opaque: string };
 
 function scanWrapperOptions(wrapper: string, words: string[], start: number): WrapperOptionScan {
 	const grammar = WRAPPER_OPTION_GRAMMAR[wrapper];
 	if (!grammar) return { opaque: `script body blocked: unsupported wrapper ${wrapper}` };
 	let index = start;
 	let positionalValues = grammar.positionalValues ?? 0;
+	let cwdChange: string | undefined;
+	const rememberValue = (name: string, value: string): void => {
+		if (wrapper === "env" && (name === "-C" || name === "--chdir")) cwdChange = value;
+	};
 	const unknown = (option: string): WrapperOptionScan => ({ opaque: `script body blocked: unknown ${wrapper} option ${option}` });
 	const missingValue = (option: string): WrapperOptionScan => ({ opaque: `script body blocked: ${wrapper} option ${option} is missing its value` });
 
 	while (index < words.length) {
 		const word = words[index];
 		if (word === "--") {
-			if (positionalValues > 0) {
-				positionalValues--;
-				index++;
-				continue;
-			}
-			return { next: index + 1 };
+			index++;
+			const consumed = Math.min(positionalValues, words.length - index);
+			index += consumed;
+			return { next: index, cwdChange };
 		}
 		if (grammar.assignments && /^[a-z_][a-z0-9_]*=/iu.test(word)) {
 			index++;
@@ -3121,7 +3125,7 @@ function scanWrapperOptions(wrapper: string, words: string[], start: number): Wr
 			index++;
 			continue;
 		}
-		if (!word.startsWith("-") || word === "-") return { next: index };
+		if (!word.startsWith("-") || word === "-") return { next: index, cwdChange };
 		if (wrapper === "nice" && /^-\d+(?:\.\d+)?$/u.test(word)) {
 			index++;
 			continue;
@@ -3139,10 +3143,12 @@ function scanWrapperOptions(wrapper: string, words: string[], start: number): Wr
 				continue;
 			}
 			if (equal !== -1) {
+				rememberValue(name, word.slice(equal + 1));
 				index++;
 				continue;
 			}
 			if (index + 1 >= words.length) return missingValue(name);
+			rememberValue(name, words[index + 1]);
 			index += 2;
 			continue;
 		}
@@ -3156,9 +3162,13 @@ function scanWrapperOptions(wrapper: string, words: string[], start: number): Wr
 			if (arity === "opaque") return { opaque: `script body blocked: ${wrapper} option ${name} cannot be resolved` };
 			if (arity === "value") {
 				const attached = word.slice(optionIndex + 1).replace(/^=/u, "");
-				if (attached !== "") index++;
-				else if (index + 1 < words.length) index += 2;
-				else return missingValue(name);
+				if (attached !== "") {
+					rememberValue(name, attached);
+					index++;
+				} else if (index + 1 < words.length) {
+					rememberValue(name, words[index + 1]);
+					index += 2;
+				} else return missingValue(name);
 				consumed = true;
 				break;
 			}
@@ -3166,7 +3176,7 @@ function scanWrapperOptions(wrapper: string, words: string[], start: number): Wr
 		}
 		if (!consumed) index++;
 	}
-	return { next: index };
+	return { next: index, cwdChange };
 }
 
 /**
@@ -3177,6 +3187,8 @@ function scanWrapperOptions(wrapper: string, words: string[], start: number): Wr
  */
 function interpreterInvocation(segment: string[]): InterpreterInvocation {
 	let i = 0;
+	let cwdChanges: string[] | undefined;
+	let stdinOwner: "wrapper" | undefined;
 	while (i < segment.length) {
 		const word = segment[i].toLowerCase();
 		if (word === "{" || word === "(") {
@@ -3191,6 +3203,8 @@ function interpreterInvocation(segment: string[]): InterpreterInvocation {
 		if (WRAPPER_COMMANDS.has(wrapper)) {
 			const options = scanWrapperOptions(wrapper, segment, i + 1);
 			if ("opaque" in options) return options;
+			if (options.cwdChange !== undefined) (cwdChanges ??= []).push(options.cwdChange);
+			if (wrapper === "xargs") stdinOwner = "wrapper";
 			i = options.next;
 			continue;
 		}
@@ -3203,7 +3217,7 @@ function interpreterInvocation(segment: string[]): InterpreterInvocation {
 	if (i >= segment.length) return null;
 	const verb = interpreterName(segment[i]);
 	if (!verb) return null;
-	return { verb, rest: segment.slice(i + 1) };
+	return { verb, rest: segment.slice(i + 1), cwdChanges, stdinOwner };
 }
 
 function interpretersInSegment(segment: string[], rawStage: string): Array<{ verb: string; codeText: string | null }> {
@@ -3357,6 +3371,8 @@ interface InterpreterProgramRef {
 	operand: string;
 	/** `stdin` is a literal file the interpreter executes from redirected stdin. */
 	arm: "program" | "load" | "stdin";
+	/** A file-taking flag that independently loads executable code. */
+	loader?: true;
 }
 
 /**
@@ -3449,12 +3465,12 @@ function interpreterProgramRefs(segment: string[]): InterpreterProgramRef[] {
 			// refuses rather than passing over (round 2 review).
 			if (grammar?.file?.test(flag.name) === true) {
 				if (flag.attached !== undefined) {
-					if (flag.attached !== "") refs.push({ verb, operand: flag.attached, arm: "program" });
+					if (flag.attached !== "") refs.push({ verb, operand: flag.attached, arm: "program", loader: true });
 					continue;
 				}
 				const value = rest[i + 1];
 				i++;
-				if (value !== undefined && value !== "") refs.push({ verb, operand: value, arm: "program" });
+				if (value !== undefined && value !== "") refs.push({ verb, operand: value, arm: "program", loader: true });
 				continue;
 			}
 			// A flag whose separate value word is NOT a program: consume that
@@ -3488,17 +3504,69 @@ function interpreterProgramRefs(segment: string[]): InterpreterProgramRef[] {
 	return refs;
 }
 
+/** True when the interpreter's main file is only parsed, not executed. */
+function interpreterSyntaxOnly(segment: string[]): boolean {
+	const invocation = interpreterInvocation(segment);
+	if (!invocation || "opaque" in invocation) return false;
+	const { verb, rest } = invocation;
+	const grammar = INTERPRETER_FLAG_GRAMMAR[verb] ?? INTERPRETER_FLAG_GRAMMAR[verb.replace(/[\d.]+$/u, "")];
+	for (let i = 0; i < rest.length; i++) {
+		const word = rest[i];
+		if (word === "--") return false;
+		if (!word.startsWith("-") || word === "-") return false;
+		const flag = splitAttachedFlagValue(word);
+		if (grammar?.syntaxOnly?.test(flag.name)) return true;
+		if (verb.startsWith("python") && (flag.name === "-m" || flag.name === "--module")) {
+			return rest[i + 1] === "py_compile";
+		}
+		if (grammar?.value?.test(flag.name) || grammar?.file?.test(flag.name)) {
+			if (flag.attached === undefined) i++;
+			continue;
+		}
+		if (SHARED_INLINE_FLAG.test(flag.name) || grammar?.inline.test(flag.name)) return false;
+	}
+	return false;
+}
+
 /** Whether an interpreter has no separate program and will execute stdin. */
 function interpreterReadsRedirectedStdin(segment: string[]): { verb: string } | null {
 	const invocation = interpreterInvocation(segment);
 	if (!invocation) return null;
 	if ("opaque" in invocation) return null;
+	if (invocation.stdinOwner === "wrapper" || interpreterSyntaxOnly(segment)) return null;
 	const { verb, rest } = invocation;
 	if (rest.some(word => /^-{1,2}(c|e|E|eval|command)$/u.test(word))) return null;
 	if (verb.startsWith("python") && rest.some(word => word === "-m" || word === "--module")) return null;
 	const grammar = INTERPRETER_FLAG_GRAMMAR[verb] ?? INTERPRETER_FLAG_GRAMMAR[verb.replace(/[\d.]+$/u, "")];
 	if (rest.includes("-") || (grammar?.stdinFlag === true && rest.includes("-s"))) return { verb };
 	return interpreterProgramRefs(segment).length === 0 ? { verb } : null;
+}
+
+type StdinDescriptorSource = { kind: "file"; target: ShellRedirect["target"] } | { kind: "inline" | "closed" | "unknown" };
+type RedirectedStdinFlow = StdinDescriptorSource | { kind: "none" };
+
+/** Follow only literal descriptor copies; an unknown source cannot be judged as no input. */
+function redirectedStdinFlow(redirects: ShellRedirect[]): RedirectedStdinFlow {
+	const descriptors = new Map<string, StdinDescriptorSource>();
+	let stdin: StdinDescriptorSource | undefined;
+	for (const redirect of redirects) {
+		const fd = redirect.fd || (redirect.direction === "out" ? "1" : "0");
+		let source: StdinDescriptorSource;
+		if (redirect.duplicate) {
+			if (redirect.target.value === "-") source = { kind: "closed" };
+			else if (/^\d+$/u.test(redirect.target.value)) source = descriptors.get(redirect.target.value) ?? { kind: "unknown" };
+			else source = { kind: "unknown" };
+		} else if (redirect.here) {
+			source = { kind: "inline" };
+		} else if (redirect.direction === "in" || redirect.direction === "both") {
+			source = { kind: "file", target: redirect.target };
+		} else {
+			source = { kind: "unknown" };
+		}
+		descriptors.set(fd, source);
+		if (fd === "0") stdin = source;
+	}
+	return stdin ?? { kind: "none" };
 }
 
 export interface InterpretedScriptBody {
@@ -3673,39 +3741,48 @@ export function readInterpretedScriptBodies(command: string, cwd: string, limit:
 			}
 		}
 
-		const inputRedirects = shellCommand?.redirects.filter(
-			redirect => redirect.direction !== "out" && !redirect.here && !redirect.duplicate && (redirect.fd === "" || redirect.fd === "0"),
-		) ?? [];
-		const interpreterWords = inputRedirects.length > 0 && shellCommand
+		const hasRedirects = (shellCommand?.redirects.length ?? 0) > 0;
+		const interpreterWords = hasRedirects && shellCommand
 			? shellCommand.words.map(word => word.value)
 			: segment;
 		const invocation = interpreterInvocation(interpreterWords);
 		if (invocation !== null && "opaque" in invocation) {
 			return { text, bodies, refusal: { why: invocation.opaque } };
 		}
-		const refs = interpreterProgramRefs(interpreterWords);
-		const stdin = inputRedirects.length > 0 ? interpreterReadsRedirectedStdin(interpreterWords) : null;
-		if (stdin !== null) {
-			if (inputRedirects.length !== 1) {
+		const syntaxOnly = interpreterSyntaxOnly(interpreterWords);
+		const refs = interpreterProgramRefs(interpreterWords).filter(ref => !syntaxOnly || ref.loader === true);
+		const flow = hasRedirects && shellCommand ? redirectedStdinFlow(shellCommand.redirects) : null;
+		const stdin = syntaxOnly || flow === null ? null : interpreterReadsRedirectedStdin(interpreterWords);
+		if (stdin !== null && flow !== null) {
+			if (flow.kind === "unknown") {
 				return {
 					text,
 					bodies,
-					refusal: { why: "script body blocked: multiple stdin redirects cannot be resolved" },
+					refusal: { why: "script body blocked: redirected stdin descriptor could not be resolved" },
 				};
 			}
-			const target = inputRedirects[0].target;
-			if (!target.literal && !SHELL_WORD_EXPANSION.test(target.value)) {
-				return {
-					text,
-					bodies,
-					refusal: { why: `script body blocked: redirected stdin target ${target.source} is not literal` },
-				};
+			if (flow.kind === "file") {
+				const target = flow.target;
+				if (!target.literal && !SHELL_WORD_EXPANSION.test(target.value)) {
+					return {
+						text,
+						bodies,
+						refusal: { why: `script body blocked: redirected stdin target ${target.source} is not literal` },
+					};
+				}
+				refs.push({ verb: stdin.verb, operand: target.value, arm: "stdin" });
 			}
-			refs.push({ verb: stdin.verb, operand: target.value, arm: "stdin" });
 		}
 
 		for (const ref of refs) {
-			const dir = dirs[index];
+			let dir = dirs[index];
+			if (ref.arm !== "stdin" && invocation && !("opaque" in invocation) && invocation.cwdChanges) {
+				for (const change of invocation.cwdChanges) {
+					if (dir === null) break;
+					if (SHELL_WORD_EXPANSION.test(change) || change.startsWith("~")) dir = null;
+					else dir = resolveToCwd(change, dir);
+				}
+			}
 			if (dir === null) {
 				// The shell's directory at this segment is not in the text (a
 				// `cd $DIR`, `cd -`, a bare `cd`, `pushd`, or a separator this

@@ -112,7 +112,19 @@ by text inside it. This is why the port did not make L1 redundant: Jev removed t
 parse prose, not the need to notice shapes without asking anyone.
 
 Invariant: no model call decides what this layer can decide, and this layer never guesses.
-Anything ambiguous falls through to L2.
+Ambiguity that only limits a heuristic falls through to L2; an unreadable program or stdin flow
+is refused before classification.
+
+The script-body reader is part of interpreter scoping: recognized interpreter operands and literal
+stdin files that actually reach the interpreter are spliced into the judged command. It follows
+literal file-descriptor copies and wrapper working-directory changes for interpreter operands;
+shell-opened redirects remain resolved by the shell.
+Unknown descriptor flows and unresolvable `env` directories fail closed; input owned by `xargs`
+is argument data, not the child's script.
+syntax-only mode omits its main source (`bash -n`, `sh -n`, `ruby -c`, `python -m py_compile`,
+`node --check`), but keeps separately loaded executable files such as Node preloads. Perl `-c`
+stays in the scanned set because compile-time `BEGIN` blocks run even though ordinary runtime
+statements do not.
 
 ### The floor (`floor.ts`, shadow)
 
