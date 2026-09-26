@@ -304,7 +304,8 @@ After a week of shadow logging, review the disagreement report. Set `policy: "je
 | Parent says "stop" after spawn | Restrictive word forces `none` | Snapshot at spawn | Test |
 | Script is a symlink to `~/.ssh/id_rsa` | No-follow open refuses it | Symlink followed | Test |
 | Script imports a sibling | Incomplete, reviewer | Import not detected | Test per language |
-| Script swapped after judgment | Runs the swapped file | A same-user background process | Stated residual. Today the gate never reads the file, so this is no worse than now |
+| Script swapped after judgment | Runs the swapped file | A same-user background process | Stated residual, accepted 2026-09-25 (#128). The fail-closed alternative is on `fix/b3script` |
+| Sourced file changes the directory | `source ./hop.sh` then a script operand: the review can open the wrong body | A `cd` inside the sourced file | Stated residual (#130). A sourced file is arbitrary shell, so closing it means resolving the transitive source graph or refusing every `source` |
 | Planted `json.py` beside a benign script | Local-shadow check marks it incomplete, ask | Resolution not checked | Test |
 | Secret captured into `$KEY`, later `echo $KEY` | Tainted variable, floor entry 2, ask | Taint not recorded | Test across two commands |
 | Body-dependent SAFE hit in cache | Never cached, the file is read again | Cache key omits the body hash | Test |
