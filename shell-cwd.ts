@@ -30,7 +30,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { shellSubstitutionRanges, type ShellSubstitutionRange } from "./shell-ast";
+import { parseShell, shellSubstitutionRanges, type ShellSubstitutionRange } from "./shell-ast";
 
 /** A word carrying one of these is expanded by the shell before the reader
  *  ever sees it, so the path it names is not readable text. `{` and `[` are
@@ -533,18 +533,37 @@ export type CwdResolver = (target: string, cwd: string) => string;
 /** The resolver for a reader whose paths are ordinary filesystem paths. */
 export const defaultCwdResolver: CwdResolver = (target, cwd) => path.resolve(cwd, target);
 
+/** Bounds make a source graph finite even when it fans out without cycling. */
+const MAX_SOURCED_FILES = 64;
+const MAX_SOURCED_FILE_BYTES = 1_048_576;
+
+interface SourceWalkContext {
+	activeFiles: Set<string>;
+	filesRead: number;
+}
+
+const newSourceWalkContext = (): SourceWalkContext => ({ activeFiles: new Set(), filesRead: 0 });
+
 /**
  * Where one segment leaves the shell's working directory.
  *
- * `cd <literal>` is the only shape this reads. Everything else that can move
- * the shell — an expanded target (`cd $DIR`), `cd -`, a bare `cd` (`$HOME`),
- * `pushd`/`popd`, a `cd` with extra words or a redirect the walk folds into
- * one — resolves to "unknown", which the reader treats as a refusal rather
- * than a guess. A target that is not an existing directory leaves the shell
- * where it was (a failed `cd` changes nothing), and a target the gate cannot
- * even stat is unknown.
+ * `cd <literal>` is the only direct cwd command this reads; a literal `source`
+ * or `.` path is followed through the readable source graph. An expanded or
+ * unsupported source, an opaque shell construct, or a directory command the
+ * walk cannot model resolves to "unknown", which the reader treats as a
+ * refusal rather than a guess. A target that is not an existing directory
+ * leaves the shell where it was (a failed `cd` changes nothing), and a target
+ * the gate cannot even stat is unknown.
  */
-function segmentDirectoryChange(words: string[], cwd: string | null, resolveCwd: CwdResolver): SegmentDirectoryChange {
+function segmentDirectoryChange(
+	words: string[],
+	cwd: string | null,
+	resolveCwd: CwdResolver,
+	context: SourceWalkContext,
+): SegmentDirectoryChange {
+	const source = sourceInvocation(words);
+	if (source.kind === "unknown") return { moves: true, path: null };
+	if (source.kind === "path") return sourcedDirectoryChange(source.target, cwd, resolveCwd, context);
 	const verb = words[0];
 	if (verb === undefined || DIRECTORY_CHANGE_BUILTINS[verb] !== true) return { moves: false };
 	// `pushd`/`popd` move the directory onto a stack this walk does not follow.
@@ -610,10 +629,164 @@ const mergeDirectories = (a: DirectorySet, b: DirectorySet): DirectorySet => {
  *  one — the answer the reader refuses on. */
 const soleDirectory = (cwds: DirectorySet): string | null => (cwds.length === 1 ? (cwds[0] ?? null) : null);
 
+type SourceInvocation = { kind: "none" } | { kind: "unknown" } | { kind: "path"; target: string };
+
+const ASSIGNMENT_WORD = /^[A-Za-z_][A-Za-z0-9_]*=/u;
+const CONTROL_WORDS: Record<string, true> = {
+	if: true,
+	then: true,
+	elif: true,
+	else: true,
+	fi: true,
+	for: true,
+	select: true,
+	while: true,
+	until: true,
+	do: true,
+	done: true,
+	case: true,
+	esac: true,
+	"{": true,
+	"}": true,
+};
+const CONTROL_PREFIXES: Record<string, true> = {
+	then: true,
+	elif: true,
+	else: true,
+	do: true,
+	if: true,
+	while: true,
+	until: true,
+	"{": true,
+	"!": true,
+};
+const DIRECTORY_OR_SOURCE_WORDS: Record<string, true> = {
+	cd: true,
+	chdir: true,
+	pushd: true,
+	popd: true,
+	source: true,
+	".": true,
+};
+const FUNCTION_DECLARATION = /(?:^|\n)\s*(?:function\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:\(\s*\))?|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\))\s*\{/mu;
+
+function sourceInvocation(words: string[]): SourceInvocation {
+	let index = 0;
+	while (index < words.length && ASSIGNMENT_WORD.test(words[index])) index++;
+	const wrapper = words[index];
+	if (wrapper === "command" || wrapper === "time" || wrapper === "exec" || wrapper === "env") {
+		const wrappedVerb = words[index + 1];
+		return wrappedVerb === "source" || wrappedVerb === "." || (wrappedVerb !== undefined && DIRECTORY_CHANGE_BUILTINS[wrappedVerb] === true)
+			? { kind: "unknown" }
+			: { kind: "none" };
+	}
+	if (wrapper === "builtin") {
+		index++;
+		const builtinVerb = words[index];
+		if (builtinVerb !== "source" && builtinVerb !== ".") {
+			return builtinVerb !== undefined && DIRECTORY_CHANGE_BUILTINS[builtinVerb] === true ? { kind: "unknown" } : { kind: "none" };
+		}
+	}
+	const verb = words[index];
+	if (verb !== "source" && verb !== ".") return { kind: "none" };
+	let targetIndex = index + 1;
+	if (words[targetIndex] === "--") targetIndex++;
+	if (words.length !== targetIndex + 1) return { kind: "unknown" };
+	const target = words[targetIndex];
+	return target === undefined ? { kind: "unknown" } : { kind: "path", target };
+}
+
+function mayChangeDirectory(words: string[]): boolean {
+	let index = 0;
+	while (index < words.length && ASSIGNMENT_WORD.test(words[index])) index++;
+	while (index < words.length && CONTROL_PREFIXES[words[index]] === true) index++;
+	if (words[index] === "time") index++;
+	const verb = words[index];
+	if (verb === "eval") return true;
+	if (verb !== undefined && DIRECTORY_OR_SOURCE_WORDS[verb] === true) return true;
+	if (verb === "builtin" || verb === "command" || verb === "exec") {
+		const inner = words[index + 1];
+		return inner === "eval" || (inner !== undefined && DIRECTORY_OR_SOURCE_WORDS[inner] === true);
+	}
+	return false;
+}
+
+function sourceTextIsWalkable(text: string): boolean {
+	const parsed = parseShell(text);
+	if (!parsed.ok) return false;
+	const events = shellWalk(text);
+	const possibleEffect = events.some(event => event.kind === "segment" && mayChangeDirectory(event.words));
+	if (!possibleEffect) return true;
+	if (parsed.commands.some(command => command.unreadShape !== undefined || command.words[0]?.value === "eval")) return false;
+	if (FUNCTION_DECLARATION.test(text)) return false;
+	return !events.some(event =>
+		event.kind === "segment" && event.words.some((word, index) => index === 0 && CONTROL_WORDS[word] === true),
+	);
+}
+
+interface SourcedFile {
+	path: string;
+	text: string;
+}
+
+function readSourcedFile(target: string, cwd: string | null, resolveCwd: CwdResolver, context: SourceWalkContext): SourcedFile | null {
+	if (target === "-" || target.includes("://") || target.startsWith("local:/") || SHELL_WORD_EXPANSION.test(target)) return null;
+	if (target !== "~" && !target.startsWith("~/") && !target.includes("/")) return null;
+	if (cwd === null && !path.isAbsolute(target) && !target.startsWith("~/")) return null;
+	if (context.filesRead >= MAX_SOURCED_FILES) return null;
+	context.filesRead++;
+	const expanded = target === "~" || target.startsWith("~/") ? path.join(os.homedir(), target.slice(1)) : target;
+	let file: string;
+	let stat: fs.Stats;
+	try {
+		const resolved = resolveCwd(expanded, cwd ?? os.homedir());
+		if (!path.isAbsolute(resolved) || resolved.includes("://") || resolved.startsWith("local:/")) return null;
+		file = fs.realpathSync(resolved);
+		stat = fs.statSync(file);
+	} catch {
+		return null;
+	}
+	if (!stat.isFile() || stat.size > MAX_SOURCED_FILE_BYTES) return null;
+	let bytes: Buffer;
+	let text: string;
+	try {
+		bytes = fs.readFileSync(file);
+		if (bytes.byteLength !== stat.size || bytes.includes(0)) return null;
+		text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+	} catch {
+		return null;
+	}
+	return { path: file, text };
+}
+
+function sourcedDirectoryChange(
+	target: string,
+	cwd: string | null,
+	resolveCwd: CwdResolver,
+	context: SourceWalkContext,
+): SegmentDirectoryChange {
+	const source = readSourcedFile(target, cwd, resolveCwd, context);
+	if (source === null || context.activeFiles.has(source.path) || !sourceTextIsWalkable(source.text)) {
+		return { moves: true, path: null };
+	}
+	context.activeFiles.add(source.path);
+	try {
+		const walked = walkedDirectories(shellWalk(source.text), cwd, resolveCwd, context);
+		return { moves: true, path: soleDirectory(walked.final) };
+	} finally {
+		context.activeFiles.delete(source.path);
+	}
+}
+
 /** One segment's directory, with the offset the segment starts at. */
 export interface ShellSegmentDirectory {
 	start: number;
 	cwd: string | null;
+}
+
+interface WalkedDirectoryResult {
+	segments: ShellSegmentDirectory[];
+	final: DirectorySet;
 }
 
 /**
@@ -644,7 +817,12 @@ export interface ShellSegmentDirectory {
  * leave the shell exactly where the command started. The conditional segment
  * only doubts the directory when running it could have changed it.
  */
-function walkedDirectories(events: ShellWalkEvent[], base: string | null, resolveCwd: CwdResolver): ShellSegmentDirectory[] {
+function walkedDirectories(
+	events: ShellWalkEvent[],
+	base: string | null,
+	resolveCwd: CwdResolver,
+	context: SourceWalkContext,
+): WalkedDirectoryResult {
 	const walked: ShellSegmentDirectory[] = [];
 	// The directories the next segment can start in, when it runs.
 	let pending: DirectorySet = [base];
@@ -680,7 +858,7 @@ function walkedDirectories(events: ShellWalkEvent[], base: string | null, resolv
 		// What this segment leaves the shell to, per directory it can start in.
 		const after: DirectorySet = [];
 		for (const cwd of from) {
-			const change = segmentDirectoryChange(event.words, cwd, resolveCwd);
+			const change = segmentDirectoryChange(event.words, cwd, resolveCwd, context);
 			addDirectory(after, change.moves ? change.path : cwd);
 		}
 		if (event.terminator === "new-shell" || event.terminator === "group-end") {
@@ -724,7 +902,7 @@ function walkedDirectories(events: ShellWalkEvent[], base: string | null, resolv
 		const conditional = event.join === "on-success" || event.join === "on-failure";
 		pending = conditional && !isBranch && !sameDirectories(from, after) ? [null] : combined;
 	}
-	return walked;
+	return { segments: walked, final: pending };
 }
 
 /**
@@ -753,7 +931,7 @@ export function segmentWorkingDirectories(
 		const words = walked[index].words;
 		if (words.length !== segments[index].length || words.some((word, at) => word !== segments[index][at])) return dirs;
 	}
-	const cwds = walkedDirectories(events, base, resolveCwd);
+	const cwds = walkedDirectories(events, base, resolveCwd, newSourceWalkContext()).segments;
 	for (let index = 0; index < cwds.length && index < dirs.length; index++) dirs[index] = cwds[index].cwd;
 	return dirs;
 }
@@ -787,7 +965,7 @@ export function segmentCwdAt(
 	base: string,
 	resolveCwd: CwdResolver = defaultCwdResolver,
 ): string | null {
-	return cwdAtOffset(walkedDirectories(shellWalk(text), base, resolveCwd), offset, base);
+	return cwdAtOffset(walkedDirectories(shellWalk(text), base, resolveCwd, newSourceWalkContext()).segments, offset, base);
 }
 
 /** Build one shell walk for all command offsets, including nested substitutions. */
@@ -796,7 +974,8 @@ export function segmentCwdLookup(
 	base: string,
 	resolveCwd: CwdResolver = defaultCwdResolver,
 ): (offset: number) => string | null {
-	const rootWalked = walkedDirectories(shellWalk(text), base, resolveCwd);
+	const sourceContext = newSourceWalkContext();
+	const rootWalked = walkedDirectories(shellWalk(text), base, resolveCwd, sourceContext).segments;
 	const allWalked = [...rootWalked];
 	const contexts: Array<{ range: ShellSubstitutionRange; base: string | null; walked: ShellSegmentDirectory[] }> = [];
 	for (const range of shellSubstitutionRanges(text)) {
@@ -813,7 +992,7 @@ export function segmentCwdLookup(
 		const offset = parent === undefined ? range.start : range.start - parent.range.innerStart;
 		const inheritedCwd = cwdAtOffset(parentWalked, offset, parentBase);
 		const inner = text.slice(range.innerStart, range.innerEnd);
-		const nestedWalked = walkedDirectories(shellWalk(inner), inheritedCwd, resolveCwd);
+		const nestedWalked = walkedDirectories(shellWalk(inner), inheritedCwd, resolveCwd, sourceContext).segments;
 		for (const segment of nestedWalked) allWalked.push({ start: range.innerStart + segment.start, cwd: segment.cwd });
 		contexts.push({ range, base: inheritedCwd, walked: nestedWalked });
 	}

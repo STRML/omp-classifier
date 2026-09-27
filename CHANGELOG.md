@@ -4,6 +4,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-27
 
+### Source-aware shell directory walks (#130)
+
+- The shell cwd walk follows readable literal `source`/`.` files transitively when resolving later script operands. Unsupported, unreadable, cyclic, or over-budget source graphs leave cwd unknown, so the script-body reader refuses instead of reviewing a file from the stale starting directory.
+
 ### Unclassified bash grant fingerprint (#78)
 
 - The bash classifier-unavailable dialog now passes the live user-scope fingerprint when recording a session grant, so the grant can match the same command on the next call.
