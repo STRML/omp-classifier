@@ -1877,6 +1877,10 @@ interface InterpreterFlagGrammar {
 	 *  word is consumed so it cannot be mistaken for the program. A verb whose
 	 *  flags all take their value attached carries no entry. */
 	value?: RegExp;
+	/** Short options that take their value from the rest of a bundled word.
+	 *  This includes optional attached values; unlike `value`, it does not say
+	 *  that a following word is consumed. */
+	shortValue?: RegExp;
 	/** Flags that only parse the interpreter's main program. */
 	syntaxOnly?: RegExp;
 	/** Flags whose value IS a file the interpreter runs, not a setting (`bun
@@ -1929,9 +1933,11 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	// perl: `-e`/`-E` are code; `-I dir` (library path) and `-F pattern` are
 	// values; `-s` is switch parsing, `-c` is a syntax check.
 	perl: { inline: /^-e$|^-E$|^--eval$/u, value: /^-I$|^-F$|^-M$|^-m$/u, stdinFlag: false },
-	// ruby: `-e` is code; `-I dir` (load path) and `-E enc`/`-W level` are
-	// settings; `-c` is a syntax check, `-s` switch parsing.
-	ruby: { inline: /^-e$|^--eval$/u, syntaxOnly: /^-c$/u, value: /^-I$|^-E$/u, stdinFlag: false },
+	// ruby: `-e` is code; `-I`, `-E`, `-r`, and `-C` take attached or
+	// separate values. `-F` requires an attached value; `-W`, `-0`, `-i`,
+	// `-T`, and `-x` accept optional attached values. In a bundle, each owns
+	// the remaining letters.
+	ruby: { inline: /^-e$|^--eval$/u, syntaxOnly: /^-c$/u, value: /^-I$|^-E$|^-r$|^-C$/u, shortValue: /^-(?:0|C|E|F|I|W|i|r|T|x)$/u, stdinFlag: false },
 	// node: `-e`/`-p` are code; `--input-type` and `-C`/`--conditions` are
 	// settings; `-r`/`--require` and `--import` preload a FILE and are read as
 	// one, in both spellings: the operand scan reads the word after `-r` today,
@@ -3512,7 +3518,7 @@ function hasBundledSyntaxOnlyFlag(word: string, grammar: InterpreterFlagGrammar 
 		if (grammar.syntaxOnly.test(name)) return true;
 		// A value-taking or code-taking short option owns the rest of the bundle;
 		// later letters are its value, not independently active flags.
-		if (grammar.value?.test(name) || grammar.file?.test(name) || grammar.inline.test(name)) return false;
+		if (grammar.shortValue?.test(name) || grammar.value?.test(name) || grammar.file?.test(name) || grammar.inline.test(name)) return false;
 	}
 	return false;
 }

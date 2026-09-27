@@ -919,6 +919,21 @@ describe("syntax-only interpreter modes do not execute file contents", () => {
 		const read = readInterpretedScriptBodies(command, root, 8000);
 		expect({ refusal: read.refusal, bodies: read.bodies, text: read.text }).toEqual({ refusal: null, bodies: [], text: command });
 	});
+	test("Ruby attached -r values cannot masquerade as bundled syntax-only flags", () => {
+		const body = 'system("rm -rf ./out")\n';
+		writeScript(root, "payload.rb", body);
+		for (const command of ["ruby -rcsv payload.rb", "ruby -r csv payload.rb", "ruby -wrcsv payload.rb", "ruby -Fcsv payload.rb"]) {
+			const read = readInterpretedScriptBodies(command, root, 8000);
+			expect({ command, refusal: read.refusal, operands: read.bodies.map(entry => entry.operand), body: read.bodies[0]?.body }).toEqual({
+				command,
+				refusal: null,
+				operands: ["payload.rb"],
+				body,
+			});
+		}
+		const syntaxCheck = readInterpretedScriptBodies("ruby -wc payload.rb", root, 8000);
+		expect({ refusal: syntaxCheck.refusal, bodies: syntaxCheck.bodies }).toEqual({ refusal: null, bodies: [] });
+	});
 
 	test("node --check skips only its main file and keeps executable preloads", () => {
 		writeScript(root, "payload.js", 'console.log("main ran");\n');
