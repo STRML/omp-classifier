@@ -527,6 +527,55 @@ describe("the floor reads the parser's view (plan 2026-09-22-real-shell-parser.m
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
 	});
+	test("parameter defaults expand an active tilde in Bash", () => {
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-parameter-tilde-home-"));
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-parameter-tilde-cwd-"));
+		const previousSafe = process.env.SAFE;
+		const previousHome = process.env.HOME;
+		try {
+			const secret = path.join(home, ".aws", "credentials");
+			fs.mkdirSync(path.dirname(secret));
+			fs.writeFileSync(secret, "token");
+			fs.symlinkSync(secret, path.join(home, "notes.txt"));
+			process.env.HOME = home;
+			delete process.env.SAFE;
+			expect(evaluateFloor({ command: "cat ${SAFE:-~/notes.txt}", cwd }).asks).toBe(true);
+		} finally {
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			if (previousSafe === undefined) delete process.env.SAFE;
+			else process.env.SAFE = previousSafe;
+			fs.rmSync(home, { recursive: true, force: true });
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("repeated slashes after a tilde still resolve beneath home", () => {
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-repeated-tilde-home-"));
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-repeated-tilde-cwd-"));
+		const previousHome = process.env.HOME;
+		try {
+			const secretDir = path.join(home, ".aws");
+			fs.mkdirSync(secretDir);
+			const secret = path.join(secretDir, "credentials");
+			fs.writeFileSync(secret, "token");
+			fs.symlinkSync(secret, path.join(home, "x"));
+			process.env.HOME = home;
+			expect([
+				evaluateFloor({ command: "cat ~//x", cwd }).asks,
+				evaluateFloor({ command: "cat ~/./x", cwd }).asks,
+				evaluateFloor({ command: "cat ~/.//x", cwd }).asks,
+				evaluateFloor({ command: "cat ~x", cwd }).asks,
+				evaluateFloor({ command: "cat ~", cwd }).asks,
+			]).toEqual([true, true, true, true, false]);
+		} finally {
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			fs.rmSync(home, { recursive: true, force: true });
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
 
 	test("partially quoted glob metacharacters stay literal", () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-quoted-glob-"));

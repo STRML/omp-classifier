@@ -450,7 +450,7 @@ function shellPath(candidate: string, globPattern: string, cwd: string, allowDas
 		if (candidate.startsWith("~") && globPattern.startsWith("~")) {
 			if (candidate !== "~" && !candidate.startsWith("~/")) return null;
 			const home = process.env.HOME;
-			return home === undefined ? resolveToCwd(candidate, cwd) : path.resolve(home, candidate.slice(candidate === "~" ? 1 : 2));
+			return home === undefined ? resolveToCwd(candidate, cwd) : path.resolve(home, candidate.slice(1).replace(/^\/+/, ""));
 		}
 		return path.resolve(cwd, candidate);
 	} catch {
