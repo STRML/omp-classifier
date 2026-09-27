@@ -6777,7 +6777,7 @@ export default function (pi: ExtensionAPI) {
 					classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable",
 					"bash",
 					"",
-					undefined,
+					userScopeFingerprint,
 					auditFields(),
 				);
 			}

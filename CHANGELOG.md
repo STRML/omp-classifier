@@ -2,6 +2,12 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-09-27
+
+### Unclassified bash grant fingerprint (#78)
+
+- The bash classifier-unavailable dialog now passes the live user-scope fingerprint when recording a session grant, so the grant can match the same command on the next call.
+
 ## 2026-09-26
 
 ### Judged script-body reader (#132)
