@@ -724,6 +724,221 @@ describe("the directory the shell will be in", () => {
 		expect(read.bodies).toEqual([]);
 		expect(read.refusal?.why).toContain("cannot be resolved from the command text");
 	});
+
+	test("an assignment-prefixed sourced cd does not read from the start directory", () => {
+		const child = path.join(root, "child");
+		fs.mkdirSync(child);
+		writeScript(root, "hop.sh", "FOO=bar cd child\n");
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(child, "payload.py", HARMFUL_CODE);
+
+		const reportCommand = readInterpretedScriptBodies(": && source ./hop.sh; python3 payload.py", root, 8000);
+		expect(reportCommand.bodies).toEqual([]);
+		expect(reportCommand.refusal?.why).toContain("working directory");
+
+		const modeledCommand = readInterpretedScriptBodies("source ./hop.sh; python3 payload.py", root, 8000);
+		expect(modeledCommand.bodies.map(entry => entry.body)).toEqual([HARMFUL_CODE]);
+	});
+
+	test("a negated sourced cd does not read from the start directory", () => {
+		const child = path.join(root, "child");
+		fs.mkdirSync(child);
+		writeScript(root, "hop.sh", "! cd child\n");
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(child, "payload.py", HARMFUL_CODE);
+
+		const reportCommand = readInterpretedScriptBodies(": && source ./hop.sh; python3 payload.py", root, 8000);
+		expect(reportCommand.bodies).toEqual([]);
+		expect(reportCommand.refusal?.why).toContain("working directory");
+
+		const modeledCommand = readInterpretedScriptBodies("source ./hop.sh; python3 payload.py", root, 8000);
+		expect(modeledCommand.bodies.map(entry => entry.body)).toEqual([HARMFUL_CODE]);
+	});
+
+	test("a control-prefixed cwd effect in a source stays unknown", () => {
+		fs.mkdirSync(path.join(root, "child"));
+		writeScript(root, "hop.sh", "if cd child; then :; fi\n");
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(path.join(root, "child"), "payload.py", HARMFUL_CODE);
+
+		const read = readInterpretedScriptBodies(": && source ./hop.sh; python3 payload.py", root, 8000);
+
+		expect(read.bodies).toEqual([]);
+		expect(read.refusal?.why).toContain("working directory");
+	});
+
+	test("wrapped eval variants in a source leave cwd unknown", () => {
+		fs.mkdirSync(path.join(root, "child"));
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(path.join(root, "child"), "payload.py", HARMFUL_CODE);
+
+		for (const wrappedEval of [
+			"builtin eval 'cd child'",
+			"command eval 'cd child'",
+			"exec eval 'cd child'",
+			"time eval 'cd child'",
+			"env eval 'cd child'",
+		]) {
+			writeScript(root, "hop.sh", `${wrappedEval}\n`);
+			const read = readInterpretedScriptBodies(": && source ./hop.sh; python3 payload.py", root, 8000);
+			expect(read.bodies).toEqual([]);
+			expect(read.refusal?.why).toContain("working directory");
+		}
+	});
+
+	test("wrapped source forms are followed only when the wrapper is modeled", () => {
+		const child = path.join(root, "child");
+		fs.mkdirSync(child);
+		writeScript(root, "enter.sh", "cd child\n");
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(child, "payload.py", HARMFUL_CODE);
+
+		for (const wrappedSource of [
+			"command source ./enter.sh",
+			"exec source ./enter.sh",
+			"time source ./enter.sh",
+			"env source ./enter.sh",
+			"command . ./enter.sh",
+			"exec . ./enter.sh",
+			"time . ./enter.sh",
+			"env . ./enter.sh",
+		]) {
+			writeScript(root, "hop.sh", `${wrappedSource}\n`);
+			const read = readInterpretedScriptBodies("source ./hop.sh; python3 payload.py", root, 8000);
+			expect(read.bodies).toEqual([]);
+			expect(read.refusal?.why).toContain("working directory");
+		}
+
+		for (const builtinSource of ["builtin source ./enter.sh", "builtin . ./enter.sh"]) {
+			writeScript(root, "hop.sh", `${builtinSource}\n`);
+			const read = readInterpretedScriptBodies("source ./hop.sh; python3 payload.py", root, 8000);
+			expect(read.bodies.map(entry => entry.body)).toEqual([HARMFUL_CODE]);
+		}
+	});
+
+	test("an inline function body that changes cwd is not treated as inert", () => {
+		fs.mkdirSync(path.join(root, "child"));
+		writeScript(root, "hop.sh", "function move { cd child; }\nmove\n");
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(path.join(root, "child"), "payload.py", HARMFUL_CODE);
+
+		const read = readInterpretedScriptBodies(": && source ./hop.sh; python3 payload.py", root, 8000);
+
+		expect(read.bodies).toEqual([]);
+		expect(read.refusal?.why).toContain("working directory");
+	});
+
+	test("cwd-changing and dynamic trap handlers leave the sourced directory unknown", () => {
+		fs.mkdirSync(path.join(root, "child"));
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(path.join(root, "child"), "payload.py", HARMFUL_CODE);
+
+		for (const trap of ["trap 'cd child' DEBUG", "trap '\"$HANDLER\"' DEBUG"]) {
+			writeScript(root, "hop.sh", `${trap}\n`);
+			const read = readInterpretedScriptBodies(": && source ./hop.sh; python3 payload.py", root, 8000);
+			expect(read.bodies).toEqual([]);
+			expect(read.refusal?.why).toContain("working directory");
+		}
+	});
+
+	test("a sourced directory change is read from its cwd or refused, never resolved at the start directory", () => {
+		fs.mkdirSync(path.join(root, "child"));
+		writeScript(root, "hop.sh", "cd child\n");
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(path.join(root, "child"), "payload.py", HARMFUL_CODE);
+
+		const read = readInterpretedScriptBodies(": && source ./hop.sh; python3 payload.py", root, 8000);
+
+		if (read.refusal !== null) expect(read.bodies).toEqual([]);
+		else expect(read.bodies.map(body => body.body)).toEqual([HARMFUL_CODE]);
+	});
+
+	test("a sourced bootstrap without a directory effect keeps the starting directory", () => {
+		writeScript(root, "activate.sh", [
+			"deactivate () {",
+			"\thash -r",
+			"}",
+			"if [ -n \"$VIRTUAL_ENV\" ]; then",
+			"\texport VIRTUAL_ENV=/venv",
+			"fi",
+		].join("\n"));
+		writeScript(root, "payload.py", BENIGN);
+
+		const read = readInterpretedScriptBodies("source ./activate.sh; python3 payload.py", root, 8000);
+
+		expect(read.bodies.map(body => body.body)).toEqual([BENIGN]);
+	});
+
+	test("a source of a source follows the changed cwd before resolving the next file", () => {
+		const child = path.join(root, "child");
+		const grandchild = path.join(child, "grandchild");
+		fs.mkdirSync(grandchild, { recursive: true });
+		writeScript(root, "hop.sh", "cd child\n. ./enter.sh\n");
+		writeScript(child, "enter.sh", "cd grandchild\n");
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(grandchild, "payload.py", HARMFUL_CODE);
+
+		const read = readInterpretedScriptBodies("source ./hop.sh; python3 payload.py", root, 8000);
+
+		expect(read.bodies.map(body => body.body)).toEqual([HARMFUL_CODE]);
+	});
+
+	test("an unresolved or unreadable source leaves the later program directory unknown", () => {
+		writeScript(root, "payload.py", BENIGN);
+		fs.mkdirSync(path.join(root, "directory.sh"));
+
+		for (const source of ["./missing.sh", "./directory.sh", '"$SOURCE_FILE"']) {
+			const read = readInterpretedScriptBodies(`source ${source}; python3 payload.py`, root, 8000);
+			expect(read.bodies).toEqual([]);
+			expect(read.refusal?.why).toContain("working directory");
+		}
+	});
+
+	test("a cyclic source graph terminates without claiming a directory", () => {
+		writeScript(root, "hop.sh", "source ./loop.sh\n");
+		writeScript(root, "loop.sh", "source ./hop.sh\n");
+		writeScript(root, "payload.py", BENIGN);
+
+		const read = readInterpretedScriptBodies("source ./hop.sh; python3 payload.py", root, 8000);
+
+		expect(read.bodies).toEqual([]);
+		expect(read.refusal?.why).toContain("working directory");
+	});
+
+	test("a source inside a loop is not treated as an unconditional source", () => {
+		writeScript(root, "hop.sh", "for item in one; do source ./enter.sh; done\n");
+		writeScript(root, "enter.sh", "cd child\n");
+		writeScript(root, "payload.py", BENIGN);
+
+		const read = readInterpretedScriptBodies("source ./hop.sh; python3 payload.py", root, 8000);
+
+		expect(read.bodies).toEqual([]);
+		expect(read.refusal?.why).toContain("working directory");
+	});
+
+	test("a sourced function that may change cwd is refused rather than assumed inert", () => {
+		fs.mkdirSync(path.join(root, "child"));
+		writeScript(root, "hop.sh", "move_into_child() {\n cd child\n}\nmove_into_child\n");
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(path.join(root, "child"), "payload.py", HARMFUL_CODE);
+
+		const read = readInterpretedScriptBodies("source ./hop.sh; python3 payload.py", root, 8000);
+
+		expect(read.bodies).toEqual([]);
+		expect(read.refusal?.why).toContain("working directory");
+	});
+
+	test("a cwd-changing loop condition in a source is not assumed to be skipped", () => {
+		fs.mkdirSync(path.join(root, "child"));
+		writeScript(root, "hop.sh", "while cd child; do break; done\n");
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(path.join(root, "child"), "payload.py", HARMFUL_CODE);
+
+		const read = readInterpretedScriptBodies("source ./hop.sh; python3 payload.py", root, 8000);
+
+		expect(read.bodies).toEqual([]);
+		expect(read.refusal?.why).toContain("working directory");
+	});
 });
 
 describe("sibling commands of this fix stay as they were", () => {
