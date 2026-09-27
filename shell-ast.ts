@@ -208,6 +208,8 @@ export interface ShellWord {
 	 *  by nothing: what the shell produces when the variables are unset. A
 	 *  path check reads both, because `${SAFE:-key.pem}` opens `key.pem`. */
 	alternate: string;
+	/** Rendered values with inactive pathname metacharacters escaped. */
+	globAlternate: string;
 	/** True when every part was a literal: no expansion, no substitution. */
 	literal: boolean;
 	/** Names this word expands, anywhere inside it: `${BRACED}`, the
@@ -456,7 +458,7 @@ function expressionWords(node: any, arithmetic: boolean, source: string, out: Sh
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 
-const literalWord = (text: string): ShellWord => ({ source: text, value: text, alternate: text, literal: true, variables: [], substitution: false, commands: [] });
+const literalWord = (text: string): ShellWord => ({ source: text, value: text, alternate: text, globAlternate: text, literal: true, variables: [], substitution: false, commands: [] });
 
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 function readCall(cmd: any, command: ShellCommand, source: string, out: ShellCommand[]): void {
@@ -592,12 +594,13 @@ function readWord(word: any, source: string, out: ShellCommand[]): ShellWord {
 	const flags = { literal: true, substitution: false };
 	const value = renderParts(word.Parts ?? [], source, "value", false, flags);
 	const alternate = renderParts(word.Parts ?? [], source, "alternate", false, { literal: true, substitution: false });
+	const globAlternate = renderParts(word.Parts ?? [], source, "globAlternate", false, { literal: true, substitution: false });
 	const variables: string[] = [];
 	collectVariables(word, variables);
 	// One walk per word visits each node once, as one walk per call did: the
 	// words of a call are disjoint subtrees.
 	const commands = collectSubstitutions(word, source, out);
-	return { source: sliceOf(word, source), offset: stringIndexAt(source, word.Pos().Offset()), value, alternate, literal: flags.literal, variables, substitution: flags.substitution, commands };
+	return { source: sliceOf(word, source), offset: stringIndexAt(source, word.Pos().Offset()), value, alternate, globAlternate, literal: flags.literal, variables, substitution: flags.substitution, commands };
 }
 
 /**
@@ -606,7 +609,7 @@ function readWord(word: any, source: string, out: ShellCommand[]): ShellWord {
  * unset: its default or operand (`${SAFE:-key.pem}` gives `key.pem`), or
  * nothing (`$SAFE.env` gives `.env`). A substitution gives nothing in both.
  */
-type Rendering = "value" | "alternate";
+type Rendering = "value" | "alternate" | "globAlternate";
 
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 function renderParts(parts: any[], source: string, mode: Rendering, quoted: boolean, flags: { literal: boolean; substitution: boolean }): string {
@@ -617,10 +620,12 @@ function renderParts(parts: any[], source: string, mode: Rendering, quoted: bool
 function renderPart(part: any, source: string, mode: Rendering, quoted: boolean, flags: { literal: boolean; substitution: boolean }): string {
 	switch (nodeType(part)) {
 		case "Lit":
-			return unescapeLit(part.Value ?? "", quoted);
-		case "SglQuoted":
-			// `$'\x2eenv'` is `.env` to the shell.
-			return part.Dollar ? decodeAnsiC(part.Value ?? "") : (part.Value ?? "");
+			return mode.startsWith("glob") ? renderGlobLiteral(part.Value ?? "", quoted) : unescapeLit(part.Value ?? "", quoted);
+		case "SglQuoted": {
+			// `$'\\x2eenv'` is `.env` to the shell.
+			const value = part.Dollar ? decodeAnsiC(part.Value ?? "") : (part.Value ?? "");
+			return mode.startsWith("glob") ? escapeGlobLiterals(value) : value;
+		}
 		case "DblQuoted":
 			return renderParts(part.Parts ?? [], source, mode, true, flags);
 		case "ParamExp": {
@@ -646,6 +651,31 @@ function renderPart(part: any, source: string, mode: Rendering, quoted: boolean,
  *  double quotes it escapes only `$`, backtick, `"`, `\` and a newline. */
 function unescapeLit(text: string, quoted: boolean): string {
 	return quoted ? text.replace(/\\([$`"\\\n])/gu, "$1") : text.replace(/\\(.)/gsu, "$1");
+}
+
+function renderGlobLiteral(text: string, quoted: boolean): string {
+	if (quoted) return escapeGlobLiterals(unescapeLit(text, true));
+	let pattern = "";
+	for (let index = 0; index < text.length; index += 1) {
+		const ch = text[index];
+		if (ch === "\\" && index + 1 < text.length) {
+			const next = text[++index];
+			pattern += isGlobCharacter(next) ? `\\${next}` : next;
+		} else {
+			pattern += ch;
+		}
+	}
+	return pattern;
+}
+
+function escapeGlobLiterals(text: string): string {
+	let pattern = "";
+	for (const ch of text) pattern += isGlobCharacter(ch) ? `\\${ch}` : ch;
+	return pattern;
+}
+
+function isGlobCharacter(ch: string): boolean {
+	return ch === "*" || ch === "?" || ch === "[" || ch === "\\";
 }
 
 /** The last source string and the byte view the offset conversion needs. The
