@@ -4,6 +4,14 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-26
 
+### Judged script-body reader (#132)
+
+- The late-SAFE guard now checks the same `judgedCommand` text as the verdict, including spliced script-body risk flags. Files redirected into interpreters are read as code; unreadable or expanded stdin targets fail closed. Recognized wrappers consume options from per-wrapper arity tables, and unknown options make the command opaque.
+- Shell-script bodies containing here-documents or here-strings are refused rather than scanned as executed text: the reader cannot safely distinguish inert input data from a nested payload that the script later runs.
+- The reader follows `timeout --`'s duration, `env -C`'s child directory for interpreter operands, and literal stdin descriptor copies; shell-opened redirects remain relative to the shell's cwd. It does not treat `xargs` argument input or a syntax-checked main file as executed code; unknown descriptor flows and unresolvable `env` directories fail closed. Node preloads remain scanned under `--check`, and Perl `-c` remains scanned because compile-time blocks can run.
+
+- Short-option bundles that include shell `-n` or Ruby `-c` are recognized as syntax-only (`bash/sh -vn`, `ruby -wc`), so their main-file bodies are not appended; Perl `-c` remains scanned because compilation can execute `BEGIN` blocks. Ruby bundle parsing now stops at each value-taking short option, including `-r`, so a library name containing `c` cannot masquerade as Ruby's syntax check.
+
 ### Runtime shell secret-file resolution (#97)
 
 - The floor resolves readable secret-file targets through the supplied command cwd, including parser-computed alternate paths and readable symlink targets. Review-round fixes preserve active mixed-quoted/default-expression globs, carry `cd` into nested command substitutions, and keep `--` dash operands, literal `@` names, and quoted tildes as shell spells them. Basename-glob probes examine at most 256 directory entries plus one overflow lookahead; overflow asks rather than scanning indefinitely. Zero/multiple matches within the bound keep the `.e*` quiet decision, `*.pem` still asks textually, cross-word assignment simulation stays out of scope, and Python spawn interception remains #13.
