@@ -53,6 +53,7 @@
  *     and the policy that derives them. Filling those answers in is
  *     jev-judge.ts, which rides OMP's own judgment module.
  */
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -698,6 +699,8 @@ export interface NetworkProvenance {
 	/** Compose services and published ports the command reaches, as this
 	 *  machine's own compose file and docker port table measure them. */
 	dockerNetworks: DockerTarget[];
+	/** Secret-safe fingerprints of ambient client settings that can redirect egress. */
+	ambientClientConfig?: Record<string, string>;
 }
 
 /** Running docker state as this module reads it: the containers that exist and
@@ -717,14 +720,14 @@ export interface NetworkSources {
 	hostsFile?: string;
 	/** Running docker state, or undefined when there is none to read. */
 	dockerState?: () => DockerPortState | undefined;
-	/** The environment the docker CLI would run with, for `DOCKER_HOST`,
-	 *  `DOCKER_CONTEXT`, and `DOCKER_CONFIG`. Defaults to this process's own. */
+	/** Home directory for ambient client settings; defaults to this process's. */
+	homeDir?: string;
+	/** The process environment supplying proxy variables and git config. */
 	env?: Record<string, string | undefined>;
 	/** This machine's docker CLI config directory: `config.json` names the
 	 *  current context, and `contexts/meta/` holds its endpoints. */
 	dockerConfigDir?: string;
 }
-
 const DEFAULT_SSH_CONFIG_PATHS = [join(homedir(), ".ssh", "config"), "/etc/ssh/ssh_config"];
 const DEFAULT_HOSTS_FILE = "/etc/hosts";
 const DEFAULT_COMPOSE_FILES = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
@@ -1295,26 +1298,50 @@ function composeInvocations(command: string, base: string): ComposeInvocation[] 
 	return invocations;
 }
 
-/**
- * Measure the network tier for one command, or undefined when nothing about its
- * destinations could be measured — an absent field means "nothing measured",
- * never "trusted". `cwd` is the directory the command STARTS in: the compose
- * file and the docker config are looked for in the directory each of the
- * command's own segments runs in, as far as the command's `cd` chain can be read
- * (that walk is `segmentCwdAt` in `shell-cwd.ts`, shared with the script-body
- * reader). The rest of the machine state is read from the paths in `sources`.
- *
- * The compose file and the docker port table are configuration on this disk:
- * they name services and ports, never the machine a container runs on. That is
- * what the daemon measurement adds (#121 review), and it is measured from the
- * command's own text (`-H`/`--context`) plus this machine's own environment and
- * docker config (`DOCKER_HOST`, `DOCKER_CONTEXT`, the active context) — never
- * from anything the file's author wrote into the file.
- */
+/** Hashes are safe to expose: raw client configuration may contain credentials. */
+const ambientClientDigest = (value: string): string => createHash("sha256").update(value).digest("hex");
+
+function ambientClientConfig(command: string, cwd: string, sources: NetworkSources): Record<string, string> | undefined {
+	if (!/\b(?:curl|wget|npm|npx|pnpm|yarn|pip|pip3)\b/iu.test(command) && !/\bgit\s+(?:clone|fetch|pull|push|ls-remote|submodule|lfs)\b/iu.test(command) && !/\bbun\s+(?:add|install|i)\b/iu.test(command)) return undefined;
+	const home = sources.homeDir ?? homedir();
+	const configFiles: Record<string, string> = {
+		curlrc: join(home, ".curlrc"),
+		npmrc: join(home, ".npmrc"),
+		pipConfig: join(home, ".config", "pip", "pip.conf"),
+	};
+	const measured: Record<string, string> = {};
+	for (const [key, path] of Object.entries(configFiles)) {
+		try {
+			const contents = readFileSync(path);
+			measured[key] = `present:${ambientClientDigest(contents.toString("base64"))}`;
+		} catch (error) {
+			const status = error && typeof error === "object" && "code" in error && error.code === "ENOENT" ? "absent" : "unreadable";
+			measured[key] = `${status}:${ambientClientDigest(JSON.stringify([status, path]))}`;
+		}
+	}
+	const env = sources.env ?? process.env;
+	for (const name of ["HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]) {
+		measured[`env.${name}`] = env[name] === undefined ? "unset" : `set:${ambientClientDigest(env[name])}`;
+	}
+	try {
+		const config = execFileSync("git", ["config", "--show-origin", "--null", "--get-regexp", "^http\\."], { cwd, env: env as NodeJS.ProcessEnv, encoding: "buffer", stdio: ["ignore", "pipe", "ignore"] });
+		measured.gitHttp = config.length === 0 ? `absent:${ambientClientDigest("absent")}` : `present:${ambientClientDigest(config.toString("base64"))}`;
+	} catch (error) {
+		const status = error && typeof error === "object" && "status" in error && error.status === 1 ? "absent" : "unreadable";
+		measured.gitHttp = `${status}:${ambientClientDigest(JSON.stringify([status, cwd]))}`;
+	}
+	return measured;
+}
+
+/** Measure destinations and ambient egress settings for a command. The returned
+ *  object joins reviewer state and the verdict cache signature; an absent
+ *  ambient setting is represented explicitly as `absent` or `unset`, not as a
+ *  claim that no redirect is possible. */
 export function measureNetworkProvenance(command: string, cwd: string, sources: NetworkSources = {}): NetworkProvenance | undefined {
 	const endpoints = namedEndpoints(command);
 	const compose = composeInvocations(command, cwd);
-	if (endpoints.length === 0 && compose.length === 0) return undefined;
+	const ambientConfig = ambientClientConfig(command, cwd, sources);
+	if (endpoints.length === 0 && compose.length === 0 && ambientConfig === undefined) return undefined;
 
 	const env = sources.env ?? process.env;
 	// The config directory this machine's own chain is read from, resolved the
@@ -1385,8 +1412,8 @@ export function measureNetworkProvenance(command: string, cwd: string, sources: 
 	}
 
 	const ports = [...localPorts].sort((a, b) => a - b);
-	if (ports.length === 0 && knownHosts.length === 0 && dockerNetworks.length === 0) return undefined;
-	return { localPorts: ports, knownHosts, dockerNetworks };
+	if (ports.length === 0 && knownHosts.length === 0 && dockerNetworks.length === 0 && ambientConfig === undefined) return undefined;
+	return { localPorts: ports, knownHosts, dockerNetworks, ...(ambientConfig !== undefined ? { ambientClientConfig: ambientConfig } : {}) };
 }
 
 /**
@@ -2076,7 +2103,7 @@ export function buildJevState(input: {
 		// it sits beside (#121 review).
 		state.networkProvenance = {
 			...input.networkProvenance,
-			note: "measured by the gate from this machine's own SSH config, hosts file, docker config, compose file and docker port table just now; not written by the command's author",
+			note: "measured by the gate from this machine's own SSH config, hosts file, docker config, compose file and docker port table just now; not written by the command's author; ambient client config and proxy variables are hashed, not disclosed or parsed, so present settings may redirect or multiply egress beyond the command text",
 		};
 	}
 	if (Object.keys(evidence).length > 0) state.evidence = evidence;
