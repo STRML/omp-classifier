@@ -4588,12 +4588,20 @@ export function normalizeGrantTarget(command: string): string {
  *  from becoming a session-wide refusal for every invocation of that subverb.
  */
 function refusalKeyForCommand(command: string): string {
-	const strictTarget = grantKeyForCommand(command);
-	if (strictTarget.startsWith("exact:")) return strictTarget;
+	// The old identity first, because it is what the session's refusals are
+	// already keyed under: an ordinary command keeps exactly the key it had,
+	// including the leading-`cd` canonicalization, so nothing that used to be
+	// the same action becomes two.
 	const grantTarget = normalizeGrantTarget(command);
-	if (!grantTarget.startsWith("git ")) return strictTarget;
+	if (!grantTarget.startsWith("git ")) return grantTarget;
+	// Git is where the old identity was too wide: it keeps the verb, the
+	// subverb and the first argument, so `git push origin main` answered for
+	// `git push origin feature`. Key the whole normalized command instead —
+	// after the same leading-`cd` strip, so `git diff --stat` and
+	// `cd /elsewhere && git diff --stat` stay one action.
 	const collapsed = command.replace(/\s+/gu, " ").trim().toLowerCase();
 	const stripped = extractLeadingCdTarget(collapsed)?.rest || collapsed;
+	if (!stripped.startsWith("git ")) return grantTarget;
 	return `git-exact:${stripped}`;
 }
 
