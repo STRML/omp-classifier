@@ -85,6 +85,14 @@ const prompted = async (command: string, answer: string, sessionId: string) => {
 };
 
 describe("session grants", () => {
+	test("unclassified bash permission request carries its scope fingerprint", () => {
+		const source = fs.readFileSync(path.join(import.meta.dir, "../index.ts"), "utf8");
+		const unclassified = source.match(/Classifier unavailable\/timed out\. Ask rather than silently run\.[\s\S]*?requestPermission\(([\s\S]*?)\n\s*\);/u)?.[1];
+		expect(unclassified).toContain('"bash"');
+		expect(unclassified).toContain("userScopeFingerprint");
+		expect(unclassified).not.toContain("undefined");
+	});
+
 	test("Allow for session records a grant; the re-fire runs with no dialog and no model call", async () => {
 		const sid = nextSession();
 		const first = await prompted(`git branch -D feature-${sid}`, ALLOW_SESSION, sid);
