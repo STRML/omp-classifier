@@ -144,7 +144,7 @@ describe("the docker tier is measured against this machine (#65)", () => {
 			const measured = measureNetworkProvenance("curl -s http://localhost:8000/my-garage/", project, sources);
 			expect(measured?.localPorts).toEqual([8000]);
 			expect(measured?.dockerNetworks).toEqual([{ target: "fixture-web", kind: "published-port", port: 8000, resolvesLocally: true }]);
-			// An unpublished loopback port is a local process, but no docker target.
+			// No docker target is measured for this unpublished port; the listener is unknown.
 			expect(measureNetworkProvenance("curl -s http://localhost:9999/x", project, sources)).toEqual({ localPorts: [9999], knownHosts: [], dockerNetworks: [] });
 		} finally {
 			remove();
@@ -546,6 +546,21 @@ describe("the state carries the measured tier, and absence means nothing measure
 			expect(remote.instructions).toContain("`networkProvenance.localPorts`");
 			expect(remote.instructions).toContain("`networkProvenance.knownHosts`");
 			expect(remote.instructions).toContain("`networkProvenance.dockerNetworks`");
+		}
+	});
+	test("criteria do not infer a loopback listener or no egress from the measured port", () => {
+		const versions: JevBatteryVersion[] = [JEV_POLICY_VERSION, JEV_V3_POLICY_VERSION];
+		for (const version of versions) {
+			const questions = jevQuestions(version) as Record<string, { instructions: string; criteria: Record<string, string> }>;
+			const text = [
+				questions.sends_local_data_outbound.instructions,
+				...Object.values(questions.sends_local_data_outbound.criteria),
+				questions.contacts_remote_endpoint.instructions,
+				...Object.values(questions.contacts_remote_endpoint.criteria),
+			].join(" ");
+			expect(text).not.toContain("reaches a process on this machine");
+			expect(text).not.toContain("so nothing leaves it");
+			expect(text).not.toContain("this machine talking to itself");
 		}
 	});
 });

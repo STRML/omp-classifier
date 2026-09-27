@@ -350,10 +350,11 @@ describe("jevQuestionsHash", () => {
 		// 14b1fbfbe041a60a… / 9471947eb279787d. Batch7's measured worktree
 		// and ref criteria then advanced through jev-v2.4–v2.9, ending at
 		// e9898fcfab3e211c… / 25072b90bb61e591. This merge keeps both sets of
-		// criteria; the merged jev-v2.10 digest and hash are pinned below.
+		// criteria; the merged jev-v2.10 digest and hash are pinned below. Issue #134
+		// rewords loopback provenance without bumping the battery version.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("8f2645eea104daf5bb32bbadb69ee298cb78c04e14d85ad08558788a7cb7054a");
-		expect(jevQuestionsHash()).toBe("6b7ceb2369a51b21");
+		expect(digest).toBe("000f8033790340af01322d879109e3d73ee65883e56924c4e8e01d35491ab06c");
+		expect(jevQuestionsHash()).toBe("869015868f1c9cf2");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 
