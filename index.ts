@@ -4499,7 +4499,7 @@ function addRefusal(
 	// Dry-run probe (issue #32): records nothing.
 	if (dryRun) return;
 	try {
-		const target = normalizeGrantTarget(command);
+		const target = refusalKeyForCommand(command);
 		if (target === "") return;
 		const list = sessionRefusals(ctx.sessionManager.getSessionId());
 		const refusalCwd = meta.cwd ?? "";
@@ -4528,7 +4528,7 @@ function addRefusal(
 function liftRefusals(ctx: ExtensionContext, command: string, cwd = ""): void {
 	try {
 		const sessionId = ctx.sessionManager.getSessionId();
-		const target = normalizeGrantTarget(command);
+		const target = refusalKeyForCommand(command);
 		if (target === "") return;
 		const list = refusals.get(sessionId);
 		if (!list) return;
@@ -4581,6 +4581,34 @@ export function normalizeGrantTarget(command: string): string {
 	}
 	return [...lead, ...[...flags].sort(), firstArg].filter(part => part !== "").join(" ");
 }
+
+/** Refusals retain the grant identity for ordinary commands, whose normalized
+ *  equivalences are intentional. Git subcommands are different: preserving the
+ *  full normalized command prevents a refusal for one branch/remote/option set
+ *  from becoming a session-wide refusal for every invocation of that subverb.
+ */
+function refusalKeyForCommand(command: string): string {
+	// The old identity first, because it is what the session's refusals are
+	// already keyed under: an ordinary command keeps exactly the key it had,
+	// including the leading-`cd` canonicalization, so nothing that used to be
+	// the same action becomes two.
+	const grantTarget = normalizeGrantTarget(command);
+	// Git is where the old identity was too wide: it keeps the verb, the
+	// subverb and the first argument, so `git push origin main` answered for
+	// `git push origin feature`. Key the whole command instead — the whitespace
+	// and the leading `cd` normalized, but NOT lowercased, because `release..main`
+	// and `Release..main` can be different refs — and look through wrappers
+	// first, so `command git diff …` is keyed as the git command it is rather
+	// than falling back to the broad `command git` identity.
+	const collapsed = command.replace(/\s+/gu, " ").trim();
+	const stripped = extractLeadingCdTarget(collapsed)?.rest || collapsed;
+	const words = stripped.split(" ").filter(word => word !== "");
+	let index = 0;
+	while (index < words.length && WRAPPER_COMMANDS.has(commandBasename(words[index].toLowerCase()))) index++;
+	if (commandBasename(words[index]?.toLowerCase() ?? "") !== "git") return grantTarget;
+	return `git-exact:${stripped}`;
+}
+
 
 /**
  * Exact-ish grant key for eval program text: the shell verb+argument shape
@@ -4810,7 +4838,7 @@ function priorRefusalFor(
 	evidenceFingerprint?: string,
 ): Refusal | undefined {
 	try {
-		const target = normalizeGrantTarget(command);
+		const target = refusalKeyForCommand(command);
 		if (target === "") return undefined;
 		return refusals.get(ctx.sessionManager.getSessionId())?.find(refusal => {
 			if (refusal.normalizedTarget !== target || refusal.cwd !== cwd) return false;

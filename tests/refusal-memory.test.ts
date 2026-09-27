@@ -119,6 +119,42 @@ describe("refusal identity (issue #64): the key a session grant uses", () => {
 });
 
 describe("refusal memory", () => {
+	test("a Git refusal does not carry over to a different branch", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("git push origin main"), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		await fire("tool_call", makeEvent("git push origin feature"), makeCtx({ sessionId: sid }));
+		expect(modelCalls.length).toBe(2);
+		expect(priorRefusalOf(1)).toBeUndefined();
+	});
+
+	test("a Git refusal does not carry over to a differently-cased ref", async () => {
+		// `release..main` and `Release..main` can name different refs, so the key
+		// keeps case. Lowercasing them into one identity would let a refusal for
+		// one weigh on the other.
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("git diff release..main"), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		await fire("tool_call", makeEvent("git diff Release..main"), makeCtx({ sessionId: sid }));
+		expect(modelCalls.length).toBe(2);
+		expect(priorRefusalOf(1)).toBeUndefined();
+	});
+
+	test("a wrapped Git command is keyed on the git command it wraps", async () => {
+		// `command git diff …` normalizes to the broad `command git` identity
+		// under the grant rule, which would make one refusal cover every wrapped
+		// git command in the session. The key looks through the wrapper instead.
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("command git diff release..main"), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		await fire("tool_call", makeEvent("command git diff feature..main"), makeCtx({ sessionId: sid }));
+		expect(modelCalls.length).toBe(2);
+		expect(priorRefusalOf(1)).toBeUndefined();
+	});
+
 	test("reworded command carries priorRefusal into the state", async () => {
 		const sid = nextSession();
 		setJevAnswer(jevUnsafeAnswer());
