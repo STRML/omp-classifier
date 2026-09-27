@@ -582,6 +582,31 @@ describe("the floor reads the parser's view (plan 2026-09-22-real-shell-parser.m
 		}
 	});
 
+	test("brace expansion preserves tilde and quote provenance for home paths", () => {
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-brace-home-"));
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-brace-cwd-"));
+		const previousHome = process.env.HOME;
+		try {
+			const secretDir = path.join(home, ".aws");
+			fs.mkdirSync(secretDir);
+			const secret = path.join(secretDir, "credentials");
+			fs.writeFileSync(secret, "token");
+			fs.symlinkSync(secret, path.join(home, "alias"));
+			process.env.HOME = home;
+			expect(evaluateFloor({ command: "cat {~,missing}/alias", cwd }).asks).toBe(true);
+			expect(evaluateFloor({ command: 'cat {~,"missing"}/alias', cwd }).asks).toBe(true);
+			expect(evaluateFloor({ command: 'cat "{~,missing}/alias"', cwd }).asks).toBe(false);
+			expect(evaluateFloor({ command: "cat {missing,other}/alias", cwd }).asks).toBe(false);
+			fs.symlinkSync(secret, path.join(cwd, "alias"));
+			expect(evaluateFloor({ command: "cat alias", cwd }).asks).toBe(true);
+		} finally {
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			fs.rmSync(home, { recursive: true, force: true });
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("a glob scan beyond its entry bound asks without scanning the directory", () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-glob-bound-"));
 		try {
