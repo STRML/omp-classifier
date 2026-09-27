@@ -222,10 +222,10 @@ One request, two inputs, no prose:
 
 - **State** — `buildJevState(...)`: the command or payload, cwd, the evidence tiers, and the
   tiers the gate measured itself (`gitPushProvenance` for the refs a push names,
-  `networkProvenance` for the destinations a command names — the loopback ports it uses, the
-  hosts this machine's own SSH config, hosts file, or docker state also names, and the
-  compose services it reaches, each with the machine the daemon the command names puts them
-  on). A measured tier carries a `note` saying so, is absent when
+  `networkProvenance` for the destinations a command names — ports at loopback addresses on
+  this machine (without identifying their listeners), hosts this machine's own SSH config,
+  hosts file, or docker state also names, and compose services it reaches, each with the
+  machine the daemon the command names puts them on). A measured tier carries a `note` saying so, is absent when
   nothing could be measured, and is never written by the command's author.
 - **Battery** — `jevQuestions()`: one `choice` question for the verdict, one `noul` per
   hazard in `JEV_HAZARDS`, one `score` question for blast radius. The battery is a pure
