@@ -375,8 +375,8 @@ function resolvedSecretPathIn(word: ShellWord, cwd: string | undefined, allowDas
 			const candidate = candidates[index];
 			const globPattern = globPatterns[index];
 			const resolved = hasActivePathGlob(globPattern)
-				? oneGlobMatch(candidate, globPattern, cwd, word, allowDashLeadingPath)
-				: shellPath(candidate, cwd, word, allowDashLeadingPath);
+				? oneGlobMatch(candidate, globPattern, cwd, allowDashLeadingPath)
+				: shellPath(candidate, globPattern, cwd, allowDashLeadingPath);
 			if (resolved === null) return candidate;
 			if (resolved !== undefined && readableSecretFile(resolved)) return candidate;
 		}
@@ -401,9 +401,9 @@ function hasActivePathGlob(pattern: string): boolean {
 const MAX_GLOB_SCAN_ENTRIES = 256;
 
 /** Match a simple basename glob; recursive and directory-glob scans stay text-only. */
-function oneGlobMatch(candidate: string, matcherPattern: string, cwd: string, word: ShellWord, allowDashLeadingPath: boolean): string | null | undefined {
+function oneGlobMatch(candidate: string, matcherPattern: string, cwd: string, allowDashLeadingPath: boolean): string | null | undefined {
 	if (matcherPattern.includes("**") || /(?:^|\/)[!@+?*]\(/u.test(matcherPattern)) return undefined;
-	const absolute = shellPath(candidate, cwd, word, allowDashLeadingPath);
+	const absolute = shellPath(candidate, matcherPattern, cwd, allowDashLeadingPath);
 	if (absolute === null) return null;
 	if (absolute === undefined) return undefined;
 	const directory = path.dirname(absolute);
@@ -444,12 +444,13 @@ function oneGlobMatch(candidate: string, matcherPattern: string, cwd: string, wo
 	}
 }
 
-function shellPath(candidate: string, cwd: string, word: ShellWord, allowDashLeadingPath: boolean): string | null | undefined {
+function shellPath(candidate: string, globPattern: string, cwd: string, allowDashLeadingPath: boolean): string | null | undefined {
 	if (candidate.length === 0 || (!allowDashLeadingPath && candidate.startsWith("-"))) return undefined;
 	try {
-		if (candidate.startsWith("~") && word.source.startsWith("~")) {
+		if (candidate.startsWith("~") && globPattern.startsWith("~")) {
 			if (candidate !== "~" && !candidate.startsWith("~/")) return null;
-			return resolveToCwd(candidate, cwd);
+			const home = process.env.HOME;
+			return home === undefined ? resolveToCwd(candidate, cwd) : path.resolve(home, candidate.slice(1).replace(/^\/+/, ""));
 		}
 		return path.resolve(cwd, candidate);
 	} catch {

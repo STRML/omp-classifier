@@ -624,7 +624,7 @@ function renderPart(part: any, source: string, mode: Rendering, quoted: boolean,
 		case "SglQuoted": {
 			// `$'\\x2eenv'` is `.env` to the shell.
 			const value = part.Dollar ? decodeAnsiC(part.Value ?? "") : (part.Value ?? "");
-			return mode.startsWith("glob") ? escapeGlobLiterals(value) : value;
+			return mode.startsWith("glob") ? escapePathLiterals(value) : value;
 		}
 		case "DblQuoted":
 			return renderParts(part.Parts ?? [], source, mode, true, flags);
@@ -654,13 +654,13 @@ function unescapeLit(text: string, quoted: boolean): string {
 }
 
 function renderGlobLiteral(text: string, quoted: boolean): string {
-	if (quoted) return escapeGlobLiterals(unescapeLit(text, true));
+	if (quoted) return escapePathLiterals(unescapeLit(text, true));
 	let pattern = "";
 	for (let index = 0; index < text.length; index += 1) {
 		const ch = text[index];
 		if (ch === "\\" && index + 1 < text.length) {
 			const next = text[++index];
-			pattern += isGlobCharacter(next) ? `\\${next}` : next;
+			pattern += isPathPatternCharacter(next) ? `\\${next}` : next;
 		} else {
 			pattern += ch;
 		}
@@ -668,14 +668,14 @@ function renderGlobLiteral(text: string, quoted: boolean): string {
 	return pattern;
 }
 
-function escapeGlobLiterals(text: string): string {
+function escapePathLiterals(text: string): string {
 	let pattern = "";
-	for (const ch of text) pattern += isGlobCharacter(ch) ? `\\${ch}` : ch;
+	for (const ch of text) pattern += isPathPatternCharacter(ch) ? `\\${ch}` : ch;
 	return pattern;
 }
 
-function isGlobCharacter(ch: string): boolean {
-	return ch === "*" || ch === "?" || ch === "[" || ch === "\\";
+function isPathPatternCharacter(ch: string): boolean {
+	return ch === "*" || ch === "?" || ch === "[" || ch === "\\" || ch === "~";
 }
 
 /** The last source string and the byte view the offset conversion needs. The
