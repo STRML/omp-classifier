@@ -73,16 +73,17 @@ Over-asking is the floor's correct failure direction, and this trades the whole 
 
 ### 4. What a name check cannot see
 
-The floor decides whether a word names a secret file by reading the word's text. That check can see anything the text fixes: quotes, backslashes, `$'…'` escapes, brace expansion, and the default in `${SAFE:-key.pem}`. It cannot see a value decided at run time:
+The floor's text check sees values fixed by the word: quotes, backslashes, `$'…'` escapes, brace expansion, and the default in `${SAFE:-key.pem}`. Runtime values remain outside that check, but the shell secret-file entry now resolves a narrow subset from facts the gate can read. It receives the command's starting `cwd`, uses the shared shell-cwd segment walk for command directories, and follows the parser's word values; it does not run the command or simulate shell state.
 
-| Runtime value | Example that passes the floor |
+| Runtime value | Resolution boundary |
 | --- | --- |
-| A glob, which matches whatever is on disk | `cat .e*` |
-| An assignment inside one expansion that changes the next | `cat ${x:=key.txt} ${x/txt/pem}` |
-| A symlink, which renames any file | `ln -s ~/.aws/credentials notes.txt && cat notes.txt` |
-| Code in another language, whose strings the floor does not evaluate | `subprocess.run(["o" "p", "read", …])` |
+| A glob, which matches whatever is on disk | A literal basename glob such as `cat .e*` is checked only in one static directory and only when it matches exactly one readable file. Recursive or directory globs, zero matches, and multiple matches keep the original text-only answer (`.e*` stays quiet); a spelled secret suffix such as `*.pem` still asks without a match. |
+| A parameter value the shell parser already computes | The parser's `alternate` value is checked against the filesystem, so `cat ${SAFE:-notes.txt}` asks when `notes.txt` is a readable symlink to a secret file. |
+| An assignment inside one expansion that changes the next | `cat ${x:=key.txt} ${x/txt/pem}` remains text-only: the parser does not compute the variable mutation across words, and the floor does not simulate it. |
+| A symlink, which renames any file | `cat notes.txt` asks when the existing, readable target resolves to a secret path. An unreadable, missing, or otherwise unresolvable target keeps the existing text-only result. |
+| Code in another language, whose strings the floor does not evaluate | `subprocess.run(["o" "p", "read", …])` remains for eval-kernel spawn interception in #13; shell path resolution does not parse Python strings. |
 
-The floor reads each of these as the text it is written as, so `*.pem` still asks. Every one of them reaches the reviewer. Three Codex rounds on PR #96 found a new runtime spelling each time, and the symlink row shows why no number of spellings closes the class. This limit is a decision, recorded here the same way as the destination residual in the intent-aware plan. Treat it as settled, not as a gap to fill. #97 tracks the two changes that would close it: judging the file a command opens, and intercepting spawns in the eval kernel (#13).
+The floor's lexical `*.pem` ask and `.e*` quiet decision are unchanged when the gate cannot resolve the file. This narrows, rather than replaces, section 4's settled boundary: exactly-one file matches and readable symlink targets can now be judged from the runtime filesystem, while assignment simulation and non-shell spawn interception remain out of scope. Three Codex rounds on PR #96 found why guessing spellings does not close those remaining classes. #97 tracked both moves; this is the shell half, and #13 remains the code half.
 
 ## Failure matrix
 
@@ -102,7 +103,8 @@ The floor reads each of these as the text it is written as, so `*.pem` still ask
 | `printf … \| tee /tmp/leak \| docker login --password-stdin` | The pipe structure is the parser's, and `tee` still breaks the exemption | Pipeline position lost | Existing test, unchanged |
 | `2>&1`, `&>`, `>&2`, `>>` | Direction and target from the parser's redirect node | Opaque operator numbers renumbered by a library upgrade | A test parses each spelling and pins its number |
 | A command 100 KB long | Parsed; the existing caps still apply | The parser walked without bound in the classification path | Test asserting the parse stays under the budget |
-| `cat .e*`, `cat ${x:=a} ${x/a/.env}`, a symlink to a secret | The floor reads the text as written and does not ask; the reviewer judges it | Expected by section 4, not a failure | Test pins that a glob reads as its text and that no glob throws |
+| `cat .e*` with one readable match, a parser-computed path, or a readable symlink to a secret | The floor resolves the actual path and asks for a secret file; zero/multiple glob matches retain `.e*`'s quiet text-only answer, while `*.pem` still asks lexically | Assuming a path for a multi-match glob or unreadable target | Tests pin one vs multiple matches, parser `alternate`, symlink target, and `cd` directory |
+| `cat ${x:=key.txt} ${x/txt/pem}` or Python `subprocess.run(["o" "p", "read", …])` | Stays at the existing text-only decision; no assignment simulation or language-specific parsing | Guessing a cross-word value or Python concatenation | The former remains quiet; code spawn interception is #13 |
 | A malformed glob such as `.e[z-a]` | The floor decides without compiling it | A regex built from the glob throws, and the floor returns no decision | Test per malformed shape, asserting no throw |
 | `mvdan-sh` missing at runtime | The floor asks and the summary reports `unparsed-command` | An import error crashing the interceptor | Test with the parser stubbed to throw |
 
