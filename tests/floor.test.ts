@@ -528,6 +528,26 @@ describe("the floor reads the parser's view (plan 2026-09-22-real-shell-parser.m
 		}
 	});
 
+	test("partially quoted glob metacharacters stay literal", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-quoted-glob-"));
+		try {
+			const secretDir = path.join(cwd, ".aws");
+			fs.mkdirSync(secretDir);
+			const secret = path.join(secretDir, "credentials");
+			fs.writeFileSync(secret, "token");
+			fs.symlinkSync(secret, path.join(cwd, "*.x-note"));
+			fs.writeFileSync(path.join(cwd, "other.x-note"), "ordinary");
+
+			expect([
+				evaluateFloor({ command: 'cat "*.x"*', cwd }).asks,
+				evaluateFloor({ command: "cat *.x*", cwd }).asks,
+				evaluateFloor({ command: 'cat "*.x*"', cwd }).asks,
+			]).toEqual([true, false, false]);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("a nested command substitution resolves after its own cd", () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-floor-nested-cwd-"));
 		try {

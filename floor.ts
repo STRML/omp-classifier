@@ -363,17 +363,19 @@ function redirectSecrets(redirect: ShellRedirect, scan: SecretScan, cwd?: string
 	return wordSecrets(redirect.target, scan, !redirect.here, cwd, true);
 }
 
-/** Resolve file spellings supplied by the shell parser. Active pathname
- *  metacharacters are checked in source so quoting and escaping stay intact. */
+/** Resolve file spellings using quote-aware patterns rendered by the shell parser. */
 function resolvedSecretPathIn(word: ShellWord, cwd: string | undefined, allowDashLeadingPath = false): string | undefined {
 	if (cwd === undefined) return undefined;
-	for (const text of word.literal ? [word.value] : [word.alternate]) {
+	const spellings = word.literal ? [[word.value, word.globAlternate]] : [[word.alternate, word.globAlternate]];
+	for (const [text, globText] of spellings) {
 		const candidates = expandBraces(text);
-		if (candidates === undefined) continue;
-		for (const candidate of candidates) {
-			const glob = (candidate.includes("*") || candidate.includes("?") || candidate.includes("[")) && hasActivePathGlob(word.source);
-			const resolved = glob
-				? oneGlobMatch(candidate, cwd, word, allowDashLeadingPath)
+		const globPatterns = expandBraces(globText);
+		if (candidates === undefined || globPatterns === undefined) continue;
+		for (let index = 0; index < candidates.length; index += 1) {
+			const candidate = candidates[index];
+			const globPattern = globPatterns[index];
+			const resolved = hasActivePathGlob(globPattern)
+				? oneGlobMatch(candidate, globPattern, cwd, word, allowDashLeadingPath)
 				: shellPath(candidate, cwd, word, allowDashLeadingPath);
 			if (resolved === null) return candidate;
 			if (resolved !== undefined && readableSecretFile(resolved)) return candidate;
@@ -382,30 +384,12 @@ function resolvedSecretPathIn(word: ShellWord, cwd: string | undefined, allowDas
 	return undefined;
 }
 
-/** True when pathname metacharacters occur outside shell quotes and escapes. */
-function hasActivePathGlob(source: string): boolean {
-	let quote: "'" | '"' | undefined;
-	for (let index = 0; index < source.length; index += 1) {
-		const ch = source[index];
-		if (quote === "'") {
-			if (ch === "'") quote = undefined;
-			continue;
-		}
-		if (quote === '"') {
-			if (ch === "\\" && index + 1 < source.length) {
-				const next = source[index + 1];
-				if (next === '"' || next === "\\" || next === "$" || next === "`") index += 1;
-				continue;
-			}
-			if (ch === '"') quote = undefined;
-			continue;
-		}
+/** True when pathname metacharacters remain active in the parser-rendered pattern. */
+function hasActivePathGlob(pattern: string): boolean {
+	for (let index = 0; index < pattern.length; index += 1) {
+		const ch = pattern[index];
 		if (ch === "\\") {
 			index += 1;
-			continue;
-		}
-		if (ch === "'" || ch === '"') {
-			quote = ch;
 			continue;
 		}
 		if (ch === "*" || ch === "?" || ch === "[") return true;
@@ -417,16 +401,16 @@ function hasActivePathGlob(source: string): boolean {
 const MAX_GLOB_SCAN_ENTRIES = 256;
 
 /** Match a simple basename glob; recursive and directory-glob scans stay text-only. */
-function oneGlobMatch(pattern: string, cwd: string, word: ShellWord, allowDashLeadingPath: boolean): string | null | undefined {
-	if (pattern.includes("**") || /(?:^|\/)[!@+?*]\(/u.test(pattern)) return undefined;
-	const absolute = shellPath(pattern, cwd, word, allowDashLeadingPath);
+function oneGlobMatch(candidate: string, matcherPattern: string, cwd: string, word: ShellWord, allowDashLeadingPath: boolean): string | null | undefined {
+	if (matcherPattern.includes("**") || /(?:^|\/)[!@+?*]\(/u.test(matcherPattern)) return undefined;
+	const absolute = shellPath(candidate, cwd, word, allowDashLeadingPath);
 	if (absolute === null) return null;
 	if (absolute === undefined) return undefined;
 	const directory = path.dirname(absolute);
 	const basename = path.basename(absolute);
 	if (basename === "" || directory.includes("*") || directory.includes("?") || directory.includes("[")) return undefined;
 	try {
-		const matcher = new Bun.Glob(basename);
+		const matcher = new Bun.Glob(path.basename(matcherPattern));
 		const entries = fs.opendirSync(directory);
 		try {
 			let match: string | undefined;

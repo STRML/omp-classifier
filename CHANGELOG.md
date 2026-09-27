@@ -15,6 +15,7 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 ### Runtime shell secret-file resolution (#97)
 
 - The floor resolves readable secret-file targets through the supplied command cwd, including parser-computed alternate paths and readable symlink targets. Review-round fixes preserve active mixed-quoted/default-expression globs, carry `cd` into nested command substitutions, and keep `--` dash operands, literal `@` names, and quoted tildes as shell spells them. Basename-glob probes examine at most 256 directory entries plus one overflow lookahead; overflow asks rather than scanning indefinitely. Zero/multiple matches within the bound keep the `.e*` quiet decision, `*.pem` still asks textually, cross-word assignment simulation stays out of scope, and Python spawn interception remains #13.
+- Runtime pathname matching preserves which glob metacharacters were active after quote removal, so `cat "*.x"*` resolves only the literal-prefix match instead of treating its quoted `*` as a wildcard (#138).
 
 ### Provenance measurement fixes (#133)
 
