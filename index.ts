@@ -4499,7 +4499,7 @@ function addRefusal(
 	// Dry-run probe (issue #32): records nothing.
 	if (dryRun) return;
 	try {
-		const target = normalizeGrantTarget(command);
+		const target = refusalKeyForCommand(command);
 		if (target === "") return;
 		const list = sessionRefusals(ctx.sessionManager.getSessionId());
 		const refusalCwd = meta.cwd ?? "";
@@ -4528,7 +4528,7 @@ function addRefusal(
 function liftRefusals(ctx: ExtensionContext, command: string, cwd = ""): void {
 	try {
 		const sessionId = ctx.sessionManager.getSessionId();
-		const target = normalizeGrantTarget(command);
+		const target = refusalKeyForCommand(command);
 		if (target === "") return;
 		const list = refusals.get(sessionId);
 		if (!list) return;
@@ -4581,6 +4581,22 @@ export function normalizeGrantTarget(command: string): string {
 	}
 	return [...lead, ...[...flags].sort(), firstArg].filter(part => part !== "").join(" ");
 }
+
+/** Refusals retain the grant identity for ordinary commands, whose normalized
+ *  equivalences are intentional. Git subcommands are different: preserving the
+ *  full normalized command prevents a refusal for one branch/remote/option set
+ *  from becoming a session-wide refusal for every invocation of that subverb.
+ */
+function refusalKeyForCommand(command: string): string {
+	const strictTarget = grantKeyForCommand(command);
+	if (strictTarget.startsWith("exact:")) return strictTarget;
+	const grantTarget = normalizeGrantTarget(command);
+	if (!grantTarget.startsWith("git ")) return strictTarget;
+	const collapsed = command.replace(/\s+/gu, " ").trim().toLowerCase();
+	const stripped = extractLeadingCdTarget(collapsed)?.rest || collapsed;
+	return `git-exact:${stripped}`;
+}
+
 
 /**
  * Exact-ish grant key for eval program text: the shell verb+argument shape
@@ -4810,7 +4826,7 @@ function priorRefusalFor(
 	evidenceFingerprint?: string,
 ): Refusal | undefined {
 	try {
-		const target = normalizeGrantTarget(command);
+		const target = refusalKeyForCommand(command);
 		if (target === "") return undefined;
 		return refusals.get(ctx.sessionManager.getSessionId())?.find(refusal => {
 			if (refusal.normalizedTarget !== target || refusal.cwd !== cwd) return false;

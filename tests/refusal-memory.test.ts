@@ -119,6 +119,16 @@ describe("refusal identity (issue #64): the key a session grant uses", () => {
 });
 
 describe("refusal memory", () => {
+	test("a Git refusal does not carry over to a different branch", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("git push origin main"), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		await fire("tool_call", makeEvent("git push origin feature"), makeCtx({ sessionId: sid }));
+		expect(modelCalls.length).toBe(2);
+		expect(priorRefusalOf(1)).toBeUndefined();
+	});
+
 	test("reworded command carries priorRefusal into the state", async () => {
 		const sid = nextSession();
 		setJevAnswer(jevUnsafeAnswer());

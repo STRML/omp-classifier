@@ -4,6 +4,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-27
 
+### Git refusal command identity (#68)
+
+- Refusal memory now retains the full normalized Git command, so refusing one branch/remote/option combination does not make a different invocation of the same Git subverb inherit that refusal. Non-Git refusal normalization remains unchanged.
+
 ### Unclassified bash grant fingerprint (#78)
 
 - The bash classifier-unavailable dialog now passes the live user-scope fingerprint when recording a session grant, so the grant can match the same command on the next call.
