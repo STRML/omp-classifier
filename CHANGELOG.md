@@ -10,6 +10,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 - User-policy snapshots are capped at 32 KiB total; project-dotenv path overrides and instruction files inside the current Git repository fail closed instead of being pinned.
 - Repository containment uses the trust command's directory when pinning and each Bash/eval execution directory when resolving; failed or ambiguous Git discovery refuses rather than disabling the repository-local check, while an explicit non-repository result still permits user-level paths.
 
+### Mid-session task evidence (#106)
+
+- The Jev v3 battery asks which already-sent `evidence.userMessages` state the current task. The collector adds at most one most-recent, unscoped message outside the existing tail as a candidate; existing scope-word evidence and the first-message pin remain. The selected-message cap remains eight, with the existing first-message pin potentially adding one more, so the judge receives at most nine user messages. The task question judges those same messages and does not widen the state. Its battery-hash change intentionally invalidates cached Jev v3 verdicts.
+
 ## 2026-09-27
 
 ### Source-aware shell directory walks (#130)

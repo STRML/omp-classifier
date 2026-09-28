@@ -250,6 +250,16 @@ describe("the question battery", () => {
 		}
 	});
 
+	test("adds one typed task-statement question to the V3 battery", () => {
+		const questions = jevQuestions(JEV_V3_POLICY_VERSION) as Record<string, { type: string; instructions: string; criteria: { true: string; false: string } }>;
+		const question = questions.task_statement;
+		expect(question.type).toBe("noul");
+		expect(question.instructions).toContain("`evidence.userMessages`");
+		expect(Object.values(question.criteria).join(" ")).not.toMatch(/first|position/iu);
+		expect(question.criteria.true).toContain("`evidence.userMessages`");
+		expect(question.criteria.false).toContain("`evidence.userMessages`");
+	});
+
 	test("the taxonomy is split, ordered gating-then-descriptive, and complete", () => {
 		// The split is the contract: nine ids, no overlap, gating first. A hazard
 		// that drifts between the groups silently changes what can block a command.
@@ -366,10 +376,10 @@ describe("the jev-v3 battery", () => {
 	const v2 = jevQuestions();
 	const v3 = jevQuestions(JEV_V3_POLICY_VERSION);
 
-	test("keeps the jev-v2 shape and changes only the secret questions and the verdict", () => {
-		expect(Object.keys(v3)).toEqual(Object.keys(v2));
+	test("keeps the jev-v2 shape and changes only the secret questions, verdict, and task statement", () => {
+		expect(Object.keys(v3)).toEqual([...Object.keys(v2).slice(0, -1), "task_statement", "blast_radius"]);
 		const changed = Object.keys(v3).filter(id => JSON.stringify(v3[id]) !== JSON.stringify(v2[id]));
-		expect(changed).toEqual(["verdict", "exposes_secrets", "sends_local_data_outbound"]);
+		expect(changed).toEqual(["verdict", "exposes_secrets", "sends_local_data_outbound", "task_statement"]);
 		const verdict2 = v2.verdict as Verdict;
 		const verdict3 = v3.verdict as Verdict;
 		expect(verdict3.criteria.safe).toBe(verdict2.criteria.safe);
@@ -495,6 +505,7 @@ const distributed = (
 		confidence: over.confidence ?? 0.92,
 	},
 	...nouls(over.hazards),
+	task_statement: { type: "noul", noul: 0.2 } as unknown as Answer,
 	blast_radius: { type: "score", score: over.score ?? 0.4, probabilities: { "0": 0.6, "1": 0.4 }, confidence: 0.8 },
 });
 
@@ -628,6 +639,7 @@ describe("judgeBattery", () => {
 		const answers = await judgeBattery(undefined, { state: "state", judge, version: JEV_V3_POLICY_VERSION });
 		expect(JSON.stringify(judged.questions)).toBe(JSON.stringify(jevQuestions(JEV_V3_POLICY_VERSION)));
 		expect(answers.hazards.exposes_secrets).toBe(0);
+		expect(answers.taskStatement).toBe(0.2);
 	});
 
 	test("distribution-shaped answers escalate exactly as the policy says", async () => {

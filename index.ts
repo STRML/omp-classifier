@@ -1700,27 +1700,21 @@ export function collectTaskEvidence(branch: ReadonlyArray<EvidenceBranchEntry>, 
 
 export interface UserEvidenceSnapshotV3 extends UserEvidenceSnapshot {
 	/** The first user message since the latest `/clear`, when the newest-8
-	 *  slice dropped it. It is positional: whatever the user said first, which
-	 *  is where a session usually states its task. It sits outside
-	 *  TASK_EVIDENCE_MAX, so later messages can't push it out. It reaches the judges but never a
-	 *  literal match: an old request cannot authorize a new command alone. */
+	 *  slice drops it. It remains positional context, not authorization by
+	 *  itself, and reaches the judge but never a literal match. */
 	pinned?: { id: string; text: string };
 }
 
 /**
- * The jev-v3 evidence builder (plan Phase 2 step 6). It differs from
- * collectTaskEvidence in two ways: it pins the first user message when the
- * slice would drop it, and its collector name records that it feeds the
- * jev-v3 battery. Both builders now read only what follows the latest
- * `/clear` (`reset_boundary`), the way the host rebuilds model context
- * (#103).
+ * The jev-v3 evidence builder. It reads only what follows the latest `/clear`
+ * (`reset_boundary`), matching the host's context boundary (#103). In addition
+ * to the newest tail and existing scope-word messages, it retains at most one
+ * most-recent unscoped message outside the tail as a candidate for the task
+ * statement question. The first-message pin remains separate; the battery
+ * judges the same bounded evidence the gate already sends.
  *
- * The plan also asked for task verbs in the anchor pattern. Four review
- * rounds showed a verb list can't converge on intent (every fix traded one
- * miss for another), so anchoring stays jev-v2's scope words, and a task
- * stated mid-session still ages out as it does today (#106).
- * collectTaskEvidence stays as it is, because the jev-v2 shadow baseline
- * reads it.
+ * collectTaskEvidence stays unchanged because the jev-v2 shadow baseline reads
+ * it.
  */
 export function collectTaskEvidenceV3(branch: ReadonlyArray<EvidenceBranchEntry>, limit: number): UserEvidenceSnapshotV3 {
 	if (limit <= 0) return { messages: [], ids: [] };
@@ -1738,10 +1732,24 @@ export function collectTaskEvidenceV3(branch: ReadonlyArray<EvidenceBranchEntry>
 	}
 	if (all.length === 0) return { messages: [], ids: [] };
 	const tail = new Set(all.slice(-limit).map(item => item.id));
+	let candidate: (typeof all)[number] | undefined;
+	for (let index = all.length - 1; index > 0; index--) {
+		const item = all[index];
+		if (!tail.has(item.id) && !item.anchored) {
+			candidate = item;
+			break;
+		}
+	}
 	const anchors = all.filter(item => item.anchored).slice(-TASK_EVIDENCE_MAX);
-	const selected = [...all.filter(item => tail.has(item.id)), ...anchors.filter(item => !tail.has(item.id))]
-		.sort((a, b) => a.index - b.index)
-		.slice(-TASK_EVIDENCE_MAX);
+	const ordered = [...all.filter(item => tail.has(item.id)), ...anchors.filter(item => !tail.has(item.id)), ...(candidate ? [candidate] : [])]
+		.sort((a, b) => a.index - b.index);
+	// The candidate is the task statement this collector exists to keep, so it
+	// holds a slot of its own: trimming the oldest of the rest, rather than
+	// letting the cap drop the one message the question is asked about.
+	const selected =
+		ordered.length > TASK_EVIDENCE_MAX && candidate !== undefined
+			? [...ordered.filter(item => item.id !== candidate.id).slice(-(TASK_EVIDENCE_MAX - 1)), candidate].sort((a, b) => a.index - b.index)
+			: ordered.slice(-TASK_EVIDENCE_MAX);
 	const snapshot = { messages: selected.map(item => item.text), ids: selected.map(item => item.id) };
 	const first = all[0];
 	if (selected.some(item => item.id === first.id)) return snapshot;
