@@ -61,18 +61,9 @@ export interface JevScoreAnswerFixture {
 }
 
 /**
- * The battery's question ids: the contract's "verdict" choice, one noul per
- * hazard, and the "blast_radius" score. Spelled here instead of imported so
- * the fixtures never reach into jev.ts's module graph; a drift against
- * jevQuestions() is loud rather than silent — jev-judge.ts rejects a judge
- * result whose answers do not cover the questions it asked, every judgement
- * becomes UNAVAILABLE, and policy-gates.test.ts pins the ids the gate actually
- * asked.
- *
- * The split mirrors the battery's: GATING hazards can force UNSAFE/UNSURE,
- * DESCRIPTIVE ones are carried into the reason, the audit line and the dialog
- * but never decide anything. A stub answer must carry all nine either way —
- * the validator requires every id with a finite 0..1 value.
+ * The battery's question ids: the verdict choice, one noul per hazard, the V3
+ * task-statement noul, and the blast-radius score. Kept separate from Jev's
+ * module graph so a drift is loud rather than silently sharing its shape.
  */
 export const JEV_FIXTURE_GATING_HAZARDS = [
 	"destructive_or_irreversible",
@@ -101,6 +92,7 @@ export type JevFixtureDescriptiveHazard = (typeof JEV_FIXTURE_DESCRIPTIVE_HAZARD
 export type JevFixtureAnswers = {
 	verdict: JevChoiceAnswerFixture;
 	blast_radius: JevScoreAnswerFixture;
+	task_statement?: JevNoulAnswerFixture;
 } & Record<JevFixtureHazard, JevNoulAnswerFixture>;
 
 /** The model id the fake reports; the real endpoint resolves jev-latest to it. */
@@ -149,6 +141,7 @@ export function jevSafeAnswer(overrides: Partial<JevFixtureAnswers> = {}): JevFi
 		...quietHazards(),
 		verdict: jevChoice("safe", { safe: 0.95, unsafe: 0.04, unsure: 0.01 }, 0.9),
 		blast_radius: jevScore(0.4, 0.85),
+		task_statement: jevNoul(0.03),
 		...overrides,
 	};
 }
@@ -160,6 +153,7 @@ export function jevUnsafeAnswer(overrides: Partial<JevFixtureAnswers> = {}): Jev
 		...quietHazards(),
 		verdict: jevChoice("unsafe", { safe: 0.02, unsafe: 0.96, unsure: 0.02 }, 0.92),
 		blast_radius: jevScore(1.2, 0.8),
+		task_statement: jevNoul(0.03),
 		...overrides,
 	};
 }
@@ -171,6 +165,7 @@ export function jevUnsureAnswer(overrides: Partial<JevFixtureAnswers> = {}): Jev
 		...quietHazards(),
 		verdict: jevChoice("unsure", { safe: 0.3, unsafe: 0.28, unsure: 0.42 }, 0.31),
 		blast_radius: jevScore(0.8, 0.4),
+		task_statement: jevNoul(0.03),
 		...overrides,
 	};
 }
@@ -449,7 +444,9 @@ async function scriptedJudgement(questions: Record<string, unknown>, signal: Abo
 	}
 	const raw = jevRawQueue.shift();
 	if (raw) return answersFromRaw(raw, questions);
-	return { kind: "answers", model: JEV_FIXTURE_MODEL, answers: (jevQueue?.shift() ?? jevDefaultAnswers) as unknown as Record<string, unknown> };
+	const answers = { ...(jevQueue?.shift() ?? jevDefaultAnswers) } as JevFixtureAnswers;
+	if ("task_statement" in questions && answers.task_statement === undefined) answers.task_statement = jevNoul(0.03);
+	return { kind: "answers", model: JEV_FIXTURE_MODEL, answers: answers as unknown as Record<string, unknown> };
 }
 
 /** The raise the native client performs for a non-2xx response. */

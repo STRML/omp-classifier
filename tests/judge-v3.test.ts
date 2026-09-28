@@ -13,6 +13,7 @@ const riskAnswers: Record<string, Answer> = {
 	verdict: { type: "choice", choice: "safe", probabilities: { safe: 0.95, unsafe: 0.03, unsure: 0.02 }, confidence: 0.92 } as unknown as Answer,
 	...Object.fromEntries(JEV_HAZARDS.map(hazard => [hazard, { type: "noul", noul: 0.01 } as unknown as Answer])),
 	blast_radius: { type: "score", score: 0.4, probabilities: { "0": 0.6, "1": 0.4 }, confidence: 0.8 } as unknown as Answer,
+	task_statement: { type: "noul", noul: 0.8 } as unknown as Answer,
 };
 
 const authorizationAnswers: Record<string, Answer> = {
@@ -60,6 +61,7 @@ describe("judgeJevV3", () => {
 		expect(risk?.state).toBe("risk-state");
 		expect(authorization?.state).toBe("auth-state");
 		expect(result.risk.verdict.choice).toBe("safe");
+		expect(result.risk.taskStatement).toBe(0.8);
 		expect(result.authorization?.level).toBe("named");
 		expect(result.authorizationError).toBeUndefined();
 	});
