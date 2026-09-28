@@ -480,7 +480,7 @@ describe("a target that reads as prose is replaced by a hash of itself", () => {
 	});
 });
 
-describe("the state holds the user's words and the summary, and nothing else", () => {
+describe("the state separates user words from the action summary", () => {
 	const state = (over: Parameters<typeof buildAuthorizationState>[0]) => JSON.parse(JSON.stringify(buildAuthorizationState(over)));
 
 	test("no command text reaches the state", () => {
@@ -519,6 +519,18 @@ describe("the state holds the user's words and the summary, and nothing else", (
 		const built = state({ actions: summarize("rm -rf build") });
 		expect(typeof built.notice).toBe("string");
 		expect(built.actions).toEqual([{ kind: "delete", count: 1, targets: ["build"] }]);
+	});
+
+	test("gate measurements are labeled and limited to facts the gate supplied", () => {
+		const built = state({
+			actions: summarize("git push origin main"),
+			gateMeasurements: {
+				gitPushProvenance: { remoteTip: "remote", localTip: "local", ahead: 1, behind: 0, forwardOnly: true },
+			},
+		});
+		expect(built.gateMeasurements.gitPushProvenance).toMatchObject({ behind: 0, forwardOnly: true });
+		expect(built.gateMeasurements.gitPushProvenance.note).toContain("measured by the gate");
+		expect(built.gateMeasurements).not.toHaveProperty("ciStatus");
 	});
 });
 
