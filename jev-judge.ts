@@ -83,13 +83,14 @@ import {
 
 /**
  * The battery as the native module types it. `Questions` is a plain
- * `Record<string, Question>`, so the hazard ids need no names here; the two
- * questions whose answers are read by name — the verdict choice and the blast
- * radius — do.
+ * `Record<string, Question>`, so the hazard ids need no names here; the verdict
+ * and blast-radius questions are read by name, and V3 optionally adds the
+ * task-statement question.
  */
 type JevBattery = Questions & {
 	verdict: ChoiceQuestion<JevChoiceOption>;
 	blast_radius: ScoreQuestion;
+	task_statement?: Questions[string];
 };
 
 /**
@@ -709,6 +710,14 @@ function toJevAnswers(result: JudgmentResult<JevBattery>, battery: JevBattery, l
 		if (value === undefined) throw fieldError(`answers.${hazard}.noul`, "is missing or not a number in 0..1");
 		hazards[hazard] = value;
 	}
+	const taskQuestion = asRecord(battery.task_statement);
+	const taskStatementAnswer = taskQuestion === undefined ? undefined : asRecord(answers.task_statement);
+	if (taskQuestion !== undefined) {
+		if (taskStatementAnswer === undefined) throw fieldError("answers.task_statement", "is missing or not an object");
+		if (taskStatementAnswer.type !== "noul") throw fieldError("answers.task_statement.type", 'is missing or not "noul"');
+	}
+	const taskStatement = taskStatementAnswer === undefined ? undefined : unitNumber(taskStatementAnswer.noul);
+	if (taskStatementAnswer !== undefined && taskStatement === undefined) throw fieldError("answers.task_statement.noul", "is missing or not a number in 0..1");
 
 	const blastAnswer = asRecord(answers.blast_radius);
 	if (blastAnswer === undefined) throw fieldError("answers.blast_radius", "is missing or not an object");
@@ -727,6 +736,7 @@ function toJevAnswers(result: JudgmentResult<JevBattery>, battery: JevBattery, l
 		model,
 		verdict: { choice, probabilities, confidence },
 		hazards,
+		...(taskStatement === undefined ? {} : { taskStatement }),
 		blastRadius: { score, confidence: blastConfidence, levels: battery.blast_radius.criteria },
 		...(usage === undefined ? {} : { usage }),
 		latencyMs,

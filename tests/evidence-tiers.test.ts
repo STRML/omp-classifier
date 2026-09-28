@@ -12,6 +12,8 @@
  * what the "tier meaning" block below asserts.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+
+import { buildJevState, JEV_V3_POLICY_VERSION, jevQuestions } from "../jev";
 import { collectTaskEvidence, collectTaskEvidenceV3, collectToolEvidence, collectUserEvidence } from "../index";
 import {
 	evidenceOf,
@@ -348,13 +350,19 @@ describe("collectTaskEvidenceV3", () => {
 		expect(snapshot.pinned).toEqual({ id: "m1", text: "add the provider neuralwatt to omp" });
 	});
 
-	test("anchoring is jev-v2's scope words; a task verb alone anchors nothing (#106)", () => {
-		const branch = [user("m0", "hello"), user("m1", "close issue 123"), user("m2", "ok"), user("m3", "yes"), user("m4", "thanks")];
+	test("mid-session task evidence is retained without relying on scope words (#106)", () => {
+		const branch = [user("m0", "hello"), user("m1", "add the provider neuralwatt"), user("m2", "ok"), user("m3", "yes"), user("m4", "try it")];
 		const snapshot = collectTaskEvidenceV3(branch, 3);
-		expect(snapshot.ids).toEqual(["m2", "m3", "m4"]);
+		expect(snapshot.ids).toEqual(["m1", "m2", "m3", "m4"]);
 		expect(snapshot.pinned).toEqual({ id: "m0", text: "hello" });
 		const scoped = [user("m0", "hello"), user("m1", "please close issue 123"), user("m2", "ok"), user("m3", "yes"), user("m4", "thanks")];
 		expect(collectTaskEvidenceV3(scoped, 3).ids).toEqual(["m1", "m2", "m3", "m4"]);
+		const judgedMessages = snapshot.pinned ? [snapshot.pinned.text, ...snapshot.messages] : snapshot.messages;
+		const judgedIds = snapshot.pinned ? [snapshot.pinned.id, ...snapshot.ids] : snapshot.ids;
+		const state = buildJevState({ command: "bun test", workingDirectory: "/repo", userMessages: judgedMessages, userMessageIds: judgedIds }) as { evidence: { userMessages: string[]; userMessageIds: string[] } };
+		expect(state.evidence.userMessages).toEqual(["hello", "add the provider neuralwatt", "ok", "yes", "try it"]);
+		expect(state.evidence.userMessageIds).toEqual(["m0", "m1", "m2", "m3", "m4"]);
+		expect((jevQuestions(JEV_V3_POLICY_VERSION) as Record<string, unknown>).task_statement).toBeDefined();
 	});
 
 	test("the pin is positional, so an unlisted first request is kept", () => {
