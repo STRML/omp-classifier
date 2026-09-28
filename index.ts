@@ -1730,9 +1730,15 @@ export function collectTaskEvidenceV3(branch: ReadonlyArray<EvidenceBranchEntry>
 		}
 	}
 	const anchors = all.filter(item => item.anchored).slice(-TASK_EVIDENCE_MAX);
-	const selected = [...all.filter(item => tail.has(item.id)), ...anchors.filter(item => !tail.has(item.id)), ...(candidate ? [candidate] : [])]
-		.sort((a, b) => a.index - b.index)
-		.slice(-TASK_EVIDENCE_MAX);
+	const ordered = [...all.filter(item => tail.has(item.id)), ...anchors.filter(item => !tail.has(item.id)), ...(candidate ? [candidate] : [])]
+		.sort((a, b) => a.index - b.index);
+	// The candidate is the task statement this collector exists to keep, so it
+	// holds a slot of its own: trimming the oldest of the rest, rather than
+	// letting the cap drop the one message the question is asked about.
+	const selected =
+		ordered.length > TASK_EVIDENCE_MAX && candidate !== undefined
+			? [...ordered.filter(item => item.id !== candidate.id).slice(-(TASK_EVIDENCE_MAX - 1)), candidate].sort((a, b) => a.index - b.index)
+			: ordered.slice(-TASK_EVIDENCE_MAX);
 	const snapshot = { messages: selected.map(item => item.text), ids: selected.map(item => item.id) };
 	const first = all[0];
 	if (selected.some(item => item.id === first.id)) return snapshot;

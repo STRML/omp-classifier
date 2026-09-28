@@ -370,6 +370,23 @@ describe("collectTaskEvidenceV3", () => {
 		expect(collectTaskEvidenceV3(branch, 3).pinned).toEqual({ id: "m0", text: "archive issue 123" });
 	});
 
+	test("the task candidate survives the evidence cap (#106 gate round 1)", () => {
+		// `hello`, the task statement, five continuations, then the tail: the
+		// candidate is the oldest entry in the selection, so a plain slice would
+		// drop exactly the message the question is asked about.
+		const branch = [
+			user("m0", "hello"),
+			user("m1", "add the provider neuralwatt"),
+			...Array.from({ length: 5 }, (_, i) => user(`c${i}`, `please continue step ${i}`)),
+			user("m7", "ok"),
+			user("m8", "yes"),
+			user("m9", "try it"),
+		];
+		const snapshot = collectTaskEvidenceV3(branch, 3);
+		expect(snapshot.ids).toContain("m1");
+		expect(snapshot.ids.length).toBeLessThanOrEqual(8);
+	});
+
 	test("the first user message is pinned outside the newest-8 slice", () => {
 		const branch = [user("first", "set up the neuralwatt provider"), ...Array.from({ length: 12 }, (_, i) => user(`m${i}`, `please continue step ${i}`))];
 		const snapshot = collectTaskEvidenceV3(branch, 3);
