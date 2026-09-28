@@ -4,6 +4,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-09-27
 
+### Source-aware shell directory walks (#130)
+
+- The cwd walk follows readable literal `source`/`.` files transitively and models assignment and negation prefixes on literal directory builtins. If a source contains an unmodelled directory effect (including dynamic command verbs, unparsed wrapper options, wrapped `eval`, effectful function bodies, or deferred trap handlers), or its source graph is unsupported, unreadable, cyclic or over budget, cwd stays unknown, so later script operands are refused instead of being read from a stale directory.
+
 ### Git refusal command identity (#68)
 
 - Refusal memory now retains the full normalized Git command, so refusing one branch/remote/option combination does not make a different invocation of the same Git subverb inherit that refusal. Non-Git refusal normalization remains unchanged.
