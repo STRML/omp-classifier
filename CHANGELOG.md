@@ -2,6 +2,14 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-09-28
+
+### Explicitly pinned standing policy (#72)
+
+- `/classifier trust-policy` explicitly pins fixed user-level instruction paths; only unchanged, hash-matching snapshots reach the judge, and the pin's current/stale signature invalidates cached verdicts when a file or profile path changes. Repo-local instruction files are never read. Policy may authorize action classes only, never egress destinations or delete targets; conditional rules require an explicit gate-measured fact, and absent CI measurement leaves "merge when CI is green" unapproved.
+- User-policy snapshots are capped at 32 KiB total; project-dotenv path overrides and instruction files inside the current Git repository fail closed instead of being pinned.
+- Repository containment uses the trust command's directory when pinning and each Bash/eval execution directory when resolving; failed or ambiguous Git discovery refuses rather than disabling the repository-local check, while an explicit non-repository result still permits user-level paths.
+
 ## 2026-09-27
 
 ### Source-aware shell directory walks (#130)

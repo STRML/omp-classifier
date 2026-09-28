@@ -262,6 +262,20 @@ describe("redaction reaches every judge state", () => {
 		const state = buildAuthorizationState({ actions: [], userMessages: [`use ${secret}`] }) as { evidence: { userMessages: string[] } };
 		expect(state.evidence.userMessages[0]).not.toContain(secret);
 	});
+	test("trusted policy contents are redacted before either judge sees them", () => {
+		const trustedPolicy = [{ file: "AGENTS.md", content: `merge after ${secret}` }];
+		const risk = buildJevState({ command: "gh pr merge 42", workingDirectory: "/repo", trustedPolicy }) as {
+			evidence: { trustedPolicy: Array<{ file: string; content: string }> };
+		};
+		const authorization = buildAuthorizationState({ actions: [], trustedPolicy }) as {
+			evidence: { trustedPolicy: Array<{ file: string; content: string }> };
+		};
+		for (const document of [risk.evidence.trustedPolicy[0], authorization.evidence.trustedPolicy[0]]) {
+			expect(document.content).not.toContain(secret);
+			expect(document.content).toContain(REDACTED);
+		}
+		expect(trustedPolicy[0].content).toContain(secret);
+	});
 
 	test("tool evidence is redacted before it is cut, so a secret at the cut never leaks half", () => {
 		const padding = "x".repeat(680);
@@ -305,10 +319,9 @@ describe("redaction reaches every judge state", () => {
 	});
 
 	test("the policy version marks the change", () => {
-		// The redaction change landed as jev-v2.2; the version has moved on with
-		// later changes to what a state means (the measured git tiers), which is
-		// the point of pinning it: a state read under one version means
-		// something else under the next.
-		expect(JEV_POLICY_VERSION).toBe("jev-v2.10");
+		// The redaction change landed as jev-v2.2; later measured-git and
+		// trusted-policy changes move the version because a state read under one
+		// policy has different meaning from the next.
+		expect(JEV_POLICY_VERSION).toBe("jev-v2.11");
 	});
 });

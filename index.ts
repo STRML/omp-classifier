@@ -106,6 +106,7 @@ import { buildAuthorizationState, DEFAULT_AUTHORIZATION_POLICY, deriveAuthorizat
 import { deriveDecisionOrder, type DecisionBranch } from "./decision-order";
 import { literalMatch } from "./literal-match";
 import { redactSecrets, redactValue } from "./redact";
+import { formatTrustPolicyPin, normalizeTrustPolicyPin, pinUserInstructionFiles, resolvePinnedUserPolicy, type TrustPolicyPin, type TrustedPolicyDocument } from "./trust-policy";
 import {
 	buildJevState,
 	DEFAULT_JEV_POLICY,
@@ -686,6 +687,12 @@ interface ClassifierConfig {
 	/** Issue #31: how many recent user messages ride into the record as
 	 *  `evidence.userMessages`. 0 sends no evidence at all. */
 	evidenceUserMessages: number;
+	/**
+	 * Hash pin made only by `/classifier trust-policy`. Paths and hashes are the
+	 * user-level file set; a live hash mismatch disables its policy text and is
+	 * included in classifierConfigSignature so stale verdicts cannot survive.
+	 */
+	trustPolicy: TrustPolicyPin | null;
 	/** Persistent "Always allow" grants (bash only): the dialog's Always
 	 *  option writes `{cmd, cwd}` to a JSON store at the config root, and a
 	 *  live entry lets that EXACT command text run in that directory across
@@ -738,6 +745,7 @@ const CLASSIFIER_CONFIG_DEFAULTS: Omit<ClassifierConfig, "typesafeModel"> = {
 	timeoutMs: DEFAULT_TIMEOUT_MS,
 	maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH,
 	evidenceUserMessages: 3,
+	trustPolicy: null,
 	persistentGrants: true,
 	shadowV3: true,
 };
@@ -792,6 +800,7 @@ function normalizeClassifierConfig(raw: Record<string, unknown>): ClassifierConf
 		typesafeModel: process.env.TYPESAFE_DEFAULT_MODEL?.trim() || "jev-latest",
 	};
 	if (typeof raw.enabled === "boolean") config.enabled = raw.enabled;
+	config.trustPolicy = normalizeTrustPolicyPin(raw.trustPolicy);
 	if (typeof raw.persistentGrants === "boolean") config.persistentGrants = raw.persistentGrants;
 	if (typeof raw.shadowV3 === "boolean") config.shadowV3 = raw.shadowV3;
 	// `judgeBackend` follows the same rule as every other key: a shape the
@@ -857,7 +866,7 @@ export function readClassifierConfig(): ClassifierConfig {
 function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig {
 	const before = readClassifierConfig();
 	const raw: Record<string, unknown> = {};
-	for (const key of ["enabled", "judgeBackend", "jevPolicy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "persistentGrants", "shadowV3"] as const) {
+	for (const key of ["enabled", "judgeBackend", "jevPolicy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "trustPolicy", "persistentGrants", "shadowV3"] as const) {
 		if (key in patch) raw[key] = patch[key];
 	}
 	const next = normalizeClassifierConfig({ ...before, ...raw });
@@ -979,7 +988,7 @@ const STATUS_TAIL_LINES = 500;
 const STATUS_LAST_DECISIONS = 10;
 
 export interface StatusReport {
-	config: ClassifierConfig;
+	config: Omit<ClassifierConfig, "trustPolicy"> & { trustPolicy: { sha256: string } | null };
 	policyVersion: string;
 	policyHash: string;
 	/** The judge identity a verdict is cached under: which backend, and the
@@ -1021,8 +1030,9 @@ export function buildStatusReport(): StatusReport {
 	}
 	const allow = recent.filter(record => record.decision === "allow").length;
 	const config = readClassifierConfig();
+	const { trustPolicy, ...statusConfig } = config;
 	return {
-		config,
+		config: { ...statusConfig, trustPolicy: trustPolicy === null ? null : { sha256: trustPolicy.sha256 } },
 		policyVersion: CLASSIFIER_POLICY_VERSION,
 		policyHash: CLASSIFIER_POLICY_HASH,
 		backendId: judgeBackendFor(config.judgeBackend).id,
@@ -1192,6 +1202,7 @@ export function formatClassifierConfig(config: ClassifierConfig): string {
 		`timeoutMs: ${config.timeoutMs}`,
 		`maxCommandLength: ${config.maxCommandLength}`,
 		`evidenceUserMessages: ${config.evidenceUserMessages}`,
+		`trustPolicy: ${config.trustPolicy?.sha256 ?? "unpinned"}`,
 		`persistentGrants: ${config.persistentGrants}`,
 		`shadowV3: ${config.shadowV3}`,
 		`contract: ${QUESTIONS_CONTRACT}`,
@@ -4865,9 +4876,9 @@ export default function (pi: ExtensionAPI) {
 	// prints the effective config and the file path.
 	pi.registerCommand("classifier", {
 		description:
-			"View or set omp-classifier options: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, persistentGrants, shadowV3, reset, status, dry-run, off, on",
+		"View or set omp-classifier options: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, trust-policy, persistentGrants, shadowV3, reset, status, dry-run, off, on",
 		getArgumentCompletions: (prefix: string) => {
-			const keywords = ["enabled", "policy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "persistentGrants", "shadowV3", "reset", "status", "dry-run", "off", "on", "file"] as const;
+			const keywords = ["enabled", "policy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "trust-policy", "persistentGrants", "shadowV3", "reset", "status", "dry-run", "off", "on", "file"] as const;
 			return keywords
 				.filter(keyword => keyword.startsWith(prefix.toLowerCase()))
 				.map(keyword => ({ label: keyword, value: keyword }));
@@ -4931,8 +4942,22 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (key === "reset") {
-				writeClassifierConfig({ enabled: true, judgeBackend: DEFAULT_JUDGE_BACKEND, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, persistentGrants: true, shadowV3: true });
+				writeClassifierConfig({ enabled: true, judgeBackend: DEFAULT_JUDGE_BACKEND, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, trustPolicy: null, persistentGrants: true, shadowV3: true });
 				notify(`omp-classifier reset to defaults (${classifierConfigPath()})`);
+				return;
+			}
+			if (key === "trust-policy") {
+				if (value !== undefined) {
+					notify("usage: /classifier trust-policy", "error");
+					return;
+				}
+				try {
+					const pin = pinUserInstructionFiles(ctx.cwd);
+					writeClassifierConfig({ trustPolicy: pin });
+					notify(formatTrustPolicyPin(pin));
+				} catch {
+					notify("could not pin user-level instruction files; the existing trust policy was left unchanged", "error");
+				}
 				return;
 			}
 			if (key === "enabled") {
@@ -5035,7 +5060,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			notify(
-				`unknown key "${key}". Keys: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, persistentGrants, shadowV3, reset, status, dry-run, off, on, file`,
+				`unknown key "${key}". Keys: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, trust-policy, persistentGrants, shadowV3, reset, status, dry-run, off, on, file`,
 				"error",
 			);
 		},
@@ -5096,6 +5121,7 @@ export default function (pi: ExtensionAPI) {
 			worktreeProvenance?: GitWorktreeProvenance;
 			refProvenance?: GitRefProvenance[];
 			networkProvenance?: NetworkProvenance;
+			trustedPolicy?: readonly TrustedPolicyDocument[];
 			recordExtras: Record<string, unknown>;
 		},
 	): Promise<ShadowV3> => {
@@ -5136,6 +5162,7 @@ export default function (pi: ExtensionAPI) {
 					command: input.command,
 					workingDirectory: input.cwd,
 					...userEvidence,
+					...(input.trustedPolicy && input.trustedPolicy.length > 0 ? { trustedPolicy: input.trustedPolicy } : {}),
 					...(input.operatorContext ? { operatorContext: input.operatorContext } : {}),
 					...(input.pushProvenance !== undefined ? { gitPushProvenance: input.pushProvenance } : {}),
 					...(input.worktreeProvenance !== undefined ? { gitWorktreeProvenance: input.worktreeProvenance } : {}),
@@ -5143,7 +5170,21 @@ export default function (pi: ExtensionAPI) {
 					...(input.networkProvenance !== undefined ? { networkProvenance: input.networkProvenance } : {}),
 					...(Object.keys(input.recordExtras).length > 0 ? { extra: input.recordExtras } : {}),
 				}),
-				authorizationState: buildAuthorizationState({ actions, ...userEvidence }),
+				authorizationState: buildAuthorizationState({
+					actions,
+					...userEvidence,
+					...(input.trustedPolicy && input.trustedPolicy.length > 0
+						? {
+							trustedPolicy: input.trustedPolicy,
+							gateMeasurements: {
+								...(input.pushProvenance !== undefined ? { gitPushProvenance: input.pushProvenance } : {}),
+								...(input.worktreeProvenance !== undefined ? { gitWorktreeProvenance: input.worktreeProvenance } : {}),
+								...(input.refProvenance !== undefined ? { gitRefProvenance: input.refProvenance } : {}),
+								...(input.networkProvenance !== undefined ? { networkProvenance: input.networkProvenance } : {}),
+							},
+						}
+						: {}),
+				}),
 				context: ctx,
 				settings,
 				// The shadow measures the judge that actually decides: same backend,
@@ -5223,6 +5264,7 @@ export default function (pi: ExtensionAPI) {
 		evidenceSnapshot?: UserEvidenceSnapshot,
 		language: "shell" | "code" = "shell",
 		startCwd: string = cwd,
+		trustedPolicy: readonly TrustedPolicyDocument[] = [],
 	): Promise<Judgement> => {
 		const config = readClassifierConfig();
 		const policy = jevPolicyFor(config);
@@ -5288,6 +5330,7 @@ export default function (pi: ExtensionAPI) {
 					cwd,
 					timeoutMs,
 					recordExtras,
+					...(trustedPolicy.length > 0 ? { trustedPolicy } : {}),
 					...(operatorContext ? { operatorContext } : {}),
 					...(pushProvenance !== undefined ? { pushProvenance } : {}),
 					...(worktreeProvenance !== undefined ? { worktreeProvenance } : {}),
@@ -5357,6 +5400,7 @@ export default function (pi: ExtensionAPI) {
 				command,
 				workingDirectory: cwd,
 				...(userMessages ? { userMessages } : {}),
+				...(trustedPolicy.length > 0 ? { trustedPolicy } : {}),
 				...(taskEvidence?.ids.length ? { userMessageIds: taskEvidence.ids } : {}),
 				...(operatorContext ? { operatorContext } : {}),
 				...(pushProvenance !== undefined ? { gitPushProvenance: pushProvenance } : {}),
@@ -6043,7 +6087,6 @@ export default function (pi: ExtensionAPI) {
 		}
 		const citableUserEvidence = citableEvidence(userEvidenceSnapshot?.messages);
 		const evidenceSnapshot = userEvidenceSnapshot;
-		const reviewEvidenceFingerprint = evidenceFingerprint(citableUserEvidence, reviewOperatorContext, userEvidenceSnapshot?.ids);
 		// Attach the same snapshot's ids to every audit line for this tool call,
 		// including the early returns before classification (issue #33 audit
 		// evidence fields). One snapshot, reused everywhere it is logged — never
@@ -6077,36 +6120,43 @@ export default function (pi: ExtensionAPI) {
 		// every progress message or host-generated message id. A new "status?"
 		// must not revoke approval; a later "do not publish" must.
 		const userScopeFingerprint = scopeFingerprint(citableUserEvidence);
-		// The merged policy is in the signature, not just the override set: two
-		// different overrides that merge to the same effective thresholds are
-		// the same trust state, and any policy change must invalidate every
-		// cached verdict. The judge's own identity (the backend plus the model
-		// that answers it) is in there for the same reason: a verdict about one
-		// judge is not a verdict about another.
-		const configSignature = [
-			config.enabled,
-			config.typesafeModel,
-			judgeBackendFor(config.judgeBackend).id,
-			JSON.stringify(jevPolicyFor(config)),
-			config.timeoutMs,
-			config.maxCommandLength,
-			config.evidenceUserMessages,
-		].join("|");
-		// persistentGrants is deliberately absent: it gates only the grant
-		// read/write path and changes no cached verdict's trust state, so
-		// flipping it must not invalidate caches (it is a kill-switch, not a
-		// policy change).
-		if (configSignature !== classifierConfigSignature) {
-			// A dry-run probe (issue #32) touches neither the cache nor the grant
-			// stores, AND leaves the signature stale on purpose: the next live
-			// call performs exactly the invalidation it would have performed.
-			if (!dryRun) {
-				cache.clear();
-				grants.clear();
-				floorTaint.clear();
-				classifierConfigSignature = configSignature;
+		const resolvePolicyContext = (projectDir: string) => {
+			const trustedPolicySnapshot = resolvePinnedUserPolicy(config.trustPolicy, projectDir);
+			const reviewEvidenceFingerprint = `${evidenceFingerprint(citableUserEvidence, reviewOperatorContext, userEvidenceSnapshot?.ids)}|${trustedPolicySnapshot.signature}`;
+			// The merged policy is in the signature, not just the override set: two
+			// different overrides that merge to the same effective thresholds are
+			// the same trust state, and any policy change must invalidate every
+			// cached verdict. The judge's own identity (the backend plus the model
+			// that answers it) is in there for the same reason: a verdict about one
+			// judge is not a verdict about another. The pinned instruction policy's
+			// current/stale signature belongs here too, before any cache lookup.
+			const configSignature = [
+				config.enabled,
+				config.typesafeModel,
+				judgeBackendFor(config.judgeBackend).id,
+				JSON.stringify(jevPolicyFor(config)),
+				config.timeoutMs,
+				config.maxCommandLength,
+				config.evidenceUserMessages,
+				trustedPolicySnapshot.signature,
+			].join("|");
+			// persistentGrants is deliberately absent: it gates only the grant
+			// read/write path and changes no cached verdict's trust state, so
+			// flipping it must not invalidate caches (it is a kill-switch, not a
+			// policy change).
+			if (configSignature !== classifierConfigSignature) {
+				// A dry-run probe (issue #32) touches neither the cache nor the grant
+				// stores, AND leaves the signature stale on purpose: the next live
+				// call performs exactly the invalidation it would have performed.
+				if (!dryRun) {
+					cache.clear();
+					grants.clear();
+					floorTaint.clear();
+					classifierConfigSignature = configSignature;
+				}
 			}
-		}
+			return { trustedPolicySnapshot, reviewEvidenceFingerprint };
+		};
 
 		// Fires whenever the lockfile says disabled, INCLUDING when
 		// `/classifier enabled false` is already set — that flag turns off model
@@ -6186,6 +6236,7 @@ export default function (pi: ExtensionAPI) {
 			const spawn = evalSpawnCwd(evalCode, ctx.cwd);
 			const declaredCwd = spawn.kind === "literal" ? spawn.cwd : undefined;
 			const cwd = declaredCwd ?? ctx.cwd;
+			const { trustedPolicySnapshot, reviewEvidenceFingerprint } = resolvePolicyContext(cwd);
 			// Rides every line this call writes, so an audit reader can tell a
 			// directory the payload declared from the session's without going
 			// back to the payload text — which the `cmd` field truncates.
@@ -6296,7 +6347,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			try {
 				let classifyError = "";
-				const judgement = cached ? withoutShadow(cached) : (await classify(ctx, evalCode, cwd, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, reviewOperatorContext, evidenceSnapshot, "code").catch(
+				const judgement = cached ? withoutShadow(cached) : (await classify(ctx, evalCode, cwd, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, reviewOperatorContext, evidenceSnapshot, "code", cwd, trustedPolicySnapshot.documents).catch(
 					(err: unknown) => {
 						classifyError = err instanceof Error ? err.message : String(err);
 						pi.logger.warn(`classifier: classify failed: ${classifyError}`);
@@ -6531,6 +6582,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			const cwd = cwdInput ? resolveToCwd(cwdInput, ctx.cwd) : ctx.cwd;
+			const { trustedPolicySnapshot, reviewEvidenceFingerprint } = resolvePolicyContext(cwd);
 			// Issue #67: a command that runs a script file is judged by what the
 			// file HOLDS, not by its path. The body joins the text every layer
 			// below reads — critical patterns, the forced-dialog token scan, the
@@ -6793,7 +6845,7 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			let classifyError = "";
-			const judgement = cached ? withoutShadow(cached) : (await classify(ctx, judgedCommand, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot, "shell", startCwd).catch((err: unknown) => {
+			const judgement = cached ? withoutShadow(cached) : (await classify(ctx, judgedCommand, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot, "shell", startCwd, trustedPolicySnapshot.documents).catch((err: unknown) => {
 				// Provider errors (quota exhausted, auth, HTTP failures) previously
 				// vanished into an opaque "unavailable". Keep the message so the
 				// permission dialog says WHY.
