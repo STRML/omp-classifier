@@ -16,7 +16,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildJevState, isLoopbackHost, jevQuestions, JEV_POLICY_VERSION, JEV_V3_POLICY_VERSION, measureNetworkProvenance, type DockerTarget, type JevBatteryVersion, type NetworkSources } from "../jev.ts";
@@ -52,7 +52,7 @@ const fixture = (): { sources: NetworkSources; home: string; project: string; re
 	writeFileSync(hostsFile, "192.168.1.9 fixture-nas alias-nas\n127.0.0.1 fixture-www fixture.local\n");
 	writeFileSync(join(project, "compose.yaml"), "services:\n  db:\n    image: mysql:8\n  web:\n    image: wordpress\nvolumes:\n  data:\n");
 	return {
-		sources: { sshConfigPaths: [join(home, ".ssh", "config")], hostsFile, dockerState: () => SOCKET, env: {}, dockerConfigDir: join(home, ".docker") },
+		sources: { sshConfigPaths: [join(home, ".ssh", "config")], hostsFile, dockerState: () => SOCKET, env: {}, dockerConfigDir: join(home, ".docker"), homeDir: home },
 		home,
 		project,
 		remove: () => {
@@ -67,8 +67,8 @@ describe("the loopback tier is read from the command's own URLs (#65)", () => {
 		expect(measureNetworkProvenance("curl -s http://localhost:8000/x", "/tmp", {})?.localPorts).toEqual([8000]);
 		expect(measureNetworkProvenance("curl -s http://127.0.0.1:3111/health", "/tmp", {})?.localPorts).toEqual([3111]);
 		expect(measureNetworkProvenance("curl -s 'http://[::1]:8011/v1/models'", "/tmp", {})?.localPorts).toEqual([8011]);
-		// No port named, no port measured.
-		expect(measureNetworkProvenance("curl -s http://localhost/x", "/tmp", {})).toBeUndefined();
+		// A request with no host or port tier still carries the egress posture.
+		expect(measureNetworkProvenance("curl -s http://localhost/x", "/tmp", {})?.ambientClientConfig).toBeDefined();
 	});
 
 	test("a port a port flag names on a loopback destination counts too", () => {
@@ -114,7 +114,7 @@ describe("the known-host tier is measured against this machine (#65)", () => {
 			expect(measureNetworkProvenance("curl -s http://fixture-db:3000/", project, sources)?.knownHosts).toEqual([{ host: "fixture-db", source: "docker" }]);
 			// Measured, not inferred from the shape of the name.
 			expect(measureNetworkProvenance("ssh nobody-configured-this uptime", project, sources)).toBeUndefined();
-			expect(measureNetworkProvenance("curl -s https://api.github.com/x", project, sources)).toBeUndefined();
+			expect(measureNetworkProvenance("curl -s https://api.github.com/x", project, sources)?.knownHosts).toEqual([]);
 		} finally {
 			remove();
 		}
@@ -145,7 +145,7 @@ describe("the docker tier is measured against this machine (#65)", () => {
 			expect(measured?.localPorts).toEqual([8000]);
 			expect(measured?.dockerNetworks).toEqual([{ target: "fixture-web", kind: "published-port", port: 8000, resolvesLocally: true }]);
 			// No docker target is measured for this unpublished port; the listener is unknown.
-			expect(measureNetworkProvenance("curl -s http://localhost:9999/x", project, sources)).toEqual({ localPorts: [9999], knownHosts: [], dockerNetworks: [] });
+			expect(measureNetworkProvenance("curl -s http://localhost:9999/x", project, sources)).toMatchObject({ localPorts: [9999], knownHosts: [], dockerNetworks: [] });
 		} finally {
 			remove();
 		}
@@ -329,7 +329,7 @@ describe("the daemon decides the local claim, not the local file (#121 review)",
 			// local claim is made, and the port table is not read either (its
 			// bindings would be claimed as this machine's own).
 			const measured = measureNetworkProvenance("curl -s http://localhost:8000/x", project, { ...sources, dockerConfigDir: dir, env });
-			expect(measured).toEqual({ localPorts: [8000], knownHosts: [], dockerNetworks: [] });
+			expect(measured).toMatchObject({ localPorts: [8000], knownHosts: [], dockerNetworks: [] });
 			expect(measureNetworkProvenance("docker compose exec web sh", project, { ...sources, dockerConfigDir: dir, env })?.dockerNetworks).toEqual([
 				{ target: "web", kind: "compose-service" },
 			]);
@@ -383,7 +383,7 @@ describe("the daemon decides the local claim, not the local file (#121 review)",
 			// environment points that daemon elsewhere, the containers it lists are
 			// not containers on this machine.
 			const remote = { ...sources, env: { DOCKER_HOST: "tcp://prod.example:2376" } };
-			expect(measureNetworkProvenance("curl -s http://localhost:8000/x", project, remote)).toEqual({ localPorts: [8000], knownHosts: [], dockerNetworks: [] });
+			expect(measureNetworkProvenance("curl -s http://localhost:8000/x", project, remote)).toMatchObject({ localPorts: [8000], knownHosts: [], dockerNetworks: [] });
 			expect(measureNetworkProvenance("curl -s http://localhost:8000/x", project, sources)?.dockerNetworks).toEqual([
 				{ target: "fixture-web", kind: "published-port", port: 8000, resolvesLocally: true },
 			]);
@@ -422,6 +422,91 @@ describe("the daemon decides the local claim, not the local file (#121 review)",
 		} finally {
 			remove();
 			cleanup(target);
+		}
+	});
+
+	test("ambient egress config is measured into judge state and its cache signature (#73)", () => {
+		const { sources, home, project, remove } = fixture();
+		const curlrc = join(home, ".curlrc");
+		try {
+			writeFileSync(curlrc, "silent\n");
+			const first = measureNetworkProvenance("curl https://collector.example/", project, sources);
+			const state = buildJevState({ command: "curl https://collector.example/", workingDirectory: project, networkProvenance: first });
+			const signature = JSON.stringify(["curl https://collector.example/", first ?? null]);
+			expect(first?.ambientClientConfig?.curlrc).toMatch(/^present:[a-f0-9]{64}$/u);
+			expect(JSON.stringify(state)).not.toContain("silent");
+			writeFileSync(curlrc, "silent\nurl = https://collector.example/\n");
+			const changed = measureNetworkProvenance("curl https://collector.example/", project, sources);
+			const changedState = buildJevState({ command: "curl https://collector.example/", workingDirectory: project, networkProvenance: changed });
+			expect(changed?.ambientClientConfig?.curlrc).not.toBe(first?.ambientClientConfig?.curlrc);
+			expect(JSON.stringify(["curl https://collector.example/", changed ?? null])).not.toBe(signature);
+			const unchanged = measureNetworkProvenance("curl https://collector.example/", project, sources);
+			expect(JSON.stringify(["curl https://collector.example/", unchanged ?? null])).toBe(JSON.stringify(["curl https://collector.example/", changed ?? null]));
+			expect(JSON.stringify(changedState)).not.toContain("url =");
+			expect(JSON.stringify(changedState)).toContain("present settings may redirect or multiply egress");
+		} finally {
+			remove();
+		}
+	});
+
+	test("project npmrc, git url rewrites and lowercase proxies are in the identity (#73)", () => {
+		// The three settings the first cut missed: a project-level `.npmrc`
+		// (registry for this tree only), a `url.*.insteadOf` rewrite (which host
+		// git actually contacts), and the lowercase proxy variables curl reads.
+		const { sources, home, project, remove } = fixture();
+		const gitConfig = join(project, "gitconfig");
+		const npmrc = join(project, ".npmrc");
+		const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, GIT_CONFIG_GLOBAL: gitConfig };
+		const scoped = { ...sources, env };
+		try {
+			writeFileSync(npmrc, "registry=https://registry.example/\n");
+			const first = measureNetworkProvenance("npm install", project, scoped);
+			expect(first?.ambientClientConfig?.["npmrc.project"]).toMatch(/^present:[a-f0-9]{64}$/u);
+			writeFileSync(npmrc, "registry=https://mirror.example/\n");
+			const second = measureNetworkProvenance("npm install", project, scoped);
+			expect(second?.ambientClientConfig?.["npmrc.project"]).not.toBe(first?.ambientClientConfig?.["npmrc.project"]);
+
+			writeFileSync(gitConfig, '[url "https://mirror.example/"]\n\tinsteadOf = https://origin.example/\n');
+			const beforeRewrite = measureNetworkProvenance("git clone https://origin.example/repo", project, scoped);
+			writeFileSync(gitConfig, '[url "https://other.example/"]\n\tinsteadOf = https://origin.example/\n');
+			const afterRewrite = measureNetworkProvenance("git clone https://origin.example/repo", project, scoped);
+			expect(beforeRewrite?.ambientClientConfig?.gitHttp).toBeDefined();
+			expect(afterRewrite?.ambientClientConfig?.gitHttp).not.toBe(beforeRewrite?.ambientClientConfig?.gitHttp);
+
+			const lower = measureNetworkProvenance("curl https://collector.example/", project, { ...sources, env: { ...env, all_proxy: "http://proxy.example:8080" } });
+			expect(lower?.ambientClientConfig?.["env.all_proxy"]).toMatch(/^set:[a-f0-9]{64}$/u);
+		} finally {
+			remove();
+		}
+	});
+
+	test("a cd before the command decides which project config is measured (#73)", () => {
+		// `cd /project && npm install` reads /project/.npmrc: measuring from the
+		// starting directory would attribute another tree's registry to it.
+		const { sources, home, project, remove } = fixture();
+		const elsewhere = mkdtempSync(join(tmpdir(), "jev73-root-"));
+		const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home };
+		const scoped = { ...sources, env };
+		try {
+			writeFileSync(join(project, ".npmrc"), "registry=https://project.example/\n");
+			writeFileSync(join(elsewhere, ".npmrc"), "registry=https://elsewhere.example/\n");
+			const fromProject = measureNetworkProvenance(`cd ${project} && npm install`, elsewhere, scoped);
+			const fromElsewhere = measureNetworkProvenance("npm install", elsewhere, scoped);
+			expect(fromProject?.ambientClientConfig?.directory).toMatch(/^moved:/u);
+			expect(fromElsewhere?.ambientClientConfig?.directory).toBe("as-given");
+			expect(fromProject?.ambientClientConfig?.["npmrc.project"]).not.toBe(fromElsewhere?.ambientClientConfig?.["npmrc.project"]);
+			// A directory the walk cannot resolve is not the starting directory:
+			// the measurement says so and the cache is bypassed for it, so a
+			// changed value behind the unresolved target cannot reuse a verdict.
+			const envDriven = (dir: string) => ({ ...sources, env: { ...env, UNSET_DIR: dir } });
+			const one = measureNetworkProvenance('cd "$UNSET_DIR" && npm install', elsewhere, envDriven("/one"));
+			const two = measureNetworkProvenance('cd "$UNSET_DIR" && npm install', elsewhere, envDriven("/two"));
+			expect(one?.ambientClientConfig?.directory).toBe("unresolved");
+			expect(one?.directoryUnresolved).toBe(true);
+			expect(two?.directoryUnresolved).toBe(true);
+		} finally {
+			remove();
+			cleanup(elsewhere);
 		}
 	});
 
@@ -586,6 +671,85 @@ describe("the gate measures it before the battery is asked (#65)", () => {
 		const provenance = state.networkProvenance as { localPorts: number[]; note: string } | undefined;
 		expect(provenance?.localPorts).toEqual([8000]);
 		expect(String(provenance?.note)).toContain("measured by the gate");
+	});
+
+	test("a proxy environment change invalidates an otherwise identical verdict", async () => {
+		const previousProxy = process.env.HTTPS_PROXY;
+		const sessionId = `net-prov-cache-${++seq}`;
+		try {
+			process.env.HTTPS_PROXY = "http://proxy-one.example:8080";
+			const command = "curl https://collector.example/";
+			await fire("tool_call", makeEvent(command), makeCtx({ sessionId }));
+			const initialCalls = modelCalls.length;
+			expect(initialCalls).toBeGreaterThan(0);
+			expect(JSON.stringify(stateOf(initialCalls - 1))).toContain('"env.HTTPS_PROXY":"set:');
+			await fire("tool_call", makeEvent(command), makeCtx({ sessionId }));
+			expect(modelCalls.length).toBe(initialCalls);
+			process.env.HTTPS_PROXY = "http://proxy-two.example:8080";
+			await fire("tool_call", makeEvent(command), makeCtx({ sessionId }));
+			expect(modelCalls.length).toBe(initialCalls + 1);
+		} finally {
+			if (previousProxy === undefined) delete process.env.HTTPS_PROXY;
+			else process.env.HTTPS_PROXY = previousProxy;
+		}
+	});
+
+	test("an unresolved client directory is never served from cache", async () => {
+		// The tree the command would run in cannot be resolved, so the config
+		// measured from the starting directory may belong to another tree that
+		// can change with nothing in the key changing. The verdict must be
+		// re-asked every time rather than reused.
+		const sessionId = `net-prov-unresolved-${++seq}`;
+		const command = 'cd "$UNRESOLVED_TREE" && npm install';
+		await fire("tool_call", makeEvent(command), makeCtx({ sessionId }));
+		const initialCalls = modelCalls.length;
+		expect(initialCalls).toBeGreaterThan(0);
+		expect(JSON.stringify(stateOf(initialCalls - 1))).toContain('"directoryUnresolved":true');
+		await fire("tool_call", makeEvent(command), makeCtx({ sessionId }));
+		expect(modelCalls.length).toBe(initialCalls + 1);
+	});
+
+	test("an unreadable config file fails closed instead of reading as absent (#73)", () => {
+		const { sources, home, project, remove } = fixture();
+		const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home };
+		const npmrc = join(project, ".npmrc");
+		try {
+			writeFileSync(npmrc, "registry=https://registry.example/\n");
+			const readable = measureNetworkProvenance("npm install", project, { ...sources, env });
+			expect(readable?.ambientConfigUnreadable).toBeUndefined();
+			chmodSync(npmrc, 0o000);
+			const blocked = measureNetworkProvenance("npm install", project, { ...sources, env });
+			// Not "nothing there": the file could hold any registry.
+			expect(blocked?.ambientConfigUnreadable).toBe(true);
+			expect(blocked?.ambientClientConfig?.["npmrc.project"]).not.toBe(readable?.ambientClientConfig?.["npmrc.project"]);
+		} finally {
+			chmodSync(npmrc, 0o600);
+			remove();
+		}
+	});
+
+	test("every client segment is measured, not the first alone (#73)", () => {
+		const { sources, home, project, remove } = fixture();
+		const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home };
+		const elsewheres = mkdtempSync(join(tmpdir(), "jev73-two-"));
+		try {
+			writeFileSync(join(project, ".npmrc"), "registry=https://one.example/\n");
+			writeFileSync(join(elsewheres, ".npmrc"), "registry=https://two.example/\n");
+			const command = (verb: string) => `curl https://collector.example/ && cd ${elsewheres} && ${verb}`;
+			const first = measureNetworkProvenance(command("npm install"), project, { ...sources, env });
+			writeFileSync(join(elsewheres, ".npmrc"), "registry=https://three.example/\n");
+			const second = measureNetworkProvenance(command("npm install"), project, { ...sources, env });
+			// The second segment's tree changed, so the measurement must too.
+			expect(second?.ambientClientConfig?.["npmrc.project"]).not.toBe(first?.ambientClientConfig?.["npmrc.project"]);
+			// A verb named by path is still a segment whose directory counts.
+			const bare = measureNetworkProvenance(`cd ${elsewheres} && npm install`, project, { ...sources, env });
+			const byPath = measureNetworkProvenance(`cd ${elsewheres} && /usr/bin/npm install`, project, { ...sources, env });
+			expect(byPath?.directoryUnresolved).toBeUndefined();
+			expect(byPath?.ambientClientConfig?.["npmrc.project"]).toBe(bare?.ambientClientConfig?.["npmrc.project"]);
+		} finally {
+			remove();
+			cleanup(elsewheres);
+		}
 	});
 
 	test("an unknown host reaches Jev with no provenance field at all", async () => {
