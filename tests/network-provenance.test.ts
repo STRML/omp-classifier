@@ -449,6 +449,65 @@ describe("the daemon decides the local claim, not the local file (#121 review)",
 		}
 	});
 
+	test("project npmrc, git url rewrites and lowercase proxies are in the identity (#73)", () => {
+		// The three settings the first cut missed: a project-level `.npmrc`
+		// (registry for this tree only), a `url.*.insteadOf` rewrite (which host
+		// git actually contacts), and the lowercase proxy variables curl reads.
+		const { sources, home, project, remove } = fixture();
+		const gitConfig = join(project, "gitconfig");
+		const npmrc = join(project, ".npmrc");
+		const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, GIT_CONFIG_GLOBAL: gitConfig };
+		const scoped = { ...sources, env };
+		try {
+			writeFileSync(npmrc, "registry=https://registry.example/\n");
+			const first = measureNetworkProvenance("npm install", project, scoped);
+			expect(first?.ambientClientConfig?.["npmrc.project"]).toMatch(/^present:[a-f0-9]{64}$/u);
+			writeFileSync(npmrc, "registry=https://mirror.example/\n");
+			const second = measureNetworkProvenance("npm install", project, scoped);
+			expect(second?.ambientClientConfig?.["npmrc.project"]).not.toBe(first?.ambientClientConfig?.["npmrc.project"]);
+
+			writeFileSync(gitConfig, '[url "https://mirror.example/"]\n\tinsteadOf = https://origin.example/\n');
+			const beforeRewrite = measureNetworkProvenance("git clone https://origin.example/repo", project, scoped);
+			writeFileSync(gitConfig, '[url "https://other.example/"]\n\tinsteadOf = https://origin.example/\n');
+			const afterRewrite = measureNetworkProvenance("git clone https://origin.example/repo", project, scoped);
+			expect(beforeRewrite?.ambientClientConfig?.gitHttp).toBeDefined();
+			expect(afterRewrite?.ambientClientConfig?.gitHttp).not.toBe(beforeRewrite?.ambientClientConfig?.gitHttp);
+
+			const lower = measureNetworkProvenance("curl https://collector.example/", project, { ...sources, env: { ...env, all_proxy: "http://proxy.example:8080" } });
+			expect(lower?.ambientClientConfig?.["env.all_proxy"]).toMatch(/^set:[a-f0-9]{64}$/u);
+		} finally {
+			remove();
+		}
+	});
+
+	test("a cd before the command decides which project config is measured (#73)", () => {
+		// `cd /project && npm install` reads /project/.npmrc: measuring from the
+		// starting directory would attribute another tree's registry to it.
+		const { sources, home, project, remove } = fixture();
+		const elsewhere = mkdtempSync(join(tmpdir(), "jev73-root-"));
+		const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home };
+		const scoped = { ...sources, env };
+		try {
+			writeFileSync(join(project, ".npmrc"), "registry=https://project.example/\n");
+			writeFileSync(join(elsewhere, ".npmrc"), "registry=https://elsewhere.example/\n");
+			const fromProject = measureNetworkProvenance(`cd ${project} && npm install`, elsewhere, scoped);
+			const fromElsewhere = measureNetworkProvenance("npm install", elsewhere, scoped);
+			expect(fromProject?.ambientClientConfig?.directory).toMatch(/^moved:/u);
+			expect(fromElsewhere?.ambientClientConfig?.directory).toBe("as-given");
+			expect(fromProject?.ambientClientConfig?.["npmrc.project"]).not.toBe(fromElsewhere?.ambientClientConfig?.["npmrc.project"]);
+			// A directory the walk cannot resolve is not the starting directory,
+			// and a changed value behind it must not reuse the earlier verdict.
+			const envDriven = (dir: string) => ({ ...sources, env: { ...env, UNSET_DIR: dir } });
+			const one = measureNetworkProvenance('cd "$UNSET_DIR" && npm install', elsewhere, envDriven("/one"));
+			const two = measureNetworkProvenance('cd "$UNSET_DIR" && npm install', elsewhere, envDriven("/two"));
+			expect(one?.ambientClientConfig?.directory).toMatch(/^unresolved:/u);
+			expect(two?.ambientClientConfig?.directory).not.toBe(one?.ambientClientConfig?.directory);
+		} finally {
+			remove();
+			cleanup(elsewhere);
+		}
+	});
+
 	test("a relative -f and the default compose file are read where the invocation runs", () => {
 		const { sources, project, remove } = fixture();
 		const target = mkdtempSync(join(tmpdir(), "jev65-cwd-f-"));
@@ -631,6 +690,21 @@ describe("the gate measures it before the battery is asked (#65)", () => {
 			if (previousProxy === undefined) delete process.env.HTTPS_PROXY;
 			else process.env.HTTPS_PROXY = previousProxy;
 		}
+	});
+
+	test("an unresolved client directory is never served from cache", async () => {
+		// The tree the command would run in cannot be resolved, so the config
+		// measured from the starting directory may belong to another tree that
+		// can change with nothing in the key changing. The verdict must be
+		// re-asked every time rather than reused.
+		const sessionId = `net-prov-unresolved-${++seq}`;
+		const command = 'cd "$UNRESOLVED_TREE" && npm install';
+		await fire("tool_call", makeEvent(command), makeCtx({ sessionId }));
+		const initialCalls = modelCalls.length;
+		expect(initialCalls).toBeGreaterThan(0);
+		expect(JSON.stringify(stateOf(initialCalls - 1))).toContain('"directoryUnresolved":true');
+		await fire("tool_call", makeEvent(command), makeCtx({ sessionId }));
+		expect(modelCalls.length).toBe(initialCalls + 1);
 	});
 
 	test("an unknown host reaches Jev with no provenance field at all", async () => {

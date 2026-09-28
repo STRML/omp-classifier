@@ -6272,7 +6272,8 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 			}
-			const cached = scoped.get(cacheKey);
+			const cacheableEval = networkProvenanceForCache?.directoryUnresolved !== true;
+			const cached = cacheableEval ? scoped.get(cacheKey) : undefined;
 			if (dryRun && !cached) {
 				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, judgement: undefined, headless: !ctx.hasUI });
 				return dryRunStop({
@@ -6305,7 +6306,7 @@ export default function (pi: ExtensionAPI) {
 				if (!judgement) {
 					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", userScopeFingerprint, { ...auditFields(), ...spawnField });
 				}
-				if (!cached && judgement.verdict !== "UNAVAILABLE" && !judgement.noCache) remember(scoped, cacheKey, judgement);
+				if (cacheableEval && !cached && judgement.verdict !== "UNAVAILABLE" && !judgement.noCache) remember(scoped, cacheKey, judgement);
 				const logCode = truncated(evalCode.replace(/\s+/gu, " ").trim(), 120);
 				if (!dryRun) pi.logger.info(
 					`classifier: verdict=${judgement.verdict}` +
@@ -6772,7 +6773,11 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			const cached = scoped.get(cacheKey);
+			// A client verb whose directory could not be resolved measured config
+			// that may belong to another tree, and that tree can change with
+			// nothing in the key changing: never serve such a verdict from cache.
+			const cacheable = networkProvenanceForCache?.directoryUnresolved !== true;
+			const cached = cacheable ? scoped.get(cacheKey) : undefined;
 			// Evidence is part of the key (evidenceFingerprint): a hit means
 			// the identical evidence window produced this verdict, so no
 			// hit-time revalidation is needed and dry-run stays read-only.
@@ -6814,7 +6819,7 @@ export default function (pi: ExtensionAPI) {
 			// real verdict caches (including UNSURE, whose cached entry keeps a
 			// nondeterministic judge from flapping verdicts); UNAVAILABLE sets
 			// noCache for the same reason.
-			if (!cached && judgement.verdict !== "UNAVAILABLE" && !judgement.noCache) remember(scoped, cacheKey, judgement);
+			if (cacheable && !cached && judgement.verdict !== "UNAVAILABLE" && !judgement.noCache) remember(scoped, cacheKey, judgement);
 			// Every resolved decision is logged so prompt/auto-run behavior is
 			// observable from ~/.omp/logs without watching dialogs. Verdict,
 			// the cache/reason provenance, and a truncated command; the full

@@ -57,7 +57,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { redactSecrets } from "./redact";
 import { parseShell, type ShellJoin } from "./shell-ast";
 import { maskHeredocBodiesAndAnsiSpans, segmentCwdAt, SHELL_WORD_EXPANSION } from "./shell-cwd";
@@ -701,6 +701,11 @@ export interface NetworkProvenance {
 	dockerNetworks: DockerTarget[];
 	/** Secret-safe fingerprints of ambient client settings that can redirect egress. */
 	ambientClientConfig?: Record<string, string>;
+	/** Set when the directory the command's client verb runs in could not be
+	 *  resolved. The tests measured from may belong to another tree, and that
+	 *  tree's config can change without any measured value changing, so a
+	 *  verdict measured under this flag is never reused from cache. */
+	directoryUnresolved?: true;
 }
 
 /** Running docker state as this module reads it: the containers that exist and
@@ -1301,15 +1306,36 @@ function composeInvocations(command: string, base: string): ComposeInvocation[] 
 /** Hashes are safe to expose: raw client configuration may contain credentials. */
 const ambientClientDigest = (value: string): string => createHash("sha256").update(value).digest("hex");
 
+/** The client verb whose directory decides which project config applies. */
+const AMBIENT_VERB_RE = /(?:^|[\s;&|(`])(curl|wget|npm|npx|pnpm|yarn|pip|pip3|git|bun)\b/iu;
+
 function ambientClientConfig(command: string, cwd: string, sources: NetworkSources): Record<string, string> | undefined {
 	if (!/\b(?:curl|wget|npm|npx|pnpm|yarn|pip|pip3)\b/iu.test(command) && !/\bgit\s+(?:clone|fetch|pull|push|ls-remote|submodule|lfs)\b/iu.test(command) && !/\bbun\s+(?:add|install|i)\b/iu.test(command)) return undefined;
 	const home = sources.homeDir ?? homedir();
+	// `cd /project && npm install` reads /project/.npmrc, not the starting
+	// directory's. Resolve the directory the verb's own segment runs in — and if
+	// the walk cannot, say so rather than measuring the starting tree, so a
+	// stale verdict cannot be reused for a differently rooted command.
+	const verb = AMBIENT_VERB_RE.exec(command);
+	const effectiveCwd = verb === null ? cwd : segmentCwdAt(maskHeredocBodiesAndAnsiSpans(command).masked, verb.index + verb[0].indexOf(verb[1]), cwd);
+	const base = effectiveCwd ?? cwd;
+	const env = sources.env ?? process.env;
+	const measured: Record<string, string> = {};
+	// An unresolved directory is not the starting directory: the same command
+	// text can run somewhere else on the next call, so bind the measurement to
+	// the environment that would drive the expansion. Two different values then
+	// produce two different cache keys instead of reusing one verdict.
+	measured.directory =
+		effectiveCwd === null
+			? `unresolved:${ambientClientDigest(JSON.stringify(Object.entries(env).sort(([a], [b]) => a.localeCompare(b))))}`
+			: effectiveCwd === cwd
+				? "as-given"
+				: `moved:${ambientClientDigest(effectiveCwd)}`;
 	const configFiles: Record<string, string> = {
 		curlrc: join(home, ".curlrc"),
 		npmrc: join(home, ".npmrc"),
 		pipConfig: join(home, ".config", "pip", "pip.conf"),
 	};
-	const measured: Record<string, string> = {};
 	for (const [key, path] of Object.entries(configFiles)) {
 		try {
 			const contents = readFileSync(path);
@@ -1319,12 +1345,30 @@ function ambientClientConfig(command: string, cwd: string, sources: NetworkSourc
 			measured[key] = `${status}:${ambientClientDigest(JSON.stringify([status, path]))}`;
 		}
 	}
-	const env = sources.env ?? process.env;
-	for (const name of ["HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]) {
+	for (const name of ["HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "all_proxy", "no_proxy"]) {
 		measured[`env.${name}`] = env[name] === undefined ? "unset" : `set:${ambientClientDigest(env[name])}`;
 	}
+	// A project-level `.npmrc` can point npm at another registry for this tree
+	// only, which the user-level file never shows. Measured from the command's
+	// directory upward, bounded, and digested as a set so no directory name
+	// reaches the judge: a depth or a path is not what changes the destination.
+	const projectNpmrc: string[] = [];
+	for (let dir = resolve(base), depth = 0; depth < 8; depth++) {
+		try {
+			const contents = readFileSync(join(dir, ".npmrc"));
+			projectNpmrc.push(`${depth}:present:${ambientClientDigest(contents.toString("base64"))}`);
+		} catch {
+			// Absent or unreadable at this level says nothing; the walk continues.
+		}
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	measured["npmrc.project"] = projectNpmrc.length === 0 ? "absent" : `present:${ambientClientDigest(projectNpmrc.join("\n"))}`;
 	try {
-		const config = execFileSync("git", ["config", "--show-origin", "--null", "--get-regexp", "^http\\."], { cwd, env: env as NodeJS.ProcessEnv, encoding: "buffer", stdio: ["ignore", "pipe", "ignore"] });
+		// `url.*.insteadOf` rewrites the remote a git command actually contacts,
+		// so it belongs in the same measurement as the http settings.
+		const config = execFileSync("git", ["config", "--show-origin", "--null", "--get-regexp", "^(http|url)\\."], { cwd: base, env: env as NodeJS.ProcessEnv, encoding: "buffer", stdio: ["ignore", "pipe", "ignore"] });
 		measured.gitHttp = config.length === 0 ? `absent:${ambientClientDigest("absent")}` : `present:${ambientClientDigest(config.toString("base64"))}`;
 	} catch (error) {
 		const status = error && typeof error === "object" && "status" in error && error.status === 1 ? "absent" : "unreadable";
@@ -1413,7 +1457,17 @@ export function measureNetworkProvenance(command: string, cwd: string, sources: 
 
 	const ports = [...localPorts].sort((a, b) => a - b);
 	if (ports.length === 0 && knownHosts.length === 0 && dockerNetworks.length === 0 && ambientConfig === undefined) return undefined;
-	return { localPorts: ports, knownHosts, dockerNetworks, ...(ambientConfig !== undefined ? { ambientClientConfig: ambientConfig } : {}) };
+	// A client verb whose directory could not be resolved: the config measured
+	// above may belong to another tree, and that tree can change with nothing
+	// here changing, so the verdict is marked as never reusable from cache.
+	const clientCwdUnresolved = ambientConfig?.directory?.startsWith("unresolved:") === true;
+	return {
+		localPorts: ports,
+		knownHosts,
+		dockerNetworks,
+		...(ambientConfig !== undefined ? { ambientClientConfig: ambientConfig } : {}),
+		...(clientCwdUnresolved ? { directoryUnresolved: true as const } : {}),
+	};
 }
 
 /**
