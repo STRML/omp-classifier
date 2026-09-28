@@ -6184,7 +6184,10 @@ export default function (pi: ExtensionAPI) {
 			const [only] = parsed.commands;
 			if (only === undefined || only.unreadShape !== undefined || only.words.length === 0) return false;
 			if (only.words.some(word => !word.literal)) return false;
-			return !POLICY_UNSTABLE_VERBS.has(commandBasename(only.words[0].value.toLowerCase()));
+			// Versioned interpreters are the same program: `python3.12`, `node20`
+			// and `bun1.4` must land on the same verdict as their bare names.
+			const base = commandBasename(only.words[0].value.toLowerCase());
+			return ![base, base.replace(/\.[\d.]*$/u, ""), base.replace(/\d+(?:\.\d+)*$/u, "")].some(candidate => POLICY_UNSTABLE_VERBS.has(candidate));
 		};
 		const resolvePolicyContext = (projectDir: string, directoryStable: boolean) => {
 			const resolved = resolvePinnedUserPolicy(config.trustPolicy, projectDir);
