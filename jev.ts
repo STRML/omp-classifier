@@ -53,10 +53,11 @@
  *     and the policy that derives them. Filling those answers in is
  *     jev-judge.ts, which rides OMP's own judgment module.
  */
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { redactSecrets } from "./redact";
 import { parseShell, type ShellJoin } from "./shell-ast";
 import { maskHeredocBodiesAndAnsiSpans, segmentCwdAt, SHELL_WORD_EXPANSION } from "./shell-cwd";
@@ -698,6 +699,17 @@ export interface NetworkProvenance {
 	/** Compose services and published ports the command reaches, as this
 	 *  machine's own compose file and docker port table measure them. */
 	dockerNetworks: DockerTarget[];
+	/** Secret-safe fingerprints of ambient client settings that can redirect egress. */
+	ambientClientConfig?: Record<string, string>;
+	/** Set when the directory the command's client verb runs in could not be
+	 *  resolved. The tests measured from may belong to another tree, and that
+	 *  tree's config can change without any measured value changing, so a
+	 *  verdict measured under this flag is never reused from cache. */
+	directoryUnresolved?: true;
+	/** Set when a config file that decides a destination could not be read: it
+	 *  could hold a redirect nothing here measured, so the verdict is never
+	 *  reused from cache. */
+	ambientConfigUnreadable?: true;
 }
 
 /** Running docker state as this module reads it: the containers that exist and
@@ -717,14 +729,14 @@ export interface NetworkSources {
 	hostsFile?: string;
 	/** Running docker state, or undefined when there is none to read. */
 	dockerState?: () => DockerPortState | undefined;
-	/** The environment the docker CLI would run with, for `DOCKER_HOST`,
-	 *  `DOCKER_CONTEXT`, and `DOCKER_CONFIG`. Defaults to this process's own. */
+	/** Home directory for ambient client settings; defaults to this process's. */
+	homeDir?: string;
+	/** The process environment supplying proxy variables and git config. */
 	env?: Record<string, string | undefined>;
 	/** This machine's docker CLI config directory: `config.json` names the
 	 *  current context, and `contexts/meta/` holds its endpoints. */
 	dockerConfigDir?: string;
 }
-
 const DEFAULT_SSH_CONFIG_PATHS = [join(homedir(), ".ssh", "config"), "/etc/ssh/ssh_config"];
 const DEFAULT_HOSTS_FILE = "/etc/hosts";
 const DEFAULT_COMPOSE_FILES = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
@@ -1295,26 +1307,149 @@ function composeInvocations(command: string, base: string): ComposeInvocation[] 
 	return invocations;
 }
 
-/**
- * Measure the network tier for one command, or undefined when nothing about its
- * destinations could be measured — an absent field means "nothing measured",
- * never "trusted". `cwd` is the directory the command STARTS in: the compose
- * file and the docker config are looked for in the directory each of the
- * command's own segments runs in, as far as the command's `cd` chain can be read
- * (that walk is `segmentCwdAt` in `shell-cwd.ts`, shared with the script-body
- * reader). The rest of the machine state is read from the paths in `sources`.
- *
- * The compose file and the docker port table are configuration on this disk:
- * they name services and ports, never the machine a container runs on. That is
- * what the daemon measurement adds (#121 review), and it is measured from the
- * command's own text (`-H`/`--context`) plus this machine's own environment and
- * docker config (`DOCKER_HOST`, `DOCKER_CONTEXT`, the active context) — never
- * from anything the file's author wrote into the file.
- */
+/** Hashes are safe to expose: raw client configuration may contain credentials. */
+const ambientClientDigest = (value: string): string => createHash("sha256").update(value).digest("hex");
+
+/** The client verb whose directory decides which project config applies. The
+ *  executable may be named by path (`/usr/bin/git clone`), which the
+ *  eligibility test above already accepts, so the path prefix is part of the
+ *  pattern rather than a reason to miss the segment. */
+const AMBIENT_VERB_RE = /(?:^|[\s;&|(`])(?:\S*\/)?(curl|wget|npm|npx|pnpm|yarn|pip|pip3|git|bun)\b/giu;
+/** Bound on client segments measured, and on the `.npmrc` walk per segment. */
+const AMBIENT_SEGMENT_CAP = 8;
+
+/** `unresolved` and `unreadable` are fail-closed signals, not just text: the
+ *  caller marks the measurement as never reusable from cache when either is
+ *  set, because the config that decides the destination was not measured. */
+interface AmbientMeasurement {
+	measured: Record<string, string>;
+	unresolved: boolean;
+	unreadable: boolean;
+}
+
+function readAmbientFile(path: string): { status: "present"; digest: string } | { status: "absent" | "unreadable" } {
+	try {
+		return { status: "present", digest: ambientClientDigest(readFileSync(path).toString("base64")) };
+	} catch (error) {
+		const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+		if (code === "ENOENT") return { status: "absent" };
+		// Exists but cannot be read: fail-closed, since it could hold a redirect
+		// nothing here measured. If it does not stat either, the answer depends
+		// on whether its directory can be traversed at all: a traversable
+		// directory means the file is genuinely not there, while a path inside
+		// one this process cannot enter is a limit we must not paper over.
+		try {
+			statSync(path);
+			return { status: "unreadable" };
+		} catch {
+			try {
+				statSync(dirname(path));
+				return { status: "absent" };
+			} catch {
+				return { status: "unreadable" };
+			}
+		}
+	}
+}
+
+function ambientClientConfig(command: string, cwd: string, sources: NetworkSources): AmbientMeasurement | undefined {
+	if (!/\b(?:curl|wget|npm|npx|pnpm|yarn|pip|pip3)\b/iu.test(command) && !/\bgit\s+(?:clone|fetch|pull|push|ls-remote|submodule|lfs)\b/iu.test(command) && !/\bbun\s+(?:add|install|i)\b/iu.test(command)) return undefined;
+	const home = sources.homeDir ?? homedir();
+	const env = sources.env ?? process.env;
+	// `cd /project && npm install` reads /project/.npmrc, not the starting
+	// directory's — and a command with two client segments (`curl … && npm
+	// install`) has two directories, so every segment is resolved rather than
+	// the first alone. A directory the walk cannot resolve is reported instead
+	// of falling back to the starting tree.
+	const masked = maskHeredocBodiesAndAnsiSpans(command).masked;
+	const allVerbs = [...command.matchAll(AMBIENT_VERB_RE)];
+	const verbs = allVerbs.slice(0, AMBIENT_SEGMENT_CAP);
+	const directories = verbs.length === 0 ? [cwd] : verbs.map(match => segmentCwdAt(masked, match.index + match[0].indexOf(match[1]), cwd));
+	// An eligible command whose verb could not be located, or one with more
+	// client segments than the cap, is measured as unresolved rather than as
+	// the starting directory.
+	let unresolved = allVerbs.length === 0 || allVerbs.length > AMBIENT_SEGMENT_CAP || directories.some(directory => directory === null);
+	let unreadable = false;
+	const bases = [...new Set(directories.map(directory => directory ?? cwd))];
+	const measured: Record<string, string> = {};
+	measured.directory = directories.map(directory => (directory === null ? "unresolved" : directory === cwd ? "as-given" : `moved:${ambientClientDigest(directory)}`)).join(",");
+	const configFiles: Record<string, string> = {
+		curlrc: join(home, ".curlrc"),
+		npmrc: join(home, ".npmrc"),
+		pipConfig: join(home, ".config", "pip", "pip.conf"),
+	};
+	for (const [key, path] of Object.entries(configFiles)) {
+		const read = readAmbientFile(path);
+		if (read.status === "present") measured[key] = `present:${read.digest}`;
+		else {
+			if (read.status === "unreadable") unreadable = true;
+			measured[key] = `${read.status}:${ambientClientDigest(JSON.stringify([read.status, path]))}`;
+		}
+	}
+	for (const name of ["HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "all_proxy", "no_proxy"]) {
+		measured[`env.${name}`] = env[name] === undefined ? "unset" : `set:${ambientClientDigest(env[name])}`;
+	}
+	// A project-level `.npmrc` can point npm at another registry for this tree
+	// only. Measured per segment directory, bounded, and digested as a set so no
+	// directory name reaches the judge. An unreadable one is not an absent one:
+	// it could hold any registry, so it fails closed rather than reading as
+	// nothing there.
+	const projectNpmrc: string[] = [];
+	for (const [index, base] of bases.entries()) {
+		for (let dir = resolve(base), depth = 0; depth < AMBIENT_SEGMENT_CAP; depth++) {
+			const read = readAmbientFile(join(dir, ".npmrc"));
+			if (read.status === "present") projectNpmrc.push(`${index}:${depth}:present:${read.digest}`);
+			else if (read.status === "unreadable") {
+				unreadable = true;
+				projectNpmrc.push(`${index}:${depth}:unreadable`);
+			}
+			const parent = dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
+		}
+	}
+	measured["npmrc.project"] = projectNpmrc.length === 0 ? "absent" : `present:${ambientClientDigest(projectNpmrc.join("\n"))}`;
+	// `url.*.insteadOf` rewrites the remote a git command actually contacts, so
+	// it belongs in the same measurement as the http settings — per git
+	// segment's directory, because the repository's own config decides it too.
+	// A command with no git segment is not probed at all: its config cannot
+	// decide where a curl or npm command goes.
+	const gitBases = [
+		...new Set(
+			allVerbs
+				.filter(match => match[1].toLowerCase() === "git")
+				.map(match => segmentCwdAt(masked, match.index + match[0].indexOf(match[1]), cwd) ?? cwd)
+				.slice(0, AMBIENT_SEGMENT_CAP),
+		),
+	];
+	const gitConfig: string[] = [];
+	for (const [index, base] of gitBases.entries()) {
+		try {
+			const config = execFileSync("git", ["config", "--show-origin", "--null", "--get-regexp", "^(http|url)\\."], { cwd: base, env: env as NodeJS.ProcessEnv, encoding: "buffer", stdio: ["ignore", "pipe", "ignore"] });
+			gitConfig.push(config.length === 0 ? `${index}:absent:${ambientClientDigest("absent")}` : `${index}:present:${ambientClientDigest(config.toString("base64"))}`);
+		} catch (error) {
+			const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+			// No git binary, or a directory that does not exist: nothing here
+			// measured, which is not the same as a config that could not be read.
+			const status = code === "ENOENT" ? "absent" : error && typeof error === "object" && "status" in error && error.status === 1 ? "absent" : "unreadable";
+			if (status === "unreadable") unreadable = true;
+			gitConfig.push(`${index}:${status}:${ambientClientDigest(JSON.stringify([status, index]))}`);
+		}
+	}
+	measured.gitHttp = gitConfig.length === 0 ? "n/a" : `set:${ambientClientDigest(gitConfig.join("\n"))}`;
+	return { measured, unresolved, unreadable };
+}
+
+/** Measure destinations and ambient egress settings for a command. The returned
+ *  object joins reviewer state and the verdict cache signature; an absent
+ *  ambient setting is represented explicitly as `absent` or `unset`, not as a
+ *  claim that no redirect is possible. */
 export function measureNetworkProvenance(command: string, cwd: string, sources: NetworkSources = {}): NetworkProvenance | undefined {
 	const endpoints = namedEndpoints(command);
 	const compose = composeInvocations(command, cwd);
-	if (endpoints.length === 0 && compose.length === 0) return undefined;
+	const ambient = ambientClientConfig(command, cwd, sources);
+	const ambientConfig = ambient?.measured;
+	if (endpoints.length === 0 && compose.length === 0 && ambientConfig === undefined) return undefined;
 
 	const env = sources.env ?? process.env;
 	// The config directory this machine's own chain is read from, resolved the
@@ -1385,8 +1520,19 @@ export function measureNetworkProvenance(command: string, cwd: string, sources: 
 	}
 
 	const ports = [...localPorts].sort((a, b) => a - b);
-	if (ports.length === 0 && knownHosts.length === 0 && dockerNetworks.length === 0) return undefined;
-	return { localPorts: ports, knownHosts, dockerNetworks };
+	if (ports.length === 0 && knownHosts.length === 0 && dockerNetworks.length === 0 && ambientConfig === undefined) return undefined;
+	// A client verb whose directory could not be resolved measured config that
+	// may belong to another tree, and an unreadable config could hold a
+	// redirect nothing here saw. Either way the tree can change with nothing in
+	// the key changing, so the verdict is marked as never reusable from cache.
+	return {
+		localPorts: ports,
+		knownHosts,
+		dockerNetworks,
+		...(ambientConfig !== undefined ? { ambientClientConfig: ambientConfig } : {}),
+		...(ambient?.unresolved === true ? { directoryUnresolved: true as const } : {}),
+		...(ambient?.unreadable === true ? { ambientConfigUnreadable: true as const } : {}),
+	};
 }
 
 /**
@@ -2076,7 +2222,7 @@ export function buildJevState(input: {
 		// it sits beside (#121 review).
 		state.networkProvenance = {
 			...input.networkProvenance,
-			note: "measured by the gate from this machine's own SSH config, hosts file, docker config, compose file and docker port table just now; not written by the command's author",
+			note: "measured by the gate from this machine's own SSH config, hosts file, docker config, compose file and docker port table just now; not written by the command's author; ambient client config and proxy variables are hashed, not disclosed or parsed, so present settings may redirect or multiply egress beyond the command text",
 		};
 	}
 	if (Object.keys(evidence).length > 0) state.evidence = evidence;

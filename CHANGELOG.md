@@ -8,6 +8,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 - The cwd walk follows readable literal `source`/`.` files transitively and models assignment and negation prefixes on literal directory builtins. If a source contains an unmodelled directory effect (including dynamic command verbs, unparsed wrapper options, wrapped `eval`, effectful function bodies, or deferred trap handlers), or its source graph is unsupported, unreadable, cyclic or over budget, cwd stays unknown, so later script operands are refused instead of being read from a stale directory.
 
+### Ambient egress configuration (#73)
+
+- Egress judgments now carry secret-safe hashes and presence markers for the applicable curl, npm, pip, and Git HTTP configuration plus `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`. These measurements join the existing network-provenance cache signature, so a changed ambient setting invalidates a cached verdict; config values are not exposed to the judge, which is warned that present settings may redirect or multiply egress beyond the command text.
+
 ### Git refusal command identity (#68)
 
 - Refusal memory now retains the full normalized Git command, so refusing one branch/remote/option combination does not make a different invocation of the same Git subverb inherit that refusal. Non-Git refusal normalization remains unchanged.
