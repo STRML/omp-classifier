@@ -53,7 +53,7 @@ L4 interaction        dialogs, refusal payloads, session grants, dry-run
 L3 memory             verdict cache, refusal memory, decision audit log
 L2 judgment           Jev state + question battery, probabilities, derived verdict
 L1 recognition        critical patterns, structural rules, compound segments, marker scans
-L0 evidence           command text, payload, cwd/env, user messages, grants, prior refusals
+L0 evidence           command text, payload, cwd/env, user messages, trusted policy, grants, prior refusals
 ```
 
 Data flows up: L0 feeds L1 and L2, L2 writes L3, L3 feeds L4 and L5, L5 tunes L1 and L2,
@@ -66,6 +66,7 @@ What the gate may read, and what each source is allowed to mean.
 | Source | Tier | May it authorize? |
 | --- | --- | --- |
 | User messages | user | Yes |
+| Explicitly pinned user policy | user | Action classes only; conditions need gate facts; never egress destinations or delete targets |
 | Approved plan or session grant | user | Yes |
 | Agent-supplied context (intent, runbook step) | agent | No. Explains, never authorizes |
 | Tool output, fetched content | hostile | No. Untrusted-wrapped if included at all |
@@ -75,6 +76,12 @@ evidence tiers that exist. Absent tiers are omitted rather than sent empty — `
 []` would read as "the user said nothing", which is a different claim from "this caller did
 not supply that tier", and the authorization question depends on the difference. `extra` is
 spread first so a caller-supplied key can never displace the command or the evidence.
+`evidence.trustedPolicy` exists only after `/classifier trust-policy` explicitly pins the fixed
+user-level instruction paths and every byte still matches. Repository-local instruction files are
+never read. The judge may apply a policy to an action class, but must not infer a condition from
+command text or missing data; no CI-status fact is measured. Policy text cannot supply egress or
+delete targets.
+The aggregate snapshot cap is 32 KiB; project-dotenv path overrides and paths inside the current Git repository make the policy unavailable.
 
 Measured tiers ride beside those: `gitPushProvenance` (#63), `gitWorktreeProvenance` and
 `gitRefProvenance` (#69 slices C and D). Each is a fact the gate read itself with git
@@ -384,11 +391,14 @@ interruption counters, and false allows by name.
 and battery hash), one agent-legible status surface for machines. Bounds on every config
 surface. Kill switches layered, and never gated by the thing they switch off.
 
+`/classifier trust-policy` is the only way to pin this user-level policy input; a changed snapshot
+disables it and changes the cache signature until its pinned bytes are restored or explicitly repinned.
+
 ## Versioning and identity
 
 | Identity | Value | Changes when |
 | --- | --- | --- |
-| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v2.10` | the meaning of a verdict or a policy knob changes |
+| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v2.11` | the meaning of a verdict or a policy knob changes |
 | `jevQuestionsHash()` (`CLASSIFIER_POLICY_HASH`) | sha256 over version + serialized battery + `DEFAULT_JEV_POLICY`, first 16 hex | the battery, its question ids, or the shipped default changes |
 | `QUESTIONS_CONTRACT` | `questions+probabilities` | the answer shape the parser accepts changes |
 
