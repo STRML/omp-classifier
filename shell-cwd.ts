@@ -540,9 +540,15 @@ const MAX_SOURCED_FILE_BYTES = 1_048_576;
 interface SourceWalkContext {
 	activeFiles: Set<string>;
 	filesRead: number;
+	/** The command text defines an alias or turns alias expansion on. A sourced
+	 *  file may then invoke a word whose effect is decided by the command line
+	 *  rather than by the file (\`alias move='cd child'\` before \`source
+	 *  ./hop.sh\`, with \`move\` as the only line of hop.sh), so no sourced file
+	 *  in that command is modelled. */
+	aliasesDefined: boolean;
 }
 
-const newSourceWalkContext = (): SourceWalkContext => ({ activeFiles: new Set(), filesRead: 0 });
+const newSourceWalkContext = (text = ""): SourceWalkContext => ({ activeFiles: new Set(), filesRead: 0, aliasesDefined: SOURCE_ALIAS_RE.test(text) });
 
 /**
  * Where one segment leaves the shell's working directory.
@@ -805,6 +811,7 @@ interface SourcedFile {
 }
 
 function readSourcedFile(target: string, cwd: string | null, resolveCwd: CwdResolver, context: SourceWalkContext): SourcedFile | null {
+	if (context.aliasesDefined) return null;
 	if (target === "-" || target.includes("://") || target.startsWith("local:/") || SHELL_WORD_EXPANSION.test(target)) return null;
 	if (target !== "~" && !target.startsWith("~/") && !target.includes("/")) return null;
 	if (cwd === null && !path.isAbsolute(target) && !target.startsWith("~/")) return null;
@@ -1006,7 +1013,7 @@ export function segmentWorkingDirectories(
 		const words = walked[index].words;
 		if (words.length !== segments[index].length || words.some((word, at) => word !== segments[index][at])) return dirs;
 	}
-	const cwds = walkedDirectories(events, base, resolveCwd, newSourceWalkContext()).segments;
+	const cwds = walkedDirectories(events, base, resolveCwd, newSourceWalkContext(text)).segments;
 	for (let index = 0; index < cwds.length && index < dirs.length; index++) dirs[index] = cwds[index].cwd;
 	return dirs;
 }
@@ -1040,7 +1047,7 @@ export function segmentCwdAt(
 	base: string,
 	resolveCwd: CwdResolver = defaultCwdResolver,
 ): string | null {
-	return cwdAtOffset(walkedDirectories(shellWalk(text), base, resolveCwd, newSourceWalkContext()).segments, offset, base);
+	return cwdAtOffset(walkedDirectories(shellWalk(text), base, resolveCwd, newSourceWalkContext(text)).segments, offset, base);
 }
 
 /** Build one shell walk for all command offsets, including nested substitutions. */
@@ -1049,7 +1056,7 @@ export function segmentCwdLookup(
 	base: string,
 	resolveCwd: CwdResolver = defaultCwdResolver,
 ): (offset: number) => string | null {
-	const sourceContext = newSourceWalkContext();
+	const sourceContext = newSourceWalkContext(text);
 	const rootWalked = walkedDirectories(shellWalk(text), base, resolveCwd, sourceContext).segments;
 	const allWalked = [...rootWalked];
 	const contexts: Array<{ range: ShellSubstitutionRange; base: string | null; walked: ShellSegmentDirectory[] }> = [];

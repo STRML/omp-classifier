@@ -763,6 +763,20 @@ describe("the directory the shell will be in", () => {
 		expect(read.refusal?.why).toContain("working directory");
 	});
 
+	test("an alias defined on the command line leaves a sourced call unknown", () => {
+		// The alias lives on the command line, not in the sourced file: hop.sh
+		// contains only `move`, whose target the text of hop.sh cannot show.
+		fs.mkdirSync(path.join(root, "child"));
+		writeScript(root, "hop.sh", "move\n");
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(path.join(root, "child"), "payload.py", HARMFUL_CODE);
+
+		const read = readInterpretedScriptBodies("shopt -s expand_aliases; alias move='cd child'; source ./hop.sh; python3 payload.py", root, 8000);
+
+		expect(read.bodies).toEqual([]);
+		expect(read.refusal?.why).toContain("working directory");
+	});
+
 	test("an optioned command wrapper around a sourced cd leaves cwd unknown", () => {
 		fs.mkdirSync(path.join(root, "child"));
 		writeScript(root, "hop.sh", "command -p cd child\n");
