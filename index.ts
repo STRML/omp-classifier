@@ -6272,7 +6272,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 			}
-			const cacheableEval = networkProvenanceForCache?.directoryUnresolved !== true;
+			const cacheableEval = networkProvenanceForCache?.directoryUnresolved !== true && networkProvenanceForCache?.ambientConfigUnreadable !== true;
 			const cached = cacheableEval ? scoped.get(cacheKey) : undefined;
 			if (dryRun && !cached) {
 				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, judgement: undefined, headless: !ctx.hasUI });
@@ -6776,7 +6776,7 @@ export default function (pi: ExtensionAPI) {
 			// A client verb whose directory could not be resolved measured config
 			// that may belong to another tree, and that tree can change with
 			// nothing in the key changing: never serve such a verdict from cache.
-			const cacheable = networkProvenanceForCache?.directoryUnresolved !== true;
+			const cacheable = networkProvenanceForCache?.directoryUnresolved !== true && networkProvenanceForCache?.ambientConfigUnreadable !== true;
 			const cached = cacheable ? scoped.get(cacheKey) : undefined;
 			// Evidence is part of the key (evidenceFingerprint): a hit means
 			// the identical evidence window produced this verdict, so no

@@ -55,7 +55,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { redactSecrets } from "./redact";
@@ -706,6 +706,10 @@ export interface NetworkProvenance {
 	 *  tree's config can change without any measured value changing, so a
 	 *  verdict measured under this flag is never reused from cache. */
 	directoryUnresolved?: true;
+	/** Set when a config file that decides a destination could not be read: it
+	 *  could hold a redirect nothing here measured, so the verdict is never
+	 *  reused from cache. */
+	ambientConfigUnreadable?: true;
 }
 
 /** Running docker state as this module reads it: the containers that exist and
@@ -1306,75 +1310,134 @@ function composeInvocations(command: string, base: string): ComposeInvocation[] 
 /** Hashes are safe to expose: raw client configuration may contain credentials. */
 const ambientClientDigest = (value: string): string => createHash("sha256").update(value).digest("hex");
 
-/** The client verb whose directory decides which project config applies. */
-const AMBIENT_VERB_RE = /(?:^|[\s;&|(`])(curl|wget|npm|npx|pnpm|yarn|pip|pip3|git|bun)\b/iu;
+/** The client verb whose directory decides which project config applies. The
+ *  executable may be named by path (`/usr/bin/git clone`), which the
+ *  eligibility test above already accepts, so the path prefix is part of the
+ *  pattern rather than a reason to miss the segment. */
+const AMBIENT_VERB_RE = /(?:^|[\s;&|(`])(?:\S*\/)?(curl|wget|npm|npx|pnpm|yarn|pip|pip3|git|bun)\b/giu;
+/** Bound on client segments measured, and on the `.npmrc` walk per segment. */
+const AMBIENT_SEGMENT_CAP = 8;
 
-function ambientClientConfig(command: string, cwd: string, sources: NetworkSources): Record<string, string> | undefined {
+/** `unresolved` and `unreadable` are fail-closed signals, not just text: the
+ *  caller marks the measurement as never reusable from cache when either is
+ *  set, because the config that decides the destination was not measured. */
+interface AmbientMeasurement {
+	measured: Record<string, string>;
+	unresolved: boolean;
+	unreadable: boolean;
+}
+
+function readAmbientFile(path: string): { status: "present"; digest: string } | { status: "absent" | "unreadable" } {
+	try {
+		return { status: "present", digest: ambientClientDigest(readFileSync(path).toString("base64")) };
+	} catch (error) {
+		const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+		if (code === "ENOENT") return { status: "absent" };
+		// Exists but cannot be read: fail-closed, since it could hold a redirect
+		// nothing here measured. If it does not stat either, the answer depends
+		// on whether its directory can be traversed at all: a traversable
+		// directory means the file is genuinely not there, while a path inside
+		// one this process cannot enter is a limit we must not paper over.
+		try {
+			statSync(path);
+			return { status: "unreadable" };
+		} catch {
+			try {
+				statSync(dirname(path));
+				return { status: "absent" };
+			} catch {
+				return { status: "unreadable" };
+			}
+		}
+	}
+}
+
+function ambientClientConfig(command: string, cwd: string, sources: NetworkSources): AmbientMeasurement | undefined {
 	if (!/\b(?:curl|wget|npm|npx|pnpm|yarn|pip|pip3)\b/iu.test(command) && !/\bgit\s+(?:clone|fetch|pull|push|ls-remote|submodule|lfs)\b/iu.test(command) && !/\bbun\s+(?:add|install|i)\b/iu.test(command)) return undefined;
 	const home = sources.homeDir ?? homedir();
-	// `cd /project && npm install` reads /project/.npmrc, not the starting
-	// directory's. Resolve the directory the verb's own segment runs in — and if
-	// the walk cannot, say so rather than measuring the starting tree, so a
-	// stale verdict cannot be reused for a differently rooted command.
-	const verb = AMBIENT_VERB_RE.exec(command);
-	const effectiveCwd = verb === null ? cwd : segmentCwdAt(maskHeredocBodiesAndAnsiSpans(command).masked, verb.index + verb[0].indexOf(verb[1]), cwd);
-	const base = effectiveCwd ?? cwd;
 	const env = sources.env ?? process.env;
+	// `cd /project && npm install` reads /project/.npmrc, not the starting
+	// directory's — and a command with two client segments (`curl … && npm
+	// install`) has two directories, so every segment is resolved rather than
+	// the first alone. A directory the walk cannot resolve is reported instead
+	// of falling back to the starting tree.
+	const masked = maskHeredocBodiesAndAnsiSpans(command).masked;
+	const allVerbs = [...command.matchAll(AMBIENT_VERB_RE)];
+	const verbs = allVerbs.slice(0, AMBIENT_SEGMENT_CAP);
+	const directories = verbs.length === 0 ? [cwd] : verbs.map(match => segmentCwdAt(masked, match.index + match[0].indexOf(match[1]), cwd));
+	// An eligible command whose verb could not be located, or one with more
+	// client segments than the cap, is measured as unresolved rather than as
+	// the starting directory.
+	let unresolved = allVerbs.length === 0 || allVerbs.length > AMBIENT_SEGMENT_CAP || directories.some(directory => directory === null);
+	let unreadable = false;
+	const bases = [...new Set(directories.map(directory => directory ?? cwd))];
 	const measured: Record<string, string> = {};
-	// An unresolved directory is not the starting directory: the same command
-	// text can run somewhere else on the next call, so bind the measurement to
-	// the environment that would drive the expansion. Two different values then
-	// produce two different cache keys instead of reusing one verdict.
-	measured.directory =
-		effectiveCwd === null
-			? `unresolved:${ambientClientDigest(JSON.stringify(Object.entries(env).sort(([a], [b]) => a.localeCompare(b))))}`
-			: effectiveCwd === cwd
-				? "as-given"
-				: `moved:${ambientClientDigest(effectiveCwd)}`;
+	measured.directory = directories.map(directory => (directory === null ? "unresolved" : directory === cwd ? "as-given" : `moved:${ambientClientDigest(directory)}`)).join(",");
 	const configFiles: Record<string, string> = {
 		curlrc: join(home, ".curlrc"),
 		npmrc: join(home, ".npmrc"),
 		pipConfig: join(home, ".config", "pip", "pip.conf"),
 	};
 	for (const [key, path] of Object.entries(configFiles)) {
-		try {
-			const contents = readFileSync(path);
-			measured[key] = `present:${ambientClientDigest(contents.toString("base64"))}`;
-		} catch (error) {
-			const status = error && typeof error === "object" && "code" in error && error.code === "ENOENT" ? "absent" : "unreadable";
-			measured[key] = `${status}:${ambientClientDigest(JSON.stringify([status, path]))}`;
+		const read = readAmbientFile(path);
+		if (read.status === "present") measured[key] = `present:${read.digest}`;
+		else {
+			if (read.status === "unreadable") unreadable = true;
+			measured[key] = `${read.status}:${ambientClientDigest(JSON.stringify([read.status, path]))}`;
 		}
 	}
 	for (const name of ["HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "all_proxy", "no_proxy"]) {
 		measured[`env.${name}`] = env[name] === undefined ? "unset" : `set:${ambientClientDigest(env[name])}`;
 	}
 	// A project-level `.npmrc` can point npm at another registry for this tree
-	// only, which the user-level file never shows. Measured from the command's
-	// directory upward, bounded, and digested as a set so no directory name
-	// reaches the judge: a depth or a path is not what changes the destination.
+	// only. Measured per segment directory, bounded, and digested as a set so no
+	// directory name reaches the judge. An unreadable one is not an absent one:
+	// it could hold any registry, so it fails closed rather than reading as
+	// nothing there.
 	const projectNpmrc: string[] = [];
-	for (let dir = resolve(base), depth = 0; depth < 8; depth++) {
-		try {
-			const contents = readFileSync(join(dir, ".npmrc"));
-			projectNpmrc.push(`${depth}:present:${ambientClientDigest(contents.toString("base64"))}`);
-		} catch {
-			// Absent or unreadable at this level says nothing; the walk continues.
+	for (const [index, base] of bases.entries()) {
+		for (let dir = resolve(base), depth = 0; depth < AMBIENT_SEGMENT_CAP; depth++) {
+			const read = readAmbientFile(join(dir, ".npmrc"));
+			if (read.status === "present") projectNpmrc.push(`${index}:${depth}:present:${read.digest}`);
+			else if (read.status === "unreadable") {
+				unreadable = true;
+				projectNpmrc.push(`${index}:${depth}:unreadable`);
+			}
+			const parent = dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
 		}
-		const parent = dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
 	}
 	measured["npmrc.project"] = projectNpmrc.length === 0 ? "absent" : `present:${ambientClientDigest(projectNpmrc.join("\n"))}`;
-	try {
-		// `url.*.insteadOf` rewrites the remote a git command actually contacts,
-		// so it belongs in the same measurement as the http settings.
-		const config = execFileSync("git", ["config", "--show-origin", "--null", "--get-regexp", "^(http|url)\\."], { cwd: base, env: env as NodeJS.ProcessEnv, encoding: "buffer", stdio: ["ignore", "pipe", "ignore"] });
-		measured.gitHttp = config.length === 0 ? `absent:${ambientClientDigest("absent")}` : `present:${ambientClientDigest(config.toString("base64"))}`;
-	} catch (error) {
-		const status = error && typeof error === "object" && "status" in error && error.status === 1 ? "absent" : "unreadable";
-		measured.gitHttp = `${status}:${ambientClientDigest(JSON.stringify([status, cwd]))}`;
+	// `url.*.insteadOf` rewrites the remote a git command actually contacts, so
+	// it belongs in the same measurement as the http settings — per git
+	// segment's directory, because the repository's own config decides it too.
+	// A command with no git segment is not probed at all: its config cannot
+	// decide where a curl or npm command goes.
+	const gitBases = [
+		...new Set(
+			allVerbs
+				.filter(match => match[1].toLowerCase() === "git")
+				.map(match => segmentCwdAt(masked, match.index + match[0].indexOf(match[1]), cwd) ?? cwd)
+				.slice(0, AMBIENT_SEGMENT_CAP),
+		),
+	];
+	const gitConfig: string[] = [];
+	for (const [index, base] of gitBases.entries()) {
+		try {
+			const config = execFileSync("git", ["config", "--show-origin", "--null", "--get-regexp", "^(http|url)\\."], { cwd: base, env: env as NodeJS.ProcessEnv, encoding: "buffer", stdio: ["ignore", "pipe", "ignore"] });
+			gitConfig.push(config.length === 0 ? `${index}:absent:${ambientClientDigest("absent")}` : `${index}:present:${ambientClientDigest(config.toString("base64"))}`);
+		} catch (error) {
+			const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+			// No git binary, or a directory that does not exist: nothing here
+			// measured, which is not the same as a config that could not be read.
+			const status = code === "ENOENT" ? "absent" : error && typeof error === "object" && "status" in error && error.status === 1 ? "absent" : "unreadable";
+			if (status === "unreadable") unreadable = true;
+			gitConfig.push(`${index}:${status}:${ambientClientDigest(JSON.stringify([status, index]))}`);
+		}
 	}
-	return measured;
+	measured.gitHttp = gitConfig.length === 0 ? "n/a" : `set:${ambientClientDigest(gitConfig.join("\n"))}`;
+	return { measured, unresolved, unreadable };
 }
 
 /** Measure destinations and ambient egress settings for a command. The returned
@@ -1384,7 +1447,8 @@ function ambientClientConfig(command: string, cwd: string, sources: NetworkSourc
 export function measureNetworkProvenance(command: string, cwd: string, sources: NetworkSources = {}): NetworkProvenance | undefined {
 	const endpoints = namedEndpoints(command);
 	const compose = composeInvocations(command, cwd);
-	const ambientConfig = ambientClientConfig(command, cwd, sources);
+	const ambient = ambientClientConfig(command, cwd, sources);
+	const ambientConfig = ambient?.measured;
 	if (endpoints.length === 0 && compose.length === 0 && ambientConfig === undefined) return undefined;
 
 	const env = sources.env ?? process.env;
@@ -1457,16 +1521,17 @@ export function measureNetworkProvenance(command: string, cwd: string, sources: 
 
 	const ports = [...localPorts].sort((a, b) => a - b);
 	if (ports.length === 0 && knownHosts.length === 0 && dockerNetworks.length === 0 && ambientConfig === undefined) return undefined;
-	// A client verb whose directory could not be resolved: the config measured
-	// above may belong to another tree, and that tree can change with nothing
-	// here changing, so the verdict is marked as never reusable from cache.
-	const clientCwdUnresolved = ambientConfig?.directory?.startsWith("unresolved:") === true;
+	// A client verb whose directory could not be resolved measured config that
+	// may belong to another tree, and an unreadable config could hold a
+	// redirect nothing here saw. Either way the tree can change with nothing in
+	// the key changing, so the verdict is marked as never reusable from cache.
 	return {
 		localPorts: ports,
 		knownHosts,
 		dockerNetworks,
 		...(ambientConfig !== undefined ? { ambientClientConfig: ambientConfig } : {}),
-		...(clientCwdUnresolved ? { directoryUnresolved: true as const } : {}),
+		...(ambient?.unresolved === true ? { directoryUnresolved: true as const } : {}),
+		...(ambient?.unreadable === true ? { ambientConfigUnreadable: true as const } : {}),
 	};
 }
 

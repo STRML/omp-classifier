@@ -16,7 +16,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildJevState, isLoopbackHost, jevQuestions, JEV_POLICY_VERSION, JEV_V3_POLICY_VERSION, measureNetworkProvenance, type DockerTarget, type JevBatteryVersion, type NetworkSources } from "../jev.ts";
@@ -495,13 +495,15 @@ describe("the daemon decides the local claim, not the local file (#121 review)",
 			expect(fromProject?.ambientClientConfig?.directory).toMatch(/^moved:/u);
 			expect(fromElsewhere?.ambientClientConfig?.directory).toBe("as-given");
 			expect(fromProject?.ambientClientConfig?.["npmrc.project"]).not.toBe(fromElsewhere?.ambientClientConfig?.["npmrc.project"]);
-			// A directory the walk cannot resolve is not the starting directory,
-			// and a changed value behind it must not reuse the earlier verdict.
+			// A directory the walk cannot resolve is not the starting directory:
+			// the measurement says so and the cache is bypassed for it, so a
+			// changed value behind the unresolved target cannot reuse a verdict.
 			const envDriven = (dir: string) => ({ ...sources, env: { ...env, UNSET_DIR: dir } });
 			const one = measureNetworkProvenance('cd "$UNSET_DIR" && npm install', elsewhere, envDriven("/one"));
 			const two = measureNetworkProvenance('cd "$UNSET_DIR" && npm install', elsewhere, envDriven("/two"));
-			expect(one?.ambientClientConfig?.directory).toMatch(/^unresolved:/u);
-			expect(two?.ambientClientConfig?.directory).not.toBe(one?.ambientClientConfig?.directory);
+			expect(one?.ambientClientConfig?.directory).toBe("unresolved");
+			expect(one?.directoryUnresolved).toBe(true);
+			expect(two?.directoryUnresolved).toBe(true);
 		} finally {
 			remove();
 			cleanup(elsewhere);
@@ -705,6 +707,49 @@ describe("the gate measures it before the battery is asked (#65)", () => {
 		expect(JSON.stringify(stateOf(initialCalls - 1))).toContain('"directoryUnresolved":true');
 		await fire("tool_call", makeEvent(command), makeCtx({ sessionId }));
 		expect(modelCalls.length).toBe(initialCalls + 1);
+	});
+
+	test("an unreadable config file fails closed instead of reading as absent (#73)", () => {
+		const { sources, home, project, remove } = fixture();
+		const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home };
+		const npmrc = join(project, ".npmrc");
+		try {
+			writeFileSync(npmrc, "registry=https://registry.example/\n");
+			const readable = measureNetworkProvenance("npm install", project, { ...sources, env });
+			expect(readable?.ambientConfigUnreadable).toBeUndefined();
+			chmodSync(npmrc, 0o000);
+			const blocked = measureNetworkProvenance("npm install", project, { ...sources, env });
+			// Not "nothing there": the file could hold any registry.
+			expect(blocked?.ambientConfigUnreadable).toBe(true);
+			expect(blocked?.ambientClientConfig?.["npmrc.project"]).not.toBe(readable?.ambientClientConfig?.["npmrc.project"]);
+		} finally {
+			chmodSync(npmrc, 0o600);
+			remove();
+		}
+	});
+
+	test("every client segment is measured, not the first alone (#73)", () => {
+		const { sources, home, project, remove } = fixture();
+		const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home };
+		const elsewheres = mkdtempSync(join(tmpdir(), "jev73-two-"));
+		try {
+			writeFileSync(join(project, ".npmrc"), "registry=https://one.example/\n");
+			writeFileSync(join(elsewheres, ".npmrc"), "registry=https://two.example/\n");
+			const command = (verb: string) => `curl https://collector.example/ && cd ${elsewheres} && ${verb}`;
+			const first = measureNetworkProvenance(command("npm install"), project, { ...sources, env });
+			writeFileSync(join(elsewheres, ".npmrc"), "registry=https://three.example/\n");
+			const second = measureNetworkProvenance(command("npm install"), project, { ...sources, env });
+			// The second segment's tree changed, so the measurement must too.
+			expect(second?.ambientClientConfig?.["npmrc.project"]).not.toBe(first?.ambientClientConfig?.["npmrc.project"]);
+			// A verb named by path is still a segment whose directory counts.
+			const bare = measureNetworkProvenance(`cd ${elsewheres} && npm install`, project, { ...sources, env });
+			const byPath = measureNetworkProvenance(`cd ${elsewheres} && /usr/bin/npm install`, project, { ...sources, env });
+			expect(byPath?.directoryUnresolved).toBeUndefined();
+			expect(byPath?.ambientClientConfig?.["npmrc.project"]).toBe(bare?.ambientClientConfig?.["npmrc.project"]);
+		} finally {
+			remove();
+			cleanup(elsewheres);
+		}
 	});
 
 	test("an unknown host reaches Jev with no provenance field at all", async () => {
