@@ -749,6 +749,20 @@ describe("the directory the shell will be in", () => {
 		expect(read.refusal?.why).toContain("working directory");
 	});
 
+	test("a sourced alias leaves cwd unknown", () => {
+		// Bash expands aliases before it runs the command, so `move` moves the
+		// directory while every word in the source text looks inert.
+		fs.mkdirSync(path.join(root, "child"));
+		writeScript(root, "hop.sh", "shopt -s expand_aliases\nalias move='cd child'\nmove\n");
+		writeScript(root, "payload.py", BENIGN);
+		writeScript(path.join(root, "child"), "payload.py", HARMFUL_CODE);
+
+		const read = readInterpretedScriptBodies(": && source ./hop.sh; python3 payload.py", root, 8000);
+
+		expect(read.bodies).toEqual([]);
+		expect(read.refusal?.why).toContain("working directory");
+	});
+
 	test("an optioned command wrapper around a sourced cd leaves cwd unknown", () => {
 		fs.mkdirSync(path.join(root, "child"));
 		writeScript(root, "hop.sh", "command -p cd child\n");

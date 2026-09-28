@@ -672,6 +672,11 @@ const DIRECTORY_OR_SOURCE_WORDS: Record<string, true> = {
 	".": true,
 };
 const FUNCTION_DECLARATION = /(?:^|\n)\s*(?:function\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:\(\s*\))?|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\))\s*\{/mu;
+/** A sourced file that defines an alias or enables alias expansion: bash
+ *  rewrites the text before it runs, so the walk cannot model the result.
+ *  `[^\w$]` keeps `unalias` from matching, and the `shopt -s` spellings cover
+ *  both the flag and the bare `shopt expand_aliases` form. */
+const SOURCE_ALIAS_RE = /(?:^|[^\w$])alias\s+[A-Za-z_][A-Za-z0-9_]*\s*=|shopt\b[^\n;]*expand_aliases|expand_aliases\s+on/u;
 
 function commandHeadIndex(words: string[]): number {
 	let index = 0;
@@ -770,6 +775,12 @@ function mayChangeDirectory(words: string[], depth = 0): boolean {
 function sourceTextIsWalkable(text: string): boolean {
 	const parsed = parseShell(text);
 	if (!parsed.ok) return false;
+	// Aliases are expanded by bash before the command runs, and the walk sees
+	// only the word that was written: `alias move='cd child'; move` moves the
+	// directory while every word in the text looks inert. A sourced file that
+	// defines an alias, or turns alias expansion on, is therefore not walkable
+	// — the text cannot say where it ends up.
+	if (SOURCE_ALIAS_RE.test(text)) return false;
 	// The text walk loses literalness, so a dynamic command name cannot be cleared as inert.
 	if (parsed.commands.some(command => command.words.length > 0 && hasDynamicCommandVerb(command.words))) return false;
 	const events = shellWalk(text);
