@@ -2830,6 +2830,54 @@ export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
 // binary they name. env/nice/timeout/stdbuf take options or durations first.
 const WRAPPER_COMMANDS = new Set(["env", "nohup", "nice", "timeout", "stdbuf", "setsid", "command", "exec", "xargs"]);
 
+/** Verbs that can change the shell's own directory, run a file that can, or
+ *  start a program that can. A command whose verb is one of these never carries
+ *  the user's pinned standing policy: the directory the containment check saw
+ *  is not necessarily the one the command runs in. Everything the plugin's own
+ *  gate already judges stays judged — it simply loses the standing approval,
+ *  which costs coverage rather than granting anything. */
+const POLICY_UNSTABLE_VERBS = new Set([
+	"cd",
+	"pushd",
+	"popd",
+	"chdir",
+	"source",
+	".",
+	"eval",
+	"exec",
+	"sh",
+	"bash",
+	"zsh",
+	"dash",
+	"ksh",
+	"fish",
+	"python",
+	"python3",
+	"node",
+	"deno",
+	"bun",
+	"npm",
+	"pnpm",
+	"yarn",
+	"ruby",
+	"perl",
+	"php",
+	"make",
+	"find",
+	"xargs",
+	"env",
+	"sudo",
+	"doas",
+	"nohup",
+	"nice",
+	"timeout",
+	"stdbuf",
+	"setsid",
+	"command",
+	"builtin",
+	"time",
+]);
+
 type WrapperOptionArity = "flag" | "value" | "opaque";
 interface WrapperOptionGrammar {
 	options: Record<string, WrapperOptionArity>;
@@ -6120,8 +6168,39 @@ export default function (pi: ExtensionAPI) {
 		// every progress message or host-generated message id. A new "status?"
 		// must not revoke approval; a later "do not publish" must.
 		const userScopeFingerprint = scopeFingerprint(citableUserEvidence);
-		const resolvePolicyContext = (projectDir: string) => {
-			const trustedPolicySnapshot = resolvePinnedUserPolicy(config.trustPolicy, projectDir);
+		/** Whether a command's directory can move before or while it runs.
+		 *
+		 *  A regex over the text is not a proof: `. ./hop.sh` moves the directory
+		 *  while spelling neither `source` nor `cd`, and `hop.sh` decides that,
+		 *  not the text. So the question is answered structurally — one parsed
+		 *  segment, every word literal, and a verb from a set that can neither
+		 *  change the shell's directory nor run code that could — and anything
+		 *  else withholds the pinned policy. Withholding costs the policy for
+		 *  that call and never grants it, which is the direction this gate
+		 *  fails. */
+		const policyDirectoryStable = (text: string) => {
+			const parsed = parseShell(text);
+			if (!parsed.ok || parsed.commands.length !== 1) return false;
+			const [only] = parsed.commands;
+			if (only === undefined || only.unreadShape !== undefined || only.words.length === 0) return false;
+			if (only.words.some(word => !word.literal)) return false;
+			return !POLICY_UNSTABLE_VERBS.has(commandBasename(only.words[0].value.toLowerCase()));
+		};
+		const resolvePolicyContext = (projectDir: string, directoryStable: boolean) => {
+			const resolved = resolvePinnedUserPolicy(config.trustPolicy, projectDir);
+			// A command that can move its own directory — `cd /repo; …`, an `env
+			// -C`, or a `chdir` in an eval payload — may run inside a repository
+			// the pin's containment check never saw. Its policy is withheld rather
+			// than attached to a directory the gate is not judging; the signature
+			// still changes with the stability, so a withheld call cannot reuse a
+			// cached verdict from an attached one. The test is deliberately
+			// conservative: a `cd` spelled inside a quoted string withholds too,
+			// which costs the policy for that call and never grants it.
+			// Withhold only when there is something to withhold: a pin that is
+			// absent or stale carries no documents, and suffixing the signature
+			// for it would change the evidence fingerprint that refusals and the
+			// floor's taint state are keyed on, for no safety gain.
+			const trustedPolicySnapshot = directoryStable || resolved.documents.length === 0 ? resolved : { ...resolved, signature: `${resolved.signature}|moving`, documents: [] };
 			const reviewEvidenceFingerprint = `${evidenceFingerprint(citableUserEvidence, reviewOperatorContext, userEvidenceSnapshot?.ids)}|${trustedPolicySnapshot.signature}`;
 			// The merged policy is in the signature, not just the override set: two
 			// different overrides that merge to the same effective thresholds are
@@ -6236,7 +6315,7 @@ export default function (pi: ExtensionAPI) {
 			const spawn = evalSpawnCwd(evalCode, ctx.cwd);
 			const declaredCwd = spawn.kind === "literal" ? spawn.cwd : undefined;
 			const cwd = declaredCwd ?? ctx.cwd;
-			const { trustedPolicySnapshot, reviewEvidenceFingerprint } = resolvePolicyContext(cwd);
+			const { trustedPolicySnapshot, reviewEvidenceFingerprint } = resolvePolicyContext(cwd, policyDirectoryStable(evalCode));
 			// Rides every line this call writes, so an audit reader can tell a
 			// directory the payload declared from the session's without going
 			// back to the payload text — which the `cmd` field truncates.
@@ -6582,7 +6661,11 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			const cwd = cwdInput ? resolveToCwd(cwdInput, ctx.cwd) : ctx.cwd;
-			const { trustedPolicySnapshot, reviewEvidenceFingerprint } = resolvePolicyContext(cwd);
+			// The raw command text is the shell's own: the reader splices script
+			// bodies into the judged text later, and every verb that reads a body
+			// (`sh`, `bash`, `python`, `node`, `bun`, `npm`, the wrappers) is in
+			// the unstable set, so a body cannot carry the policy past this check.
+			const { trustedPolicySnapshot, reviewEvidenceFingerprint } = resolvePolicyContext(cwd, policyDirectoryStable(command));
 			// Issue #67: a command that runs a script file is judged by what the
 			// file HOLDS, not by its path. The body joins the text every layer
 			// below reads — critical patterns, the forced-dialog token scan, the

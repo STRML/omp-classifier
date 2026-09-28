@@ -119,8 +119,23 @@ function sha256(bytes: Uint8Array): string {
 
 function readPolicyFile(filePath: string): ReadPolicyFile {
 	try {
-		if (fs.statSync(filePath).size > MAX_TRUST_POLICY_BYTES) throw new RangeError("user instruction file exceeds the trust-policy size limit");
-		const bytes = fs.readFileSync(filePath);
+		// A regular file only, and a bounded read. `statSync` follows a symlink,
+		// so a link to a character device or a FIFO arrives here as a non-file
+		// and is refused: /dev/zero reports size 0, and reading a FIFO blocks
+		// before any size check could run.
+		const stats = fs.statSync(filePath, { throwIfNoEntry: false });
+		if (stats === undefined) return { path: filePath, sha256: null, bytes: null, content: null };
+		if (!stats.isFile()) throw new TypeError("user instruction path is not a regular file");
+		if (stats.size > MAX_TRUST_POLICY_BYTES) throw new RangeError("user instruction file exceeds the trust-policy size limit");
+		const handle = fs.openSync(filePath, "r");
+		let bytes: Buffer;
+		try {
+			const buffer = Buffer.allocUnsafe(MAX_TRUST_POLICY_BYTES + 1);
+			const read = fs.readSync(handle, buffer, 0, MAX_TRUST_POLICY_BYTES + 1, 0);
+			bytes = buffer.subarray(0, read);
+		} finally {
+			fs.closeSync(handle);
+		}
 		if (bytes.byteLength > MAX_TRUST_POLICY_BYTES) throw new RangeError("user instruction file exceeds the trust-policy size limit");
 		return { path: filePath, sha256: sha256(bytes), bytes: bytes.byteLength, content: bytes.toString("utf8") };
 	} catch (error) {
