@@ -7,7 +7,7 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 ### Sessions with no UI have no user channel (spec step 1)
 
 - In every session where the host's `hasUI` is false (`omp -p`, review workers and subagents, plain `rpc`, ACP and SDK embedders; the host sets `hasUI` only for interactive and `rpc-ui` modes), role-user messages are the launch prompt, not the user's words: they no longer reach `userMessages`, the authorization question or the literal match. The launch prompt is not carried as operator context either (candidate a).
-- `bun eval/headless-brief-probe.ts` measures the injection hazard with the launch prompt as user words, omitted, and as operator context. The live probe could not run (no TypeSafe credential or network), so the step-1 injection gate is unmet: whether omitting the brief removes the `state_contains_injection` hazard on review workers is unmeasured.
+- `bun eval/headless-brief-probe.ts` measures the injection hazard with the launch prompt as user words, omitted, and as operator context. Run live on 2026-10-01 (15 samples per arm, jev-v3.1): with the launch prompt as user words `state_contains_injection` has a median of 0.63 and 13 of 15 samples at or above the 0.55 review line (15 of 15 on jev-v2.11); omitted, the median is 0.10 and none reach the line; as operator context it is 0.72 and 15 of 15 reach it. Omitting the prompt (the shipped candidate a) is the selection.
 - A corpus row with `evidence.userMessages` needs `hasUI: true`; `validateCase` rejects it otherwise.
 
 ### Security

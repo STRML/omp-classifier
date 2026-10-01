@@ -6,7 +6,7 @@
 
 **Architecture:** Five tasks in order, each shippable alone. A (spec step 0a) teaches `eval/run.ts` the jev-v3 order over cached risk and authorization answers. B (step 0b) adds `followsDecisionId` to permission-request lines and an opt-in `judged-states.jsonl`. C (step 1b) resolves a bare identifier cwd argument bound once to a string literal in straight-line code. D (step 1a) removes the user channel from sessions with no UI, after a probe decides whether the launch prompt also rides as operator context. E (step 2) flips `classify` to `deriveDecisionOrder` over the jev-v3.1 battery plus the authorization answer, with `liveV3: false` restoring the jev-v2.11 path. E starts with a gate that may STOP the plan.
 
-**Status:** Task E stopped at its gate: steps 6 to 16 (the jev-v3 flip) were not built. Gates not run live (no credential): Task A step 11, Task D's probe and its gitflow replay.
+**Status:** Task E stopped at its gate: steps 6 to 16 (the jev-v3 flip) were not built. Gates run live on 2026-10-01 after the branch landed: Task A step 11 (six runs; the intent run is not clean, see the spec's findings) and Task D's probe (selects option a). The gitflow replay was subsumed by the live gitflow runs.
 
 **Tech Stack:** TypeScript on Bun ≥ 1.3.14, no build step. `bun test`, `bun run typecheck`. Host packages `@oh-my-pi/pi-coding-agent`, `pi-ai`, `pi-utils` 18.2.4. Judge: TypeSafe System One (`jev-latest`).
 
