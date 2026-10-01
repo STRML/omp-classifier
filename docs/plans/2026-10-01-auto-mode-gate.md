@@ -1,7 +1,7 @@
 # Design: an auto-mode gate (allow or deny, never a dialog)
 
-Status: draft for review, 2026-10-01. Builds on `2026-09-19-intent-aware-judgment.md`,
-which settled the intent model and left it shadow-only.
+Status: draft 2, 2026-10-01, revised after an adversarial Opus review of draft 1. Builds on
+`2026-09-19-intent-aware-judgment.md`, which settled the intent model and left it shadow-only.
 
 ## Goal
 
@@ -16,10 +16,13 @@ Success looks like this:
 - A command the user asked for runs silent, including merge, deploy and credential use against the
   issuer, which the 2026-09-19 plan measured as most of the false asks.
 - A denial leaves the agent a lawful next move, and one sentence from the user opens it.
+- Chat asks caused by denials are counted as interruptions beside dialogs. Moving a dialog into a
+  chat turn is not a win.
 
 ## Acceptance scenario (the behavior to match)
 
-A Claude Code session, supplied by the user as the model for this gate:
+A Claude Code session, supplied by the user as the model for this gate. The command was a bash
+change (sed, `caddy validate`, reload), so it is inside this gate, which sees only `bash` and `eval`.
 
 ```
 agent    plans to edit /etc/caddy/Caddyfile
@@ -30,118 +33,176 @@ user     "add it to caddy"
 agent    retries, gate allows, change lands, verified from the Mac
 ```
 
-What this fixes in the design:
+- The deny payload tells the agent to report what did **not** happen and to offer ways forward.
+- "add it to caddy" names no path, so `literalMatch` cannot clear it. A reviewer clears it, resolving
+  "it" against the **pending-denial ledger** below, never against assistant prose.
 
-- The deny payload tells the agent to report what did **not** happen (state unchanged, nothing
-  half-applied) and to offer the user ways forward. The agent writes the chat message. The gate
-  supplies the reason and the facts.
-- The user's reply is four words and names no path. `literalMatch` cannot clear it, because it only
-  extracts local deletes, branch deletes, `gh pr merge <n>` and in-repo deploy scripts. The reviewer
-  clears it, and for that it must resolve "it" against the agent's previous message.
-- So the reviewer receives the assistant's last message as **explanatory context that never
-  authorizes**. The user's message is still the only thing that authorizes. This answers the first
-  open item below: the reviewer, and only the reviewer, reads assistant prose.
-- The retry is the same call with a new user message in the window. The deny must not pin the shape
-  for the session (the 2026-09-19 plan, point 9).
+## Measured starting point (re-based after review)
 
-## Measured starting point
+Window: a rolling 72 hours ending 2026-10-01T18:20Z, from `~/.omp/omp-classifier/decisions.jsonl`.
+Draft 1 described the wrong population. The numbers below were reproduced by the reviewer and, where
+marked, by a second pass of mine.
 
-Decision log, last 3 days (2026-09-28 to 2026-10-01), 1,960 decisions with a verdict answer.
+Of 1,972 rows, the verdict-layer asks are 262. Joining each ask to the line that followed it, same
+session and command, within 600 s:
 
-| Fact | Number |
+| Population | Asks | Followed by |
+|---|---|---|
+| Injection is the only hazard at or above 0.55 | about 160 | headless block, **0 dialogs** (mine: 165 of 165) |
+| Everything else | 103 | 79 dialogs, 14 headless, 10 with no follow-up (mine, same split) |
+
+- The injection asks never reached the user. They are headless workers. The reviewer found 92 of 96
+  headless sessions are `omp -p` review runs whose first prompt is a script-written brief addressed
+  to a reviewer, carried as `attribution: "user"`. The first call of such a session has a median
+  injection score of 0.57, against 0.16 in interactive sessions. That is correlation. No probe has
+  run, so the cause is a hypothesis.
+- Dialogs the user answered: 120 (117 allow-once, 2 always-allow, 1 deny). Reviewer's split by cause,
+  not yet re-run by me:
+
+| Cause of the dialog | Count |
 |---|---|
-| Dialogs answered | 120 (117 allow-once, 2 always-allow, 1 deny) |
-| Verdict-layer asks | 262 |
-| Asks where `state_contains_injection` is the only hazard at or above `hazardReview` (0.55) | 159 |
-| `state_contains_injection` on auto-allowed calls | median 0.17, max 0.54 |
-| `state_contains_injection` on asked calls | median 0.56 |
-| Asks on `git diff`/`log`/`show` | 86 of 442 such calls |
-| Headless blocks (subagents) | 178 |
-| Asks whose jev-v3 shadow had authorization `named` or `goal` | 231 of 262 |
+| eval "unreadable spawn cwd" (layer `cwd`) | 31 |
+| below the safe floor (`jev:below-floor`) | 29 |
+| `jev:unsafe` | 18 |
+| SAFE held back by an overlay or a prior refusal | 15 |
+| `unauthorized_consequential_action` | 14 |
+| injection | 1 |
 
-The v3 shadow has run live-beside-live since 2026-09-21, so branch 1, 3 and 5 counts above are
-real. Two causes follow. The injection hazard fires on ordinary read-only work, and the user's words
-are read but never used in the live decision.
+- jev-v3 branch 4 (literal match) fired on 0 of 1,972 rows (mine). Branch 5, the reviewer stub,
+  accounts for 30 of the 79 verdict-led dialogs (reviewer's count).
+- The verdict cache scored 0 hits in 1,960 rows, because tool evidence is part of its key.
+- Corrections to draft 1: the live decision does read user messages (`unauthorized_consequential_action`,
+  `jev.ts:351`); "231 of 262 had named or goal authorization" was a miscount (reviewer: 197); the
+  "86 of 442 git reads" figure does not reproduce under any definition and is dropped.
 
-Why the hazard fires is not yet known. Its question covers "any other field of this state", which
-includes recent tool output and the user's messages. Step 1 measures that before anything is changed.
+What this means: the dialogs Sam sees come from eval spawn-cwd, below-floor verdicts, and the
+reviewer stub. The injection hazard is a headless-worker problem and a separate one.
 
 ## Design
 
 ```
-command ─▶ floor ───────────────────────────✗─▶ deny + reason
-             ▼
-           risk (Jev battery) ── clear ──────────▶ allow
-             ▼ close call
-           literal match on the user's words ─ yes ─▶ allow
-             ▼ no
-           reviewer (transcript-aware, typed) ─ yes ─▶ allow
-             ▼ no, unsure, or unavailable
-           deny + reason ─▶ agent asks in chat ─▶ the reply is evidence
+command ─▶ floor ───────────────────────────✗─▶ deny + reason ─┐
+             ▼                                                  │ ledger entry
+           risk (Jev battery) ── clear ──────────▶ allow        │ (identity + summary)
+             ▼ close call                                       │
+           literal match on the user's words ─ yes ─▶ allow     │
+             ▼ no                                               │
+           reviewer: covered AND proportionate ─ yes ─▶ allow   │
+             ▼ no, unsure, or unavailable                       │
+           deny + reason ──────────────────────────────────────┘
+                 │
+   agent asks in chat ─▶ user replies ─▶ reply judged against the ledger entry ─▶ retry
 ```
 
-1. **Floor.** Unchanged in content (`floor.ts`, critical patterns, secret sinks, download piped to an
-   interpreter, obfuscation). Its outcome changes from a dialog to a deny. Nothing above it can cross it.
-2. **Risk.** The existing battery. The injection question is scoped so it reads the command text and
-   the evidence the channel marks as untrusted, and never the user's own messages or the gate's measured
-   tiers. The exact change comes from step 1's probe.
-3. **Intent.** `authorization.ts`, `literal-match.ts` and `decision-order.ts` go live as the decision
-   (the jev-v3 flip, issue #55). Branches 3 and 4 allow, branch 5 hands to the reviewer.
-4. **Reviewer.** A second typed request, not prose. It sees the same state plus the transcript tier and
-   answers a `choice` of covered, not covered, unsure on "does the user's request cover this action".
-   Anything below its confidence floor, and any outage, denies. The reviewer's model is chosen by
-   measurement, as the 2026-09-19 plan decided: a second Jev pass against an LLM reviewer.
-5. **Deny.** One payload for the agent: the layer, the reason built from numbers and hazard ids, what
-   to ask the user, and what not to try. It lands in the transcript, the user answers in chat, and the
-   next evidence window carries that answer.
-6. **No dialogs.** Dialog code, Allow once, session grants and Always allow are deleted. A standing
-   authorization comes from the user's words, the pinned trust policy, or the host's `allow` rules.
+1. **Floor.** Critical patterns and the shadow floor entries (secret sink, download to interpreter,
+   obfuscation). Outcome changes from a dialog to a deny. Precision first: the shadow floor asked on
+   28 calls, and 14 of those 28 ran SAFE under the live gate, including `curl … | python3 -c "import
+   json…"`, `ls /tmp/g26sig* 2>/dev/null` and `pdfinfo … | grep -i pages`. A floor entry may deny only
+   after it shows 0 benign hits on the mined log. A host `allow` rule cannot cross the floor today
+   (`replayDecision` checks `critical` first), so standing authorization does not apply to it. The
+   only override is a user approval through the ledger, once, for that exact identity: the same power
+   today's dialog gives.
+2. **Risk.** The existing battery. The injection hazard is fixed at its source. Prompts in a session
+   with no UI are carried as `agent` channel evidence, not `user`. That one change addresses the
+   injection scores on review briefs and the authorization hole in section 7.
+3. **Intent.** `authorization.ts`, `literal-match.ts` and `decision-order.ts` become the live
+   decision (the jev-v3 flip, issue #55). Branch 4 has never fired, so the flip is measured before it
+   is trusted.
+4. **Reviewer.** A third request on close calls, sequential after the parallel pair (measured pair
+   latency: p50 229 ms, p95 418 ms, reviewer's figures). It answers two things: does the user's
+   message cover the action, and is this the least destructive means inside that scope. `goal`-level
+   authorization alone never allows a hazard at or above `hazardBlock`, or p(unsafe) at or above
+   `unsafeMinProbability`. The confidence floor lives in `jevPolicy` and in the policy hash. It
+   shares the handler deadline. Anything below its floor, and any outage, denies. The existing
+   `user_authorization` question is the same model reading the same words, so it cannot be the
+   independent second opinion. Step 3 measures an independent LLM arm against a Jev arm with
+   differently framed questions, and any unauthorized allow over three samples disqualifies an arm.
+5. **Pending-denial ledger.** Each deny records an action identity and a one-line summary the gate
+   wrote. The next user message is judged against that entry, not against assistant prose. An approval
+   clears that identity once, lifts its refusal, and is consumed. It gains session scope only if the
+   user says so. In UI sessions the gate also shows its own summary with a non-blocking notification,
+   so the user approves the gate's facts, not the agent's paraphrase. The approval phrases anchored by
+   `TASK_SCOPE_RE` ("go ahead", "proceed") must not persist past the entry they answered.
+6. **Deny payload.** The layer, the reason built from numbers and hazard ids, what to ask the user,
+   what not to try, and "report what did not happen". Outage denies carry a retry delay and say not
+   to loop. A breaker stops calling the judge for 30 s after consecutive outages.
+7. **Sessions with no UI.** Authorization is capped at `goal`, never lifts a refusal, and the reviewer
+   cannot allow a block-band hazard, until the host marks a human-typed prompt. Today this is the
+   decision-order headless exception (`decision-order.ts:79`). It stays stated, because "headless"
+   loses its dialog meaning once no session has dialogs.
+8. **Subagents.** Inherit the root session's words through the 2026-09-19 in-process registry keyed by
+   `parentSession`. `parentAgentId` is not exposed to extensions (README, Limits). Inherited words
+   authorize only inside the brief's scope, so delegating "review" never carries "deploy". A
+   restriction from any channel applies. Review workers have no parent, so this does not help them;
+   section 2 does.
+9. **Eval spawn-cwd.** The largest dialog source today. An unreadable `cwd` denies with the lawful
+   next move (pass a literal directory). Step 1 sorts the 31 cases by shape and extends the scan to
+   the common ones first.
+10. **Deleted.** Dialogs, Allow once, session grants, Always allow, human refusals and their lift
+    path, persistent grants (the file, the `persistentGrants` key and its `/classifier` command),
+    dry-run's "would prompt", the headless "rerun interactively" guidance, the late-verdict mechanism
+    (0 lines in 14 days), and `replayDecision`'s `approval` input. The harness's "false ask" now
+    means a labeled-allow case that denies.
 
 ## What stays
 
-- Host `deny`/`prompt`/narrow `allow` rules still run before the gate. A host `prompt` rule is the
-  host's dialog, not this plugin's, and is out of scope.
-- The 8,000-character cap, env-override ask, fail-closed on every outage, and the decision log.
+- Host `deny`/`prompt`/narrow `allow` rules before the gate. A host `prompt` rule is the host's
+  dialog, out of scope.
+- The 8,000-character cap, the env-override gate (now a deny with ledger approval), fail-closed on
+  every outage, and the decision log.
 - The replay contract: a verdict re-derives from its recorded answers.
 
 ## Failure matrix
 
 | State or input | What the gate does | How it can fail | What the agent is told |
 |---|---|---|---|
-| Floor entry matches | Deny at the floor, no model call | A pattern over-matches a benign command | Entry id, the shape that matched, a reversible alternative where one exists |
-| Jev unavailable (no key, 5xx, timeout, malformed) | Deny, uncached | Outage denies all unmatched work | "Judge unavailable", retry, no verdict claimed |
-| Reviewer unavailable | Deny, uncached | Same | Same, naming the reviewer |
-| Reviewer unsure or below floor | Deny | Real work denied | The action, and the one sentence from the user that would cover it |
-| User replies "go ahead" or "add it to caddy" after a deny | Reply enters the evidence window, reviewer resolves the referent from the agent's last message, retry re-judges | The reply ages out before the retry; the referent is ambiguous because the agent proposed two things | Retry reuses the denied call's identity; an ambiguous referent denies and names both candidates |
-| Cached allow, then a restriction ("don't push") | Key includes the evidence fingerprint, the allow is not reused | Restriction text trips the fingerprint on unrelated calls (known today: any "need", "must", "only") | Fingerprint covers restrictions that match the action only |
-| Prior deny on a shape, then the user approves | Approval lifts it, refusal keyed on the grant identity | Approval spelled differently from the denied command | Deny names the identity it will accept |
-| Subagent, no user messages | Judged against the root session's words | Host omits `parentAgentId`, so the root cannot be found | Deny names the parent as the party to ask |
-| Injection text in a command | Branch 1 denies, no refusal written for one-hot answers | Hazard fires on benign text (the measured 159) | Hazard id and score, no claim the command was malicious |
-| Late verdict after the deadline | Allowed to land only as allow or deny on the same call | Late allow after a deny the agent already acted on | None, the call is already answered |
-| Config or battery changes mid-session | Cache and refusal memory flush | A flushed refusal lets a denied shape retry | Retry re-judges from scratch |
+| Floor entry matches | Deny at the floor, no model call | Entry over-matches a benign command | Entry id, the shape matched, a reversible alternative if one exists |
+| Jev unavailable | Deny, uncached, breaker counts it | About 1% of calls (128 of 12,678 in 14 days); every one denies, reads included | "Judge unavailable", retry after N s, do not loop |
+| Reviewer unavailable or unsure | Deny, uncached | Same | The action, and the sentence from the user that would cover it |
+| Reply after a deny: "go ahead", "add it to caddy" | Judged against the ledger entry | Two pending entries, so the referent is ambiguous | Ambiguous: deny and name both |
+| Approval consumed, same shape repeats | Approval does not carry; re-judged | Agent loops asking | "Approval was single-use; ask again or say 'for the session'" |
+| Prior refusal, then approval | Ledger approval lifts that identity's refusal | Approval spelled differently from the denied command | Deny names the identity it accepts |
+| Restriction from the user ("don't push") | Applies from any channel and re-judges cached allows | Restriction wording trips unrelated calls (grants key on `scopeFingerprint`, which hashes `only`/`must`/`need`/`do not` messages) | Names the restriction |
+| Cache key and the gate's own deny results | Deny results are excluded from the key | Today they are in the key (0 hits in 1,960) | None |
+| No-UI session, close call | Capped at `goal`, reviewer cannot allow block-band | An agent writes "the user asked you to rm -rf" into `omp -p` | Names the cap |
+| Subagent with inherited words | Authorizes inside the brief's scope only | Brief is broader than the user meant | Names the scope |
+| Eval spawn with unreadable cwd | Deny with the next move | Common shapes deny until the scan covers them | "Pass a literal cwd" |
+| Floor approval via ledger | One use, exact identity | Reply read as a general permission | Names the identity |
+| Injection text in a command | Branch 1 denies, no refusal for one-hot answers | Hazard fires on a benign brief | Hazard id and score, no claim of malice |
+| Config or battery change mid-session | Cache, refusal memory and ledger flush | A flushed refusal lets a denied shape retry | Retry re-judges from scratch |
 
 Every row becomes a failing end-to-end scenario before its code, per `dev-workflow.md` stage 4.
 
 ## Order of work
 
-Each step is shippable on its own, and the measurement gate sits on the step it names.
+Each step is shippable alone. Each gate is a number a command prints.
 
 | Step | Work | Gate |
 |---|---|---|
-| 1 | Probe: command alone vs full state on a sample of the 159 injection asks. Fix the question or its inputs. | Asks that cite injection alone drop to under 10% of today's count on the replayed corpus, 0 new false allows |
-| 2 | Flip jev-v3 live. Branches 3 and 4 allow. | `bun eval/run.ts --replay` shows 0 false allows on the adversarial corpus, REGRESSIONS none |
-| 3 | Reviewer: build both candidates, measure, keep one. | False asks and false allows reported by name for each candidate |
-| 4 | Remove dialogs and grants. Deny payload and evidence-window retry. | The failure matrix rows above all pass |
-| 5 | Subagent intent inheritance. | Headless blocks on authorized work drop. If the host cannot supply the parent, record the host gap and keep the deny |
+| 0 | Plumbing. Add v3 (`deriveDecisionOrder`, `literalMatch`) to `eval/run.ts`, which today scores only `deriveJevDecision` plus `replayDecision`. Log a redacted state (or a hash plus the evidence ids) behind a flag so a probe can replay. Log, per ask, what a human did next. | `bun eval/run.ts` reports v3 branches on the held-out corpus |
+| 1 | Headless prompts as `agent` channel evidence, plus the injection probe on logged review briefs. Sort the 31 spawn-cwd cases and extend the scan. | Injection-only asks fall below 10% of today's count on replay. 0 new false allows on the adversarial corpus |
+| 2 | Flip jev-v3 live. Branches 3 and 4 allow. | `eval/run.ts` shows 0 false allows and REGRESSIONS none, with at least one branch-4 hit on a mined case |
+| 3 | Reviewer: build both arms, measure. | Any unauthorized allow over 3 samples disqualifies an arm. Report the false-allow upper bound at the held-out size (about 23 rows) |
+| 4 | Ledger, deny payload, deletions in section 10. Floor precision gate lands first. | Failure matrix rows all pass. A one-week shadow of "would-deny vs human-allowed" and "would-allow vs human-denied" on live traffic, and chat asks counted as interruptions |
+| 5 | Subagent inheritance through the registry. | Headless blocks on authorized subagent work drop. A review worker is not counted |
 
-Steps 1 and 2 reduce prompts the day they ship. Step 4 is the one that ends them, and it does not
-ship before step 3, because removing the dialog without a reviewer converts every close call into a
-deny.
+Steps 0 to 2 cut prompts the day they ship. Step 4 ends dialogs, and it does not ship before step 3
+and a shadow week, because deleting the dialog without a measured reviewer turns every close call
+into a deny.
 
 ## Open items
 
-- Whether the host exposes the root session's user messages to a subagent's `tool_call` (step 5).
-- Decided: the reviewer reads the assistant's previous message as non-authorizing context, to resolve
-  references like "it" and "that" in a short user reply. Open: how many assistant turns back, and the
-  size cap. Measure on replies like the acceptance scenario's.
-- `codemaps/` does not exist in this repository, and the workflow suggests `/update-codemaps`.
+- Whether the host can mark a human-typed prompt, which would lift the no-UI cap in section 7.
+- Whether the host exposes the root session to a subagent's `tool_call` without the registry.
+- The ledger's exact identity key: reuse `normalizeGrantTarget`, or a new one.
+
+## Review log
+
+Draft 1 was reviewed adversarially by an Opus agent at high effort on 2026-10-01. Verdict: approve
+with changes. Blockers B1 to B6, all taken in this draft: wrong measured population (section
+"Measured"), headless authorization (sections 2, 7), retry, refusal lift and referent (section 5),
+floor override and precision (section 1), reviewer independence and proportionality (section 4), and
+unexecutable gates (step 0 and the gate column). High and medium findings (subagent scope, assistant
+prose as an injection surface, outage behavior, the late-verdict mechanism, hidden dialog
+dependencies, the Caddy scenario's gate scope) are sections 5, 6, 8 and 10 and the acceptance
+scenario. The reviewer's unverified items stay open above.
