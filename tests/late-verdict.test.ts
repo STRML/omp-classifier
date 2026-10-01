@@ -99,11 +99,27 @@ function writeConfig(raw: Record<string, unknown>): void {
 	lastConfigMtimeMs = mtimeMs;
 }
 
-/** Yield to the real event loop until `ready` holds (or the bound runs out). */
-async function until(ready: () => boolean, turns = 400): Promise<void> {
-	for (let turn = 0; turn < turns && !ready(); turn += 1) {
+/** The real clock, captured before any test installs fake timers. */
+const realNow = performance.now.bind(performance);
+
+/**
+ * Yield to the real event loop until `ready` holds. The bound is wall-clock time:
+ * a slow machine needs more event-loop turns before the gate reaches its first
+ * judgement, and a fixed turn count gave up early and returned silently, so the
+ * test went on with nothing captured and failed several assertions later. A
+ * condition that never holds fails here instead.
+ */
+async function until(ready: () => boolean, timeoutMs = 10_000): Promise<void> {
+	const deadline = realNow() + timeoutMs;
+	while (!ready()) {
+		if (realNow() > deadline) throw new Error(`until: the condition did not hold within ${timeoutMs} ms`);
 		await new Promise<void>(resolve => realImmediate(resolve));
 	}
+}
+
+/** Let the real event loop run a fixed number of turns, for "nothing should happen" checks. */
+async function settle(turns = 20): Promise<void> {
+	for (let turn = 0; turn < turns; turn += 1) await new Promise<void>(resolve => realImmediate(resolve));
 }
 
 interface DeferredDialog {
@@ -339,7 +355,7 @@ describe("a judgment that answers after its deadline (issue #62)", () => {
 		// Nothing is left listening: the answer that was 45ms away has no dialog
 		// to refine and no line to write.
 		jest.advanceTimersByTime(10_000);
-		await until(() => false, 20);
+		await settle();
 		expect(readDecisions().map(line => line.layer)).toEqual(["verdict", "dialog"]);
 		expect(notifyCalls(dialog.ctx)).toHaveLength(0);
 	});
@@ -359,7 +375,7 @@ describe("a judgment that answers after its deadline (issue #62)", () => {
 		// The answer arrives long after, to nobody: the dialog is still the
 		// human's, and the only verdict on record is UNAVAILABLE.
 		jest.advanceTimersByTime(10_000);
-		await until(() => false, 20);
+		await settle();
 		expect(lateLines()).toHaveLength(0);
 		expect(dialog.state()).toBe("open");
 
