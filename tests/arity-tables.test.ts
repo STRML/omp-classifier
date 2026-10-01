@@ -22,10 +22,20 @@ const bySpelling = (readings: readonly FlagReading[]): Record<string, FlagReadin
 	return table;
 };
 
-/** A check against a live tool, skipped when the tool is not installed. */
-const live = (name: string, tool: string, body: () => void): void => {
-	test.skipIf(Bun.which(tool) === null)(name, body);
+/**
+ * A live check spawns the installed tool, and `probe` gives it up to 20 s. A cold
+ * runner took 8 s for kubectl, past bun's 5 s test default, so the test failed
+ * while the probe was still working. The test limit sits above the probe's.
+ */
+const LIVE_TEST_TIMEOUT_MS = 30_000;
+
+/** A check against a live tool, skipped unless `installed`. */
+const liveWhen = (name: string, installed: boolean, body: () => void): void => {
+	test.skipIf(!installed)(name, body, LIVE_TEST_TIMEOUT_MS);
 };
+
+/** A check against a live tool, skipped when the tool is not installed. */
+const live = (name: string, tool: string, body: () => void): void => liveWhen(name, Bun.which(tool) !== null, body);
 
 /**
  * The table's yarn grammar is Yarn Berry's. Classic (1.x), which GitHub's runners
@@ -234,7 +244,7 @@ describe("the table still says what the installed tools say", () => {
 		expect(toolGrammar("npm")?.flags(["audit"])?.valued("--audit-level")).toBe("audit-level");
 	});
 
-	test.skipIf(!yarnBerryInstalled())("yarn names the npm namespace and types its tag", () => {
+	liveWhen("yarn names the npm namespace and types its tag", yarnBerryInstalled(), () => {
 		const help = probe(["yarn", "--help"]) ?? "";
 		expect(help).toContain("yarn npm publish");
 		expect(toolGrammar("yarn")?.names(["npm"], "publish")).toBe(true);
