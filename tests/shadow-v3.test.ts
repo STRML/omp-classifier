@@ -129,7 +129,7 @@ describe("the shadow decides by the jev-v3 order", () => {
 		try {
 			setJevAnswer(jevUnsureAnswer());
 			setShadowAuthorization("named", { none: 0.02, goal: 0.03, named: 0.95 });
-			const ctx = makeCtx({ sessionId: session(), hasUI: false, cwd, branch: [user("delete scratch-build")] });
+			const ctx = makeCtx({ sessionId: session(), hasUI: true, cwd, branch: [user("delete scratch-build")] });
 			const result = await fire("tool_call", makeEvent("trash scratch-build"), ctx);
 			// Live: jev-v2 is unsure and nobody can answer a dialog.
 			expect(result).toMatchObject({ block: true });
@@ -146,7 +146,7 @@ describe("the shadow decides by the jev-v3 order", () => {
 		try {
 			setJevAnswer(jevUnsureAnswer());
 			setShadowAuthorization("named", { none: 0.02, goal: 0.03, named: 0.95 });
-			const ctx = makeCtx({ sessionId: session(), hasUI: false, artifactsDir: artifacts, branch: [user("delete the scratch dir")] });
+			const ctx = makeCtx({ sessionId: session(), hasUI: true, artifactsDir: artifacts, branch: [user("delete the scratch dir")] });
 			await fire("tool_call", makeEvent(`trash ${path.join(artifacts, "scratch")}`), ctx);
 			const v3 = readDecisions().find(entry => entry.v3 !== undefined)?.v3;
 			expect(v3).toMatchObject({ literalMatched: true, branch: 4 });

@@ -294,18 +294,18 @@ describe("decision audit log", () => {
 
 		test("a critical early return carries the evidence ids, never the message text", async () => {
 			seq += 1;
-			const ctx = makeCtx({ sessionId: `audit-evidence-critical-${seq}`, branch: [userEntry(rawText)] });
+			const ctx = makeCtx({ sessionId: `audit-evidence-critical-${seq}`, hasUI: true, branch: [userEntry(rawText)] });
 			const blocked = resultText(await fire("tool_call", makeEvent("rm -rf /"), ctx));
-			expect(refusalOf(blocked).layer).toBe("headless");
+			expect(refusalOf(blocked).layer).toBe("dialog");
 			// Critical pattern logs twice: the critical-layer line itself, then the
-			// headless outcome from requestPermission. Both carry the same ids.
+			// dialog outcome from requestPermission. Both carry the same ids.
 			const lines = readDecisions();
 			expect(lines).toHaveLength(2);
 			expect(lines[0].layer).toBe("critical");
 			expect(lines[0].userMessageIds).toEqual(["user-0"]);
 			// No judgement preceded a critical hit, so there is nothing to carry.
 			expect(lines[0].authorization).toBeUndefined();
-			expect(lines[1].layer).toBe("headless");
+			expect(lines[1].layer).toBe("dialog");
 			expect(lines[1].userMessageIds).toEqual(["user-0"]);
 			expect(lines[1].authorization).toBeUndefined();
 			for (const line of lines) {
@@ -316,7 +316,7 @@ describe("decision audit log", () => {
 		test("a static allow rule carries the evidence ids, never the message text", async () => {
 			seq += 1;
 			await loadPlugin(makeSettings([{ match: "echo audit-evidence-static*", approval: "allow" }]));
-			const ctx = makeCtx({ sessionId: `audit-evidence-static-${seq}`, branch: [userEntry(rawText)] });
+			const ctx = makeCtx({ sessionId: `audit-evidence-static-${seq}`, hasUI: true, branch: [userEntry(rawText)] });
 			const command = `echo audit-evidence-static-${seq}`;
 			expect(await fire("tool_call", makeEvent(command), ctx)).toBeUndefined();
 			const lines = readDecisions();
@@ -333,7 +333,7 @@ describe("decision audit log", () => {
 		test("a verdict path carries the evidence ids and the judgement's authorization, never the message text", async () => {
 			seq += 1;
 			const command = `echo audit-evidence-verdict-${seq}`;
-			const ctx = makeCtx({ sessionId: `audit-evidence-verdict-${seq}`, branch: [userEntry(rawText)] });
+			const ctx = makeCtx({ sessionId: `audit-evidence-verdict-${seq}`, hasUI: true, branch: [userEntry(rawText)] });
 			expect(await fire("tool_call", makeEvent(command), ctx)).toBeUndefined();
 			const lines = readDecisions();
 			expect(lines).toHaveLength(1);
@@ -351,7 +351,7 @@ describe("decision audit log", () => {
 		test("an outage carries the evidence ids and no authorization label", async () => {
 			seq += 1;
 			const command = `echo audit-evidence-outage-${seq}`;
-			const ctx = makeCtx({ sessionId: `audit-evidence-outage-${seq}`, branch: [userEntry(rawText)] });
+			const ctx = makeCtx({ sessionId: `audit-evidence-outage-${seq}`, hasUI: true, branch: [userEntry(rawText)] });
 			setJevUnavailable();
 			try {
 				expect(resultText(await fire("tool_call", makeEvent(command), ctx))).toContain("classifier unavailable");

@@ -1326,6 +1326,20 @@ function headAndTail(value: string, max: number): string {
 }
 
 /**
+ * The branch the user-channel collectors may read (spec §2, §7). A session
+ * with no UI has nobody typing into it that the gate can tell apart: every
+ * role-user message there is the prompt whoever launched it wrote — a review
+ * script's brief, a worker's task — and the host stamps those `attribution:
+ * "user"`. Counting one as the user's words let a script authorize its own
+ * commands, and it rode with the injection scores on review workers. Until
+ * the host marks a human-typed prompt, a no-UI session has no user channel.
+ * Tool evidence still reads the whole branch: it never authorizes.
+ */
+function userChannelBranch(ctx: ExtensionContext): ReadonlyArray<EvidenceBranchEntry> {
+	return ctx.hasUI ? (ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>) : [];
+}
+
+/**
  * evidence.userMessages exactly as the state carries them: the newest N
  * user messages (issue #31), absent entirely when the limit is 0 or there is
  * nothing to send. classify builds its state from this, and the tool_call path
@@ -1337,7 +1351,7 @@ function evidenceUserSnapshot(ctx: ExtensionContext): UserEvidenceSnapshot | und
 	if (limit <= 0) return undefined;
 	let snapshot: UserEvidenceSnapshot;
 	try {
-		snapshot = collectTaskEvidence(ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>, limit);
+		snapshot = collectTaskEvidence(userChannelBranch(ctx), limit);
 	} catch {
 		// Isolated contexts may omit branch history. Evidence stays enabled but
 		// empty, so a judge cannot cite a user who was not actually supplied.
@@ -5237,7 +5251,7 @@ export default function (pi: ExtensionAPI) {
 			const config = readClassifierConfig();
 			let snapshot: UserEvidenceSnapshotV3 = { messages: [], ids: [] };
 			try {
-				snapshot = collectTaskEvidenceV3(ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>, config.evidenceUserMessages);
+				snapshot = collectTaskEvidenceV3(userChannelBranch(ctx), config.evidenceUserMessages);
 			} catch {
 				// No branch in an isolated SDK context: no user evidence, as live.
 			}

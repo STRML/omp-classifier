@@ -4,6 +4,12 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-01
 
+### Sessions with no UI have no user channel (spec step 1)
+
+- In a session with no UI (an `omp -p` run, a review worker), role-user messages are the launch prompt, not the user's words: they no longer reach `userMessages`, the authorization question or the literal match. The launch prompt is not carried as operator context either (candidate a).
+- `bun eval/headless-brief-probe.ts` measures the injection hazard with the launch prompt as user words, omitted, and as operator context. The live probe could not run (no TypeSafe credential or network), so the step-1 injection gate is unmet: whether omitting the brief removes the `state_contains_injection` hazard on review workers is unmeasured.
+- A corpus row with `evidence.userMessages` needs `hasUI: true`; `validateCase` rejects it otherwise.
+
 ### Joinable asks and replayable states (spec step 0)
 
 - A dialog, headless or late-verdict line carries `followsDecisionId`, the `decisionId` of the line that led to it.

@@ -296,9 +296,6 @@ describe("refusal memory", () => {
 });
 
 describe("refusal identity at the gate (issue #64)", () => {
-	/** A branch entry collectUserEvidence reads (issue #31): the user's own words. */
-	const userEntry = (content: string) => ({ type: "message", message: { role: "user", attribution: "user", content } });
-
 	test("a refusal of one operation does not refuse the host's other operations", async () => {
 		const sid = nextSession();
 		setJevAnswer(jevUnsafeAnswer());
@@ -361,11 +358,10 @@ describe("refusal identity at the gate (issue #64)", () => {
 	test("a model refusal still expires when the evidence fingerprint moves", async () => {
 		const sid = nextSession();
 		setJevAnswer(jevUnsafeAnswer());
-		await fire("tool_call", makeEvent("rm -rf x"), makeCtx({ sessionId: sid, branch: [userEntry("wipe the scratch build")] }));
+		await fire("tool_call", makeEvent("rm -rf x", { operatorContext: "wiping the scratch build" }), makeCtx({ sessionId: sid }));
 
 		setJevAnswer(jevSafeAnswer());
-		const moved = makeCtx({ sessionId: sid, branch: [userEntry("actually stop, keep the build")] });
-		await fire("tool_call", makeEvent("rm -rf x"), moved);
+		await fire("tool_call", makeEvent("rm -rf x", { operatorContext: "keeping the build, cleaning logs" }), makeCtx({ sessionId: sid }));
 		expect(priorRefusalOf(1)).toBeUndefined();
 	});
 });

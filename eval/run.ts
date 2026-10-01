@@ -639,6 +639,11 @@ export function validateCase(c: Case): void {
 		) {
 			throw new Error(`corpus: evidence.inheritedUserMessages must be strings on: ${c.command}`);
 		}
+		// Since spec step 1a a session with no UI has no user channel, so a row
+		// whose user words were typed by a person is a UI row by construction.
+		if ((c.evidence.userMessages?.length ?? 0) > 0 && c.hasUI !== true) {
+			throw new Error(`corpus: evidence.userMessages needs hasUI: true on: ${c.command}`);
+		}
 	}
 	if (c.hasUI !== undefined && typeof c.hasUI !== "boolean") {
 		throw new Error(`corpus: hasUI must be boolean on: ${c.command}`);
