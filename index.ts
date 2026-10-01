@@ -288,6 +288,10 @@ const CACHE_CAP = 500;
 /** Per-session refusal memory (issue #30): sessionId -> refusals, oldest first. */
 interface Refusal {
 	normalizedTarget: string;
+	/** The target as text for a log or a dialog: normalized from the REDACTED
+	 *  command, because normalization reorders arguments and would separate a
+	 *  secret from the flag that names it. Never use normalizedTarget as text. */
+	loggableTarget: string;
 	why: string;
 	ts: number;
 	/** Refusals are not interchangeable: a model judgment is revisitable when
@@ -4640,6 +4644,7 @@ function addRefusal(
 		while (list.length >= REFUSAL_CAP) list.shift();
 		list.push({
 			normalizedTarget: target,
+			loggableTarget: refusalKeyForCommand(redactSecrets(command.replace(/\\\r?\n/gu, ""))),
 			why,
 			ts: Date.now(),
 			source: meta.source ?? "model",
@@ -5720,6 +5725,9 @@ export default function (pi: ExtensionAPI) {
 				policyVersion: CLASSIFIER_POLICY_VERSION,
 				policyHash: CLASSIFIER_POLICY_HASH,
 				...line,
+				// Free text is redacted here too, so a future string site that
+				// quotes a command or a target cannot put a secret on disk.
+				why: redactSecrets(line.why),
 				// The judged command is never redacted (redact.ts header), but the
 				// copy that lands on disk is: the first 120 flattened characters can
 				// hold a bearer token or a `--password` value. The file is created
@@ -6084,7 +6092,7 @@ export default function (pi: ExtensionAPI) {
 						const guardWhy =
 							late.riskFlags.length > 0
 								? `classifier-safe but flags: ${late.riskFlags.join(", ")}`
-								: `classifier-safe despite prior refusal of "${late.priorRefusal?.normalizedTarget ?? ""}"`;
+								: `classifier-safe despite prior refusal of "${late.priorRefusal?.loggableTarget ?? ""}"`;
 						auditLate(judgement, `${pair}: dialog kept open — ${guardWhy}`, "block");
 						ctx.ui.notify(`classifier: judgment answered late (${guardWhy})\nThe dialog still needs your answer.`, "warning");
 						return;
@@ -7110,7 +7118,7 @@ export default function (pi: ExtensionAPI) {
 				// means the command looks safe, not that the refusal was wrong.
 				// The prior refusal stands until a human says otherwise, and the
 				// moderate-risk overlay keeps its own reason when both hit.
-				const priorTarget = prior?.normalizedTarget ?? "";
+				const priorTarget = prior?.loggableTarget ?? "";
 				const why =
 					flags.length > 0
 						? `classifier-safe but flags: ${flags.join(", ")}`

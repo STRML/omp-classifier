@@ -155,3 +155,19 @@ describe("logJudgedStates", () => {
 		expect(notifyCalls(ctx).at(-1)).toEqual(["usage: /classifier logJudgedStates true|false", "error"]);
 	});
 });
+
+describe("decisions.jsonl never carries a prior refusal's secret", () => {
+	test("a reworded retry after a refusal leaves the password on no line", async () => {
+		const sid = session();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("mysql --password hunter2-secret -e 'drop table t'"), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		// Reworded (two spaces): the cache misses, the refusal rides in, SAFE is
+		// held for approval, and the why quotes the refused target.
+		await fire("tool_call", makeEvent("mysql  --password hunter2-secret -e 'drop table t'"), makeCtx({ sessionId: sid }));
+		const text = fs.readFileSync(path.join(dir, "decisions.jsonl"), "utf8");
+		expect(text).toContain("despite prior refusal");
+		expect(text).not.toContain("hunter2-secret");
+		expect(text).not.toContain("hunter2");
+	});
+});
