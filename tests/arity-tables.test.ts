@@ -27,6 +27,15 @@ const live = (name: string, tool: string, body: () => void): void => {
 	test.skipIf(Bun.which(tool) === null)(name, body);
 };
 
+/**
+ * The table's yarn grammar is Yarn Berry's. Classic (1.x), which GitHub's runners
+ * ship, has no `yarn npm` namespace, so for this check it counts as not installed.
+ */
+const yarnBerryInstalled = (): boolean => {
+	const version = Bun.which("yarn") === null ? "" : (probe(["yarn", "--version"]) ?? "").trim();
+	return version !== "" && !version.startsWith("1.");
+};
+
 describe("the parsers read the tools' own help", () => {
 	test("a typed usage block separates a value placeholder from a description", () => {
 		// Recorded from `gh api --help` (gh 2.101.0).
@@ -225,7 +234,7 @@ describe("the table still says what the installed tools say", () => {
 		expect(toolGrammar("npm")?.flags(["audit"])?.valued("--audit-level")).toBe("audit-level");
 	});
 
-	live("yarn names the npm namespace and types its tag", "yarn", () => {
+	test.skipIf(!yarnBerryInstalled())("yarn names the npm namespace and types its tag", () => {
 		const help = probe(["yarn", "--help"]) ?? "";
 		expect(help).toContain("yarn npm publish");
 		expect(toolGrammar("yarn")?.names(["npm"], "publish")).toBe(true);
