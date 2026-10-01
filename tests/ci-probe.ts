@@ -86,3 +86,36 @@ afterEach(() => {
 	if (took > 3000) log(`TEST-SLOW ${Math.round(took)}ms test=${running}`);
 	running = "";
 });
+
+// ---- watchdog: when this process stops heartbeating, ask the kernel what it is blocked on ----
+const heartbeat = `/tmp/ci-probe-heartbeat-${process.pid}`;
+const nodeFs = require("node:fs") as typeof import("node:fs");
+nodeFs.writeFileSync(heartbeat, "x");
+realSetInterval(() => {
+	try {
+		const now = new Date();
+		nodeFs.utimesSync(heartbeat, now, now);
+	} catch {
+		// ignore
+	}
+}, 200);
+const script = `
+PARENT=${process.pid}
+HB=${heartbeat}
+dumped=0
+while kill -0 $PARENT 2>/dev/null; do
+  sleep 1
+  now=$(date +%s); mt=$(stat -c %Y $HB 2>/dev/null || echo $now)
+  age=$((now - mt))
+  if [ $age -ge 4 ] && [ $dumped -lt 3 ]; then
+    dumped=$((dumped + 1))
+    echo "CIPROBE WATCHDOG stale=\${age}s dump=$dumped"
+    for t in /proc/$PARENT/task/*; do
+      echo "CIPROBE WATCHDOG thread $(basename $t) comm=$(cat $t/comm 2>/dev/null) state=$(awk '{print $3}' $t/stat 2>/dev/null) wchan=$(cat $t/wchan 2>/dev/null) syscall=$(cat $t/syscall 2>/dev/null | cut -d' ' -f1-3)"
+    done | head -40
+    echo "CIPROBE WATCHDOG fds: $(ls -l /proc/$PARENT/fd 2>/dev/null | awk '{print $9 $10 $11}' | tr '\\n' ' ' | cut -c1-600)"
+    echo "CIPROBE WATCHDOG tree:"; ps -eo pid,ppid,stat,etimes,args --forest 2>/dev/null | grep -v "ps -eo" | head -30 | cut -c1-160 | sed 's/^/CIPROBE WATCHDOG /'
+  fi
+done
+`;
+Bun.spawn(["sh", "-c", script], { stdout: "inherit", stderr: "inherit", stdin: "ignore" });
