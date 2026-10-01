@@ -132,11 +132,11 @@ describe("bun eval/run.ts --replay --battery jev-v3.1 (end to end)", () => {
 			if (authorization !== undefined) writeFileSync(join(cache, `${key(AUTH)}.json`), JSON.stringify({ authorization }));
 		}
 	};
-	const run = (only: string): { exitCode: number; stdout: string; report: Record<string, unknown> | undefined } => {
+	const run = (only: string, extra: string[] = []): { exitCode: number; stdout: string; report: Record<string, unknown> | undefined } => {
 		const env: Record<string, string | undefined> = { ...process.env, OMP_EVAL_CACHE_DIR: cache, OMP_EVAL_REPORT_DIR: reports };
 		// --replay needs no credential: prove it by removing the one the suite sets.
 		delete env.TYPESAFE_API_KEY;
-		const child = Bun.spawnSync({ cmd: ["bun", "eval/run.ts", "--replay", "--corpus", "intent", "--battery", JEV_V3_POLICY_VERSION, `--only=${only}`], cwd: REPO, env });
+		const child = Bun.spawnSync({ cmd: ["bun", "eval/run.ts", "--replay", "--corpus", "intent", "--battery", JEV_V3_POLICY_VERSION, `--only=${only}`, ...extra], cwd: REPO, env });
 		const file = readdirSync(reports).find(name => name.endsWith(".json"));
 		return {
 			exitCode: child.exitCode ?? -1,
@@ -173,6 +173,19 @@ describe("bun eval/run.ts --replay --battery jev-v3.1 (end to end)", () => {
 		expect(rows.length).toBe(2);
 		for (const testCase of rows) seed(testCase, riskAnswers({ safe: 0.95, unsafe: 0.02 }), authorizationAnswer("none", { none: 0.9, goal: 0.05, named: 0.05 }));
 		const result = run("intent-unrequested-publish");
+		expect(result.stdout).toContain("FAIL: v3 order DISQUALIFIED");
+		expect(result.exitCode).toBe(1);
+	});
+
+	test("an allow observed before a later outage still disqualifies the order", async () => {
+		const row = (await intentRows()).find(candidate => candidate.family === "intent-unrequested-publish");
+		if (row === undefined) throw new Error("intent.jsonl lost the unrequested publish rows");
+		// Sample 0 is cached and allows; sample 1 is a cache miss, so the case is UNAVAILABLE.
+		const cwd = row.cwd ?? DEFAULT_CWD;
+		const key = (battery: string) => answerCacheKey({ battery, model: DEFAULT_JEV_MODEL, cwd, sample: 0, testCase: row });
+		writeFileSync(join(cache, `${key(RISK)}.json`), JSON.stringify({ answers: riskAnswers({ safe: 0.95, unsafe: 0.02 }) }));
+		writeFileSync(join(cache, `${key(AUTH)}.json`), JSON.stringify({ authorization: authorizationAnswer("none", { none: 0.9, goal: 0.05, named: 0.05 }) }));
+		const result = run(row.family, ["--samples", "2"]);
 		expect(result.stdout).toContain("FAIL: v3 order DISQUALIFIED");
 		expect(result.exitCode).toBe(1);
 	});
