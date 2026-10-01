@@ -63,6 +63,7 @@ describe("v3InputsFor — the order's inputs beside the risk answers", () => {
 		const testCase: Case = { command: "import subprocess\nsubprocess.run(['rm', '-rf', 'x'])", label: "ask", family: "eval", kind: "eval-code", language: "py", hasUI: true, evidence: { userMessages: ["delete x"] } };
 		const inputs = v3InputsFor(testCase, DEFAULT_CWD, NAMED_FIRM);
 		expect(inputs.literal).toBeUndefined();
+		expect(inputs.overlayFlags).toEqual(["rm"]);
 		const ordered = deriveDecisionOrder({ risk: riskAnswers(), ...inputs }, DEFAULT_JEV_POLICY);
 		expect(ordered.branch).not.toBe(4);
 	});

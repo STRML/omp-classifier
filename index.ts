@@ -6561,7 +6561,7 @@ export default function (pi: ExtensionAPI) {
 					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", userScopeFingerprint, { ...auditFields(), ...spawnField });
 				}
 				if (cacheableEval && !cached && judgement.verdict !== "UNAVAILABLE" && !judgement.noCache) remember(scoped, cacheKey, judgement);
-				const logCode = truncated(evalCode.replace(/\s+/gu, " ").trim(), 120);
+				const logCode = truncated(redactSecrets(evalCode.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120);
 				if (!dryRun) pi.logger.info(
 					`classifier: verdict=${judgement.verdict}` +
 						` tool=eval lang=${language || "?"} cached=${cached ? 1 : 0} reason="${judgement.reason}" code="${logCode}"`,

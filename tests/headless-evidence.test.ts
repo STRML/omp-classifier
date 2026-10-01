@@ -55,6 +55,7 @@ describe("a session with no UI has no user channel", () => {
 		await fire("tool_call", makeEvent("git status"), makeCtx({ sessionId: session(), hasUI: false, branch: [user(BRIEF)] }));
 		expect(evidenceOf(0).userMessages).toBeUndefined();
 		expect(evidenceOf(0).userMessageIds).toBeUndefined();
+		expect(shadowCalls.some(call => "user_authorization" in call.questions)).toBe(true);
 		expect(authorizationState()).not.toContain("marker-brief-7731");
 		expect(decisions()[0].userMessageIds).toBeUndefined();
 	});
@@ -77,5 +78,23 @@ describe("a session with no UI has no user channel", () => {
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("the judged-states log follows the same channel", () => {
+	const states = (): string => fs.readFileSync(path.join(dir, "judged-states.jsonl"), "utf8");
+	const enableLog = (): void => fs.writeFileSync(path.join(dir, "omp-classifier.json"), JSON.stringify({ logJudgedStates: true }));
+
+	test("a no-UI launch prompt never reaches judged-states.jsonl", async () => {
+		enableLog();
+		await fire("tool_call", makeEvent("git status"), makeCtx({ sessionId: session(), hasUI: false, branch: [user(BRIEF)] }));
+		expect(fs.existsSync(path.join(dir, "judged-states.jsonl"))).toBe(true);
+		expect(states()).not.toContain("marker-brief-7731");
+	});
+
+	test("a UI session's user words do", async () => {
+		enableLog();
+		await fire("tool_call", makeEvent("git status"), makeCtx({ sessionId: session(), hasUI: true, branch: [user(BRIEF)] }));
+		expect(states()).toContain("marker-brief-7731");
 	});
 });

@@ -58,6 +58,17 @@ afterEach(() => {
 });
 
 describe("log-side secret redaction", () => {
+	test("the OMP log line for eval code drops a flag's value too", async () => {
+		seq += 1;
+		const secret = `hunter2-eval-do-not-log-${seq}`;
+		const code = `import subprocess\nsubprocess.run("mysql --password ${secret} -e x", shell=True)`;
+		await fire("tool_call", { toolName: "eval", input: { code, language: "py" } }, makeCtx({ sessionId: `redact-eval-${seq}` }));
+		const line = loggerInfos.find(m => m.includes("tool=eval"));
+		expect(line).toBeDefined();
+		expect(line).toContain(REDACTED);
+		expect(loggerInfos.join("\n")).not.toContain(secret);
+	});
+
 	test("decisions.jsonl keeps the command shape but not the flag's value", async () => {
 		seq += 1;
 		const marker = `redact-marker-${seq}`;
