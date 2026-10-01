@@ -2433,7 +2433,13 @@ function resolveSpawnCwdLiteral(raw: string, base: string): string | null {
  *  one, for the dialog: the human decides what to do with a directory the scan
  *  refused to guess. Whether that source text is a literal, and what directory
  *  it names, is decided in one place — see evalSpawnCwd. */
-type EvalCwdArgument = { kind: "none" } | { kind: "value"; value: string } | { kind: "dynamic"; detail: string };
+type EvalCwdArgument =
+	| { kind: "none" }
+	/** `at` is where the value's source text starts; `keyAt` is where its
+	 *  `cwd`/`chdir` key starts, for a keyed value. A bare identifier is a value
+	 *  too, and evalSpawnCwd decides whether it is bound to a literal. */
+	| { kind: "value"; value: string; at: number; keyAt?: number }
+	| { kind: "dynamic"; detail: string };
 
 /** One `cwd`/`chdir` key found in a call's own arguments, with the bracket
  *  depth it sits at (so the outermost is the one that counts) and its offset in
@@ -2448,7 +2454,7 @@ interface EvalCwdKey {
 /** The same key narrowed to a readable literal: the shape a value check leaves
  *  behind, for callers that need `.value` without asserting it. */
 interface EvalCwdLiteralKey extends EvalCwdKey {
-	argument: { kind: "value"; value: string };
+	argument: { kind: "value"; value: string; at: number; keyAt?: number };
 }
 
 /** The directory argument of a positional site (`Dir.chdir("/tmp")`,
@@ -2466,8 +2472,15 @@ function readPositionalCwd(masked: string, code: string, start: number, end: num
 		// the value past what was read — `Dir.chdir "/a" "/b"` is not /a.
 		const rest = code.slice(quoted).trimStart();
 		if (rest === "" || /^[),;{}\n]/u.test(rest) || /^(?:do|then|end)\b/u.test(rest)) {
-			return { kind: "value", value: code.slice(i, quoted) };
+			return { kind: "value", value: code.slice(i, quoted), at: i };
 		}
+	}
+	// A bare name the call ends on (`Dir.chdir(W)`, `Dir.chdir W do`) is a
+	// value for evalSpawnCwd to look up, not yet a directory.
+	const name = /^[A-Za-z_$][\w$]*/u.exec(masked.slice(i, end))?.[0];
+	if (name !== undefined) {
+		const rest = masked.slice(i + name.length, end).trim();
+		if (rest === "" || /^(?:do|then)\b/u.test(rest)) return { kind: "value", value: name, at: i };
 	}
 	return { kind: "dynamic", detail: truncated(code.slice(i, Math.max(i + 1, scanValueEnd(masked, i, end))).trim(), 60) };
 }
@@ -2516,7 +2529,7 @@ function readKeyedCwd(masked: string, code: string, start: number, end: number):
 			let valueStart = cursor + 1;
 			while (valueStart < end && (masked[valueStart] === " " || masked[valueStart] === "\t")) valueStart += 1;
 			const raw = code.slice(valueStart, Math.max(valueStart, scanValueEnd(masked, valueStart, end))).trim();
-			found.push({ depth: own.depth, at, argument: raw === "" ? { kind: "dynamic", detail: `${match[0]}=` } : { kind: "value", value: raw } });
+			found.push({ depth: own.depth, at, argument: raw === "" ? { kind: "dynamic", detail: `${match[0]}=` } : { kind: "value", value: raw, at: valueStart, keyAt: at } });
 			continue;
 		}
 		// Key position only: `{ cwd }` is the shorthand form of the option,
@@ -2526,7 +2539,7 @@ function readKeyedCwd(masked: string, code: string, start: number, end: number):
 		const previous = before < start ? "" : masked[before];
 		const closer = masked[cursor] ?? "";
 		if (match[0] === "cwd" && own.inBrace && (previous === "{" || previous === ",") && (closer === "," || closer === "}")) {
-			found.push({ depth: own.depth, at, argument: { kind: "dynamic", detail: `{ ${match[0]} }` } });
+			found.push({ depth: own.depth, at, argument: { kind: "value", value: "cwd", at, keyAt: at } });
 		}
 	}
 	if (found.length === 0) {
@@ -2802,6 +2815,108 @@ function evalChdirScope(masked: string, site: EvalCwdSiteMatch): EvalChdirScope 
 	return end === -1 ? { kind: "unreadable", why: "the block's end cannot be read" } : { kind: "block", end };
 }
 
+/** A cwd argument that names a variable rather than spelling a string. */
+const EVAL_CWD_IDENTIFIER = /^[A-Za-z_$][\w$]*$/u;
+
+/** Names that let code rebind a variable without spelling the name as code:
+ *  Python's globals()/exec, JS eval/Function/with, Ruby's binding. A payload
+ *  carrying one can change what a name holds where this scan cannot see, so
+ *  no binding is read from it. `exec` counts only unqualified: `cp.exec(…)`
+ *  is child_process, a bare `exec(` may be Python's. */
+const EVAL_SCOPE_ESCAPE =
+	/(?<![\w$.])(?:globals|locals|vars|exec|eval|compile|setattr|__dict__|__builtins__|binding|local_variable_set|instance_variable_set|instance_eval|class_eval|module_eval|define_method|Function)\b|(?<![\w$.])with\s*\(/u;
+
+/** A line that opens a block, in any of the scanned languages. */
+const EVAL_BLOCK_OPENER = /^(?:if|elif|else|elsif|unless|while|until|for|do|try|except|finally|catch|with|def|class|module|function|async|case|when|match|switch|begin|rescue|ensure|loop|lambda)\b/u;
+/** A line that leaves its statement open onto the next one. */
+const EVAL_OPEN_LINE_END = /(?:[:\\,([{=+|&]|\bdo|\bthen|=>)\s*$/u;
+
+interface EvalCwdBinding {
+	/** Offset of the bound name in its binding statement. */
+	at: number;
+	literal: string;
+}
+
+/** True when every line of `prefix` is top-level straight-line code:
+ *  unindented, bracket-balanced, opening no block and leaving no statement
+ *  open. `prefix` is masked, so a keyword inside a string or a comment cannot
+ *  count. */
+function straightLinePrefix(prefix: string): boolean {
+	let depth = 0;
+	for (const char of prefix) {
+		if (char === "(" || char === "[" || char === "{") depth += 1;
+		else if (char === ")" || char === "]" || char === "}") depth -= 1;
+	}
+	if (depth !== 0) return false;
+	return prefix.split("\n").every(line => {
+		const text = line.trim();
+		return text === "" || (!/^\s/u.test(line) && !EVAL_BLOCK_OPENER.test(text) && !EVAL_OPEN_LINE_END.test(text));
+	});
+}
+
+/** Offsets of every `cwd`/`chdir` key inside a site's own argument list: the
+ *  key half of `cwd=cwd` is the option's name, not a use of the variable. */
+function siteKeyOffsets(masked: string, sites: readonly EvalCwdSiteMatch[]): number[] {
+	const offsets: number[] = [];
+	for (const site of sites) {
+		if (site.argEnd === -1) continue;
+		const span = masked.slice(site.argStart, site.argEnd);
+		for (const match of span.matchAll(/(?<![\w.$])(?:cwd|chdir)\b(?=\s*(?::|=(?!=)))/gu)) offsets.push(site.argStart + (match.index ?? 0));
+	}
+	return offsets;
+}
+
+/**
+ * The literal `name` is bound to, when the payload proves it: apart from the
+ * spawn-site uses in `owned`, the name occurs exactly once, that occurrence is
+ * a column-0 `name = "…"` (optionally `const`/`let`, never the hoisting `var`)
+ * whose line holds nothing else, and every line before it is straight-line
+ * top-level code. Undefined otherwise, and the caller keeps "not a literal".
+ */
+function evalCwdBinding(masked: string, code: string, name: string, owned: ReadonlySet<number>): EvalCwdBinding | undefined {
+	const token = new RegExp(`(?<![\\w$.])${name.replace(/\$/gu, "\\$")}(?![\\w$])`, "gu");
+	const others = [...masked.matchAll(token)].map(match => match.index ?? 0).filter(at => !owned.has(at));
+	if (others.length !== 1) return undefined;
+	const at = others[0];
+	const lineStart = masked.lastIndexOf("\n", at - 1) + 1;
+	const newline = masked.indexOf("\n", at);
+	const lineEnd = newline === -1 ? masked.length : newline;
+	if (!/^(?:(?:const|let)\s+)?$/u.test(masked.slice(lineStart, at))) return undefined;
+	const assign = /^\s*=(?![=~>])\s*/u.exec(masked.slice(at + name.length, lineEnd));
+	if (assign === null) return undefined;
+	const valueStart = at + name.length + assign[0].length;
+	// Measured on the masked text, so a trailing comment is whitespace here.
+	const valueEnd = valueStart + masked.slice(valueStart, lineEnd).replace(/[\s;]+$/u, "").length;
+	const literal = cwdLiteralText(code.slice(valueStart, valueEnd));
+	if (literal === null || !straightLinePrefix(masked.slice(0, lineStart))) return undefined;
+	return { at, literal };
+}
+
+/** The bindings for every bare-name cwd argument the sites read, by name. */
+function evalCwdBindings(masked: string, code: string, sites: readonly EvalCwdSiteMatch[], reads: ReadonlyArray<EvalCwdArgument | undefined>): Map<string, EvalCwdBinding> {
+	const bindings = new Map<string, EvalCwdBinding>();
+	const names = new Set<string>();
+	const owned = new Set<number>(siteKeyOffsets(masked, sites));
+	for (const read of reads) {
+		if (read?.kind !== "value" || !EVAL_CWD_IDENTIFIER.test(read.value)) continue;
+		names.add(read.value);
+		owned.add(read.at);
+		if (read.keyAt !== undefined) owned.add(read.keyAt);
+	}
+	if (names.size === 0 || EVAL_SCOPE_ESCAPE.test(masked)) return bindings;
+	for (const name of names) {
+		const binding = evalCwdBinding(masked, code, name, owned);
+		if (binding !== undefined) bindings.set(name, binding);
+	}
+	return bindings;
+}
+
+/** A bare-name argument's bound literal, when the binding precedes the use. */
+function boundCwdLiteral(argument: { value: string; at: number }, bindings: ReadonlyMap<string, EvalCwdBinding>): string | null {
+	const binding = bindings.get(argument.value);
+	return binding !== undefined && binding.at < argument.at ? binding.literal : null;
+}
+
 /**
  * Read the directory an eval payload spawns in, resolved against the session
  * directory it starts from. The payload's `language` label does not take part:
@@ -2822,12 +2937,18 @@ export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
 	const masked = maskCodeText(code);
 	const sites = evalCwdSites(masked);
 	if (sites.length === 0) return { kind: "session" };
+	// Every site's argument is read before the walk, because a binding is
+	// proven against all of the payload's uses of its name, not the first.
+	const reads = sites.map(site =>
+		site.argEnd === -1 ? undefined : site.positional ? readPositionalCwd(masked, code, site.argStart, site.argEnd) : readKeyedCwd(masked, code, site.argStart, site.argEnd),
+	);
+	const bindings = evalCwdBindings(masked, code, sites, reads);
 	let current = sessionCwd;
 	/** The chdir blocks still open at this point in the walk, innermost last. */
 	const blocks: Array<{ end: number; saved: string }> = [];
 	const perSite: string[] = [];
 	let opaque = "";
-	for (const site of sites) {
+	for (const [index, site] of sites.entries()) {
 		// The block is over once the walk reaches a site it does not contain:
 		// that site — and every one after it — runs in the directory the chdir
 		// found in place, not the one it moved to.
@@ -2841,7 +2962,8 @@ export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
 			if (opaque === "") opaque = `${site.name}: the argument list does not close`;
 			continue;
 		}
-		const argument = site.positional ? readPositionalCwd(masked, code, site.argStart, site.argEnd) : readKeyedCwd(masked, code, site.argStart, site.argEnd);
+		const argument = reads[index];
+		if (argument === undefined) continue;
 		if (argument.kind === "none") {
 			// `Dir.chdir()` with nothing in it goes to the home directory, which
 			// is not a directory this scan can name.
@@ -2856,7 +2978,7 @@ export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
 			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${argument.detail})`;
 			continue;
 		}
-		const literal = cwdLiteralText(argument.value);
+		const literal = cwdLiteralText(argument.value) ?? boundCwdLiteral(argument, bindings);
 		if (literal === null) {
 			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${truncated(argument.value, 60)})`;
 			continue;

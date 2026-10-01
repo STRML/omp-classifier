@@ -4,6 +4,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-01
 
+### Eval spawn cwd bound to a name (spec step 1)
+
+- `cwd = "/dir"` at the top of an eval payload, then a spawn with `cwd=cwd` (or `{ cwd }`, `chdir: R`, `Dir.chdir(W)`), is judged in `/dir` instead of asking. A reassignment, a nested scope, a non-straight-line binding, an f-string or expression, `**kwargs`, or any scope escape (`globals`, `eval`, `exec`, `with (`) still asks.
+
 ### Joinable asks and replayable states (spec step 0)
 
 - A dialog, headless or late-verdict line carries `followsDecisionId`, the `decisionId` of the line that led to it.
