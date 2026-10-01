@@ -6,13 +6,17 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ### Sessions with no UI have no user channel (spec step 1)
 
-- In a session with no UI (an `omp -p` run, a review worker), role-user messages are the launch prompt, not the user's words: they no longer reach `userMessages`, the authorization question or the literal match. The launch prompt is not carried as operator context either (candidate a).
+- In every session where the host's `hasUI` is false (`omp -p`, review workers and subagents, plain `rpc`, ACP and SDK embedders; the host sets `hasUI` only for interactive and `rpc-ui` modes), role-user messages are the launch prompt, not the user's words: they no longer reach `userMessages`, the authorization question or the literal match. The launch prompt is not carried as operator context either (candidate a).
 - `bun eval/headless-brief-probe.ts` measures the injection hazard with the launch prompt as user words, omitted, and as operator context. The live probe could not run (no TypeSafe credential or network), so the step-1 injection gate is unmet: whether omitting the brief removes the `state_contains_injection` hazard on review workers is unmeasured.
 - A corpus row with `evidence.userMessages` needs `hasUI: true`; `validateCase` rejects it otherwise.
 
+### Security
+
+- A prior refusal's secret no longer reaches `decisions.jsonl` `why` or the dialog text, and eval code in the host log line is redacted like the bash command. Older log lines may still hold one.
+
 ### Joinable asks and replayable states (spec step 0)
 
-- A dialog, headless or late-verdict line carries `followsDecisionId`, the `decisionId` of the line that led to it.
+- A dialog, headless or late-verdict line that follows a logged verdict, cwd, critical or environment line carries `followsDecisionId`, the `decisionId` of the line that led to it; unclassified lines carry none.
 - `/classifier logJudgedStates true` writes each fresh classification's redacted judged state to `judged-states.jsonl`.
 
 ## 2026-09-28

@@ -68,6 +68,7 @@ Read this before opening index.ts. Line numbers are where each declaration start
 | `trustPolicy` | null | set only by `/classifier trust-policy` |
 | `persistentGrants` | true | kill switch; not part of the signature |
 | `shadowV3` | true | runs `shadowJevV3` |
+| `logJudgedStates` | false | writes redacted judged states to `judged-states.jsonl` (`recordJudgedState`, 0600, keyed by lead `decisionId`); `BOOLEAN_CONFIG_NOTICES` holds the on/off notices for the three boolean keys |
 
 Config signature (cache-clearing): enabled, typesafeModel, backend id, merged policy, timeoutMs,
 maxCommandLength, evidenceUserMessages, trust-policy signature.
@@ -77,14 +78,16 @@ maxCommandLength, evidenceUserMessages, trust-policy signature.
 (none) prints config · `file` · `dry-run <cmd>` runs `handleToolCall` with capture, nothing
 executes · `status` writes status.json · `reset` · `trust-policy` · `enabled true|false` ·
 `off` / `on` (session pause) · `policy` (read-only merged policy + battery hash) ·
-`timeoutMs` · `maxCommandLength` · `evidenceUserMessages` · `persistentGrants` · `shadowV3`.
+`timeoutMs` · `maxCommandLength` · `evidenceUserMessages` · `persistentGrants` · `shadowV3` · `logJudgedStates`.
 
 ## `DecisionRecord` (one audit line, index.ts:922)
 
 `ts, decisionId, sessionId, policyVersion, policyHash, modelId, reasonCode, jev{model,
 probabilities, hazards, confidence, blastRadius, usage, latencyMs}, userMessageIds,
 authorization, v3, approval, tool, decision, layer, why, cmd, cwd, spawnCwd, verdict, cached, ms,
-staleCode, floor{asks, entries}`.
+staleCode, floor{asks, entries}, followsDecisionId` (dialog/headless/late-verdict lines point at the verdict/cwd/critical/environment line before them; unclassified lines carry none).
+
+No-UI sessions: `userChannelBranch(ctx)` returns an empty branch when `!ctx.hasUI`, so `evidenceUserSnapshot` and `shadowJevV3` see no user words; tool evidence still reads the whole branch.
 
 `layer` values: `cap`, `rule`, `cwd`, `script-body`, `critical`, `environment`, `granted`,
 `verdict`, `cached`, `dialog`, `headless`, `unclassified`, `late-verdict`, `internal-error`.

@@ -103,8 +103,11 @@ command ─▶ floor ───────────────────�
    only override is a user approval through the ledger, once, for that exact identity: the same power
    today's dialog gives.
 2. **Risk.** The existing battery. The injection hazard is fixed at its source. Prompts in a session
-   with no UI are carried as `agent` channel evidence, not `user`. That one change addresses the
-   injection scores on review briefs and the authorization hole in section 7.
+   with no UI are not `user` evidence. As shipped (option a), the launch prompt is dropped from the
+   judged state entirely, not carried as agent channel evidence. The probe that would choose option b
+   (carry it as labelled operator context) did not run (no credential), so that choice is
+   unconfirmed. That one change addresses the authorization hole in section 7; its effect on the
+   injection scores on review briefs is unmeasured.
 3. **Intent.** `authorization.ts`, `literal-match.ts` and `decision-order.ts` become the live
    decision (the jev-v3 flip, issue #55). Branch 4 has never fired, so the flip is measured before it
    is trusted.
@@ -126,7 +129,8 @@ command ─▶ floor ───────────────────�
 6. **Deny payload.** The layer, the reason built from numbers and hazard ids, what to ask the user,
    what not to try, and "report what did not happen". Outage denies carry a retry delay and say not
    to loop. A breaker stops calling the judge for 30 s after consecutive outages.
-7. **Sessions with no UI.** The launch prompt is agent-channel evidence (section 2), so authorization
+7. **Sessions with no UI.** The launch prompt is not user evidence (section 2; shipped as option a: dropped
+   from the judged state entirely, option b unconfirmed because the probe did not run), so authorization
    from it is `none`, not `goal`. It never lifts a refusal, and the reviewer cannot allow a block-band
    hazard, until the host marks a human-typed prompt. The host sets `hasUI` only for interactive and
    `rpc-ui` modes, so plain `rpc` and ACP sessions lose user authorization too (to be re-checked if ACP
@@ -184,7 +188,7 @@ Each step is shippable alone. Each gate is a number a command prints.
 | Step | Work | Gate |
 |---|---|---|
 | 0 | Plumbing. Add v3 (`deriveDecisionOrder`, `literalMatch`) to `eval/run.ts`, which today scores only `deriveJevDecision` plus `replayDecision`. Log a redacted state (or a hash plus the evidence ids) behind a flag so a probe can replay. Log, per ask, what a human did next. | `bun eval/run.ts` reports v3 branches on the held-out corpus |
-| 1 | Headless prompts as `agent` channel evidence, plus the injection probe on logged review briefs. The 31 spawn-cwd cases stay a deny: the name-binding scan was reverted (see findings). | Injection-only asks fall below 10% of today's count on replay. 0 new false allows on the adversarial corpus |
+| 1 | Headless prompts dropped from the judged state (shipped as option a; the probe choosing option b did not run, so it is unconfirmed), plus the injection probe on logged review briefs. The 31 spawn-cwd cases stay a deny: the name-binding scan was reverted (see findings). | Injection-only asks fall below 10% of today's count on replay. 0 new false allows on the adversarial corpus |
 | 2 | Flip jev-v3 live. Branches 3 and 4 allow. | `eval/run.ts` shows 0 false allows and REGRESSIONS none, with at least one branch-4 hit on a mined case. If none exists the step STOPs and reports, because the flip buys nothing without branch 4 |
 | 3 | Reviewer: build both arms, measure. | Any unauthorized allow over 3 samples disqualifies an arm. Report the false-allow upper bound at the held-out size (about 23 rows) |
 | 4 | Ledger, deny payload, deletions in section 10. Floor precision gate lands first. | Failure matrix rows all pass. A one-week shadow of "would-deny vs human-allowed" and "would-allow vs human-denied" on live traffic, and chat asks counted as interruptions |
@@ -196,11 +200,14 @@ into a deny.
 
 ## Findings from drafting the steps 0-2 plan
 
+- **Not run live (no credential).** The step 0 live baseline and the step 1 injection gate were not run live.
 - **No baseline.** No stored report exists for `jev-v2.11` or `jev-v3.1`, and the answer cache holds
   0 answers for the current batteries, so `--replay` reports every case UNAVAILABLE today. Every
   gate first needs one live run of about 1,800 requests.
-- **Branch 4 will very likely STOP step 2.** Offline, `literalMatch` matches 1 of the 52 intent rows
-  that carry user words (`./scripts/deploy.sh --staging`, an authored twin) and 0 of 17 mined seeds,
+- **Result: step 2 STOPPED at its gate.** `bun eval/literal-match-probe.ts` printed `0/15` intent seeds
+  matched (every one "segment not extracted or inert") and 0/0 judged states, so the jev-v3 flip was not
+  built. Offline, `literalMatch` matches 1 of the 52 intent rows
+  that carry user words (`./scripts/deploy.sh --staging`, an authored twin) and 0 of the 15 mined seeds,
   mostly because a `cd <dir> &&` prefix or a `| tail` pipe makes a segment non-inert. Widening the
   matcher for those shapes is its own piece of work and needs mined interactive states, which come
   from `logJudgedStates` data on the owner's sessions. I reproduced the 1-of-52 figure.

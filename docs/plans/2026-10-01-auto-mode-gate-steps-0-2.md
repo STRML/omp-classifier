@@ -6,6 +6,8 @@
 
 **Architecture:** Five tasks in order, each shippable alone. A (spec step 0a) teaches `eval/run.ts` the jev-v3 order over cached risk and authorization answers. B (step 0b) adds `followsDecisionId` to permission-request lines and an opt-in `judged-states.jsonl`. C (step 1b) resolves a bare identifier cwd argument bound once to a string literal in straight-line code. D (step 1a) removes the user channel from sessions with no UI, after a probe decides whether the launch prompt also rides as operator context. E (step 2) flips `classify` to `deriveDecisionOrder` over the jev-v3.1 battery plus the authorization answer, with `liveV3: false` restoring the jev-v2.11 path. E starts with a gate that may STOP the plan.
 
+**Status:** Task E stopped at its gate: steps 6 to 16 (the jev-v3 flip) were not built. Gates not run live (no credential): Task A step 11, Task D's probe and its gitflow replay.
+
 **Tech Stack:** TypeScript on Bun ≥ 1.3.14, no build step. `bun test`, `bun run typecheck`. Host packages `@oh-my-pi/pi-coding-agent`, `pi-ai`, `pi-utils` 18.2.4. Judge: TypeSafe System One (`jev-latest`).
 
 **Spec:** `docs/plans/2026-10-01-auto-mode-gate.md` (draft 2, approved). Read it beside this plan. Background: `docs/plans/2026-09-19-intent-aware-judgment.md`.
@@ -47,7 +49,7 @@ These change what the executor can do offline. Re-measure before relying on them
 - `eval/reports/` holds no report for `jev-v2.11` or `jev-v3.1`. The newest are HARNESS v7 for `jev-v2.1` and `jev-v3`. `eval/.cache/` and `eval/reports/` are gitignored (`eval/.gitignore`), so "the stored report" means a report the executor writes on the machine that runs the gate.
 - `eval/corpus/labels.jsonl` does not exist, so `--corpus all` throws. Use `--corpus gitflow` (adversarial + gitflow) and `--corpus intent`.
 - `eval/corpus/intent.jsonl` has 68 cases plus a schema comment line (not 69 cases). 18 are `heldOut`. 52 carry `evidence.userMessages`. None set `hasUI`. Rows 0 to 16 are the mined seeds (their `note` says "seed").
-- `literalMatch` over the 52 intent rows with user words (offline, `homeDir: "/Users/you"`, identity real-path): exactly 1 match, row 45 `./scripts/deploy.sh --staging` (an authored twin, not a seed). 0 of the 17 seeds match; the dominant reason is "segment not extracted or inert" on `cd <dir> &&` prefixes, `| tail` pipes, `curl`, `security`, `ssh`.
+- `literalMatch` over the 52 intent rows with user words (offline, `homeDir: "/Users/you"`, identity real-path): exactly 1 match, row 45 `./scripts/deploy.sh --staging` (an authored twin, not a seed). 0 of the 15 seeds match; the dominant reason is "segment not extracted or inert" on `cd <dir> &&` prefixes, `| tail` pipes, `curl`, `security`, `ssh`.
 - `tests/fixtures.ts` `makeCtx` defaults to `hasUI: false`, so most existing end-to-end tests run as sessions with no UI.
 - The host sets `hasUI = isInteractive || mode === "rpc-ui"` (`node_modules/@oh-my-pi/pi-coding-agent/src/main.ts`, `sessionOptions.hasUI`). Plain `rpc` and `acp` sessions are therefore no-UI sessions too.
 
@@ -2366,7 +2368,7 @@ Expected: PASS.
 
 Branch 4 is the only new allow the flip brings, so it is measured before it is trusted.
 
-1. Run `bun eval/literal-match-probe.ts`. Expected today: `intent seeds: 0/17 matched`, top reason `segment not extracted or inert`. The judged-states section has rows only if Sam has run `/classifier logJudgedStates true` in interactive sessions.
+1. Run `bun eval/literal-match-probe.ts`. Expected today: `intent seeds: 0/15 matched`, top reason `segment not extracted or inert`. The judged-states section has rows only if Sam has run `/classifier logJudgedStates true` in interactive sessions.
 2. If the judged-states section is empty: ask Sam to enable `logJudgedStates` for at least 3 days of interactive use, then rerun. This is a wait on Sam, not a code task.
 3. For each `MATCH` from a judged state: add it to `eval/corpus/intent.jsonl` as `{"command": …, "label": "allow", "family": "intent-mined", "cwd": …, "hasUI": true, "evidence": {"userMessages": […]}, "note": "mined from judged-states <date>"}`, with paths rewritten under `/Users/you/…` and hosts anonymized (the repo is public). Then run `bun eval/run.ts --corpus intent --battery jev-v3.1 --only=intent-mined` (needs a credential).
 4. **STOP** if no seed and no judged state matches, or if no `intent-mined` row shows branch 4 in the `branch 4` list. Do not implement Steps 6 to 16. Report to Sam: the probe output (match counts and reason tally), the observation that `cd <dir> &&` prefixes and `| tail` pipes keep mined commands from matching, and that widening literalMatch's inert set is a separate, reviewed change.
@@ -3061,7 +3063,7 @@ Run from the repo root, in order. Every command must show the stated shape. Past
 5. (Credential) the same two with `--battery jev-v3.1`: an extra block `=== jev-v3 order over N sample(s) ===` with `branches 1:… 3:… 5:… 7:…`, `v3 order  false ask a  false allow b`, `legacy    false ask c  false allow d`, and either `branch 4: none` or a named list.
 6. `bun eval/run.ts --replay --corpus intent --battery jev-v3.1 --compare <report from 4, intent>`: `mode=replay`, no `NO ANSWERS` line, a `=== vs … ===` block and a `VERDICT:` line. For Task E: `false allow 0` in the v3 block, no `DISQUALIFIED`, `VERDICT` is not `DO NOT ADOPT`, and an `intent-mined` row in the branch-4 list. Repeat for `--corpus gitflow`.
 7. (Credential, Task D) `bun eval/headless-brief-probe.ts --samples 5`: two battery tables with `answered 15` per arm and a `selection (jev-v3.1): …` line matching what Task D implemented.
-8. `bun eval/literal-match-probe.ts`: `intent seeds: x/17 matched` and the judged-states section; for Task E at least one MATCH that became an `intent-mined` row.
+8. `bun eval/literal-match-probe.ts`: `intent seeds: x/15 matched` and the judged-states section; for Task E at least one MATCH that became an `intent-mined` row.
 9. `git log --format=%B -n 5`: no `Co-Authored-By` or other attribution lines.
 
 If a credential-dependent command could not run in this environment, the PR says which ones and that the gates they carry are unproven. Task E does not merge on unproven gates.

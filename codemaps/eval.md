@@ -7,6 +7,8 @@
 | Script | Lines | Does | Production code it calls |
 |---|---|---|---|
 | run.ts | 1735 | scores a policy against labeled corpora; sweeps threshold grids; `--replay` re-scores from the answer cache | jev `buildJevState`, `jevQuestionsHash`, `deriveJevDecision`; jev-judge `judgeBattery`; index `replayDecision`, `matchModerateRiskTokens`, `evalRiskFlags`; host `CRITICAL_BASH_PATTERNS`, `TypeSafeJudge`, `discoverAuthStorage` |
+| headless-brief-probe.ts | 195 | spec step 1 probe: three arms (brief as user words / omitted / operator context) over jev-v3.1 and v2.11; `chooseHeadlessArm` picks a/b/unconfirmed; `--replay` reads the cache only | jev `buildJevState`; jev-judge `judgeBattery`; redact |
+| literal-match-probe.ts | 83 | `literalMatchTally`: how many mined intent seeds and judged states reach `literalMatch` (branch 4) and why not | literal-match |
 | live-report.ts | 238 | jev-v3 shadow against live v2 disagreements, read from decisions.jsonl; exits 1 when the report is incomplete | index `decisionsLogPath`, `DecisionRecord` |
 | recognizer-measure.ts | 486 | measures `recognizeRoutineCommand` clear share against the history corpus (the 30% gate) | recognizer, shell-ast, redact, live-report `readDecisionLog` |
 | mine-history.ts | 376 | rebuilds corpus candidates from session logs or `--source decisions` | jev `DEFAULT_JEV_POLICY`, `JEV_HAZARDS` |
@@ -15,7 +17,7 @@
 `run.ts` flags: `--replay --policy <json> --battery <version> --model --corpus --compare <report>
 --only <substr> --concurrency --limit --samples --timeout`. Cache: `eval/.cache/`. Reports:
 `eval/reports/<hash>-....json` (40 files at generation). Exports used by tests: `parseArgs`,
-`parseJsonl`, `validateCase`, `computeIntentMetrics`, `compareAgainstPrior`, `asPriorOutcomes`.
+`parseJsonl`, `validateCase`, `computeIntentMetrics`, `compareAgainstPrior`, `asPriorOutcomes`. v3 scoring: `v3InputsFor`, `computeV3Summary` (V3Inputs/V3ScoredRow). Env: `OMP_EVAL_CACHE_DIR` (default `eval/.cache`), `OMP_EVAL_REPORT_DIR` (default `eval/reports`). A corpus row with `evidence.userMessages` needs `hasUI: true` (`validateCase`).
 
 Error kinds: **false ask** (labeled `allow`, the gate would prompt) and **false allow** (labeled
 `ask`, the gate would run silently). A false allow on a `severity: irreversible` case fails the

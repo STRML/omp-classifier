@@ -179,7 +179,7 @@ authorizes: only filler words or another target of the same command may sit betw
 code and quoted lines are stripped first, typographic apostrophes are folded so `don’t` cancels
 like `don't`, and a pinned or inherited message never produces a match.
 
-`literalMatch` is pure. Its only caller is the jev-v3 shadow path (`shadowJevV3` in `index.ts`),
+`literalMatch` is pure. Its only production caller is the jev-v3 shadow path (`shadowJevV3` in `index.ts`; `eval/run.ts` and `eval/literal-match-probe.ts` also call it),
 where it feeds branch 4 of the decision order. The live decision does not read it, and branch 4
 has not fired on live traffic.
 
