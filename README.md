@@ -88,6 +88,7 @@ Plugin settings live in `omp-classifier.json` at the config root the host resolv
 | `trustPolicy` | `null` | Set only by `/classifier trust-policy`. A current pin lets the judge see explicitly trusted user-level instructions as bounded action-class policy; changed files disable it until the pinned bytes are restored or repinned. |
 | `persistentGrants` | `true` | Offers **Always allow** on bash dialogs (30-day exact-command grants in `omp-classifier-grants.json`). Kill-switch: `false` stops offering them and stops honoring live ones; the stored file stays on disk. |
 | `shadowV3` | `true` | Runs the jev-v3 judgment in shadow beside the live one and logs it on the same decision line as `v3`. It decides nothing, and it costs two more Jev requests per fresh classification. `bun eval/live-report.ts` shows where the two disagree. |
+| `logJudgedStates` | `false` | Writes each fresh classification's judged state, every string redacted, to `judged-states.jsonl` beside `decisions.jsonl`, keyed by the verdict line's `decisionId`, so a probe can replay it. Changes no verdict and flushes no cache. |
 
 Changing any key flushes the verdict cache and the session grants. To silence the judge quickly, `/classifier enabled false` takes effect on the very next command. `omp plugin disable` needs a session restart, since interceptors bind when a session begins.
 

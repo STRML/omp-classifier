@@ -2,6 +2,13 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-10-01
+
+### Joinable asks and replayable states (spec step 0)
+
+- A dialog, headless or late-verdict line carries `followsDecisionId`, the `decisionId` of the line that led to it.
+- `/classifier logJudgedStates true` writes each fresh classification's redacted judged state to `judged-states.jsonl`.
+
 ## 2026-09-28
 
 ### Explicitly pinned standing policy (#72)
