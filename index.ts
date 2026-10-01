@@ -82,7 +82,7 @@
  * judge said SAFE.
  */
 import * as fs from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -5735,7 +5735,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const record: DecisionRecord = {
 				ts: new Date().toISOString(),
-				decisionId: line.decisionId ?? crypto.randomUUID(),
+				decisionId: line.decisionId ?? randomUUID(),
 				policyVersion: CLASSIFIER_POLICY_VERSION,
 				policyHash: CLASSIFIER_POLICY_HASH,
 				...line,
@@ -6209,7 +6209,7 @@ export default function (pi: ExtensionAPI) {
 		// One id per tool call for the line that can lead into a permission
 		// request, and the pointer every line that request writes carries back to
 		// it (spec step 0b). The judged state is written under the same id.
-		const leadDecisionId = crypto.randomUUID();
+		const leadDecisionId = randomUUID();
 		const lead = { decisionId: leadDecisionId };
 		const follows = { followsDecisionId: leadDecisionId };
 		const isBash = event.toolName === "bash";
