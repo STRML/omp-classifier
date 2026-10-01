@@ -624,6 +624,16 @@ export async function loadPlugin(settings: Record<string, unknown>): Promise<voi
 	jevRawQueue.length = 0;
 	jevAnsweringApi = TYPESAFE_PROVIDER;
 	restoreJevApiKey();
+	// The jev-v3 shadow adds two judge requests and several shell parses to
+	// every classification. The suite runs thousands of them in one process,
+	// and on a Linux runner that held the event loop for seconds: refusal
+	// memory > store caps at 20 took 19 to 32 s against its 5 s limit, with
+	// the shadow on and 0.2 s with it off (bisected in a bun 1.3.14
+	// container; no single function was slow). Tests that are not about the
+	// shadow start without it, and a file that is calls enableShadow() after
+	// this. A config the test already wrote is left as it is.
+	const configTarget = process.env.OMP_JEV_CONFIG ?? useTempConfigFile();
+	if (!fs.existsSync(configTarget)) writeConfigFile({ shadowV3: false }, configTarget);
 	const mod = await import("../index.ts");
 	mod.default({
 		pi: { settings },
@@ -877,8 +887,9 @@ export function useTempConfigFile(): string {
 
 let lastConfigMtimeMs = 0;
 
-export function writeConfigFile(raw: Record<string, unknown>): void {
-	const target = useTempConfigFile();
+/** Write the plugin's config file: the suite's shared temp path by default, or
+ *  the one a test file pointed OMP_JEV_CONFIG at (which must not be reset). */
+export function writeConfigFile(raw: Record<string, unknown>, target: string = useTempConfigFile()): void {
 	fs.writeFileSync(target, JSON.stringify(raw));
 	// The plugin's config cache is keyed on mtimeMs; coarse-granularity
 	// filesystems (the codebase flags 1-2s on NFS) can stamp two rapid writes
@@ -887,6 +898,14 @@ export function writeConfigFile(raw: Record<string, unknown>): void {
 	const mtimeMs = Math.max(Date.now(), lastConfigMtimeMs + 1);
 	fs.utimesSync(target, mtimeMs / 1000, mtimeMs / 1000);
 	lastConfigMtimeMs = mtimeMs;
+}
+
+/** Turn the jev-v3 shadow on for a test file that exercises it, keeping any
+ *  other config the file already wrote. Call it after loadPlugin(). */
+export function enableShadow(): void {
+	const target = process.env.OMP_JEV_CONFIG ?? useTempConfigFile();
+	const current = fs.existsSync(target) ? (JSON.parse(fs.readFileSync(target, "utf8")) as Record<string, unknown>) : {};
+	writeConfigFile({ ...current, shadowV3: true }, target);
 }
 
 export function removeConfigFile(): void {

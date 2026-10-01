@@ -9,6 +9,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { DecisionRecord } from "../index";
 import {
+	enableShadow,
 	evidenceOf,
 	fire,
 	jevSafeAnswer,
@@ -42,6 +43,7 @@ beforeEach(async () => {
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-headless-"));
 	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));
+	enableShadow();
 	setJevAnswer(jevSafeAnswer());
 });
 
