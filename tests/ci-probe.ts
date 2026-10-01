@@ -14,6 +14,8 @@ const testName = (): string => {
 		return "?";
 	}
 };
+type Call = { label: string; start: number; dur: number };
+const calls: Call[] = [];
 const log = (line: string): void => {
 	process.stderr.write(`CIPROBE ${line}\n`);
 };
@@ -28,6 +30,8 @@ function wrap<T extends object>(target: T, name: keyof T & string, label: string
 			return original.apply(this, args);
 		} finally {
 			const took = realNow() - started;
+			calls.push({ label, start: started, dur: took });
+			if (calls.length > 4000) calls.splice(0, 2000);
 			if (took >= thresholdMs) log(`SLOW ${label} ${Math.round(took)}ms test=${testName()} args=${JSON.stringify(args[0]).slice(0, 160)}`);
 		}
 	};
@@ -57,6 +61,14 @@ realSetInterval(() => {
 	const res = process.resourceUsage();
 	if (gap > 1000) {
 		log(`LOOP-GAP ${Math.round(gap)}ms userCpu=${Math.round(cpu.user / 1000)}ms sysCpu=${Math.round(cpu.system / 1000)}ms majorFaults+${res.majorPageFault - lastRes.majorPageFault} minorFaults+${res.minorPageFault - lastRes.minorPageFault} voluntaryCtx+${res.voluntaryContextSwitches - lastRes.voluntaryContextSwitches} rssMB=${Math.round(process.memoryUsage().rss / 1e6)} heapUsedMB=${Math.round(process.memoryUsage().heapUsed / 1e6)} test=${running}`);
+	}
+	if (gap > 1000) {
+		const inGap = calls.filter(c => c.start >= now - gap - 50);
+		const total = inGap.reduce((sum, c) => sum + c.dur, 0);
+		const byLabel: Record<string, { n: number; ms: number }> = {};
+		for (const c of inGap) { const e = (byLabel[c.label] ??= { n: 0, ms: 0 }); e.n += 1; e.ms += c.dur; }
+		const top = Object.entries(byLabel).sort((a, b) => b[1].ms - a[1].ms).slice(0, 4).map(([k, v]) => `${k}:${v.n}x=${Math.round(v.ms)}ms`).join(' ');
+		log(`GAP-EXPLAINED gap=${Math.round(gap)}ms wrappedCalls=${inGap.length} wrappedTotal=${Math.round(total)}ms unexplained=${Math.round(gap - total)}ms top=[${top}]`);
 	}
 	lastCpu = process.cpuUsage();
 	lastRes = res;
