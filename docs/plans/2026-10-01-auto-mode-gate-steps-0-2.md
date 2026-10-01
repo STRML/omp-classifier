@@ -10,6 +10,8 @@
 
 **Spec:** `docs/plans/2026-10-01-auto-mode-gate.md` (draft 2, approved). Read it beside this plan. Background: `docs/plans/2026-09-19-intent-aware-judgment.md`.
 
+**Status of Task C:** built, adversarially reviewed and REVERTED (net zero on the branch). Its safe-subset text below is kept for the record and is not to be re-implemented as written; the spec's findings section says why and what a retry needs (an allowlist).
+
 **Scope:** spec steps 0, 1 and 2 only. Steps 3 (reviewer), 4 (ledger, deny payload, dialog and grant deletions) and 5 (subagent inheritance) are separate plans, written after step 2's gates have produced data. Nothing here deletes a dialog: branch 5 stays a dialog, and every non-SAFE verdict still reaches `requestPermission`.
 
 ## Global Constraints

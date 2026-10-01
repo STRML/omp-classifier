@@ -139,8 +139,9 @@ command ─▶ floor ───────────────────�
    restriction from any channel applies. Review workers have no parent, so this does not help them;
    section 2 does.
 9. **Eval spawn-cwd.** The largest dialog source today. An unreadable `cwd` denies with the lawful
-   next move (pass a literal directory). Step 1 sorts the 31 cases by shape and extends the scan to
-   the common ones first.
+   next move (pass a literal directory). A first attempt to read a bare name bound once to a literal
+   was built, adversarially reviewed and reverted (see the findings below), so this stays a deny until
+   an allowlist design replaces it.
 10. **Deleted.** Dialogs, Allow once, session grants, Always allow, human refusals and their lift
     path, persistent grants (the file, the `persistentGrants` key and its `/classifier` command),
     dry-run's "would prompt", the headless "rerun interactively" guidance, the late-verdict mechanism
@@ -183,7 +184,7 @@ Each step is shippable alone. Each gate is a number a command prints.
 | Step | Work | Gate |
 |---|---|---|
 | 0 | Plumbing. Add v3 (`deriveDecisionOrder`, `literalMatch`) to `eval/run.ts`, which today scores only `deriveJevDecision` plus `replayDecision`. Log a redacted state (or a hash plus the evidence ids) behind a flag so a probe can replay. Log, per ask, what a human did next. | `bun eval/run.ts` reports v3 branches on the held-out corpus |
-| 1 | Headless prompts as `agent` channel evidence, plus the injection probe on logged review briefs. Sort the 31 spawn-cwd cases and extend the scan. | Injection-only asks fall below 10% of today's count on replay. 0 new false allows on the adversarial corpus |
+| 1 | Headless prompts as `agent` channel evidence, plus the injection probe on logged review briefs. The 31 spawn-cwd cases stay a deny: the name-binding scan was reverted (see findings). | Injection-only asks fall below 10% of today's count on replay. 0 new false allows on the adversarial corpus |
 | 2 | Flip jev-v3 live. Branches 3 and 4 allow. | `eval/run.ts` shows 0 false allows and REGRESSIONS none, with at least one branch-4 hit on a mined case. If none exists the step STOPs and reports, because the flip buys nothing without branch 4 |
 | 3 | Reviewer: build both arms, measure. | Any unauthorized allow over 3 samples disqualifies an arm. Report the false-allow upper bound at the held-out size (about 23 rows) |
 | 4 | Ledger, deny payload, deletions in section 10. Floor precision gate lands first. | Failure matrix rows all pass. A one-week shadow of "would-deny vs human-allowed" and "would-allow vs human-denied" on live traffic, and chat asks counted as interruptions |
@@ -203,6 +204,20 @@ into a deny.
   mostly because a `cd <dir> &&` prefix or a `| tail` pipe makes a segment non-inert. Widening the
   matcher for those shapes is its own piece of work and needs mined interactive states, which come
   from `logJudgedStates` data on the owner's sessions. I reproduced the 1-of-52 figure.
+- **Spawn-cwd name binding was built and reverted (step 1).** The plan's "name bound once to a
+  literal, in straight-line code" scan resolved a name to a directory the child did not run in. An
+  adversarial reviewer confirmed it in real node, python3 and ruby: 16 payloads against the first
+  build and 23 more against the hardened one, all from two root causes. One lexer served three
+  languages, so a construct one language reads as code another reads as a string or comment (regex
+  literals, `%`-literals, interpolation, character literals, floor division, private fields), and a
+  denylist of scope-escape spellings, which line continuations, aliasing, string-built names and
+  Unicode-equivalent identifiers all walk around. Each fix closed the spelling and left its siblings.
+  The reviewer's recommendation, and ours: any retry is an ALLOWLIST. Refuse unless every character
+  of the payload falls in a tokenized subset that all three lexers agree on, with calls and subscripts
+  restricted to a short allowed callee list, and no dotted escape exemption anywhere. Until then the
+  31 `cwd`-layer dialogs stay. The abandoned patch with the two linear-time regex fixes is kept in the
+  implementation ledger. A background security scan flagged the same classes (parser differential,
+  denylist bypass) on both commits, which the reviews then confirmed.
 - "Held-out" means the `heldOut` rows of `eval/corpus/intent.jsonl`, not `--corpus heldout` (500
   generated benign rows).
 - Step 2 changes a default: branch 1 turns injection scores from 0.55 to 0.9 from UNSURE into UNSAFE
