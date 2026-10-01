@@ -22,7 +22,7 @@ function wrap<T extends object>(target: T, name: keyof T & string, label: string
 	const original = target[name] as unknown as (...args: unknown[]) => unknown;
 	if (typeof original !== "function") return;
 	try {
-	(target as Record<string, unknown>)[name] = function (this: unknown, ...args: unknown[]) {
+	const wrapped = function (this: unknown, ...args: unknown[]) {
 		const started = realNow();
 		try {
 			return original.apply(this, args);
@@ -31,6 +31,8 @@ function wrap<T extends object>(target: T, name: keyof T & string, label: string
 			if (took >= thresholdMs) log(`SLOW ${label} ${Math.round(took)}ms test=${testName()} args=${JSON.stringify(args[0]).slice(0, 160)}`);
 		}
 	};
+	Object.assign(wrapped, original);
+	(target as Record<string, unknown>)[name] = wrapped;
 	} catch (error) {
 		log(`wrap failed for ${label}: ${String(error)}`);
 	}
@@ -43,13 +45,21 @@ for (const name of ["readFileSync", "realpathSync", "readdirSync", "statSync", "
 }
 
 let last = realNow();
+let lastCpu = process.cpuUsage();
+let lastRes = process.resourceUsage();
 let startedAt = 0;
 let running = "";
 realSetInterval(() => {
 	const now = realNow();
 	const gap = now - last;
 	last = now;
-	if (gap > 1000) log(`LOOP-GAP ${Math.round(gap)}ms test=${running || testName()}`);
+	const cpu = process.cpuUsage(lastCpu);
+	const res = process.resourceUsage();
+	if (gap > 1000) {
+		log(`LOOP-GAP ${Math.round(gap)}ms userCpu=${Math.round(cpu.user / 1000)}ms sysCpu=${Math.round(cpu.system / 1000)}ms majorFaults+${res.majorPageFault - lastRes.majorPageFault} minorFaults+${res.minorPageFault - lastRes.minorPageFault} voluntaryCtx+${res.voluntaryContextSwitches - lastRes.voluntaryContextSwitches} rssMB=${Math.round(process.memoryUsage().rss / 1e6)} heapUsedMB=${Math.round(process.memoryUsage().heapUsed / 1e6)} test=${running}`);
+	}
+	lastCpu = process.cpuUsage();
+	lastRes = res;
 	if (running !== "" && now - startedAt > 4000 && Math.round((now - startedAt) / 1000) % 5 === 0) {
 		log(`STILL-RUNNING ${Math.round((now - startedAt) / 1000)}s test=${running} loopAlive=true`);
 	}
