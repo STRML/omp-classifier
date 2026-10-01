@@ -18,4 +18,6 @@ jobs:
       - name: Typecheck against published packages
         run: bun run typecheck
       - name: Unit tests (mocked model boundary)
+        env:
+          BUN_JSC_useFTLJIT: "0"
         run: bun test
