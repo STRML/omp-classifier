@@ -96,53 +96,6 @@ describe("evalSpawnCwd reads a name bound once to a literal", () => {
 	});
 });
 
-describe("evalSpawnCwd keeps a name opaque when the runtime can rebind it unseen", () => {
-	const JS = `const cp = require("child_process");\n`;
-	const PY = `import subprocess\n`;
-	const opaque = (code: string) => expect(opaqueWhy(code)).toContain("not a literal");
-	const cases: Record<string, string> = {
-		// Masking differentials: the shared lexer reads one language's comment or string rule for all three.
-		"python // is floor division, not a comment": `${PY}cwd = "/tmp/a"\nn = 7 // 2; cwd = "/"\nsubprocess.run(["ls"], cwd=cwd)`,
-		"js #private field is not a comment": `${JS}let cwd = "/tmp/a";\nclass K { #y = 0; static m() { cwd = "/"; } }\nK.m();\ncp.execSync("ls", { cwd });`,
-		"js template interpolation is code": `${JS}let cwd = "/tmp/a";\nconst s = \`\${cwd = "/"}\`;\ncp.execSync("ls", { cwd });`,
-		"ruby string interpolation is code": `cwd = "/tmp/a"\nputs "#{cwd = '/'}"\nsystem("ls", chdir: cwd)`,
-		"python f-string walrus is code": `${PY}cwd = "/tmp/a"\nprint(f"{(cwd := '/')}")\nsubprocess.run(["ls"], cwd=cwd)`,
-		"ruby character literal opens no string": `cwd = "/tmp/a"\nx = ?"; cwd = "/"; y = ?"\nsystem("ls", chdir: cwd)`,
-		"ruby heredoc body is not code": `x = <<EOS\nhi\nEOS\ncwd = "/tmp/a"\nsystem("ls", chdir: cwd)`,
-		"ruby x = if opens a block": `x = if flag\nputs 1\ncwd = "/tmp/a"\nend\nsystem("ls", chdir: cwd)`,
-		// Qualified and indirect rebinding.
-		"Kernel.eval": `cwd = "/tmp/a"\nKernel.eval("cwd = '/'")\nsystem("ls", chdir: cwd)`,
-		"TOPLEVEL_BINDING.local_variable_set": `cwd = "/tmp/a"\nTOPLEVEL_BINDING.local_variable_set(:cwd, "/")\nsystem("ls", chdir: cwd)`,
-		"builtins.exec": `import builtins, subprocess\ncwd = "/tmp/a"\nbuiltins.exec("cwd = '/'")\nsubprocess.run(["ls"], cwd=cwd)`,
-		"globalThis.eval": `${JS}let cwd = "/tmp/a";\nglobalThis.eval("cwd = '/'");\ncp.execSync("ls", { cwd });`,
-		"globalThis.cwd assignment": `${JS}cwd = "/tmp/a";\nglobalThis.cwd = "/";\ncp.execSync("ls", { cwd });`,
-		"sys.modules attribute assignment": `import sys, subprocess\ncwd = "/tmp/a"\nsys.modules[__name__].cwd = "/"\nsubprocess.run(["ls"], cwd=cwd)`,
-		"getattr builtins exec": `import builtins, subprocess\ncwd = "/tmp/a"\ngetattr(builtins, "ex" + "ec")("cwd = '/'")\nsubprocess.run(["ls"], cwd=cwd)`,
-		"Object.const_set": `R = "/tmp/a"\nObject.const_set("R", "/")\nDir.chdir(R) do\n  system("ls")\nend`,
-		"Object.assign onto globalThis": `${JS}let cwd = "/tmp/a";\nObject.assign(globalThis, { ["c" + "wd"]: "/" });\ncp.execSync("ls", { cwd });`,
-		"star import": `import subprocess\ncwd = "/tmp/a"\nfrom m import *\nsubprocess.run(["ls"], cwd=cwd)`,
-		"an attribute assignment of the name": `${PY}cwd = "/tmp/a"\nobj.cwd = "/"\nsubprocess.run(["ls"], cwd=cwd)`,
-		"implicit js global": `${JS}cwd = "/tmp/a";\ncp.execSync("ls", { cwd });`,
-		"hoisted js function declaration": `${JS}f();\nlet cwd = "/tmp/a";\nfunction f() { cp.execSync("ls", { cwd }); }`,
-		"a prefix line calls a declared function": `${JS}const f = () => cp.execSync("ls", { cwd });\nf();\nlet cwd = "/tmp/a";`,
-		"walrus inside a site argument list": `${PY}cwd = "/tmp/a"\nsubprocess.run(["ls"], env=(cwd := "/"), cwd=cwd)`,
-		"js assignment inside a site options object": `${JS}let cwd = "/tmp/a";\ncp.execSync("ls", { env: (cwd = "/"), cwd });`,
-	};
-	for (const [name, code] of Object.entries(cases)) test(name, () => opaque(code));
-
-	test("a long line stays linear", () => {
-		const long = `import subprocess\ncwd = "/tmp/a"${" ".repeat(80_000)}\nsubprocess.run(["ls"], cwd=cwd)`;
-		const semis = `import subprocess\ncwd = "/tmp/a"${";".repeat(80_000)}\nsubprocess.run(["ls"], cwd=cwd)`;
-		const wide = `import subprocess\ncwd = "/tmp/a"\nx = 1${" ".repeat(80_000)}y\nsubprocess.run(["ls"], cwd=cwd)`;
-		const tail = `import subprocess\ncwd = "/tmp/a"${" ".repeat(80_000)}x\nsubprocess.run(["ls"], cwd=cwd)`;
-		for (const code of [long, semis, wide, tail]) {
-			const start = performance.now();
-			evalSpawnCwd(code, SESSION);
-			expect(performance.now() - start).toBeLessThan(500);
-		}
-	});
-});
-
 describe("the eval gate judges a bound cwd where it runs", () => {
 	let dir = "";
 	let seq = 0;

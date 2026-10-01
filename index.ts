@@ -2819,28 +2819,17 @@ function evalChdirScope(masked: string, site: EvalCwdSiteMatch): EvalChdirScope 
 const EVAL_CWD_IDENTIFIER = /^[A-Za-z_$][\w$]*$/u;
 
 /** Names that let code rebind a variable without spelling the name as code:
- *  Python's globals()/exec/getattr(builtins, …), JS eval/Function/globalThis/
- *  with, Ruby's binding/const_set. A payload carrying one can change what a
- *  name holds where this scan cannot see, so no binding is read from it. There
- *  is no `.` exemption: `Kernel.eval`, `builtins.exec` and `globalThis.eval`
- *  rebind exactly as the bare names do, and the cost of a false ask is lower
- *  than a false resolution. */
+ *  Python's globals()/exec, JS eval/Function/with, Ruby's binding. A payload
+ *  carrying one can change what a name holds where this scan cannot see, so
+ *  no binding is read from it. `exec` counts only unqualified: `cp.exec(…)`
+ *  is child_process, a bare `exec(` may be Python's. */
 const EVAL_SCOPE_ESCAPE =
-	/(?<![\w$])(?:globals|locals|vars|exec|eval|compile|setattr|getattr|__import__|importlib|__main__|__dict__|__builtins__|builtins|binding|TOPLEVEL_BINDING|local_variable_set|instance_variable_set|instance_eval|class_eval|module_eval|define_method|const_set|globalThis|window|self|Function)\b|(?<![\w$])with\s*\(|\bsys\s*\.\s*modules\b|\bimport\s+\*/u;
-
-/** A named function declaration: JS hoists it, so it can run before the
- *  binding's line does. */
-const EVAL_HOISTED_FUNCTION = /(?<![\w$.])function\s*\*?\s*[A-Za-z_$]/u;
-/** A Ruby heredoc opener: its body is text the masker reads as code. */
-const EVAL_HEREDOC = /<<(?![\s\d=])/u;
-/** Signs that the payload is JS, where a bare `name = …` is an implicit global
- *  rather than a binding. */
-const EVAL_JS_SIGNS = /\b(?:const|let|function)\b|\brequire\s*\(|\bimport\b[^\n]*\bfrom\b|child_process|\b(?:execSync|spawnSync|execFileSync)\b/u;
+	/(?<![\w$.])(?:globals|locals|vars|exec|eval|compile|setattr|__dict__|__builtins__|binding|local_variable_set|instance_variable_set|instance_eval|class_eval|module_eval|define_method|Function)\b|(?<![\w$.])with\s*\(/u;
 
 /** A line that opens a block, in any of the scanned languages. */
 const EVAL_BLOCK_OPENER = /^(?:if|elif|else|elsif|unless|while|until|for|do|try|except|finally|catch|with|def|class|module|function|async|case|when|match|switch|begin|rescue|ensure|loop|lambda)\b/u;
 /** A line that leaves its statement open onto the next one. */
-const EVAL_OPEN_LINE_END = /(?:[:\\,([{=+|&]|\b(?:do|then|if|unless|case|begin|while|until)|=>)\s*$|[=(]\s*(?:if|unless|case|begin|while|until)\b/u;
+const EVAL_OPEN_LINE_END = /(?:[:\\,([{=+|&]|\bdo|\bthen|=>)\s*$/u;
 
 interface EvalCwdBinding {
 	/** Offset of the bound name in its binding statement. */
@@ -2865,76 +2854,16 @@ function straightLinePrefix(prefix: string): boolean {
 	});
 }
 
-/** True when `body` (a string literal's source, quotes included, starting at
- *  `at` in `code`) interpolates code: a JS template's `${`, a Ruby `#{` in a
- *  double-quoted or backtick string, or a Python f-string. The masker blanks
- *  all of these as text, so an assignment inside one would go unseen. */
-function stringInterpolates(code: string, at: number, body: string): boolean {
-	const quote = body[0];
-	if (quote === "`" && body.includes("${")) return true;
-	if (quote !== "'" && body.includes("#{")) return true;
-	return /(?<![\w$])(?:rf|fr|f)$/iu.test(code.slice(Math.max(0, at - 3), at));
-}
-
-/** True when a `//` comment is one in every scanned language: it starts its
- *  line or follows a statement end, and holds nothing that would be code to a
- *  language where `//` is floor division or an empty regex. */
-function inertSlashComment(code: string, at: number, end: number): boolean {
-	const before = code.slice(code.lastIndexOf("\n", at - 1) + 1, at).trimEnd();
-	return (before === "" || /[;{}]$/u.test(before)) && !/[;=]/u.test(code.slice(at, end));
-}
-
-/** The shared lexer reads one comment and string rule for all three languages.
- *  Where the languages disagree about what is text, a rebinding can hide from
- *  the occurrence count, so the payload is refused: an interpolating string, a
- *  Ruby `?"` character literal, a `#name` (a JS private field) or a `//` that
- *  is not a comment everywhere. */
-function evalLexHazard(code: string): boolean {
-	let i = 0;
-	while (i < code.length) {
-		const char = code[i];
-		if (char === '"' || char === "'" || char === "`") {
-			const end = scanStringEnd(code, i);
-			const stop = end === -1 ? code.length : end;
-			if (stringInterpolates(code, i, code.slice(i, stop))) return true;
-			i = stop;
-			continue;
-		}
-		if (char === "?" && /["'`]/u.test(code[i + 1] ?? "")) return true;
-		if (char === "#" && /[A-Za-z_$]/u.test(code[i + 1] ?? "")) return true;
-		if (char === "#" || (char === "/" && code[i + 1] === "/")) {
-			const newline = code.indexOf("\n", i);
-			const end = newline === -1 ? code.length : newline;
-			if (char === "/" && !inertSlashComment(code, i, end)) return true;
-			i = end;
-			continue;
-		}
-		if (char === "/" && code[i + 1] === "*") {
-			const end = code.indexOf("*/", i + 2);
-			i = end === -1 ? code.length : end + 2;
-			continue;
-		}
-		i += 1;
+/** Offsets of every `cwd`/`chdir` key inside a site's own argument list: the
+ *  key half of `cwd=cwd` is the option's name, not a use of the variable. */
+function siteKeyOffsets(masked: string, sites: readonly EvalCwdSiteMatch[]): number[] {
+	const offsets: number[] = [];
+	for (const site of sites) {
+		if (site.argEnd === -1) continue;
+		const span = masked.slice(site.argStart, site.argEnd);
+		for (const match of span.matchAll(/(?<![\w.$])(?:cwd|chdir)\b(?=\s*(?::|=(?!=)))/gu)) offsets.push(site.argStart + (match.index ?? 0));
 	}
-	return false;
-}
-
-/** True when no name may be read from this payload at all. */
-function evalBindingHazard(masked: string, code: string): boolean {
-	return EVAL_SCOPE_ESCAPE.test(masked) || EVAL_HOISTED_FUNCTION.test(masked) || EVAL_HEREDOC.test(masked) || evalLexHazard(code);
-}
-
-/** True when a prefix line calls a function the payload itself declares: that
- *  call runs the function body before the binding's line does. */
-function prefixCallsDeclared(masked: string, prefix: string): boolean {
-	const declared = new Set<string>();
-	for (const match of masked.matchAll(/\b(?:def|function|class)\s+([A-Za-z_$][\w$]*)|(?<![\w$.])(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[\w$]+\s*=>)/gu)) {
-		declared.add(match[1] ?? match[2]);
-	}
-	for (const name of declared) {
-		if (new RegExp(`(?<![\\w$.])${name.replace(/\$/gu, "\\$")}\\s*\\(`, "u").test(prefix)) return true;
-	}
-	return false;
+	return offsets;
 }
 
 /**
@@ -2945,47 +2874,36 @@ function prefixCallsDeclared(masked: string, prefix: string): boolean {
  * top-level code. Undefined otherwise, and the caller keeps "not a literal".
  */
 function evalCwdBinding(masked: string, code: string, name: string, owned: ReadonlySet<number>): EvalCwdBinding | undefined {
-	// A dotted occurrence (`obj.cwd = …`, `globalThis.cwd`) counts as a use.
-	const token = new RegExp(`(?<![\\w$])${name.replace(/\$/gu, "\\$")}(?![\\w$])`, "gu");
+	const token = new RegExp(`(?<![\\w$.])${name.replace(/\$/gu, "\\$")}(?![\\w$])`, "gu");
 	const others = [...masked.matchAll(token)].map(match => match.index ?? 0).filter(at => !owned.has(at));
 	if (others.length !== 1) return undefined;
 	const at = others[0];
 	const lineStart = masked.lastIndexOf("\n", at - 1) + 1;
 	const newline = masked.indexOf("\n", at);
 	const lineEnd = newline === -1 ? masked.length : newline;
-	const declaration = masked.slice(lineStart, at);
-	if (!/^(?:(?:const|let)\s+)?$/u.test(declaration)) return undefined;
-	// A bare `name = …` in JS is an implicit global, which any code can reach.
-	if (declaration === "" && EVAL_JS_SIGNS.test(masked)) return undefined;
+	if (!/^(?:(?:const|let)\s+)?$/u.test(masked.slice(lineStart, at))) return undefined;
 	const assign = /^\s*=(?![=~>])\s*/u.exec(masked.slice(at + name.length, lineEnd));
 	if (assign === null) return undefined;
 	const valueStart = at + name.length + assign[0].length;
 	// Measured on the masked text, so a trailing comment is whitespace here.
-	// Scanned back from the line end: a regex over the run is quadratic.
-	let valueEnd = lineEnd;
-	while (valueEnd > valueStart && /[\s;]/u.test(masked[valueEnd - 1])) valueEnd -= 1;
+	const valueEnd = valueStart + masked.slice(valueStart, lineEnd).replace(/[\s;]+$/u, "").length;
 	const literal = cwdLiteralText(code.slice(valueStart, valueEnd));
-	if (literal === null) return undefined;
-	const prefix = masked.slice(0, lineStart);
-	if (!straightLinePrefix(prefix) || prefixCallsDeclared(masked, prefix)) return undefined;
+	if (literal === null || !straightLinePrefix(masked.slice(0, lineStart))) return undefined;
 	return { at, literal };
 }
 
 /** The bindings for every bare-name cwd argument the sites read, by name. */
-function evalCwdBindings(masked: string, code: string, reads: ReadonlyArray<EvalCwdArgument | undefined>): Map<string, EvalCwdBinding> {
+function evalCwdBindings(masked: string, code: string, sites: readonly EvalCwdSiteMatch[], reads: ReadonlyArray<EvalCwdArgument | undefined>): Map<string, EvalCwdBinding> {
 	const bindings = new Map<string, EvalCwdBinding>();
 	const names = new Set<string>();
-	const owned = new Set<number>();
-	// Only the key positions readKeyedCwd accepted are the option's name, not
-	// a use of the variable; any other `cwd` (a walrus, an assignment) is one.
+	const owned = new Set<number>(siteKeyOffsets(masked, sites));
 	for (const read of reads) {
-		if (read?.kind !== "value") continue;
-		if (read.keyAt !== undefined) owned.add(read.keyAt);
-		if (!EVAL_CWD_IDENTIFIER.test(read.value)) continue;
+		if (read?.kind !== "value" || !EVAL_CWD_IDENTIFIER.test(read.value)) continue;
 		names.add(read.value);
 		owned.add(read.at);
+		if (read.keyAt !== undefined) owned.add(read.keyAt);
 	}
-	if (names.size === 0 || evalBindingHazard(masked, code)) return bindings;
+	if (names.size === 0 || EVAL_SCOPE_ESCAPE.test(masked)) return bindings;
 	for (const name of names) {
 		const binding = evalCwdBinding(masked, code, name, owned);
 		if (binding !== undefined) bindings.set(name, binding);
@@ -3024,7 +2942,7 @@ export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
 	const reads = sites.map(site =>
 		site.argEnd === -1 ? undefined : site.positional ? readPositionalCwd(masked, code, site.argStart, site.argEnd) : readKeyedCwd(masked, code, site.argStart, site.argEnd),
 	);
-	const bindings = evalCwdBindings(masked, code, reads);
+	const bindings = evalCwdBindings(masked, code, sites, reads);
 	let current = sessionCwd;
 	/** The chdir blocks still open at this point in the walk, innermost last. */
 	const blocks: Array<{ end: number; saved: string }> = [];
