@@ -296,9 +296,6 @@ describe("refusal memory", () => {
 });
 
 describe("refusal identity at the gate (issue #64)", () => {
-	/** A branch entry collectUserEvidence reads (issue #31): the user's own words. */
-	const userEntry = (content: string) => ({ type: "message", message: { role: "user", attribution: "user", content } });
-
 	test("a refusal of one operation does not refuse the host's other operations", async () => {
 		const sid = nextSession();
 		setJevAnswer(jevUnsafeAnswer());
@@ -358,14 +355,27 @@ describe("refusal identity at the gate (issue #64)", () => {
 		expect(readDecisions().some(line => line.why.includes("prior refusal"))).toBe(true);
 	});
 
+	test("a model refusal expires when the user's words move in a UI session", async () => {
+		const sid = nextSession();
+		const userEntry = (content: string) => ({ type: "message", message: { role: "user", attribution: "user", content } });
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("rm -rf x"), makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_ONCE, branch: [userEntry("wipe the scratch build")] }));
+
+		setJevAnswer(jevSafeAnswer());
+		// Allow once keeps the refusal a model refusal: a denied dialog would
+		// record a human refusal, which stays sticky whatever the user says next.
+		const moved = makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_ONCE, branch: [userEntry("actually stop, keep the build")] });
+		await fire("tool_call", makeEvent("rm -rf x"), moved);
+		expect(priorRefusalOf(1)).toBeUndefined();
+	});
+
 	test("a model refusal still expires when the evidence fingerprint moves", async () => {
 		const sid = nextSession();
 		setJevAnswer(jevUnsafeAnswer());
-		await fire("tool_call", makeEvent("rm -rf x"), makeCtx({ sessionId: sid, branch: [userEntry("wipe the scratch build")] }));
+		await fire("tool_call", makeEvent("rm -rf x", { operatorContext: "wiping the scratch build" }), makeCtx({ sessionId: sid }));
 
 		setJevAnswer(jevSafeAnswer());
-		const moved = makeCtx({ sessionId: sid, branch: [userEntry("actually stop, keep the build")] });
-		await fire("tool_call", makeEvent("rm -rf x"), moved);
+		await fire("tool_call", makeEvent("rm -rf x", { operatorContext: "keeping the build, cleaning logs" }), makeCtx({ sessionId: sid }));
 		expect(priorRefusalOf(1)).toBeUndefined();
 	});
 });

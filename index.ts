@@ -82,7 +82,7 @@
  * judge said SAFE.
  */
 import * as fs from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -288,6 +288,10 @@ const CACHE_CAP = 500;
 /** Per-session refusal memory (issue #30): sessionId -> refusals, oldest first. */
 interface Refusal {
 	normalizedTarget: string;
+	/** The target as text for a log or a dialog: normalized from the REDACTED
+	 *  command, because normalization reorders arguments and would separate a
+	 *  secret from the flag that names it. Never use normalizedTarget as text. */
+	loggableTarget: string;
 	why: string;
 	ts: number;
 	/** Refusals are not interchangeable: a model judgment is revisitable when
@@ -708,6 +712,11 @@ interface ClassifierConfig {
 	 *  persistentGrants, it stays out of classifierConfigSignature: flipping it
 	 *  changes no cached verdict. */
 	shadowV3: boolean;
+	/** Write each fresh classification's judged state, redacted, to
+	 *  judged-states.jsonl (spec step 0b). Off by default. It changes no
+	 *  verdict, so like persistentGrants and shadowV3 it stays out of
+	 *  classifierConfigSignature: turning it on must not flush caches. */
+	logJudgedStates: boolean;
 }
 
 /** Bounds for the `maxCommandLength` config key and the `/classifier` setter. */
@@ -748,7 +757,28 @@ const CLASSIFIER_CONFIG_DEFAULTS: Omit<ClassifierConfig, "typesafeModel"> = {
 	trustPolicy: null,
 	persistentGrants: true,
 	shadowV3: true,
+	logJudgedStates: false,
 };
+
+/** The boolean keys `/classifier <key> true|false` sets, with what each value
+ *  means for the operator. One table, so a new switch is a row, not another
+ *  branch in the command handler. */
+type BooleanConfigKey = "persistentGrants" | "shadowV3" | "logJudgedStates";
+const BOOLEAN_CONFIG_NOTICES: Record<BooleanConfigKey, { on: string; off: string }> = {
+	persistentGrants: {
+		on: "classifier persistentGrants=true. Stored Always-allow grants apply again.",
+		off: "classifier persistentGrants=false. Stored grants are kept on disk but never read; the dialog hides Always allow.",
+	},
+	shadowV3: {
+		on: "classifier shadowV3=true. Each fresh classification also asks the jev-v3 judgment (two more Jev requests) and logs it; it decides nothing.",
+		off: "classifier shadowV3=false. Only the live jev-v2 judgment runs.",
+	},
+	logJudgedStates: {
+		on: "classifier logJudgedStates=true. Each fresh classification writes its redacted judged state to judged-states.jsonl beside decisions.jsonl.",
+		off: "classifier logJudgedStates=false. No judged state is written.",
+	},
+};
+const isBooleanConfigKey = (key: string): key is BooleanConfigKey => Object.hasOwn(BOOLEAN_CONFIG_NOTICES, key);
 
 /** The effective policy: shipped defaults with the operator's overrides applied.
  *  Every decision and the config signature read the policy through this, so a
@@ -803,6 +833,7 @@ function normalizeClassifierConfig(raw: Record<string, unknown>): ClassifierConf
 	config.trustPolicy = normalizeTrustPolicyPin(raw.trustPolicy);
 	if (typeof raw.persistentGrants === "boolean") config.persistentGrants = raw.persistentGrants;
 	if (typeof raw.shadowV3 === "boolean") config.shadowV3 = raw.shadowV3;
+	if (typeof raw.logJudgedStates === "boolean") config.logJudgedStates = raw.logJudgedStates;
 	// `judgeBackend` follows the same rule as every other key: a shape the
 	// loader does not understand (a string, an unknown kind, an endpoint with no
 	// model or a non-URL baseUrl) keeps the default rather than half-applying an
@@ -866,7 +897,7 @@ export function readClassifierConfig(): ClassifierConfig {
 function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig {
 	const before = readClassifierConfig();
 	const raw: Record<string, unknown> = {};
-	for (const key of ["enabled", "judgeBackend", "jevPolicy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "trustPolicy", "persistentGrants", "shadowV3"] as const) {
+	for (const key of ["enabled", "judgeBackend", "jevPolicy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "trustPolicy", "persistentGrants", "shadowV3", "logJudgedStates"] as const) {
 		if (key in patch) raw[key] = patch[key];
 	}
 	const next = normalizeClassifierConfig({ ...before, ...raw });
@@ -900,6 +931,35 @@ export function decisionsLogPath(): string {
 	return path.join(classifierDataDir(), "decisions.jsonl");
 }
 
+/** Where `logJudgedStates` writes: beside decisions.jsonl (spec step 0b). */
+export function judgedStatesPath(): string {
+	return path.join(classifierDataDir(), "judged-states.jsonl");
+}
+
+/** One judged-states.jsonl line: the state a fresh classification sent, keyed
+ *  by the `decisionId` of the verdict line it produced, so a probe can replay
+ *  exactly what was judged. */
+export interface JudgedStateRecord {
+	ts: string;
+	decisionId: string;
+	sessionId?: string;
+	policyVersion: string;
+	policyHash: string;
+	tool: "bash" | "eval";
+	states: { risk: unknown; authorization?: unknown };
+}
+
+/** Every string in a judged state, redacted. The state's evidence tiers
+ *  already are; its `command` and a prior refusal's `target` are not, because
+ *  they are what gets judged. A copy on disk is not judged, so nothing in it
+ *  is exempt. */
+function redactStringLeaves(value: unknown): unknown {
+	if (typeof value === "string") return redactSecrets(value);
+	if (Array.isArray(value)) return value.map(redactStringLeaves);
+	if (typeof value !== "object" || value === null) return value;
+	return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactStringLeaves(item)]));
+}
+
 function statusReportPath(): string {
 	return path.join(classifierDataDir(), "status.json");
 }
@@ -923,6 +983,11 @@ export interface DecisionRecord {
 	ts: string;
 	/** Unique line/action id for joining verdict and interaction entries. */
 	decisionId?: string;
+	/** The `decisionId` of the line that led to this one: set on every dialog,
+	 *  headless and late-verdict line that follows a logged verdict, cwd,
+	 *  critical or environment line of the same tool call (spec step 0). An ask
+	 *  joins to what a human did next by id, not by session, command and time. */
+	followsDecisionId?: string;
 	/** Session that produced the decision, when the host exposed one. */
 	sessionId?: string;
 	/** Policy identity that produced this line; lets status/eval distinguish
@@ -1205,6 +1270,7 @@ export function formatClassifierConfig(config: ClassifierConfig): string {
 		`trustPolicy: ${config.trustPolicy?.sha256 ?? "unpinned"}`,
 		`persistentGrants: ${config.persistentGrants}`,
 		`shadowV3: ${config.shadowV3}`,
+		`logJudgedStates: ${config.logJudgedStates}`,
 		`contract: ${QUESTIONS_CONTRACT}`,
 		`policyHash: ${CLASSIFIER_POLICY_HASH}`,
 		`policy: ${JSON.stringify(policy)}`,
@@ -1239,7 +1305,7 @@ const EVIDENCE_ELISION = "\n…\n";
 /** The path the kernel will open, following symlinks. A path that does not
  *  exist yet resolves its parent and keeps its own name, so a delete target
  *  that is already gone still gets its real parent checked. */
-function realPathOf(candidate: string): string {
+export function realPathOf(candidate: string): string {
 	try {
 		return fs.realpathSync.native(candidate);
 	} catch {
@@ -1260,6 +1326,20 @@ function headAndTail(value: string, max: number): string {
 }
 
 /**
+ * The branch the user-channel collectors may read (spec §2, §7). A session
+ * with no UI has nobody typing into it that the gate can tell apart: every
+ * role-user message there is the prompt whoever launched it wrote — a review
+ * script's brief, a worker's task — and the host stamps those `attribution:
+ * "user"`. Counting one as the user's words let a script authorize its own
+ * commands, and it rode with the injection scores on review workers. Until
+ * the host marks a human-typed prompt, a no-UI session has no user channel.
+ * Tool evidence still reads the whole branch: it never authorizes.
+ */
+function userChannelBranch(ctx: ExtensionContext): ReadonlyArray<EvidenceBranchEntry> {
+	return ctx.hasUI ? (ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>) : [];
+}
+
+/**
  * evidence.userMessages exactly as the state carries them: the newest N
  * user messages (issue #31), absent entirely when the limit is 0 or there is
  * nothing to send. classify builds its state from this, and the tool_call path
@@ -1271,7 +1351,7 @@ function evidenceUserSnapshot(ctx: ExtensionContext): UserEvidenceSnapshot | und
 	if (limit <= 0) return undefined;
 	let snapshot: UserEvidenceSnapshot;
 	try {
-		snapshot = collectTaskEvidence(ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>, limit);
+		snapshot = collectTaskEvidence(userChannelBranch(ctx), limit);
 	} catch {
 		// Isolated contexts may omit branch history. Evidence stays enabled but
 		// empty, so a judge cannot cite a user who was not actually supplied.
@@ -4578,6 +4658,7 @@ function addRefusal(
 		while (list.length >= REFUSAL_CAP) list.shift();
 		list.push({
 			normalizedTarget: target,
+			loggableTarget: refusalKeyForCommand(redactSecrets(command.replace(/\\\r?\n/gu, ""))),
 			why,
 			ts: Date.now(),
 			source: meta.source ?? "model",
@@ -4932,9 +5013,9 @@ export default function (pi: ExtensionAPI) {
 	// prints the effective config and the file path.
 	pi.registerCommand("classifier", {
 		description:
-		"View or set omp-classifier options: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, trust-policy, persistentGrants, shadowV3, reset, status, dry-run, off, on",
+		"View or set omp-classifier options: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, trust-policy, persistentGrants, shadowV3, logJudgedStates, reset, status, dry-run, off, on",
 		getArgumentCompletions: (prefix: string) => {
-			const keywords = ["enabled", "policy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "trust-policy", "persistentGrants", "shadowV3", "reset", "status", "dry-run", "off", "on", "file"] as const;
+			const keywords = ["enabled", "policy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "trust-policy", "persistentGrants", "shadowV3", "logJudgedStates", "reset", "status", "dry-run", "off", "on", "file"] as const;
 			return keywords
 				.filter(keyword => keyword.startsWith(prefix.toLowerCase()))
 				.map(keyword => ({ label: keyword, value: keyword }));
@@ -4998,7 +5079,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (key === "reset") {
-				writeClassifierConfig({ enabled: true, judgeBackend: DEFAULT_JUDGE_BACKEND, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, trustPolicy: null, persistentGrants: true, shadowV3: true });
+				writeClassifierConfig({ enabled: true, judgeBackend: DEFAULT_JUDGE_BACKEND, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, trustPolicy: null, persistentGrants: true, shadowV3: true, logJudgedStates: false });
 				notify(`omp-classifier reset to defaults (${classifierConfigPath()})`);
 				return;
 			}
@@ -5089,34 +5170,18 @@ export default function (pi: ExtensionAPI) {
 				notify(`classifier evidenceUserMessages=${next.evidenceUserMessages}`);
 				return;
 			}
-			if (key === "persistentGrants") {
+			if (isBooleanConfigKey(key)) {
 				if (value !== "true" && value !== "false") {
-					notify("usage: /classifier persistentGrants true|false", "error");
+					notify(`usage: /classifier ${key} true|false`, "error");
 					return;
 				}
-				const next = writeClassifierConfig({ persistentGrants: value === "true" });
-				notify(
-					next.persistentGrants
-						? "classifier persistentGrants=true. Stored Always-allow grants apply again."
-						: "classifier persistentGrants=false. Stored grants are kept on disk but never read; the dialog hides Always allow.",
-				);
-				return;
-			}
-			if (key === "shadowV3") {
-				if (value !== "true" && value !== "false") {
-					notify("usage: /classifier shadowV3 true|false", "error");
-					return;
-				}
-				const next = writeClassifierConfig({ shadowV3: value === "true" });
-				notify(
-					next.shadowV3
-						? "classifier shadowV3=true. Each fresh classification also asks the jev-v3 judgment (two more Jev requests) and logs it; it decides nothing."
-						: "classifier shadowV3=false. Only the live jev-v2 judgment runs.",
-				);
+				const next = writeClassifierConfig({ [key]: value === "true" });
+				const notices = BOOLEAN_CONFIG_NOTICES[key];
+				notify(next[key] ? notices.on : notices.off);
 				return;
 			}
 			notify(
-				`unknown key "${key}". Keys: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, trust-policy, persistentGrants, shadowV3, reset, status, dry-run, off, on, file`,
+				`unknown key "${key}". Keys: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, trust-policy, persistentGrants, shadowV3, logJudgedStates, reset, status, dry-run, off, on, file`,
 				"error",
 			);
 		},
@@ -5186,7 +5251,7 @@ export default function (pi: ExtensionAPI) {
 			const config = readClassifierConfig();
 			let snapshot: UserEvidenceSnapshotV3 = { messages: [], ids: [] };
 			try {
-				snapshot = collectTaskEvidenceV3(ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>, config.evidenceUserMessages);
+				snapshot = collectTaskEvidenceV3(userChannelBranch(ctx), config.evidenceUserMessages);
 			} catch {
 				// No branch in an isolated SDK context: no user evidence, as live.
 			}
@@ -5321,6 +5386,9 @@ export default function (pi: ExtensionAPI) {
 		language: "shell" | "code" = "shell",
 		startCwd: string = cwd,
 		trustedPolicy: readonly TrustedPolicyDocument[] = [],
+		/** The `decisionId` the caller will log this judgment's verdict line
+		 *  under; the judged state is written under the same id. */
+		decisionId?: string,
 	): Promise<Judgement> => {
 		const config = readClassifierConfig();
 		const policy = jevPolicyFor(config);
@@ -5450,9 +5518,7 @@ export default function (pi: ExtensionAPI) {
 				},
 			});
 		};
-		const outcome = await judgeBatteryUnderDeadline({
-			timeoutMs,
-			state: buildJevState({
+		const riskState = buildJevState({
 				command,
 				workingDirectory: cwd,
 				...(userMessages ? { userMessages } : {}),
@@ -5464,7 +5530,11 @@ export default function (pi: ExtensionAPI) {
 				...(refProvenance !== undefined ? { gitRefProvenance: refProvenance } : {}),
 				...(networkProvenance !== undefined ? { networkProvenance } : {}),
 				...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
-			}),
+		});
+		if (config.logJudgedStates && decisionId !== undefined) recordJudgedState(ctx, decisionId, language === "code" ? "eval" : "bash", { risk: riskState });
+		const outcome = await judgeBatteryUnderDeadline({
+			timeoutMs,
+			state: riskState,
 			// The host settings instance, not a plugin-local singleton copy:
 			// the native resolver reads providers.judgmentProvider and the
 			// credential store through it (see the header note on settings).
@@ -5665,10 +5735,13 @@ export default function (pi: ExtensionAPI) {
 			}
 			const record: DecisionRecord = {
 				ts: new Date().toISOString(),
-				decisionId: line.decisionId ?? crypto.randomUUID(),
+				decisionId: line.decisionId ?? randomUUID(),
 				policyVersion: CLASSIFIER_POLICY_VERSION,
 				policyHash: CLASSIFIER_POLICY_HASH,
 				...line,
+				// Free text is redacted here too, so a future string site that
+				// quotes a command or a target cannot put a secret on disk.
+				why: redactSecrets(line.why),
 				// The judged command is never redacted (redact.ts header), but the
 				// copy that lands on disk is: the first 120 flattened characters can
 				// hold a bearer token or a `--password` value. The file is created
@@ -5685,6 +5758,7 @@ export default function (pi: ExtensionAPI) {
 				cmd: truncated(redactSecrets(line.cmd.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120),
 			};
 			fs.appendFileSync(decisionsLogPath(), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+			fs.chmodSync(decisionsLogPath(), 0o600);
 		} catch (err) {
 			if (!auditLogWarned) {
 				auditLogWarned = true;
@@ -5743,6 +5817,40 @@ export default function (pi: ExtensionAPI) {
 		logDecision({ ...line, ...(sessionId ? { sessionId } : {}) });
 	};
 
+	let judgedStateWarned = false;
+	/** Append one judged state (spec step 0b). Fire-and-forget like logDecision:
+	 *  an unwritable file warns once per plugin load and never throws into the
+	 *  gate. */
+	const recordJudgedState = (ctx: ExtensionContext, decisionId: string, tool: "bash" | "eval", states: JudgedStateRecord["states"]): void => {
+		if (dryRun) return;
+		let sessionId: string | undefined;
+		try {
+			sessionId = ctx.sessionManager.getSessionId();
+		} catch {
+			sessionId = undefined;
+		}
+		try {
+			const record: JudgedStateRecord = {
+				ts: new Date().toISOString(),
+				decisionId,
+				...(sessionId ? { sessionId } : {}),
+				policyVersion: CLASSIFIER_POLICY_VERSION,
+				policyHash: CLASSIFIER_POLICY_HASH,
+				tool,
+				states: redactStringLeaves(states) as JudgedStateRecord["states"],
+			};
+			fs.mkdirSync(path.dirname(judgedStatesPath()), { recursive: true });
+			fs.appendFileSync(judgedStatesPath(), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+			// `mode` applies on creation only: tighten a log an older build or the
+			// user made wider.
+			fs.chmodSync(judgedStatesPath(), 0o600);
+		} catch (err) {
+			if (judgedStateWarned) return;
+			judgedStateWarned = true;
+			pi.logger.warn(`classifier: judged-state log unwritable (${err instanceof Error ? err.message : String(err)}); state logging is off`);
+		}
+	};
+
 	/**
 	 * Raise a real permission request. Returns the block result, or undefined to
 	 * let the command through. Headless (no UI) always blocks: there is nobody to
@@ -5792,7 +5900,7 @@ export default function (pi: ExtensionAPI) {
 		 *  as the verdict line it follows. One object rather than one parameter
 		 *  per field: this list grew a field per phase, and each time a caller
 		 *  was missed the log came out half-filled. */
-		auditExtras: Pick<DecisionRecord, "userMessageIds" | "authorization" | "v3" | "floor" | "spawnCwd"> = {},
+		auditExtras: Pick<DecisionRecord, "userMessageIds" | "authorization" | "v3" | "floor" | "spawnCwd" | "followsDecisionId"> = {},
 		/** The still-running judgment behind a timed-out classification (issue
 		 *  #62), with the guards a late SAFE must still clear. Present only
 		 *  where classify hit its deadline: the dialog then races the late
@@ -5837,6 +5945,7 @@ export default function (pi: ExtensionAPI) {
 				...(auditExtras.v3 ? { v3: auditExtras.v3 } : {}),
 				...(auditExtras.floor ? { floor: auditExtras.floor } : {}),
 				...(auditExtras.spawnCwd ? { spawnCwd: auditExtras.spawnCwd } : {}),
+				...(auditExtras.followsDecisionId ? { followsDecisionId: auditExtras.followsDecisionId } : {}),
 			});
 		const block = (whyOverride?: string, approval: DecisionRecord["approval"] = ctx.hasUI ? "deny" : "headless"): { block: true; reason: string } => {
 			// Verdict-driven callers pass "follows verdict" so the dialog/headless
@@ -5879,6 +5988,7 @@ export default function (pi: ExtensionAPI) {
 				// answered a dialog, and an audit reader must not have to guess
 				// which directory the payload named from the one it is in.
 				...(auditExtras.spawnCwd ? { spawnCwd: auditExtras.spawnCwd } : {}),
+				...(auditExtras.followsDecisionId ? { followsDecisionId: auditExtras.followsDecisionId } : {}),
 			});
 
 		// Dry-run probe (issue #32): never open a dialog, never audit. When a
@@ -6000,7 +6110,7 @@ export default function (pi: ExtensionAPI) {
 						const guardWhy =
 							late.riskFlags.length > 0
 								? `classifier-safe but flags: ${late.riskFlags.join(", ")}`
-								: `classifier-safe despite prior refusal of "${late.priorRefusal?.normalizedTarget ?? ""}"`;
+								: `classifier-safe despite prior refusal of "${late.priorRefusal?.loggableTarget ?? ""}"`;
 						auditLate(judgement, `${pair}: dialog kept open — ${guardWhy}`, "block");
 						ctx.ui.notify(`classifier: judgment answered late (${guardWhy})\nThe dialog still needs your answer.`, "warning");
 						return;
@@ -6100,6 +6210,12 @@ export default function (pi: ExtensionAPI) {
 	const handleToolCall = async (event: ToolCallEvent, ctx: ExtensionContext) => {
 		// Wall-clock anchor for the audit log's `ms`: gate entry to decision.
 		const started = Date.now();
+		// One id per tool call for the line that can lead into a permission
+		// request, and the pointer every line that request writes carries back to
+		// it (spec step 0b). The judged state is written under the same id.
+		const leadDecisionId = randomUUID();
+		const lead = { decisionId: leadDecisionId };
+		const follows = { followsDecisionId: leadDecisionId };
 		const isBash = event.toolName === "bash";
 		const isEval = event.toolName === "eval";
 		if (!isBash && !isEval) return;
@@ -6366,6 +6482,7 @@ export default function (pi: ExtensionAPI) {
 					tool: "eval",
 					decision: "block",
 					layer: "cwd",
+					...lead,
 					why: `${headline}: ${spawn.why}`,
 					cmd: evalCode,
 					cwd,
@@ -6374,7 +6491,7 @@ export default function (pi: ExtensionAPI) {
 					ms: Date.now() - started,
 					...auditFields(),
 				});
-				return await requestPermission(ctx, target, headline, spawn.why, "eval", "", userScopeFingerprint, auditFields());
+				return await requestPermission(ctx, target, headline, spawn.why, "eval", "", userScopeFingerprint, { ...auditFields(), ...follows });
 			}
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
 			// Judge identity is the model selector plus the question battery: a
@@ -6437,7 +6554,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			try {
 				let classifyError = "";
-				const judgement = cached ? withoutShadow(cached) : (await classify(ctx, evalCode, cwd, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, reviewOperatorContext, evidenceSnapshot, "code", cwd, trustedPolicySnapshot.documents).catch(
+				const judgement = cached ? withoutShadow(cached) : (await classify(ctx, evalCode, cwd, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, reviewOperatorContext, evidenceSnapshot, "code", cwd, trustedPolicySnapshot.documents, leadDecisionId).catch(
 					(err: unknown) => {
 						classifyError = err instanceof Error ? err.message : String(err);
 						pi.logger.warn(`classifier: classify failed: ${classifyError}`);
@@ -6448,7 +6565,7 @@ export default function (pi: ExtensionAPI) {
 					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", userScopeFingerprint, { ...auditFields(), ...spawnField });
 				}
 				if (cacheableEval && !cached && judgement.verdict !== "UNAVAILABLE" && !judgement.noCache) remember(scoped, cacheKey, judgement);
-				const logCode = truncated(evalCode.replace(/\s+/gu, " ").trim(), 120);
+				const logCode = truncated(redactSecrets(evalCode.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120);
 				if (!dryRun) pi.logger.info(
 					`classifier: verdict=${judgement.verdict}` +
 						` tool=eval lang=${language || "?"} cached=${cached ? 1 : 0} reason="${judgement.reason}" code="${logCode}"`,
@@ -6472,7 +6589,7 @@ export default function (pi: ExtensionAPI) {
 					if (replay.decision === "allow") {
 						// Fresh SAFE auto-run logs layer "verdict"; a replayed cached
 						// verdict logs "cached" — provenance, same allow.
-						logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
+						logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", ...lead, why: judgement.reason, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
 						return;
 					}
 					// A SAFE on a target this session already refused is not a
@@ -6485,8 +6602,8 @@ export default function (pi: ExtensionAPI) {
 						flagList.length > 0
 							? `classifier-safe but flags: ${flagList.join(", ")}`
 							: replay.why;
-					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
-					return await requestPermission(ctx, target, "flagged for approval", why, "eval", flagList.length > 0 ? "follows verdict" : "despite prior refusal", userScopeFingerprint, { ...auditFields(), ...judgementAudit(judgement), ...spawnField });
+					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", ...lead, why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
+					return await requestPermission(ctx, target, "flagged for approval", why, "eval", flagList.length > 0 ? "follows verdict" : "despite prior refusal", userScopeFingerprint, { ...auditFields(), ...judgementAudit(judgement), ...spawnField, ...follows });
 				}
 				const detail =
 					judgement.verdict === "UNSAFE"
@@ -6500,6 +6617,7 @@ export default function (pi: ExtensionAPI) {
 					tool: "eval",
 					decision: "block",
 					layer: "verdict",
+					...lead,
 					why: `${detail}: ${judgement.reason}`,
 					cmd: evalCode,
 					cwd,
@@ -6534,7 +6652,7 @@ export default function (pi: ExtensionAPI) {
 					"eval",
 					"follows verdict",
 					userScopeFingerprint,
-					{ ...auditFields(), ...judgementAudit(judgement), ...spawnField },
+					{ ...auditFields(), ...judgementAudit(judgement), ...spawnField, ...follows },
 					judgement.late === undefined
 						? undefined
 						: { handle: judgement.late, priorRefusal: prior, riskFlags: evalRiskFlags(evalCode) },
@@ -6772,7 +6890,7 @@ export default function (pi: ExtensionAPI) {
 			// without appearing in settings at all.
 			if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(judgedCommand))) {
 				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, riskFlags: ["critical"], headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "critical pattern: matches a built-in dangerous-command pattern", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, ...lead, why: "critical pattern: matches a built-in dangerous-command pattern", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				// A critical hit is a refusal (issue #30) however the dialog below
 				// ends: the pattern itself is the memory. An approval lifts it via
 				// requestPermission.
@@ -6785,7 +6903,7 @@ export default function (pi: ExtensionAPI) {
 					"bash",
 					"",
 					userScopeFingerprint,
-					auditFields(),
+					{ ...auditFields(), ...follows },
 				);
 			}
 
@@ -6795,7 +6913,7 @@ export default function (pi: ExtensionAPI) {
 			// values are not shown to the classifier — they can hold secrets.
 			if (env.key !== "") {
 				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, envKeys: env.keys, headless: !ctx.hasUI });
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why: "environment override: command runs with caller-supplied env; not classified", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, ...lead, why: "environment override: command runs with caller-supplied env; not classified", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				return await requestPermission(
 					ctx,
 					target,
@@ -6804,7 +6922,7 @@ export default function (pi: ExtensionAPI) {
 					"bash",
 					"",
 					userScopeFingerprint,
-					auditFields(),
+					{ ...auditFields(), ...follows },
 				);
 			}
 
@@ -6939,7 +7057,7 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			let classifyError = "";
-			const judgement = cached ? withoutShadow(cached) : (await classify(ctx, judgedCommand, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot, "shell", startCwd, trustedPolicySnapshot.documents).catch((err: unknown) => {
+			const judgement = cached ? withoutShadow(cached) : (await classify(ctx, judgedCommand, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot, "shell", startCwd, trustedPolicySnapshot.documents, leadDecisionId).catch((err: unknown) => {
 				// Provider errors (quota exhausted, auth, HTTP failures) previously
 				// vanished into an opaque "unavailable". Keep the message so the
 				// permission dialog says WHY.
@@ -7010,7 +7128,7 @@ export default function (pi: ExtensionAPI) {
 					headless: !ctx.hasUI,
 				});
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", why: judgement.reason, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", ...lead, why: judgement.reason, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
 					return;
 				}
 				// A SAFE on a target this session already refused is not a clean
@@ -7018,14 +7136,14 @@ export default function (pi: ExtensionAPI) {
 				// means the command looks safe, not that the refusal was wrong.
 				// The prior refusal stands until a human says otherwise, and the
 				// moderate-risk overlay keeps its own reason when both hit.
-				const priorTarget = prior?.normalizedTarget ?? "";
+				const priorTarget = prior?.loggableTarget ?? "";
 				const why =
 					flags.length > 0
 						? `classifier-safe but flags: ${flags.join(", ")}`
 						: `classifier-safe despite prior refusal of "${priorTarget}"`;
 				const foot = trashFootnote(flags);
 				const dialogWhy = foot === "" ? why : `${why}\n${foot}`;
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", why, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", ...lead, why, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
 				return await requestPermission(
 					ctx,
 					target,
@@ -7034,7 +7152,7 @@ export default function (pi: ExtensionAPI) {
 					"bash",
 					flags.length > 0 ? "follows verdict" : "despite prior refusal",
 					userScopeFingerprint,
-					{ ...auditFields(), ...judgementAudit(judgement) },
+					{ ...auditFields(), ...judgementAudit(judgement), ...follows },
 				);
 			}
 			const verdict = judgement.verdict;
@@ -7048,6 +7166,7 @@ export default function (pi: ExtensionAPI) {
 				tool: "bash",
 				decision: "block",
 				layer: "verdict",
+				...lead,
 				why: `${detail}: ${judgement.reason}`,
 				cmd: judgedCommand,
 				cwd,
@@ -7080,7 +7199,7 @@ export default function (pi: ExtensionAPI) {
 				"bash",
 				"follows verdict",
 				userScopeFingerprint,
-				{ ...auditFields(), ...judgementAudit(judgement) },
+				{ ...auditFields(), ...judgementAudit(judgement), ...follows },
 				judgement.late === undefined
 					? undefined
 					: { handle: judgement.late, priorRefusal: prior, riskFlags: matchModerateRiskTokens(judgedCommand, cwd) },

@@ -55,7 +55,7 @@ const userEntry = (content: string | Array<Record<string, unknown>>): BranchEntr
 describe("default config", () => {
 	test("the state carries the newest three user messages by default", async () => {
 		const ctx = makeCtx({
-			sessionId: nextSession(),
+			sessionId: nextSession(), hasUI: true,
 			branch: [userEntry("one"), userEntry("two"), userEntry("three"), userEntry("four")],
 		});
 		await fire("tool_call", makeEvent("git status"), ctx);
@@ -69,7 +69,7 @@ describe("evidenceUserMessages", () => {
 		writeConfigFile({ evidenceUserMessages: 2 });
 		const long = "y".repeat(2_500);
 		const ctx = makeCtx({
-			sessionId: nextSession(),
+			sessionId: nextSession(), hasUI: true,
 			branch: [
 				userEntry("oldest message, outside the window"),
 				{ type: "model_change" },
@@ -137,7 +137,7 @@ describe("tool evidence", () => {
 			{ type: "message", message: { role: "toolResult", toolName: "write", content: "wrote scripts/check.sh" } },
 		] as const;
 		expect(collectToolEvidence(branch)).toContain("scripts/check.sh");
-		const ctx = makeCtx({ sessionId: nextSession(), branch });
+		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true, branch });
 		await fire("tool_call", makeEvent("bash scripts/check.sh"), ctx);
 		const evidence = evidenceOf();
 		expect(evidence.operatorContext).toContain("recent tool evidence (non-authorizing)");
@@ -148,7 +148,7 @@ describe("tool evidence", () => {
 describe("bounds", () => {
 	test("values above the ceiling fall back to the default 3", async () => {
 		writeConfigFile({ evidenceUserMessages: 9 });
-		const ctx = makeCtx({ sessionId: nextSession(), branch: [userEntry("check"), userEntry("again")] });
+		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true, branch: [userEntry("check"), userEntry("again")] });
 		await fire("tool_call", makeEvent("git status"), ctx);
 		expect(modelCalls.length).toBe(1);
 		expect(evidenceOf().userMessages).toEqual(["check", "again"]);
@@ -156,7 +156,7 @@ describe("bounds", () => {
 
 	test("negative values fall back to the default 3", async () => {
 		writeConfigFile({ evidenceUserMessages: -1 });
-		const ctx = makeCtx({ sessionId: nextSession(), branch: [userEntry("check"), userEntry("again"), userEntry("third"), userEntry("fourth")] });
+		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true, branch: [userEntry("check"), userEntry("again"), userEntry("third"), userEntry("fourth")] });
 		await fire("tool_call", makeEvent("git status"), ctx);
 		expect(modelCalls.length).toBe(1);
 		expect(evidenceOf().userMessages).toEqual(["again", "third", "fourth"]);
@@ -164,7 +164,7 @@ describe("bounds", () => {
 
 	test("zero sends no evidence at all", async () => {
 		writeConfigFile({ evidenceUserMessages: 0 });
-		const ctx = makeCtx({ sessionId: nextSession(), branch: [userEntry("check")] });
+		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true, branch: [userEntry("check")] });
 		await fire("tool_call", makeEvent("git status"), ctx);
 		expect(modelCalls.length).toBe(1);
 		expect(stateOf(0).evidence).toBeUndefined();
@@ -173,7 +173,7 @@ describe("bounds", () => {
 
 describe("tier meaning", () => {
 	test("user words and agent context ride in separate tiers, never merged", async () => {
-		const ctx = makeCtx({ sessionId: nextSession(), branch: [userEntry("delete the scratch build")] });
+		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true, branch: [userEntry("delete the scratch build")] });
 		await fire("tool_call", makeEvent("rm -rf ./build", { operatorContext: "the user asked for a clean rebuild" }), ctx);
 		const evidence = evidenceOf();
 		expect(evidence.userMessages).toEqual(["delete the scratch build"]);

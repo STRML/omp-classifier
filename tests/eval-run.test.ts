@@ -55,11 +55,11 @@ describe("validateCase — heldOut", () => {
 
 describe("validateCase — evidence.inheritedUserMessages", () => {
 	test("accepts a case with no inheritedUserMessages field", () => {
-		expect(() => validateCase(baseCase({ evidence: { userMessages: ["hi"] } }))).not.toThrow();
+		expect(() => validateCase(baseCase({ evidence: { userMessages: ["hi"] }, hasUI: true }))).not.toThrow();
 	});
 
 	test("accepts an array of strings", () => {
-		expect(() => validateCase(baseCase({ evidence: { inheritedUserMessages: ["fix the four P1 findings"] } }))).not.toThrow();
+		expect(() => validateCase(baseCase({ evidence: { inheritedUserMessages: ["fix the four P1 findings"] }, hasUI: true }))).not.toThrow();
 	});
 
 	test("accepts an empty array", () => {
@@ -89,7 +89,7 @@ describe("validateCase — existing checks are unchanged by the new fields", () 
 	});
 
 	test("still rejects a non-array evidence.userMessages", () => {
-		expect(() => validateCase(baseCase({ evidence: { userMessages: "nope" as unknown as string[] } }))).toThrow(/evidence\.userMessages must be strings/);
+		expect(() => validateCase(baseCase({ evidence: { userMessages: "nope" as unknown as string[] }, hasUI: true }))).toThrow(/evidence\.userMessages must be strings/);
 	});
 });
 
@@ -316,5 +316,13 @@ describe("parseJsonl — a malformed corpus line names its file and line", () =>
 			{ command: "echo a", label: "allow", family: "f" },
 			{ command: "rm -rf /", label: "ask", family: "f" },
 		]);
+	});
+});
+
+describe("validateCase — user words need a UI", () => {
+	test("user words without a UI are a corpus error", () => {
+		expect(() => validateCase(baseCase({ evidence: { userMessages: ["delete it"] } }))).toThrow(/evidence\.userMessages needs hasUI: true/);
+		expect(() => validateCase(baseCase({ evidence: { userMessages: ["delete it"] }, hasUI: true }))).not.toThrow();
+		expect(() => validateCase(baseCase({ evidence: { userMessages: [] } }))).not.toThrow();
 	});
 });

@@ -179,8 +179,9 @@ authorizes: only filler words or another target of the same command may sit betw
 code and quoted lines are stripped first, typographic apostrophes are folded so `don’t` cancels
 like `don't`, and a pinned or inherited message never produces a match.
 
-`literalMatch` is pure, and nothing calls it yet. Phase 2 step 5 gives it a branch in the
-decision order.
+`literalMatch` is pure. Its only production caller is the jev-v3 shadow path (`shadowJevV3` in `index.ts`; `eval/run.ts` and `eval/literal-match-probe.ts` also call it),
+where it feeds branch 4 of the decision order. The live decision does not read it, and branch 4
+has not fired on live traffic.
 
 ### The routine recognizer (`recognizer.ts`, measured only)
 
@@ -387,8 +388,8 @@ interruption counters, and false allows by name.
 
 ## L6 control plane
 
-`/classifier` for humans (`model <id>` sets `typesafeModel`, `policy` prints the merged policy
-and battery hash), one agent-legible status surface for machines. Bounds on every config
+`/classifier` for humans (`policy` prints the merged policy and battery hash; the judge model comes
+from `TYPESAFE_DEFAULT_MODEL`, default `jev-latest`), one agent-legible status surface for machines. Bounds on every config
 surface. Kill switches layered, and never gated by the thing they switch off.
 
 `/classifier trust-policy` is the only way to pin this user-level policy input; a changed snapshot

@@ -22,15 +22,16 @@ subagents should use the local `node_modules/@oh-my-pi/pi-coding-agent/{src,dist
 
 ## How the gate judges
 
-- Judgment comes from Jev, TypeSafe's System One model, over plain `fetch` (no SDK
-  dependency): `POST https://api.typesafe.ai/v1/systemone`, body
-  `{ state, model, questions }`, `model` pinned to `jev-latest` (which resolves server-side
-  to a dated build, `jev-1.13.0` at the time of writing). `jev.ts` owns that exchange
-  end to end; `index.ts` owns everything around it — static rules, grants, refusals,
-  dialogs, audit logging.
+- Judgment comes from Jev, TypeSafe's System One model, through the host's own judgment module
+  (`@oh-my-pi/pi-coding-agent/judgment`), which owns credentials, retries, and the fallback
+  chain. `jev-judge.ts` is the one adapter between the gate's battery and that module; the
+  model is `TYPESAFE_DEFAULT_MODEL`, else `jev-latest` (resolved server-side to a dated build,
+  `jev-1.13.0` at the time of writing). `jev.ts` owns the battery and the derivation;
+  `index.ts` owns everything around them — static rules, grants, refusals, dialogs, audit
+  logging. A full map is in `codemaps/`.
 - There is no prompt and no text parsing any more. Jev never writes prose: it answers typed
   questions (`choice`, `noul`, `score`), and the verdict is derived in code from the
-  returned probabilities (`deriveJevDecision` under policy version `jev-v1`). Do not go
+  returned probabilities (`deriveJevDecision` under policy version `jev-v2.11`). Do not go
   looking for `CLASSIFIER_PROMPT`, a `VERDICT:` regex, or an analysis string to check
   things against; a decision's `reason` is assembled from numbers and hazard ids.
 - The battery is the contract: `jevQuestionsHash()` is the sha256 (first 16 hex chars) of
@@ -38,11 +39,11 @@ subagents should use the local `node_modules/@oh-my-pi/pi-coding-agent/{src,dist
   the cache key. Editing a question, an option description, or a default threshold therefore
   invalidates every cached verdict — that is the intent, not a bug to paper over with a
   version bump.
-- The API key resolves from `TYPESAFE_API_KEY`, else from the macOS keychain entry `jev`
-  (`security find-generic-password -s jev -w`). Never commit it, never echo it in tests,
-  reports, or decision records. A missing key, a non-2xx response, an unparseable body, a
-  malformed answer, or a timeout must surface as `JevUnavailableError` and fail closed to a
-  permission request — never as a verdict.
+- The credential resolves through the host's AuthStorage (`/login typesafe`, or a stored
+  `TYPESAFE_API_KEY`). Never commit it, never echo it in tests, reports, or decision records.
+  A missing credential, a non-2xx response, an unparseable body, a malformed answer, or a
+  timeout must surface as `JevUnavailableError` and fail closed to a permission request —
+  never as a verdict.
 - Measured answer probabilities and confidence move with the question set and with the
   shape of the state, so the thresholds in `DEFAULT_JEV_POLICY` are policy, not constants
   copied from anywhere. Do not tune a threshold to make one command classify the way you
