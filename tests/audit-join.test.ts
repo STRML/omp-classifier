@@ -116,6 +116,15 @@ describe("logJudgedStates", () => {
 		expect(fs.statSync(path.join(dir, "judged-states.jsonl")).mode & 0o777).toBe(0o600);
 	});
 
+	test("an existing wider states file is tightened to 0600", async () => {
+		writeConfig({ logJudgedStates: true });
+		const file = path.join(dir, "judged-states.jsonl");
+		fs.writeFileSync(file, "", { mode: 0o644 });
+		fs.chmodSync(file, 0o644);
+		await fire("tool_call", makeEvent("git status"), makeCtx({ sessionId: session() }));
+		expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+	});
+
 	test("a prior refusal's target is redacted in the states file", async () => {
 		writeConfig({ logJudgedStates: true });
 		const sid = session();

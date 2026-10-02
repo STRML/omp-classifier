@@ -1305,7 +1305,7 @@ const EVIDENCE_ELISION = "\n…\n";
 /** The path the kernel will open, following symlinks. A path that does not
  *  exist yet resolves its parent and keeps its own name, so a delete target
  *  that is already gone still gets its real parent checked. */
-function realPathOf(candidate: string): string {
+export function realPathOf(candidate: string): string {
 	try {
 		return fs.realpathSync.native(candidate);
 	} catch {
@@ -5758,6 +5758,7 @@ export default function (pi: ExtensionAPI) {
 				cmd: truncated(redactSecrets(line.cmd.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120),
 			};
 			fs.appendFileSync(decisionsLogPath(), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+			fs.chmodSync(decisionsLogPath(), 0o600);
 		} catch (err) {
 			if (!auditLogWarned) {
 				auditLogWarned = true;
@@ -5840,6 +5841,9 @@ export default function (pi: ExtensionAPI) {
 			};
 			fs.mkdirSync(path.dirname(judgedStatesPath()), { recursive: true });
 			fs.appendFileSync(judgedStatesPath(), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+			// `mode` applies on creation only: tighten a log an older build or the
+			// user made wider.
+			fs.chmodSync(judgedStatesPath(), 0o600);
 		} catch (err) {
 			if (judgedStateWarned) return;
 			judgedStateWarned = true;

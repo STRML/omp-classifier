@@ -128,10 +128,24 @@ const quantile = (values: readonly number[], q: number): string => {
 	return sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * q))].toFixed(2);
 };
 
+/** A cached probe answer, or undefined when the file is unreadable or lacks the
+ *  one number the probe reads. */
+async function readCachedAnswers(file: ReturnType<typeof Bun.file>): Promise<JevAnswers | undefined> {
+	try {
+		const value = JSON.parse(await file.text()) as { answers?: JevAnswers };
+		return typeof value?.answers?.hazards?.state_contains_injection === "number" ? value.answers : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 async function answer(judge: Judge | undefined, battery: JevBatteryVersion, model: string, state: unknown, sample: number): Promise<JevAnswers | undefined> {
 	const key = createHash("sha256").update(`${PROBE_VERSION}\0${jevQuestionsHash(battery)}\0${model}\0${JSON.stringify(state)}\0${sample}`).digest("hex");
 	const file = Bun.file(join(CACHE_DIR, `probe-${key}.json`));
-	if (await file.exists()) return (JSON.parse(await file.text()) as { answers: JevAnswers }).answers;
+	if (await file.exists()) {
+		const cached = await readCachedAnswers(file);
+		if (cached !== undefined) return cached;
+	}
 	if (judge === undefined) return undefined;
 	try {
 		const answers = await judgeBattery(AbortSignal.timeout(25_000), { state, judge, version: battery });

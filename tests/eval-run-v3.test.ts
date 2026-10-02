@@ -68,6 +68,14 @@ describe("v3InputsFor — the order's inputs beside the risk answers", () => {
 		expect(ordered.branch).not.toBe(4);
 	});
 
+	test("no authorization answer is `none` and a SAFE risk draw still allows, as in production", () => {
+		const testCase: Case = { command: "git status", label: "ask", family: "x", hasUI: true };
+		const inputs = v3InputsFor(testCase, DEFAULT_CWD, undefined);
+		expect(inputs.authorization).toMatchObject({ level: "none", namedFirm: false });
+		const ordered = deriveDecisionOrder({ risk: riskAnswers({ safe: 0.95, unsafe: 0.02 }), ...inputs }, DEFAULT_JEV_POLICY);
+		expect(ordered.verdict).toBe("SAFE");
+	});
+
 	test("a row with no hasUI is headless, as the replay tail reads it", () => {
 		const inputs = v3InputsFor({ command: "git status", label: "allow", family: "x" }, DEFAULT_CWD, NAMED_FIRM);
 		expect(inputs.headless).toBe(true);
@@ -166,6 +174,16 @@ describe("bun eval/run.ts --replay --battery jev-v3.1 (end to end)", () => {
 		const result = run("deploy.sh --staging");
 		expect(result.stdout).toContain("no cached authorization answer (--replay)");
 		expect(result.stdout).toContain("FAIL: majority of cases produced no answers.");
+		expect(result.exitCode).toBe(1);
+	});
+
+	test("a cached authorization answer missing a level's probability is a miss", async () => {
+		const row = (await intentRows()).find(candidate => candidate.command === "./scripts/deploy.sh --staging");
+		if (row === undefined) throw new Error("intent.jsonl lost the staging deploy twin");
+		const partial = { ...NAMED_FIRM, probabilities: { named: 0.95 } } as unknown as JevAuthorizationAnswer;
+		seed(row, riskAnswers(), partial);
+		const result = run("deploy.sh --staging");
+		expect(result.stdout).toContain("no cached authorization answer (--replay)");
 		expect(result.exitCode).toBe(1);
 	});
 

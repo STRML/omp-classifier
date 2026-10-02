@@ -11,9 +11,9 @@
  * which can only lose a match where a secret was present.
  */
 import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { judgedStatesPath, type JudgedStateRecord } from "../index";
+import { judgedStatesPath, type JudgedStateRecord, realPathOf } from "../index";
 import { literalMatch } from "../literal-match";
 
 export interface LiteralProbeRow {
@@ -32,7 +32,7 @@ export interface LiteralProbeTally {
 export function literalMatchTally(rows: readonly LiteralProbeRow[], homeDir: string): LiteralProbeTally {
 	const tally: LiteralProbeTally = { rows: rows.length, matched: [], reasons: {} };
 	for (const row of rows) {
-		const result = literalMatch({ command: row.command, cwd: row.cwd, homeDir, userMessages: row.userMessages, resolveRealPath: candidate => resolve(candidate) });
+		const result = literalMatch({ command: row.command, cwd: row.cwd, homeDir, userMessages: row.userMessages, resolveRealPath: realPathOf });
 		if (result.matched) {
 			tally.matched.push(row);
 			continue;

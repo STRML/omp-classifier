@@ -186,7 +186,7 @@ interface Outcome extends Case {
 		branches: DecisionBranch[];
 		legacyVerdicts: JevVerdict[];
 		legacyDecisions: Decision[];
-		authorizationSamples: JevAuthorizationAnswer[];
+		authorizationSamples: (JevAuthorizationAnswer | undefined)[];
 	};
 }
 
@@ -774,7 +774,7 @@ export interface V3Inputs {
 	headless: boolean;
 }
 
-export function v3InputsFor(testCase: Case, cwd: string, authorization: JevAuthorizationAnswer): V3Inputs {
+export function v3InputsFor(testCase: Case, cwd: string, authorization: JevAuthorizationAnswer | undefined): V3Inputs {
 	const shell = testCase.kind !== "eval-code";
 	// Corpus paths do not exist on this machine, so the real-path resolver is
 	// lexical: production's resolver falls back to the same reading for a path
@@ -1377,6 +1377,9 @@ function asCachedAuthorization(value: unknown): JevAuthorizationAnswer | undefin
 	if (answer === null || typeof answer !== "object") return undefined;
 	if (!("level" in answer) || !JEV_AUTHORIZATION_LEVELS.some(level => level === answer.level)) return undefined;
 	if (!("probabilities" in answer) || answer.probabilities === null || typeof answer.probabilities !== "object") return undefined;
+	// The live validator requires a finite probability for every level.
+	const probabilities = answer.probabilities as Record<string, unknown>;
+	if (!JEV_AUTHORIZATION_LEVELS.every(level => typeof probabilities[level] === "number" && Number.isFinite(probabilities[level]))) return undefined;
 	if (!("confidence" in answer) || typeof answer.confidence !== "number") return undefined;
 	return answer as JevAuthorizationAnswer;
 }
@@ -1482,7 +1485,7 @@ async function runScored(args: Args, judge: Judge | undefined): Promise<void> {
 			const branches: DecisionBranch[] = [];
 			const legacyVerdicts: JevVerdict[] = [];
 			const legacyDecisions: Decision[] = [];
-			const authorizationSamples: JevAuthorizationAnswer[] = [];
+			const authorizationSamples: (JevAuthorizationAnswer | undefined)[] = [];
 			let unavailable: string | undefined;
 			for (let sample = 0; sample < args.samples; sample++) {
 				// The sample index is part of the key so repeated draws are cached
@@ -1514,15 +1517,19 @@ async function runScored(args: Args, judge: Judge | undefined): Promise<void> {
 						judgeAuthorization(AbortSignal.timeout(args.timeoutMs), { state: caseAuthorizationState(testCase), judge: live }),
 						value => ({ authorization: value }),
 					);
-					if ("missing" in authorization) {
+					// A live authorization outage is `none`, as in production
+					// (deriveAuthorization): the risk answer still decides, so a SAFE
+					// risk draw can allow. Only a replay miss is missing evidence.
+					if ("missing" in authorization && judge === undefined) {
 						unavailableSample(authorization.missing);
 						break;
 					}
-					const inputs = v3InputsFor(testCase, cwd, authorization.value);
+					const authorizationAnswer = "value" in authorization ? authorization.value : undefined;
+					const inputs = v3InputsFor(testCase, cwd, authorizationAnswer);
 					const ordered = deriveDecisionOrder({ risk: answers, ...inputs }, policy);
 					v3Inputs.push(inputs);
 					branches.push(ordered.branch);
-					authorizationSamples.push(authorization.value);
+					authorizationSamples.push(authorizationAnswer);
 					legacyVerdicts.push(legacy.verdict);
 					legacyDecisions.push(tail(legacy).decision);
 					decision = ordered;
