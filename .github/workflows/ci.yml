@@ -18,4 +18,11 @@ jobs:
       - name: Typecheck against published packages
         run: bun run typecheck
       - name: Unit tests (mocked model boundary)
+        # One test in a run stalled for 20 to 33 s on this 2-core runner: the event loop
+        # stopped while a JavaScriptCore JIT worker thread compiled, and a kernel dump of
+        # the stalled process showed its main thread waiting on it. No wrapped sync call
+        # explained the gap (7 to 10 ms of 31 s). With the optimizing tier off, 3 of 3 runs
+        # passed with no gap over 10 s, where the same code stalled in 3 of 3.
+        env:
+          BUN_JSC_useFTLJIT: "0"
         run: bun test

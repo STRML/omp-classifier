@@ -22,9 +22,33 @@ const bySpelling = (readings: readonly FlagReading[]): Record<string, FlagReadin
 	return table;
 };
 
+/**
+ * A live check spawns the installed tool, and `probe` gives each call up to 20 s.
+ * A cold runner took 8 s for kubectl, past bun's 5 s test default, so the test
+ * failed while the probe was still working. Some checks run two probes in a row,
+ * so the test limit covers three probes' worth.
+ */
+const LIVE_TEST_TIMEOUT_MS = 60_000;
+
+/** A check against a live tool, skipped unless `installed`. */
+const liveWhen = (name: string, installed: boolean, body: () => void): void => {
+	test.skipIf(!installed)(name, body, LIVE_TEST_TIMEOUT_MS);
+};
+
 /** A check against a live tool, skipped when the tool is not installed. */
-const live = (name: string, tool: string, body: () => void): void => {
-	test.skipIf(Bun.which(tool) === null)(name, body);
+const live = (name: string, tool: string, body: () => void): void => liveWhen(name, Bun.which(tool) !== null, body);
+
+/**
+ * The table's yarn grammar is Yarn Berry's. Classic (1.x), which GitHub's runners
+ * ship, has no `yarn npm` namespace, so for this check it counts as not installed.
+ * Only a yarn that is absent or positively reads as 1.x skips. A yarn that is
+ * installed but whose version cannot be read is a broken setup, and the check
+ * runs so that it fails where it can be seen.
+ */
+const yarnBerryInstalled = (): boolean => {
+	if (Bun.which("yarn") === null) return false;
+	const version = (probe(["yarn", "--version"]) ?? "").trim();
+	return !version.startsWith("1.");
 };
 
 describe("the parsers read the tools' own help", () => {
@@ -225,7 +249,7 @@ describe("the table still says what the installed tools say", () => {
 		expect(toolGrammar("npm")?.flags(["audit"])?.valued("--audit-level")).toBe("audit-level");
 	});
 
-	live("yarn names the npm namespace and types its tag", "yarn", () => {
+	liveWhen("yarn names the npm namespace and types its tag", yarnBerryInstalled(), () => {
 		const help = probe(["yarn", "--help"]) ?? "";
 		expect(help).toContain("yarn npm publish");
 		expect(toolGrammar("yarn")?.names(["npm"], "publish")).toBe(true);
