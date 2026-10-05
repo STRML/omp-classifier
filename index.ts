@@ -723,6 +723,15 @@ interface ClassifierConfig {
 const MIN_COMMAND_LENGTH = 64;
 const MAX_COMMAND_LENGTH_CEILING = 100_000;
 
+/** Appended to every review-limit refusal so the agent can offer the user the
+ *  one real knob. The agent cannot run a slash command itself. */
+function reviewLimitTuning(limit: number): string {
+	return (
+		` If the size is legitimate, tell the user the review limit is ${limit} characters and they can raise it ` +
+		`with \`/classifier maxCommandLength <chars>\` (${MIN_COMMAND_LENGTH}-${MAX_COMMAND_LENGTH_CEILING}); a larger limit means a slower judge call.`
+	);
+}
+
 /** Bounds for the `evidenceUserMessages` config key and the `/classifier` setter. */
 const MIN_EVIDENCE_USER_MESSAGES = 0;
 const MAX_EVIDENCE_USER_MESSAGES = 6;
@@ -6462,7 +6471,7 @@ export default function (pi: ExtensionAPI) {
 						"eval",
 						"cap",
 						why,
-						"Move the long code into a file and eval a short cell that reads it.",
+						`Move the long code into a file and eval a short cell that reads it.${reviewLimitTuning(config.maxCommandLength)}`,
 						"Do not shorten the code only to dodge the limit.",
 						{ chars: String(evalCode.length), limit: String(config.maxCommandLength) },
 					),
@@ -6688,7 +6697,7 @@ export default function (pi: ExtensionAPI) {
 					"bash",
 					"cap",
 					why,
-					"Write long text to a file and reference it (e.g. git commit -F <file>), or split the command into steps.",
+					`Write long text to a file and reference it (e.g. git commit -F <file>), or split the command into steps.${reviewLimitTuning(config.maxCommandLength)}`,
 					"Do not shorten the message only to dodge the limit.",
 					{ chars: String(command.length), limit: String(config.maxCommandLength) },
 				),
@@ -6826,7 +6835,7 @@ export default function (pi: ExtensionAPI) {
 						"bash",
 						"script-body",
 						why,
-						"Run the script's steps as individual commands, or keep the file inside the review limit and readable.",
+						`Run the script's steps as individual commands, or keep the file inside the review limit and readable.${why.includes("review limit") ? reviewLimitTuning(config.maxCommandLength) : ""}`,
 						"Do not rename, move or shrink the script to dodge the read.",
 					),
 				};

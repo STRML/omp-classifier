@@ -221,6 +221,7 @@ describe("fail closed when the body cannot be read", () => {
 		expect(payload.layer).toBe("script-body");
 		expect(payload.why).toContain("review limit");
 		expect(payload.why).toContain("big.py");
+		expect(payload.next).toContain("/classifier maxCommandLength");
 		// Nothing was judged: the file is refused before the model is asked.
 		expect(modelCalls.length).toBe(0);
 	});

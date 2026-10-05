@@ -366,6 +366,9 @@ describe("the refusal payload is structured at every deterministic layer", () =>
 		// The remedy has to be actionable: shortening the command to dodge the
 		// limit would launder text past the reviewer that the user never saw.
 		expect(payload.next).toContain("commit -F");
+		// The agent is told the one knob, so it can ask the user to raise it.
+		expect(payload.next).toContain("/classifier maxCommandLength");
+		expect(payload.next).toContain("8000 characters");
 		expect(payload.notThis.length).toBeGreaterThan(0);
 		expect(modelCalls.length).toBe(0); // blocked unseen, no model call
 	});
