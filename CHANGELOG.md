@@ -4,6 +4,11 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-14
 
+### Every native judgment wire is a distribution, not a keyword bridge
+
+- 18.10 answers natively through four wires — `typesafe`, `openrouter-decisions`, `workers-ai-systemone`, `openai-decisions` — and all four return measured probabilities. The gate decided `oneHot` by `result.api !== "typesafe"`, so a judge role routed to any of the other three had its probability answer read as a keyword one, which reads the distribution floors as the choice label itself and is the fail-open direction. `answeredNatively` now asks the host's own `isJudgmentApi`, so a wire the host adds cannot be misread here.
+- Only `TextJudge` answers (a chat model, the on-device tiny judge) are one-hot, and that split is asserted for all six APIs.
+
 ### The plugin loads again on OMP 18.10 (host API migration)
 
 - The plugin failed to load on OMP 18.10.4: `Export named 'TypeSafeJudge' not found`. `pi-ai` renamed the native judge to `NativeJudge` (and `TypeSafeApiError` to `JudgmentApiError`) in 18.9.2, so `jev-judge.ts`, `eval/run.ts`, `eval/headless-brief-probe.ts` and the endpoint-backend test now import `NativeJudge`. The endpoint transport is the same client on the same wire: `api` still defaults to `typesafe`, whose dialect is `POST {baseUrl}/v1/systemone`, so retries, timeouts and the redirect policy are unchanged. A 3xx now reports the host client's own `${provider}/${model} API error (<status>)` message.

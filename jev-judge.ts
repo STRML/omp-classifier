@@ -58,6 +58,7 @@ import {
 	type ScoreQuestion,
 	NativeJudge,
 	TYPESAFE_PROVIDER,
+	isJudgmentApi,
 	typesafeModel,
 	type Usage,
 } from "@oh-my-pi/pi-ai";
@@ -474,6 +475,23 @@ const DISTRIBUTION_TOLERANCE = 0.05;
 type AuthorizationBattery = Questions & { user_authorization: ChoiceQuestion<JevAuthorizationLevel> };
 
 /**
+ * Whether the answer came from a native judgment wire — measured probabilities
+ * — rather than from a keyword bridge. `TextJudge` answers are one-hot by
+ * construction: `parseAnswer` returns the parsed label with probability 1 and
+ * confidence 1, so there is no distribution to read floors against.
+ *
+ * 18.10 answers natively through four wires (`typesafe`,
+ * `openrouter-decisions`, `workers-ai-systemone`, `openai-decisions`), and the
+ * host's own `isJudgmentApi` is the source of truth for which APIs those are.
+ * Naming the wires here instead would misread a probability answer as a keyword
+ * one the day the host adds a wire, which is the fail-open direction: one-hot
+ * answers are read as the choice label itself and skip the distribution floors.
+ */
+function answeredNatively(api: string): boolean {
+	return isJudgmentApi(api as Parameters<typeof isJudgmentApi>[0]);
+}
+
+/**
  * Ask the authorization question about one authorization state.
  *
  * A second request rather than a question added to the risk battery, because
@@ -586,7 +604,7 @@ function toAuthorizationAnswer(
 		confidence,
 		...(usage === undefined ? {} : { usage }),
 		latencyMs,
-		oneHot: result.api !== TYPESAFE_PROVIDER,
+		oneHot: !answeredNatively(result.api),
 	};
 }
 
@@ -740,7 +758,7 @@ function toJevAnswers(result: JudgmentResult<JevBattery>, battery: JevBattery, l
 		blastRadius: { score, confidence: blastConfidence, levels: battery.blast_radius.criteria },
 		...(usage === undefined ? {} : { usage }),
 		latencyMs,
-		oneHot: result.api !== TYPESAFE_PROVIDER,
+		oneHot: !answeredNatively(result.api),
 	};
 }
 
