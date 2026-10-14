@@ -267,7 +267,7 @@ deadline as an `AbortSignal` — no temperature to set.
 
 Which transport answers is one seam (`JudgeBackend` in `jev-judge.ts`, issue #84). The default
 kind, `typesafe`, is exactly the paragraph above. The `endpoint` kind constructs the host's own
-`TypeSafeJudge` against `{baseUrl, model}` from the config file, with the credential read from
+`NativeJudge` against `{baseUrl, model}` from the config file, with the credential read from
 the environment variable named by `apiKeyEnv`, so any server speaking the same wire contract
 (`POST {state, model, questions}` → `{answers, model}`) can judge without a patch — a
 self-hosted or fully local classifier included. Its one transport change is the redirect

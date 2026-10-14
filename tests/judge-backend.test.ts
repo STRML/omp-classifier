@@ -12,7 +12,7 @@
  * What has to hold, and is asserted here:
  *   - No `judgeBackend` key: the host path, unchanged — the seam is a no-op,
  *     and the plugin's own transport opens no socket at all.
- *   - Endpoint kind: `TypeSafeJudge` built from the config's baseUrl/model, the
+ *   - Endpoint kind: `NativeJudge` built from the config's baseUrl/model, the
  *     bearer from the named env var, the request at that baseUrl, and a verdict
  *     still derived from returned probabilities (not one-hot).
  *   - Fail closed: a missing env var is `JevUnavailableError` -> permission
@@ -34,7 +34,7 @@
  */
 import * as fs from "node:fs";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { TypeSafeJudge } from "@oh-my-pi/pi-ai";
+import { NativeJudge } from "@oh-my-pi/pi-ai";
 import { buildStatusReport, decisionsLogPath, formatClassifierConfig, readClassifierConfig } from "../index";
 import { DEFAULT_JUDGE_BACKEND, judgeBackendFor, noFollowFetch, parseJudgeBackend } from "../jev-judge";
 import {
@@ -200,10 +200,10 @@ describe("the endpoint backend", () => {
 		process.env.LOCAL_JUDGE_KEY = KEY_VALUE;
 		const backend = judgeBackendFor(parseJudgeBackend(ENDPOINT)!);
 		const judge = backend.judge({ state: {} });
-		expect(judge).toBeInstanceOf(TypeSafeJudge);
+		expect(judge).toBeInstanceOf(NativeJudge);
 		// The host's own wire client: no transport code of ours.
-		expect((judge as TypeSafeJudge).baseUrl).toBe(ENDPOINT.baseUrl);
-		expect((judge as TypeSafeJudge).model).toBe(ENDPOINT.model);
+		expect((judge as NativeJudge).baseUrl).toBe(ENDPOINT.baseUrl);
+		expect((judge as NativeJudge).model).toBe(ENDPOINT.model);
 		expect(backend.id).toBe(`endpoint/${ENDPOINT.baseUrl}#${ENDPOINT.model}`);
 	});
 
@@ -520,8 +520,10 @@ describe("the endpoint transport cannot follow a redirect", () => {
 			const payload = refusalOf(blocked);
 			expect(payload.layer).toBe("headless");
 			expect(payload.why).toContain("classifier unavailable");
-			// And the status the endpoint answered is what failed the call.
-			expect(payload.why).toContain(`TypeSafe API error (${status})`);
+			// And the status the endpoint answered is what failed the call. The
+			// message is the host client's own (`${provider}/${model} API error`),
+			// so the assertion names the judge the endpoint built, not a class.
+			expect(payload.why).toContain(`typesafe/${ENDPOINT.model} API error (${status})`);
 			expect(endpoint.calls.length).toBe(1);
 			expect(target.calls).toEqual([]);
 		});

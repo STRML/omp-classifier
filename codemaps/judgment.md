@@ -85,8 +85,8 @@ Every hazard ≥ `hazardReview` (descriptive included) lands in `decision.hazard
 | `judgeAuthorization(signal, opts)` | 490 | authorization question over a separate state | `judgeJevV3` |
 | `judgeJevV3(signal, opts)` | 521 | v3 risk ∥ authorization; an authorization failure → `undefined` | index `shadowJevV3` |
 
-Internals: `resolveHostJudge` (619) calls host `resolveJudge` with `ONLINE_MEMORY_MODEL_KEY`;
-`endpointBackend` (318) builds a `TypeSafeJudge`; `toJevAnswers` (678) sets
+Internals: `resolveHostJudge` (619) calls host `resolveJudge` with `purpose`;
+`endpointBackend` (318) builds a `NativeJudge`; `toJevAnswers` (678) sets
 `oneHot = result.api !== "typesafe"`. Every failure path throws `JevUnavailableError`.
 
 ## decision-order.ts (93 lines): jev-v3 order, shadow only

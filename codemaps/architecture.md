@@ -15,7 +15,7 @@ There is no model prose anywhere. TypeScript on Bun ≥1.3.14, no build step (`p
 | `bun eval/run.ts` | score policy against corpora (L5) |
 
 Runtime dep: `mvdan-sh` (shell parser, loaded lazily by `shell-ast.ts`). Dev deps are the host
-(`@oh-my-pi/pi-coding-agent`, `pi-ai`, `pi-utils` 18.2.4); host source is at
+(`@oh-my-pi/pi-coding-agent`, `pi-ai`, `pi-utils` 18.10.4); host source is at
 `node_modules/@oh-my-pi/pi-coding-agent/src/`.
 
 ## Layer tower → files (docs/SYSTEM.md)
@@ -70,9 +70,9 @@ recognizer.ts ─► floor.ts, shell-ast.ts      (not imported by index.ts)
 | `pi.on(session_start/before_switch/switch)` | index.ts:7120-7122 | `dropCurrent`: clears this session's state |
 | `pi.on("session_shutdown")` | index.ts:7137 | same, plus stale-disable warned flag |
 | `pi.registerCommand("classifier")` | index.ts:4933 | L6 control plane |
-| `pi.pi.settings` | index.ts:4926 | host `bash.patterns`, `tools.approval` (static rules) |
+| `pi.pi.settings` + `cfgToolsApproval`/`cfgBashPatterns` | index.ts:5016, 5215 | host `bash.patterns`, `tools.approval` (static rules) |
 | `@oh-my-pi/pi-coding-agent/judgment` `resolveJudge` | jev-judge.ts | the native judge (TypeSafe or the tiny/smol chat chain) |
-| `pi-ai` `TypeSafeJudge` | jev-judge.ts (endpoint backend), eval/run.ts | custom endpoint transport |
+| `pi-ai` `NativeJudge` | jev-judge.ts (endpoint backend), eval/run.ts | custom endpoint transport |
 | `tools/bash` `CRITICAL_BASH_PATTERNS` | index.ts, floor.ts, eval/run.ts | built-in critical patterns |
 | `tools/shell-tokenize` | index.ts | `extractLeadingCdTarget`, `tokenizeShellSegments` |
 

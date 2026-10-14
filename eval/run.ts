@@ -55,7 +55,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs as parseCliArgs } from "node:util";
-import { type Judge, TYPESAFE_PROVIDER, TypeSafeJudge } from "@oh-my-pi/pi-ai";
+import { type Judge, NativeJudge, TYPESAFE_PROVIDER } from "@oh-my-pi/pi-ai";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import {
@@ -1951,13 +1951,18 @@ async function main(): Promise<void> {
 	try {
 		// A missing credential is a run-level fact worth printing up front — not
 		// 103 identical UNAVAILABLE lines to read afterwards.
-		if (!credentials.hasResolvableAuth(TYPESAFE_PROVIDER)) {
+		if (credentials.keys.source(TYPESAFE_PROVIDER) === undefined) {
 			console.error("warning: no TypeSafe credential — run /login typesafe or set TYPESAFE_API_KEY. Uncached cases will be recorded UNAVAILABLE.");
 		}
 		// The judge is built once, explicitly, and injected: production falls back
 		// to a chat judge when TypeSafe fails, and a run that inherited that
-		// fallback would score a keyword verdict as the model's.
-		const judge = new TypeSafeJudge({ apiKey: credentials.resolver(TYPESAFE_PROVIDER), model: args.model, timeoutMs: args.timeoutMs });
+		// fallback would score a keyword verdict as the model's. The key is a
+		// resolver, not a snapshot, so a store that rotates mid-run is followed.
+		const judge = new NativeJudge({
+			apiKey: credentials.keys.resolver(TYPESAFE_PROVIDER),
+			model: args.model,
+			timeoutMs: args.timeoutMs,
+		});
 		await runScored(args, judge);
 	} finally {
 		credentials.close();

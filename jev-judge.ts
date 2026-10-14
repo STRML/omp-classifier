@@ -4,7 +4,7 @@
  *
  * The gate used to own its transport: a POST to TypeSafe, an API key resolved
  * from the environment or the macOS keychain, a hand-rolled timeout, and a
- * response validator. OMP 18.2.4 ships that path as its native judgment module
+ * response validator. OMP ships that path as its native judgment module
  * — credentials through AuthStorage (`/login typesafe` and a stored
  * `TYPESAFE_API_KEY` both land there, and 401s rotate them), retries with
  * backoff on 408/429/5xx, and a fallback to the tiny/smol/default chat chain
@@ -56,15 +56,14 @@ import {
 	type JudgmentState,
 	type Questions,
 	type ScoreQuestion,
+	NativeJudge,
 	TYPESAFE_PROVIDER,
-	TypeSafeJudge,
 	typesafeModel,
 	type Usage,
 } from "@oh-my-pi/pi-ai";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { type JudgeDeps, resolveJudge } from "@oh-my-pi/pi-coding-agent/judgment";
-import { ONLINE_MEMORY_MODEL_KEY } from "@oh-my-pi/pi-coding-agent/tiny/models";
 import {
 	jevAuthorizationQuestions,
 	type JevAuthorizationAnswer,
@@ -282,7 +281,7 @@ const TYPESAFE_BACKEND: JudgeBackend = {
  * runtime's, and retries stay the host client's.
  *
  * A 3xx is left for the client to fail on rather than raised here: it is not one
- * of the statuses `TypeSafeJudge` retries (408/429/5xx), so a redirect costs one
+ * of the statuses `NativeJudge` retries (408/429/5xx), so a redirect costs one
  * request and surfaces as `JevUnavailableError` → a permission request, never a
  * verdict from the redirect target. Exported because it is the transport
  * `endpointBackend` injects, and the no-follow property is asserted against it
@@ -301,7 +300,7 @@ export async function noFollowFetch(input: string | URL | Request, init?: Reques
 
 /**
  * An endpoint speaking the System One contract. The client is the host's
- * `TypeSafeJudge` — the same one the default path uses, so retries, timeouts,
+ * `NativeJudge` — the same one the default path uses, so retries, timeouts,
  * the error taxonomy and the wire shape are the host's and not a second
  * implementation to keep in step — over the runtime's own `fetch` with one
  * change: `noFollowFetch` forces the redirect policy to `"manual"`, because the
@@ -326,7 +325,7 @@ function endpointBackend(config: Extract<JudgeBackendConfig, { kind: "endpoint" 
 			if (!apiKey) {
 				throw new JevUnavailableError(`judge endpoint credential ${config.apiKeyEnv} is not set`);
 			}
-			return new TypeSafeJudge({ baseUrl: config.baseUrl, model: config.model, apiKey, fetch: noFollowFetch });
+			return new NativeJudge({ baseUrl: config.baseUrl, model: config.model, apiKey, fetch: noFollowFetch });
 		},
 	};
 }
@@ -613,7 +612,7 @@ function toAuthorizationAnswer(
  * its judgment.
  *
  * This is the `typesafe` backend and only that: an endpoint backend takes the
- * `TypeSafeJudge` path instead (`endpointBackend`), and neither reads the
+ * `NativeJudge` path instead (`endpointBackend`), and neither reads the
  * other's config.
  */
 function resolveHostJudge(options: JudgeBatteryOptions): Judge {
@@ -627,12 +626,13 @@ function resolveHostJudge(options: JudgeBatteryOptions): Judge {
 		const deps: JudgeDeps = {
 			settings,
 			registry: context.modelRegistry,
-			// 18.2.4's JudgeDeps requires `backend`; the 18.3 ChainJudge ignores
-			// it. What matters for fail-closed is the absent `sessionModel`:
-			// without it the chain ends after the configured judge role, so an
-			// unreachable TypeSafe endpoint is an outage, not a weaker verdict
-			// from whatever model the session is using.
-			backend: ONLINE_MEMORY_MODEL_KEY,
+			// `purpose` labels the session ledger entry and the judgment telemetry
+			// span; the classifier is its own consumer of the judge role.
+			purpose: "omp-classifier",
+			// What matters for fail-closed is the absent `sessionModel`: without
+			// it the chain ends after the configured judge role, so an unreachable
+			// TypeSafe endpoint is an outage, not a weaker verdict from whatever
+			// model the session is using.
 			sessionId: safely(() => context.sessionManager.getSessionId()),
 		};
 		return resolveJudge(deps);

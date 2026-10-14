@@ -87,8 +87,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
+import { cfgBashPatterns } from "@oh-my-pi/pi-coding-agent/exec/settings";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
+import { cfgToolsApproval } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 import { getPluginsDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
@@ -5210,9 +5212,9 @@ export default function (pi: ExtensionAPI) {
 	 */
 	const readHostPolicy = (): HostPolicy => {
 		try {
-			const userPolicies: Record<string, unknown> = settings.get("tools.approval") ?? {};
+			const userPolicies = (cfgToolsApproval.get(settings) ?? {}) as Record<string, unknown>;
 			return {
-				rules: parseBashApprovalPatternRules(settings.get("bash.patterns")),
+				rules: parseBashApprovalPatternRules(cfgBashPatterns.get(settings)),
 				bashPolicy: normalizeUserPolicy(userPolicies.bash),
 			};
 		} catch (err) {
@@ -6841,7 +6843,12 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			const judgedCommand = script.text;
-			const env = canonicalEnv(event.input.env);
+			// The 18.10 bash tool no longer declares an `env` parameter, but the
+			// event carries the raw call input and any tool or host variant that
+			// still honors one must stay gated: a caller-supplied environment
+			// (`PATH`, `BASH_ENV`, `LD_PRELOAD`) changes what runs, so it is read
+			// defensively and still forces a permission request.
+			const env = canonicalEnv((event.input as Record<string, unknown>).env);
 			const pty = event.input.pty === true;
 			const timeout = typeof event.input.timeout === "number" ? event.input.timeout : undefined;
 			const async = event.input.async === true;
