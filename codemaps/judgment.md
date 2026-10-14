@@ -72,7 +72,7 @@ Every hazard ≥ `hazardReview` (descriptive included) lands in `decision.hazard
 (a keyword bridge answered) add ` (llm keyword answer)` to the reason and set `persistRefusal:false`.
 `UNAVAILABLE` is never returned here; the caller sets it (`jev:unavailable` via `annotateJudgement`).
 
-## jev-judge.ts (762 lines): transport adapter, fail-closed
+## jev-judge.ts (780 lines): transport adapter, fail-closed
 
 | Export | Line | Notes | Called by |
 |---|---|---|---|
@@ -86,8 +86,11 @@ Every hazard ≥ `hazardReview` (descriptive included) lands in `decision.hazard
 | `judgeJevV3(signal, opts)` | 521 | v3 risk ∥ authorization; an authorization failure → `undefined` | index `shadowJevV3` |
 
 Internals: `resolveHostJudge` (619) calls host `resolveJudge` with `purpose`;
-`endpointBackend` (318) builds a `NativeJudge`; `toJevAnswers` (678) sets
-`oneHot = result.api !== "typesafe"`. Every failure path throws `JevUnavailableError`.
+`endpointBackend` (318) builds a `NativeJudge`; `answeredNatively` (484) decides
+`oneHot = !isJudgmentApi(result.api)`, so every native wire (typesafe,
+openrouter-decisions, workers-ai-systemone, openai-decisions) reads as a
+distribution and only a keyword bridge is one-hot. Every failure path throws
+`JevUnavailableError`.
 
 ## decision-order.ts (93 lines): jev-v3 order, shadow only
 

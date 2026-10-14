@@ -265,8 +265,8 @@ export function jevAttemptCount(): number {
 	return modelCalls.length;
 }
 
-/** Which provider the scripted judge reports as having answered. TypeSafe by
- *  default; anything else makes jev-judge.ts mark the answers one-hot, as the
+/** Which api the scripted judge reports as having answered. TypeSafe by
+ *  default; a native wire is a distribution, anything else is one-hot, as the
  *  keyword bridge's answers are. Reset by loadPlugin. */
 let jevAnsweringApi: string = TYPESAFE_PROVIDER;
 export function setJevAnsweringApi(api: string = TYPESAFE_PROVIDER): void {

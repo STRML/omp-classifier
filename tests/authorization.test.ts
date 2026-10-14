@@ -730,6 +730,25 @@ describe("judgeAuthorization", () => {
 		expect(deriveAuthorization(result, DEFAULT_AUTHORIZATION_POLICY).level).toBe("none");
 	});
 
+	test("every native judgment wire is a distribution, never a keyword bridge", async () => {
+		// The same predicate as the risk battery's, and the same consequence:
+		// marking a probability answer one-hot discards it (deriveAuthorization
+		// reads one-hot as `none`), so a judge role routed to any native wire
+		// must not lose its fast path.
+		for (const api of ["typesafe", "openrouter-decisions", "workers-ai-systemone", "openai-decisions"]) {
+			const result = await judgeAuthorization(undefined, { state: "state", judge: fakeJudge(choiceAnswer(), { api }).judge });
+			expect(result.oneHot, api).toBe(false);
+			expect(deriveAuthorization(result, DEFAULT_AUTHORIZATION_POLICY).level, api).toBe("named");
+		}
+		for (const api of ["openai-completions", "local-inference"]) {
+			const result = await judgeAuthorization(undefined, {
+				state: "state",
+				judge: fakeJudge(choiceAnswer({ probabilities: { none: 0, goal: 0, named: 1 }, confidence: 1 }), { api }).judge,
+			});
+			expect(result.oneHot, api).toBe(true);
+		}
+	});
+
 	test("a partial or mistyped answer is no answer", async () => {
 		await expectUnavailable(
 			judgeAuthorization(undefined, { state: "state", judge: fakeJudge(choiceAnswer({ probabilities: { none: 0.5, named: 0.5 } })).judge }),

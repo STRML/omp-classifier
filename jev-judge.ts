@@ -25,12 +25,15 @@
  *     field the policy reads is checked, a missing hazard is a throw rather than
  *     a 0, and an option label that is not one of ours is dropped rather than
  *     passed through into a dialog or an audit line.
- *   - Provenance. `result.api !== "typesafe"` means a text/keyword bridge
- *     answered — the configured local model, or the chat chain TypeSafe falls
- *     back to — and those answers are one-hot by construction: pi-ai's
- *     `TextJudge.parseAnswer` returns the label it parsed with probability 1 and
- *     confidence 1. `JevAnswers.oneHot` records that, and deriveJevDecision
- *     reads its distribution-shaped floors accordingly.
+ *   - Provenance. `answeredNatively(result.api)` says a native judgment wire
+ *     answered: measured probabilities, one of `typesafe`,
+ *     `openrouter-decisions`, `workers-ai-systemone`, `openai-decisions`. Any
+ *     other api is a text/keyword bridge — the configured local model, or the
+ *     chat chain the judge role falls back to — and those answers are one-hot
+ *     by construction: pi-ai's `TextJudge.parseAnswer` returns the label it
+ *     parsed with probability 1 and confidence 1. `JevAnswers.oneHot` records
+ *     that, and deriveJevDecision reads its distribution-shaped floors
+ *     accordingly.
  *   - Fail closed. Every failure — no judge to ask, a resolver that throws, the
  *     judge throwing (network, non-2xx after retries, a reply that parses to no
  *     answer, the caller's deadline aborting the call), an answer set that does
@@ -58,6 +61,7 @@ import {
 	type ScoreQuestion,
 	NativeJudge,
 	TYPESAFE_PROVIDER,
+	isJudgmentApi,
 	typesafeModel,
 	type Usage,
 } from "@oh-my-pi/pi-ai";
@@ -474,6 +478,23 @@ const DISTRIBUTION_TOLERANCE = 0.05;
 type AuthorizationBattery = Questions & { user_authorization: ChoiceQuestion<JevAuthorizationLevel> };
 
 /**
+ * Whether the answer came from a native judgment wire — measured probabilities
+ * — rather than from a keyword bridge. `TextJudge` answers are one-hot by
+ * construction: `parseAnswer` returns the parsed label with probability 1 and
+ * confidence 1, so there is no distribution to read floors against.
+ *
+ * 18.10 answers natively through four wires (`typesafe`,
+ * `openrouter-decisions`, `workers-ai-systemone`, `openai-decisions`), and the
+ * host's own `isJudgmentApi` is the source of truth for which APIs those are.
+ * Naming the wires here instead would misread a probability answer as a keyword
+ * one the day the host adds a wire, which is the fail-open direction: one-hot
+ * answers are read as the choice label itself and skip the distribution floors.
+ */
+function answeredNatively(api: string): boolean {
+	return isJudgmentApi(api as Parameters<typeof isJudgmentApi>[0]);
+}
+
+/**
  * Ask the authorization question about one authorization state.
  *
  * A second request rather than a question added to the risk battery, because
@@ -586,7 +607,7 @@ function toAuthorizationAnswer(
 		confidence,
 		...(usage === undefined ? {} : { usage }),
 		latencyMs,
-		oneHot: result.api !== TYPESAFE_PROVIDER,
+		oneHot: !answeredNatively(result.api),
 	};
 }
 
@@ -740,7 +761,7 @@ function toJevAnswers(result: JudgmentResult<JevBattery>, battery: JevBattery, l
 		blastRadius: { score, confidence: blastConfidence, levels: battery.blast_radius.criteria },
 		...(usage === undefined ? {} : { usage }),
 		latencyMs,
-		oneHot: result.api !== TYPESAFE_PROVIDER,
+		oneHot: !answeredNatively(result.api),
 	};
 }
 

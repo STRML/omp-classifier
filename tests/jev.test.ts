@@ -548,9 +548,11 @@ interface Judged {
 
 /**
  * A judge answering from a scripted map. `api` is the transport the host
- * reports — anything that is not TypeSafe is the keyword bridge, which is what
- * makes the answer set one-hot downstream — and `usage: null` models a judge
- * that reports no token counts at all.
+ * reports — a native judgment wire (`typesafe`, `openrouter-decisions`,
+ * `workers-ai-systemone`, `openai-decisions`) reads as a distribution, anything
+ * else is the keyword bridge, which is what makes the answer set one-hot
+ * downstream — and `usage: null` models a judge that reports no token counts at
+ * all.
  */
 const fakeJudge = (
 	answers: BatteryAnswers,
@@ -701,6 +703,24 @@ describe("judgeBattery", () => {
 		expect(wide.verdict).toBe("UNSURE");
 		expect(wide.reasonCode).toBe("jev:blast-radius");
 		expect(wide.reason).toContain("(llm keyword answer)");
+	});
+
+	test("every native judgment wire is a distribution, never a keyword bridge", async () => {
+		// 18.10 answers natively through four wires, and all four return
+		// probabilities. Reading one as one-hot would skip the distribution
+		// floors (a one-hot answer is read as the choice label itself), which is
+		// the fail-open direction — so the predicate is the host's own
+		// `isJudgmentApi`, not a hand-kept list that can fall behind it.
+		for (const api of ["typesafe", "openrouter-decisions", "workers-ai-systemone", "openai-decisions"]) {
+			const answers = await judgeBattery(undefined, { state: "state", judge: fakeJudge(distributed(), { api }).judge });
+			expect(answers.oneHot, api).toBe(false);
+		}
+		// And the keyword bridges stay one-hot, so the split is not "always
+		// false" in disguise.
+		for (const api of ["openai-completions", "local-inference"]) {
+			const answers = await judgeBattery(undefined, { state: "state", judge: fakeJudge(oneHot("safe"), { api }).judge });
+			expect(answers.oneHot, api).toBe(true);
+		}
 	});
 
 	test("a missing hazard answer fails closed instead of reading as zero", async () => {
