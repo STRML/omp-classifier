@@ -25,12 +25,15 @@
  *     field the policy reads is checked, a missing hazard is a throw rather than
  *     a 0, and an option label that is not one of ours is dropped rather than
  *     passed through into a dialog or an audit line.
- *   - Provenance. `result.api !== "typesafe"` means a text/keyword bridge
- *     answered — the configured local model, or the chat chain TypeSafe falls
- *     back to — and those answers are one-hot by construction: pi-ai's
- *     `TextJudge.parseAnswer` returns the label it parsed with probability 1 and
- *     confidence 1. `JevAnswers.oneHot` records that, and deriveJevDecision
- *     reads its distribution-shaped floors accordingly.
+ *   - Provenance. `answeredNatively(result.api)` says a native judgment wire
+ *     answered: measured probabilities, one of `typesafe`,
+ *     `openrouter-decisions`, `workers-ai-systemone`, `openai-decisions`. Any
+ *     other api is a text/keyword bridge — the configured local model, or the
+ *     chat chain the judge role falls back to — and those answers are one-hot
+ *     by construction: pi-ai's `TextJudge.parseAnswer` returns the label it
+ *     parsed with probability 1 and confidence 1. `JevAnswers.oneHot` records
+ *     that, and deriveJevDecision reads its distribution-shaped floors
+ *     accordingly.
  *   - Fail closed. Every failure — no judge to ask, a resolver that throws, the
  *     judge throwing (network, non-2xx after retries, a reply that parses to no
  *     answer, the caller's deadline aborting the call), an answer set that does

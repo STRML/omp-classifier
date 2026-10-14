@@ -176,14 +176,14 @@ export interface JevAnswers {
 	latencyMs: number;
 	/**
 	 * Provenance of the answer set: true when a text/keyword bridge answered
-	 * rather than TypeSafe (the judge reports `api !== "typesafe"`, which is
-	 * what a TypeSafe failure falling back to the tiny/smol chain, or a local
-	 * model, looks like). Those answers are one-hot by construction —
-	 * probabilities are 0/1 and confidence is 1, because the bridge parses a
-	 * keyword out of prose and there is no distribution behind it — so
-	 * deriveJevDecision reads the distribution-shaped floors as the choice
-	 * label and marks the reason. Absent on a hand-built answer, which reads as
-	 * "not one-hot".
+	 * rather than a native wire (`typesafe`, `openrouter-decisions`,
+	 * `workers-ai-systemone`, `openai-decisions`), which all return measured
+	 * probabilities. Anything else is a bridge — the judge role falling back to
+	 * the tiny/smol chain, or a local model — and its answers are one-hot by
+	 * construction: probabilities are 0/1 and confidence is 1, because the
+	 * bridge parses a keyword out of prose and there is no distribution behind
+	 * it, so deriveJevDecision reads the distribution-shaped floors as the
+	 * choice label and marks the reason. Absent reads as "not one-hot".
 	 */
 	oneHot?: boolean;
 }

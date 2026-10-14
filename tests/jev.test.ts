@@ -548,9 +548,11 @@ interface Judged {
 
 /**
  * A judge answering from a scripted map. `api` is the transport the host
- * reports — anything that is not TypeSafe is the keyword bridge, which is what
- * makes the answer set one-hot downstream — and `usage: null` models a judge
- * that reports no token counts at all.
+ * reports — a native judgment wire (`typesafe`, `openrouter-decisions`,
+ * `workers-ai-systemone`, `openai-decisions`) reads as a distribution, anything
+ * else is the keyword bridge, which is what makes the answer set one-hot
+ * downstream — and `usage: null` models a judge that reports no token counts at
+ * all.
  */
 const fakeJudge = (
 	answers: BatteryAnswers,
