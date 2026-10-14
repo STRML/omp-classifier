@@ -2,6 +2,17 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-10-14
+
+### The plugin loads again on OMP 18.10 (host API migration)
+
+- The plugin failed to load on OMP 18.10.4: `Export named 'TypeSafeJudge' not found`. `pi-ai` renamed the native judge to `NativeJudge` (and `TypeSafeApiError` to `JudgmentApiError`) in 18.9.2, so `jev-judge.ts`, `eval/run.ts`, `eval/headless-brief-probe.ts` and the endpoint-backend test now import `NativeJudge`. The endpoint transport is the same client on the same wire: `api` still defaults to `typesafe`, whose dialect is `POST {baseUrl}/v1/systemone`, so retries, timeouts and the redirect policy are unchanged. A 3xx now reports the host client's own `${provider}/${model} API error (<status>)` message.
+- Static bash policy had been silently dead since 2026-09-29: `Settings.get(key)` was removed from the host, so `readHostPolicy` threw on every bash call and the catch degraded to "no static rules, classify everything" — no `deny`, `prompt` or narrow `allow` rule was honored for two weeks, with one warning per session in the host log. It now reads the registry's setting handles, `cfgToolsApproval` and `cfgBashPatterns`, against the live `Settings` instance; verified live with a `--config` overlay whose `bash.patterns` allow rule is honored (`layer: "rule"`, no model call). The test fixture's `{get}` stub, which hid the break, is replaced by a real `Settings.isolated(...)`.
+- `JudgeDeps` no longer takes `backend` and now requires `purpose`; the gate passes `purpose: "omp-classifier"` and keeps `sessionModel` absent, so a TypeSafe outage stays an outage rather than falling back to the session's chat model.
+- `AuthStorage.hasResolvableAuth`/`resolver` are gone; the eval harnesses use `credentials.keys.source(provider)` and the rotation-aware `credentials.keys.resolver(provider)`.
+- Dev dependencies move from 18.2.4 to 18.10.4 so typechecking sees the runtime's real surface.
+- The 18.10 bash tool no longer declares an `env` parameter; the gate still reads `event.input.env` defensively, because a caller-supplied environment changes what runs and must stay a permission request.
+
 ## 2026-10-01
 
 ### Sessions with no UI have no user channel (spec step 1)

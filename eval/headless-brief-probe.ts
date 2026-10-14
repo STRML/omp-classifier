@@ -18,7 +18,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { type Judge, TYPESAFE_PROVIDER, TypeSafeJudge } from "@oh-my-pi/pi-ai";
+import { type Judge, NativeJudge, TYPESAFE_PROVIDER } from "@oh-my-pi/pi-ai";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
 import {
 	buildJevState,
@@ -199,8 +199,8 @@ async function main(): Promise<void> {
 	}
 	const credentials = await discoverAuthStorage();
 	try {
-		if (!credentials.hasResolvableAuth(TYPESAFE_PROVIDER)) console.error("warning: no TypeSafe credential; every sample will be UNAVAILABLE.");
-		process.exitCode = await probe(new TypeSafeJudge({ apiKey: credentials.resolver(TYPESAFE_PROVIDER), model, timeoutMs: 25_000 }), model, samples);
+		if (credentials.keys.source(TYPESAFE_PROVIDER) === undefined) console.error("warning: no TypeSafe credential; every sample will be UNAVAILABLE.");
+		process.exitCode = await probe(new NativeJudge({ apiKey: credentials.keys.resolver(TYPESAFE_PROVIDER), model, timeoutMs: 25_000 }), model, samples);
 	} finally {
 		credentials.close();
 	}

@@ -13,7 +13,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import type { Answer, Judge, JudgeOptions, JudgmentRequest, JudgmentResult, Questions, Usage } from "@oh-my-pi/pi-ai";
-import { ONLINE_MEMORY_MODEL_KEY } from "@oh-my-pi/pi-coding-agent/tiny/models";
 import {
 	buildJevState,
 	DEFAULT_JEV_POLICY,
@@ -779,7 +778,7 @@ describe("judgeBattery", () => {
 		await expectUnavailable(judgeBattery(undefined, { state: "state", context: { modelRegistry: {} } as unknown as JudgeContext }), /no judge to ask/u);
 	});
 
-	test("the ctx supplies the resolver's deps: registry, backend and id, never a session model", async () => {
+	test("the ctx supplies the resolver's deps: registry, purpose and id, never a session model", async () => {
 		resolvedJudgeDeps.length = 0;
 		const context = {
 			modelRegistry: { authStorage: { hasAuth: () => false }, getAvailable: () => [] },
@@ -796,8 +795,9 @@ describe("judgeBattery", () => {
 		const deps = resolvedJudgeDeps[0] as unknown as Record<string, unknown>;
 		expect(deps.settings).toBe(settings);
 		expect(deps.registry).toBe((context as unknown as Record<string, unknown>).modelRegistry);
-		// The chat chain is the backend key (an 18.2.4 field the 18.3 chain ignores).
-		expect(deps.backend).toBe(ONLINE_MEMORY_MODEL_KEY);
+		// `purpose` labels the session ledger entry and the judgment telemetry
+		// span, and 18.10's JudgeDeps requires it.
+		expect(deps.purpose).toBe("omp-classifier");
 		// A session model would give the host's judge chain a chat fallback after a
 		// TypeSafe outage — an unavailability must be an outage, never a weaker
 		// verdict — so the adapter must not pass one even when the ctx has one.

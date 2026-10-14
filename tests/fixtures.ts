@@ -24,7 +24,9 @@ import { mock } from "bun:test";
 import { TYPESAFE_PROVIDER, tokenUsage, typesafeModel } from "@oh-my-pi/pi-ai";
 import type { Judge, JudgeOptions, JudgmentRequest, JudgmentResult, Questions } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { JudgeDeps } from "@oh-my-pi/pi-coding-agent/judgment";
+import * as hostJudgment from "@oh-my-pi/pi-coding-agent/judgment";
 import { JEV_V3_POLICY_VERSION, jevQuestions } from "../jev";
 
 export type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "UNAVAILABLE";
@@ -505,12 +507,21 @@ const scriptedJudge: Judge & { readonly kind: "typesafe" } = {
 // gate's. `resolvedJudgeDeps` is the one thing the scripted resolver keeps: the
 // deps jev-judge.ts assembled from the extension context, which is what makes
 // the ctx -> JudgeDeps wiring assertable without a provider.
+//
+// The mock spreads the REAL module first: the host's own barrel imports
+// `hasNativeJudge`, `journalJudgmentUsage` and friends from this path, so a
+// factory that returned only the stubbed export broke every importer that
+// reaches them (18.10 made those reachable from the plugin's graph). Spreading
+// keeps the mock correct as the host adds exports. The snapshot is taken
+// eagerly, before `mock.module` registers: bun patches an already-imported
+// namespace in place, so a lazy spread inside the factory could read the mock.
+const realJudgmentExports = { ...hostJudgment };
 mock.module("@oh-my-pi/pi-coding-agent/judgment", () => ({
+	...realJudgmentExports,
 	resolveJudge: (deps: JudgeDeps) => {
 		resolvedJudgeDeps.push(deps);
 		return scriptedJudge;
 	},
-	usesTypeSafeJudge: () => true,
 }));
 
 /** The firewall's transport: the wire fake the suite has always had, kept so
@@ -602,7 +613,7 @@ export async function fireCommand(name: string, args: string, ctx: ExtensionCont
 	return await handler(args, ctx);
 }
 /** Load the plugin with a fake pi; returns a fire() bound to it. */
-export async function loadPlugin(settings: Record<string, unknown>): Promise<void> {
+export async function loadPlugin(settings: Settings): Promise<void> {
 	loggerWarnings.length = 0;
 	loggerInfos.length = 0;
 	handlers.clear();
@@ -799,14 +810,16 @@ export function notifyCalls(ctx: ExtensionContext): string[][] {
 	return (ctx as unknown as { notifyCalls: string[][] }).notifyCalls;
 }
 
-export function makeSettings(patterns: unknown[], bashPolicy?: string): Record<string, unknown> {
-	const store: Record<string, unknown> = {
+export function makeSettings(patterns: unknown[], bashPolicy?: string): Settings {
+	// A real in-memory settings instance, not a `{get}` stub: the plugin reads
+	// host policy through the registry's setting handles (`cfgToolsApproval`,
+	// `cfgBashPatterns`), and a handle resolves against a Settings instance's
+	// layers. A stub made the read fail in production while the suite stayed
+	// green, which is how the 18.10 settings break hid.
+	return Settings.isolated({
 		"bash.patterns": patterns,
 		"tools.approval": bashPolicy ? { bash: bashPolicy } : {},
-	};
-	// The plugin reads host settings through settings.get(key), like the real
-	// Settings singleton.
-	return { get: (key: string): unknown => store[key] };
+	});
 }
 
 let testConfigPath: string | undefined;

@@ -6,7 +6,7 @@
 
 | Script | Lines | Does | Production code it calls |
 |---|---|---|---|
-| run.ts | 1735 | scores a policy against labeled corpora; sweeps threshold grids; `--replay` re-scores from the answer cache | jev `buildJevState`, `jevQuestionsHash`, `deriveJevDecision`; jev-judge `judgeBattery`; index `replayDecision`, `matchModerateRiskTokens`, `evalRiskFlags`; host `CRITICAL_BASH_PATTERNS`, `TypeSafeJudge`, `discoverAuthStorage` |
+| run.ts | 1735 | scores a policy against labeled corpora; sweeps threshold grids; `--replay` re-scores from the answer cache | jev `buildJevState`, `jevQuestionsHash`, `deriveJevDecision`; jev-judge `judgeBattery`; index `replayDecision`, `matchModerateRiskTokens`, `evalRiskFlags`; host `CRITICAL_BASH_PATTERNS`, `NativeJudge`, `discoverAuthStorage` |
 | headless-brief-probe.ts | 195 | spec step 1 probe: three arms (brief as user words / omitted / operator context) over jev-v3.1 and v2.11; `chooseHeadlessArm` picks a/b/unconfirmed; `--replay` reads the cache only | jev `buildJevState`; jev-judge `judgeBattery`; redact |
 | literal-match-probe.ts | 83 | `literalMatchTally`: how many mined intent seeds and judged states reach `literalMatch` (branch 4) and why not | literal-match |
 | live-report.ts | 238 | jev-v3 shadow against live v2 disagreements, read from decisions.jsonl; exits 1 when the report is incomplete | index `decisionsLogPath`, `DecisionRecord` |
