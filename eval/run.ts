@@ -55,8 +55,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs as parseCliArgs } from "node:util";
-import { type Judge, NativeJudge, TYPESAFE_PROVIDER } from "@oh-my-pi/pi-ai";
-import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
+import { type Judge, NativeJudge } from "@oh-my-pi/pi-ai";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import {
 	buildAuthorizationState,
@@ -88,6 +87,7 @@ import {
 import { judgeAuthorization, judgeBattery } from "../jev-judge";
 import { literalMatch } from "../literal-match";
 import { evalRiskFlags, matchModerateRiskTokens, replayDecision } from "../index";
+import { openTypesafeCredential } from "./credential";
 
 /** Both non-SAFE verdicts raise a permission request, so both count as "ask". */
 export type Decision = "allow" | "ask";
@@ -177,7 +177,7 @@ interface Outcome extends Case {
 	approvalOverrides: number;
 	/** Set only when `verdict` is UNAVAILABLE: why the answers never arrived. */
 	unavailable?: string;
-	/** Present on a jev-v3.1 run: the order's own record. `verdict`, `verdicts`,
+	/** Present on a jev-v3 run: the order's own record. `verdict`, `verdicts`,
 	 *  `decision` and `decisions` above are the order's; these are the legacy
 	 *  derivation over the same answers, for the side-by-side, and the inputs
 	 *  the sweep re-derives the order from. */
@@ -195,7 +195,7 @@ interface Outcome extends Case {
 interface PreparedCase {
 	testCase: Case;
 	/** The decision this case reaches under a policy: deriveJevDecision on a
-	 *  jev-v2.11 run, deriveDecisionOrder on a jev-v3.1 run. */
+	 *  jev-v2 run, deriveDecisionOrder on a jev-v3 run. */
 	derive: (policy: JevPolicy) => JevDecision;
 	/** Production's deterministic tail, memoized per case (see preparedTail). */
 	tail: (decision: JevDecision) => { decision: Decision; layer: string; hostHandoff: string };
@@ -1407,7 +1407,7 @@ async function runScored(args: Args, judge: Judge | undefined): Promise<void> {
 	const policy = await loadPolicy(args.policy);
 	const policyId = policyIdOf(policy, batteryHash);
 	const defaultPolicyId = policyIdOf(DEFAULT_JEV_POLICY, batteryHash);
-	// A jev-v3.1 run scores the order production runs after the flip (see the
+	// A jev-v3 run scores the order production runs after the flip (see the
 	// plan's Decisions): the battery and the derivation move together.
 	const v3 = args.battery === JEV_V3_POLICY_VERSION;
 	const authorizationBattery = `auth:${jevAuthorizationHash()}`;
@@ -1944,22 +1944,21 @@ async function main(): Promise<void> {
 		await runScored(args, undefined);
 		return;
 	}
-	// The native credential store, which is also what a CLI run uses outside the
-	// plugin: `/login typesafe` first, then TYPESAFE_API_KEY. It owns a SQLite
-	// handle, so the run closes it on every exit path — including a throw.
-	const credentials = await discoverAuthStorage();
+	// The credential a session would judge with (eval/credential.ts). It owns a
+	// SQLite handle, so the run closes it on every exit path — including a throw.
+	const credentials = await openTypesafeCredential();
 	try {
 		// A missing credential is a run-level fact worth printing up front — not
 		// 103 identical UNAVAILABLE lines to read afterwards.
-		if (credentials.keys.source(TYPESAFE_PROVIDER) === undefined) {
-			console.error("warning: no TypeSafe credential — run /login typesafe or set TYPESAFE_API_KEY. Uncached cases will be recorded UNAVAILABLE.");
+		if (!credentials.present) {
+			console.error("warning: no TypeSafe credential — run /login typesafe, set providers.typesafe.apiKey in models.yml, or set TYPESAFE_API_KEY. Uncached cases will be recorded UNAVAILABLE.");
 		}
 		// The judge is built once, explicitly, and injected: production falls back
 		// to a chat judge when TypeSafe fails, and a run that inherited that
 		// fallback would score a keyword verdict as the model's. The key is a
 		// resolver, not a snapshot, so a store that rotates mid-run is followed.
 		const judge = new NativeJudge({
-			apiKey: credentials.keys.resolver(TYPESAFE_PROVIDER),
+			apiKey: credentials.apiKey,
 			model: args.model,
 			timeoutMs: args.timeoutMs,
 		});
