@@ -84,6 +84,7 @@ import {
 	type JevDecision,
 	type JevPolicy,
 	type JevVerdict,
+	type DeleteTarget,
 	type GitPushProvenance,
 	type GitWorktreeProvenance,
 	type GitRefProvenance,
@@ -154,6 +155,7 @@ export interface Case {
 		gitWorktreeProvenance?: GitWorktreeProvenance;
 		gitRefProvenance?: GitRefProvenance[];
 		networkProvenance?: NetworkProvenance;
+		deleteTargets?: DeleteTarget[];
 	};
 }
 
@@ -695,7 +697,7 @@ function validateProvenance(value: unknown, command: string): asserts value is N
 	const exactKeys = (input: Record<string, unknown>, keys: readonly string[]): boolean => Object.keys(input).every(key => keys.includes(key));
 	const strings = (input: unknown): input is string[] => Array.isArray(input) && input.every(item => typeof item === "string");
 	const provenance = asRecord(value, "object");
-	const tiers = new Set(["gitPushProvenance", "gitWorktreeProvenance", "gitRefProvenance", "networkProvenance"]);
+	const tiers = new Set(["gitPushProvenance", "gitWorktreeProvenance", "gitRefProvenance", "networkProvenance", "deleteTargets"]);
 	for (const key of Object.keys(provenance)) if (!tiers.has(key)) throw new Error(`corpus: unknown provenance key '${key}' on: ${command}`);
 	const push = provenance.gitPushProvenance;
 	if (push !== undefined) {
@@ -752,6 +754,15 @@ function validateProvenance(value: unknown, command: string): asserts value is N
 		if (tier.ambientClientConfig !== undefined && Object.values(asRecord(tier.ambientClientConfig, "networkProvenance")).some(setting => typeof setting !== "string")) fail("networkProvenance");
 		if (tier.directoryUnresolved !== undefined && tier.directoryUnresolved !== true) fail("networkProvenance");
 		if (tier.ambientConfigUnreadable !== undefined && tier.ambientConfigUnreadable !== true) fail("networkProvenance");
+	}
+	const deletes = provenance.deleteTargets;
+	if (deletes !== undefined) {
+		if (!Array.isArray(deletes)) fail("deleteTargets");
+		for (const entryValue of deletes as unknown[]) {
+			const entry = asRecord(entryValue, "deleteTargets");
+			if (!exactKeys(entry, ["target", "underTempRoot"]) || typeof entry.target !== "string" || !("underTempRoot" in entry)) fail("deleteTargets");
+			if (!(entry.underTempRoot === null || typeof entry.underTempRoot === "boolean")) fail("deleteTargets");
+		}
 	}
 }
 
@@ -815,6 +826,7 @@ export function caseState(testCase: Case, cwd: string): unknown {
 		...(testCase.provenance?.gitWorktreeProvenance ? { gitWorktreeProvenance: testCase.provenance.gitWorktreeProvenance } : {}),
 		...(testCase.provenance?.gitRefProvenance ? { gitRefProvenance: testCase.provenance.gitRefProvenance } : {}),
 		...(testCase.provenance?.networkProvenance ? { networkProvenance: testCase.provenance.networkProvenance } : {}),
+		...(testCase.provenance?.deleteTargets ? { deleteTargets: testCase.provenance.deleteTargets } : {}),
 		// Omitted when empty, exactly as production omits it: `extra: {}` and an
 		// absent key produce the same state, and matching the call shape keeps the
 		// two paths comparable by eye.

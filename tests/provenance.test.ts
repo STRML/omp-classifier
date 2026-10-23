@@ -36,7 +36,7 @@ describe("gate-measured git push provenance (#63)", () => {
 		try {
 			git("git init -q -b main && git remote add origin https://example.invalid/repo.git && git commit -q --allow-empty -m base", dir);
 			// A known remote with no tracking ref yet: the parse is visible as null tips.
-			const p = measureGitPushProvenance("git push origin +feature/some:feature/some --force-with-lease", dir);
+			const p = measureGitPushProvenance("git push origin feature/some:feature/some --force-with-lease", dir);
 			expect(p?.remoteTip).toBeNull();
 			expect(p?.ahead).toBeNull();
 		} finally {
@@ -48,12 +48,12 @@ describe("gate-measured git push provenance (#63)", () => {
 		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
 		try {
 			git("git init -q -b main && git remote add origin https://example.invalid/repo.git && git commit -q --allow-empty -m base && git branch side && git update-ref refs/remotes/origin/side HEAD", dir);
-			const p = measureGitPushProvenance("git push origin +main:side --force-with-lease", dir);
+			const p = measureGitPushProvenance("git push --force-with-lease origin main:side", dir);
 			expect(p?.forwardOnly).toBe(true);
 			expect(p?.ahead).toBe(0);
 			expect(p?.behind).toBe(0);
 			// State carries the measured tier with its authority note.
-			const state = buildJevState({ command: "git push origin +main:side --force-with-lease", workingDirectory: dir, gitPushProvenance: p }) as Record<string, unknown>;
+			const state = buildJevState({ command: "git push --force-with-lease origin main:side", workingDirectory: dir, gitPushProvenance: p }) as Record<string, unknown>;
 			const prov = state.gitPushProvenance as Record<string, unknown>;
 			expect(prov.forwardOnly).toBe(true);
 			expect(String(prov.note)).toContain("measured by the gate");
@@ -76,19 +76,18 @@ describe("gate-measured git push provenance (#63)", () => {
 					"git reset -q --hard main && git commit -q --allow-empty -m local-rewrite",
 				dir,
 			);
-			// `+HEAD` matters most: the moderate-risk overlay flags `--force`
-			// spellings, so a SAFE there still asked, but `+` reaches no overlay.
-			for (const command of ["git push --force origin HEAD", "git push -u origin HEAD", "git push --force origin @", "git push origin +HEAD"]) {
+			// A leased force push is the only force spelling measured (#169).
+			for (const command of ["git push --force-with-lease origin HEAD", "git push -u origin HEAD", "git push --force-with-lease origin @", "git push --force-with-lease=feature origin HEAD"]) {
 				const p = measureGitPushProvenance(command, dir);
 				expect(p?.forwardOnly, command).toBe(false);
 				expect(p?.behind, command).toBe(1);
 			}
 			// `HEAD:<name>` names its remote side, so only the local side is HEAD.
-			const explicit = measureGitPushProvenance("git push --force origin HEAD:feature", dir);
+			const explicit = measureGitPushProvenance("git push --force-with-lease origin HEAD:feature", dir);
 			expect(explicit?.behind).toBe(1);
 			// `<src>:HEAD` names a destination spelled HEAD: it is not the
 			// current-branch shorthand, so the current branch is not swapped in.
-			const destination = measureGitPushProvenance("git push --force origin main:HEAD", dir);
+			const destination = measureGitPushProvenance("git push --force-with-lease origin main:HEAD", dir);
 			expect(destination?.remoteTip).toBe(execSync("git rev-parse refs/remotes/origin/HEAD", { cwd: dir, env: GIT_ENV }).toString().trim());
 			// A branch the remote does not have yet: no remote tip, nothing compared.
 			git("git switch -q -c brand-new", dir);
@@ -114,24 +113,24 @@ describe("gate-measured git push provenance (#63)", () => {
 				dir,
 			);
 			for (const command of [
-				"git commit --amend --no-edit && git push origin +main",
-				"git commit --amen --no-edit && git push origin +main",
-				"git branch --forc main HEAD~1 && git push origin +main",
-				"git branch -fq main HEAD~1 && git push origin +main",
-				"git reset --hard HEAD~1 && git push --force origin main",
+				"git commit --amend --no-edit && git push --force-with-lease origin main",
+				"git commit --amen --no-edit && git push --force-with-lease origin main",
+				"git branch --forc main HEAD~1 && git push --force-with-lease origin main",
+				"git branch -fq main HEAD~1 && git push --force-with-lease origin main",
+				"git reset --hard HEAD~1 && git push --force-with-lease origin main",
 				"git rebase -i HEAD~2 && git push --force-with-lease origin main",
-				"git pull --rebase && git push --force origin main",
-				"git branch -f main HEAD~1 && git push origin +main",
-				"git switch b && git push origin +HEAD",
-				"git checkout b && git push --force origin HEAD",
+				"git pull --rebase && git push --force-with-lease origin main",
+				"git branch -f main HEAD~1 && git push --force-with-lease origin main",
+				"git switch b && git push --force-with-lease origin HEAD",
+				"git checkout b && git push --force-with-lease origin HEAD",
 				// A global option hides which subcommand runs, and in which repository.
-				"git -C . reset --hard HEAD~1 && git push origin +main",
-				"git -c user.name=x rebase -i HEAD~2 && git push origin +main",
+				"git -C . reset --hard HEAD~1 && git push --force-with-lease origin main",
+				"git -c user.name=x rebase -i HEAD~2 && git push --force-with-lease origin main",
 				// Anything not known to leave refs alone: an alias, a script, an export.
-				"git amend && git push origin +main",
-				"./rewrite.sh && git push --force origin main",
-				"export GIT_DIR=/elsewhere/.git; git push --force origin main",
-				"echo 1111111111111111111111111111111111111111 > .git/refs/heads/main && git push origin +main",
+				"git amend && git push --force-with-lease origin main",
+				"./rewrite.sh && git push --force-with-lease origin main",
+				"export GIT_DIR=/elsewhere/.git; git push --force-with-lease origin main",
+				"echo 1111111111111111111111111111111111111111 > .git/refs/heads/main && git push --force-with-lease origin main",
 			]) {
 				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
 			}
@@ -155,7 +154,7 @@ describe("gate-measured git push provenance (#63)", () => {
 		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
 		try {
 			git("git init -q -b main && git remote add origin https://example.invalid/repo.git && git commit -q --allow-empty -m base && git branch feature && git update-ref refs/remotes/origin/feature HEAD", dir);
-			for (const measured of ["git push origin feature", "git push -fu origin feature", "git push --force-with-lease=feature origin feature"]) {
+			for (const measured of ["git push origin feature", "git push -u --force-with-lease origin feature", "git push --force-with-lease=feature origin feature"]) {
 				expect(measureGitPushProvenance(measured, dir)?.forwardOnly, measured).toBe(true);
 			}
 			for (const command of [
@@ -163,18 +162,23 @@ describe("gate-measured git push provenance (#63)", () => {
 				"git push -d origin feature",
 				"git push origin feature --delete",
 				"git push -fd origin feature",
-				"git push --force origin feature main",
-				"git push --force --tags origin feature",
+				"git push --force-with-lease origin feature main",
+				"git push --force-with-lease --tags origin feature",
 				"git push --all origin feature",
 				"git push --mirror origin feature",
 				"git push -o ci.skip origin feature",
-				"GIT_DIR=/elsewhere/.git git push --force origin feature",
-				"git --git-dir=/elsewhere/.git push --force origin feature",
-				"env GIT_DIR=/elsewhere/.git git push origin +feature",
-				"command git push --force origin feature",
+				"GIT_DIR=/elsewhere/.git git push --force-with-lease origin feature",
+				"git --git-dir=/elsewhere/.git push --force-with-lease origin feature",
+				"env GIT_DIR=/elsewhere/.git git push --force-with-lease origin feature",
+				"command git push --force-with-lease origin feature",
 				// git accepts unambiguous abbreviations of long options.
 				"git push --del origin feature",
 				"git push --mir origin feature",
+				// A word the shell rewrites is not the word git receives.
+				"git push origin {feature,+main}",
+				"git push origin $SPEC",
+				"git push $FLAGS origin feature",
+				"git push origin feature*",
 			]) {
 				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
 			}
@@ -197,17 +201,17 @@ describe("gate-measured git push provenance (#63)", () => {
 				dir,
 			);
 			for (const command of [
-				"git log -1 --format=%H --output=.git/refs/heads/main && git push origin +main",
-				"git log -1 --outp=.git/refs/heads/main && git push origin +main",
-				"git diff --output=.git/refs/heads/main && git push origin +main",
-				"git cherry-pick --abort && git push origin +main",
-				"git revert --abo && git push origin +main",
-				"git merge --abort && git push origin +main",
-				"git stash branch tmp && git push origin +HEAD",
-				"echo 1111111111111111111111111111111111111111 >& .git/refs/heads/main && git push origin +main",
+				"git log -1 --format=%H --output=.git/refs/heads/main && git push --force-with-lease origin main",
+				"git log -1 --outp=.git/refs/heads/main && git push --force-with-lease origin main",
+				"git diff --output=.git/refs/heads/main && git push --force-with-lease origin main",
+				"git cherry-pick --abort && git push --force-with-lease origin main",
+				"git revert --abo && git push --force-with-lease origin main",
+				"git merge --abort && git push --force-with-lease origin main",
+				"git stash branch tmp && git push --force-with-lease origin HEAD",
+				"echo 1111111111111111111111111111111111111111 >& .git/refs/heads/main && git push --force-with-lease origin main",
 				"git push origin +$(git reset -q --hard HEAD~1; echo main)",
-				"git stash show --output=.git/refs/heads/main && git push origin +main",
-				"git branch -D main && git branch main HEAD~1 && git push --force origin main",
+				"git stash show --output=.git/refs/heads/main && git push --force-with-lease origin main",
+				"git branch -D main && git branch main HEAD~1 && git push --force-with-lease origin main",
 			]) {
 				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
 			}
@@ -233,17 +237,17 @@ describe("gate-measured git push provenance (#63)", () => {
 		try {
 			git("git init -q -b main && git remote add origin https://example.invalid/repo.git && git commit -q --allow-empty -m base && git update-ref refs/remotes/origin/main HEAD", dir);
 			for (const command of [
-				"for i in 1 2; do git push origin +main; git reset --hard HEAD~1; done",
-				"f(){ git push origin +main; }; git reset --hard HEAD~1; f",
-				"git push origin +main & git reset --hard HEAD~1",
-				"git push origin +main | git reset --hard HEAD~1",
-				"( git reset --hard HEAD~1 ); git push origin +main",
-				"git push --force origin main && gh pr create --fill",
-				"git status && git push --force origin main",
+				"for i in 1 2; do git push --force-with-lease origin main; git reset --hard HEAD~1; done",
+				"f(){ git push --force-with-lease origin main; }; git reset --hard HEAD~1; f",
+				"git push --force-with-lease origin main & git reset --hard HEAD~1",
+				"git push --force-with-lease origin main | git reset --hard HEAD~1",
+				"( git reset --hard HEAD~1 ); git push --force-with-lease origin main",
+				"git push --force-with-lease origin main && gh pr create --fill",
+				"git status && git push --force-with-lease origin main",
 			]) {
 				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
 			}
-			expect(measureGitPushProvenance("cd . && git push --force origin main", dir)?.forwardOnly).toBe(true);
+			expect(measureGitPushProvenance("cd . && git push --force-with-lease origin main", dir)?.forwardOnly).toBe(true);
 			expect(measureGitPushProvenance("git push -u origin main && gh pr create --fill", dir)?.forwardOnly).toBe(true);
 		} finally {
 			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
@@ -350,6 +354,17 @@ describe("gate-measured git push provenance (#63)", () => {
 				"git push origin main | git remote set-url origin x",
 				// A substitution in the push's own words runs before it.
 				"git push origin $(git remote set-url origin x; echo main)",
+				// Review of #174: a word the shell rewrites can become an option or
+				// subcommand the allowlist never saw.
+				"git rebase $OPT && git push origin main",
+				"git commit $(echo -x) && git push origin main",
+				"git {rebase,-x,sh} && git push origin main",
+				"git log --oneline -1 ${X:---output=.git/config} && git push origin main",
+				"git checkout ?ebase && git push origin main",
+				"cat <(git remote set-url origin x) && git push origin main",
+				// fetch rewrites the tracking refs, and a transport can run a program.
+				"git fetch && git push origin main",
+				"git fetch 'ext::sh -c x' && git push origin main",
 			]) {
 				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
 			}
@@ -358,6 +373,8 @@ describe("gate-measured git push provenance (#63)", () => {
 				'git commit -q --allow-empty -m "fix foo()" && git push origin main',
 				"git status 2>&1 && git push origin main",
 				"git add -A && git commit -q --allow-empty -m next && git push origin main",
+				// Quoted glob and brace characters are text, not expansions.
+				'git commit -q --allow-empty -m "fix [P1] {x} *" && git push origin main',
 				"git merge --squash -q main && git push origin main",
 				"cd . && git log --oneline -1 | head -1 && git push origin main",
 				"git push origin main 2>&1 | tail -5",
@@ -410,6 +427,50 @@ describe("gate-measured git push provenance (#63)", () => {
 		}
 	});
 
+	test("a force push is measured only when a lease on the measured tip is all that forces it (#169)", () => {
+		// The gate never fetches. Someone else pushes after the last fetch, so the
+		// tracking ref is stale and the local tip looks forward-only against it.
+		const dir = mkdtempSync(join(tmpdir(), "jev169-"));
+		const origin = join(dir, "origin.git");
+		const repo = join(dir, "repo");
+		const other = join(dir, "other");
+		try {
+			git(`git init -q --bare -b main ${JSON.stringify(origin)}`, dir);
+			git(`git init -q -b main ${JSON.stringify(repo)}`, dir);
+			git(`git remote add origin ${JSON.stringify(origin)} && git commit -q --allow-empty -m base && git push -q origin main`, repo);
+			git(`git clone -q ${JSON.stringify(origin)} ${JSON.stringify(other)}`, dir);
+			git("git commit -q --allow-empty -m theirs && git push -q origin main", other);
+			git("git commit -q --allow-empty -m mine", repo);
+			// A lease is measured: git checks the remote still holds the tip the gate read.
+			for (const command of ["git push --force-with-lease origin main", "git push --force-with-lease=main origin main", "git push --force-with-lease=refs/heads/main --force-if-includes origin main"]) {
+				expect(measureGitPushProvenance(command, repo)?.forwardOnly, command).toBe(true);
+			}
+			// ...and git refuses that push, so the stale numbers never describe a discard.
+			expect(() => git("git push -q --force-with-lease origin main", repo)).toThrow();
+			// Every other force spelling pushes past the stale ref, so it is not measured.
+			for (const command of [
+				"git push --force origin main",
+				"git push -f origin main",
+				"git push -fu origin main",
+				"git push origin +main",
+				"git push --force-with-lease origin +main",
+				"git push --force-with-lease -f origin main",
+				"git push --force-with-lease --force origin main",
+				"git push --force-with-lease=main:abc123 origin main",
+				"git push --force-with-lease=other origin main",
+				"git push --force-with-lease= origin main",
+				"git push --force-if-includes origin main",
+			]) {
+				expect(measureGitPushProvenance(command, repo), command).toBeUndefined();
+			}
+			// The measurement was right to refuse them: a plain force push discards their commit.
+			git("git push -q --force origin main", repo);
+			expect(execSync("git log --format=%s main", { cwd: origin, env: GIT_ENV }).toString()).not.toContain("theirs");
+		} finally {
+			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
+		}
+	});
+
 	test("a HEAD refspec on a detached HEAD names no remote branch, so nothing is measured", () => {
 		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
 		try {
@@ -418,7 +479,7 @@ describe("gate-measured git push provenance (#63)", () => {
 					"git update-ref refs/remotes/origin/main HEAD && git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main && git switch -q --detach",
 				dir,
 			);
-			expect(measureGitPushProvenance("git push --force origin HEAD", dir)).toBeUndefined();
+			expect(measureGitPushProvenance("git push --force-with-lease origin HEAD", dir)).toBeUndefined();
 		} finally {
 			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
 		}
@@ -467,7 +528,7 @@ describe("gate-measured git push provenance (#63)", () => {
 			// Two pushes name two pairs of refs, and one measurement cannot stand
 			// in for both: the force push below would otherwise be judged by the
 			// forward-only numbers of the push before it.
-			expect(measureGitPushProvenance("git push origin main && git push --force origin side", repo)).toBeUndefined();
+			expect(measureGitPushProvenance("git push origin main && git push --force-with-lease origin side", repo)).toBeUndefined();
 			expect(measureGitPushProvenance("git push origin main; git push origin main", repo)).toBeUndefined();
 		} finally {
 			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);

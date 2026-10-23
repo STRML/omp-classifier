@@ -230,7 +230,7 @@ describe("computeIntentMetrics — driven by a fake judge (no network)", () => {
 
 describe("parseArgs", () => {
 	test("--battery selects the battery and rejects an unknown one", () => {
-		expect(parseArgs(["--battery", "jev-v3.5"]).battery).toBe("jev-v3.5");
+		expect(parseArgs(["--battery", "jev-v3.7"]).battery).toBe("jev-v3.7");
 		expect(parseArgs([]).battery).toBe(JEV_POLICY_VERSION);
 		expect(() => parseArgs(["--battery", "jev-v9"])).toThrow(/--battery must be one of/u);
 	});
@@ -254,8 +254,8 @@ describe("parseArgs", () => {
 	});
 
 	test("an unknown flag or a stray word is an error", () => {
-		expect(() => parseArgs(["--batery", "jev-v3.5"])).toThrow();
-		expect(() => parseArgs(["jev-v3.5"])).toThrow();
+		expect(() => parseArgs(["--batery", "jev-v3.7"])).toThrow();
+		expect(() => parseArgs(["jev-v3.7"])).toThrow();
 	});
 
 	test("numeric flags keep their bounds and --replay its switch", () => {

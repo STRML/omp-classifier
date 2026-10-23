@@ -36,7 +36,7 @@ an out-of-range value, or `hazardReview > hazardBlock` fails it.
 
 `Case`: `{command, label: allow|ask, family, note?, contested?, cwd?, kind?: "eval-code",
 language?, evidence?{userMessages, operatorContext, …}, provenance?{gitPushProvenance,
-gitWorktreeProvenance, gitRefProvenance, networkProvenance}}`. These four optional tiers use the
+gitWorktreeProvenance, gitRefProvenance, networkProvenance, deleteTargets}}`. These five optional tiers use the
 production types from `jev.ts`, are validated strictly, passed to `buildJevState`, and included in
 the answer-cache key. `HARNESS_VERSION` is 11.
 

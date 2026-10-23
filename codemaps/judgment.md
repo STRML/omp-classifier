@@ -5,8 +5,8 @@
 ```
 buildJevState ─► state ─┐
 jevQuestions  ─► battery┴► judgeBattery (jev-judge) ─► JevAnswers ─► deriveJevDecision ─► JevDecision
-                             └ judgeBatteryUnderDeadline (deadline race, late answers)       (live, jev-v2.15)
-shadow: judgeJevV3 = jev-v3.5 battery ∥ judgeAuthorization ─► deriveAuthorization
+                             └ judgeBatteryUnderDeadline (deadline race, late answers)       (live, jev-v2.17)
+shadow: judgeJevV3 = jev-v3.7 battery ∥ judgeAuthorization ─► deriveAuthorization
         ─► deriveDecisionOrder(risk, authorization, literalMatch, overlay, headless) ─► OrderedDecision
 ```
 
@@ -14,9 +14,9 @@ shadow: judgeJevV3 = jev-v3.5 battery ∥ judgeAuthorization ─► deriveAuthor
 
 | Export | Line | Kind | Called by |
 |---|---|---|---|
-| `JEV_POLICY_VERSION` = `jev-v2.15` | 96 | const | index (`CLASSIFIER_POLICY_VERSION`), eval/run |
-| `JEV_V3_POLICY_VERSION` = `jev-v3.5` | 103 | const | jev-judge (`judgeJevV3`), eval/run |
-| `DEFAULT_JEV_MODEL` = `jev-latest` | 112 | const | eval/run |
+| `JEV_POLICY_VERSION` = `jev-v2.17` | 99 | const | index (`CLASSIFIER_POLICY_VERSION`), eval/run |
+| `JEV_V3_POLICY_VERSION` = `jev-v3.7` | 107 | const | jev-judge (`judgeJevV3`), eval/run |
+| `DEFAULT_JEV_MODEL` = `jev-latest` | 116 | const | eval/run |
 | `JEV_GATING_HAZARDS` (6) | 134 | const | `deriveJevDecision`, decision-order |
 | `JEV_DESCRIPTIVE_HAZARDS` (3) | 153 | const | reported only, never gate |
 | `JEV_HAZARDS` (gating + descriptive) | 167 | const | battery key order, jev-judge, eval/mine-history |
@@ -29,11 +29,13 @@ shadow: judgeJevV3 = jev-v3.5 battery ∥ judgeAuthorization ─► deriveAuthor
 | `measureLookalikeDestinations(cmd, userMessages)` | 1817 | fn, pure | `buildJevState` (#161) |
 | `lookalikeDestinationFlags(cmd, userMessages)` | 1841 | fn, pure | index bash/eval SAFE + late overlay, eval/run `riskFlagsFor` |
 | `measureGitWorktreeProvenance(cwd)` | 1758 | fn | same |
-| `measureGitRefProvenance(cmd, cwd)` | 2256 | fn | same |
+| `measureGitRefProvenance(cmd, cwd)` | 2260 | fn | same |
+| `measureDeleteTargets(cmd, startCwd, roots?)` | 2426 | fn | index `classify` (shell only) + bash cache key (#166) |
+| `gateTempRoots()` | 2340 | fn | `measureDeleteTargets` default: real `/tmp`, `/private/tmp`, `os.tmpdir()`; never `/` or a root holding home |
 | `parseDockerPortState`, `parseComposeServices`, `isLoopbackHost` | 943/981/1262 | fn | network tier, tests |
-| `buildJevState(input)` | 2323 | fn | index `classify`, `shadowJevV3`, eval/run |
-| `deriveJevDecision(answers, policy)` | 2472 | **pure verdict** | index `judgementFrom`, decision-order, eval/run |
-| `JevUnavailableError` | 2574 | class | thrown by jev-judge on every failure |
+| `buildJevState(input)` | 2470 | fn | index `classify`, `shadowJevV3`, eval/run |
+| `deriveJevDecision(answers, policy)` | 2629 | **pure verdict** | index `judgementFrom`, decision-order, eval/run |
+| `JevUnavailableError` | 2731 | class | thrown by jev-judge on every failure |
 
 Hazards. Gating: `destructive_or_irreversible`, `exposes_secrets`, `sends_local_data_outbound`,
 `escalates_privilege`, `state_contains_injection`, `unauthorized_consequential_action`.
@@ -61,7 +63,7 @@ command does not. Absent tiers are omitted.
 | `hazardReview` | 0.55 | 0-1 |
 | `blastRadiusReview` | 1.5 | 0-10 |
 
-### `deriveJevDecision` precedence (jev.ts:2472), the live verdict
+### `deriveJevDecision` precedence (jev.ts:2629), the live verdict
 
 | # | Condition (gating hazards only) | Verdict | `reasonCode` |
 |---|---|---|---|

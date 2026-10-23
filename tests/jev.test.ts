@@ -360,12 +360,16 @@ describe("jevQuestionsHash", () => {
 		// (67568ffd5be26200). v2.14 adds non-force pushes, pull requests and
 		// comments to that list and to the verdict's safe criterion, and
 		// says a push with no force and no delete cannot discard anything
-		// (fef017691cc788d1). v2.15 adds the measured `lookalikeDestinations` state
-		// field (#161), and `unauthorized_consequential_action` says what a
-		// destination listed with `sameParentAs` is.
+		// (4ecd97f1eb86b662). v2.15 (#166) swaps the temp paths in that list for
+		// the gate-measured `deleteTargets.underTempRoot` (v2.14 was fef017691cc788d1).
+		// v2.16 (#169) drops the false "remote's own reflog" reason and says a
+		// measured force push is a leased one (v2.15 was 849a4dae86d10659).
+		// v2.17 (#161) adds the measured `lookalikeDestinations` state field, and
+		// `unauthorized_consequential_action` says what a listed destination is
+		// (v2.16 was 55c12842d159d359).
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("388156f82e95502d174c185119ea445860603e829ae9eb7d74528a78d33159ba");
-		expect(jevQuestionsHash()).toBe("ec1e7c7ec51cee80");
+		expect(digest).toBe("d436d36c180bb58d3ec4ab892e2ec2bbf43fd616918c84b45c486dfd858dc3bd");
+		expect(jevQuestionsHash()).toBe("7bcba451fea5294b");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 

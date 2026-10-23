@@ -212,6 +212,10 @@ export interface ShellWord {
 	globAlternate: string;
 	/** True when every part was a literal: no expansion, no substitution. */
 	literal: boolean;
+	/** True when the shell passes this word on exactly as written: literal, and
+	 *  no unquoted glob or brace character (`*`, `?`, `[`, `{`) that pathname or
+	 *  brace expansion could turn into other words. */
+	fixed: boolean;
 	/** Names this word expands, anywhere inside it: `${BRACED}`, the
 	 *  `$API_KEY` in `${SAFE:-$API_KEY}`, `${#LEN}`, and the bare names an
 	 *  arithmetic expansion reads. */
@@ -487,7 +491,7 @@ function expressionWords(node: any, arithmetic: boolean, source: string, out: Sh
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 
-const literalWord = (text: string): ShellWord => ({ source: text, value: text, alternate: text, globAlternate: text, literal: true, variables: [], substitution: false, commands: [] });
+const literalWord = (text: string): ShellWord => ({ source: text, value: text, alternate: text, globAlternate: text, literal: true, fixed: !/[*?[{]/u.test(text), variables: [], substitution: false, commands: [] });
 
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 function readCall(cmd: any, command: ShellCommand, source: string, out: ShellCommand[]): void {
@@ -620,7 +624,7 @@ function readRedirect(redir: any, source: string, out: ShellCommand[]): ShellRed
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 function readWord(word: any, source: string, out: ShellCommand[]): ShellWord {
 	if (!word) return { ...literalWord(""), source: "" };
-	const flags = { literal: true, substitution: false };
+	const flags = { literal: true, substitution: false, pattern: false };
 	const value = renderParts(word.Parts ?? [], source, "value", false, flags);
 	const alternate = renderParts(word.Parts ?? [], source, "alternate", false, { literal: true, substitution: false });
 	const globAlternate = renderParts(word.Parts ?? [], source, "globAlternate", false, { literal: true, substitution: false });
@@ -629,7 +633,7 @@ function readWord(word: any, source: string, out: ShellCommand[]): ShellWord {
 	// One walk per word visits each node once, as one walk per call did: the
 	// words of a call are disjoint subtrees.
 	const commands = collectSubstitutions(word, source, out);
-	return { source: sliceOf(word, source), offset: stringIndexAt(source, word.Pos().Offset()), value, alternate, globAlternate, literal: flags.literal, variables, substitution: flags.substitution, commands };
+	return { source: sliceOf(word, source), offset: stringIndexAt(source, word.Pos().Offset()), value, alternate, globAlternate, literal: flags.literal, fixed: flags.literal && !flags.pattern, variables, substitution: flags.substitution, commands };
 }
 
 /**
@@ -641,14 +645,15 @@ function readWord(word: any, source: string, out: ShellCommand[]): ShellWord {
 type Rendering = "value" | "alternate" | "globAlternate";
 
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function renderParts(parts: any[], source: string, mode: Rendering, quoted: boolean, flags: { literal: boolean; substitution: boolean }): string {
+function renderParts(parts: any[], source: string, mode: Rendering, quoted: boolean, flags: { literal: boolean; substitution: boolean; pattern?: boolean }): string {
 	return parts.map(part => renderPart(part, source, mode, quoted, flags)).join("");
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function renderPart(part: any, source: string, mode: Rendering, quoted: boolean, flags: { literal: boolean; substitution: boolean }): string {
+function renderPart(part: any, source: string, mode: Rendering, quoted: boolean, flags: { literal: boolean; substitution: boolean; pattern?: boolean }): string {
 	switch (nodeType(part)) {
 		case "Lit":
+			if (!quoted && /[*?[{]/u.test(part.Value ?? "")) flags.pattern = true;
 			return mode.startsWith("glob") ? renderGlobLiteral(part.Value ?? "", quoted) : unescapeLit(part.Value ?? "", quoted);
 		case "SglQuoted": {
 			// `$'\\x2eenv'` is `.env` to the shell.
