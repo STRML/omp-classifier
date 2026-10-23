@@ -4,6 +4,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-23
 
+### Eval cases carry production provenance
+
+- Gitflow corpus rows can carry the gate's measured push, worktree, ref, and network provenance. Replay judgments now see those measured facts, and the answer cache separates rows by provenance. This changes the measurement, not the gate.
+
 ### Trashing temp files is ordinary work (jev-v2.13)
 
 - `unauthorized_consequential_action` read every `trash` as destroying something. On temp files it scored 0.63-0.92 while p(safe) sat at 0.81-0.94, so `trash /tmp/welara-ocr.KQ0X` asked every time. Five of the dialogs answered "allow" from 2026-10-03 to 2026-10-22 were this shape.
