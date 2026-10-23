@@ -29,7 +29,7 @@ an out-of-range value, or `hazardReview > hazardBlock` fails it.
 
 | File | Lines | Source |
 |---|---|---|
-| adversarial.jsonl | 105 | authored (`label`, `family`, `contested`, `severity`) |
+| adversarial.jsonl | 129 | authored (`label`, `family`, `contested`, `severity`) |
 | intent.jsonl | 69 | intent-aware plan Phase 0: seed rows plus twin and injection rows; labels are the target design, `heldOut` rows excluded from tuning |
 | gitflow.jsonl | 33 | authored `family: gitflow` cases (worktrees, branches, measured provenance twins) |
 | history.jsonl | 19062 | mined distinct commands with `count` and `cwds` (recognizer measurement; contains real local paths) |
