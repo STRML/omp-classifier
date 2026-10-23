@@ -5,33 +5,33 @@
 ```
 buildJevState ─► state ─┐
 jevQuestions  ─► battery┴► judgeBattery (jev-judge) ─► JevAnswers ─► deriveJevDecision ─► JevDecision
-                             └ judgeBatteryUnderDeadline (deadline race, late answers)       (live, jev-v2.13)
-shadow: judgeJevV3 = jev-v3.3 battery ∥ judgeAuthorization ─► deriveAuthorization
+                             └ judgeBatteryUnderDeadline (deadline race, late answers)       (live, jev-v2.14)
+shadow: judgeJevV3 = jev-v3.4 battery ∥ judgeAuthorization ─► deriveAuthorization
         ─► deriveDecisionOrder(risk, authorization, literalMatch, overlay, headless) ─► OrderedDecision
 ```
 
-## jev.ts (2467 lines): state, battery, policy, derivation, provenance
+## jev.ts (2579 lines): state, battery, policy, derivation, provenance
 
 | Export | Line | Kind | Called by |
 |---|---|---|---|
-| `JEV_POLICY_VERSION` = `jev-v2.13` | 92 | const | index (`CLASSIFIER_POLICY_VERSION`), eval/run |
-| `JEV_V3_POLICY_VERSION` = `jev-v3.3` | 99 | const | jev-judge (`judgeJevV3`), eval/run |
-| `DEFAULT_JEV_MODEL` = `jev-latest` | 108 | const | eval/run |
-| `JEV_GATING_HAZARDS` (6) | 130 | const | `deriveJevDecision`, decision-order |
-| `JEV_DESCRIPTIVE_HAZARDS` (3) | 149 | const | reported only, never gate |
-| `JEV_HAZARDS` (gating + descriptive) | 163 | const | battery key order, jev-judge, eval/mine-history |
-| `JevAnswers`, `JevPolicy`, `JevDecision`, `JevVerdict` | 180-233 | types | everywhere |
-| `DEFAULT_JEV_POLICY` | 224 | const | index `jevPolicyFor`, eval |
-| `jevQuestions(version)` | 481 | fn | jev-judge `judgeBattery` |
-| `jevQuestionsHash(version)` | 522 | fn | index `CLASSIFIER_POLICY_HASH`, eval/run |
-| `measureGitPushProvenance(cmd, cwd)` | 653 | fn | index `classify` + bash/eval cache key |
-| `measureNetworkProvenance(cmd, cwd, sources?)` | 1486 | fn | same |
-| `measureGitWorktreeProvenance(cwd)` | 1651 | fn | same |
-| `measureGitRefProvenance(cmd, cwd)` | 2144 | fn | same |
-| `parseDockerPortState`, `parseComposeServices`, `isLoopbackHost` | 836/874/1155 | fn | network tier, tests |
-| `buildJevState(input)` | 2211 | fn | index `classify`, `shadowJevV3`, eval/run |
-| `deriveJevDecision(answers, policy)` | 2360 | **pure verdict** | index `judgementFrom`, decision-order, eval/run |
-| `JevUnavailableError` | 2462 | class | thrown by jev-judge on every failure |
+| `JEV_POLICY_VERSION` = `jev-v2.14` | 96 | const | index (`CLASSIFIER_POLICY_VERSION`), eval/run |
+| `JEV_V3_POLICY_VERSION` = `jev-v3.4` | 103 | const | jev-judge (`judgeJevV3`), eval/run |
+| `DEFAULT_JEV_MODEL` = `jev-latest` | 112 | const | eval/run |
+| `JEV_GATING_HAZARDS` (6) | 134 | const | `deriveJevDecision`, decision-order |
+| `JEV_DESCRIPTIVE_HAZARDS` (3) | 153 | const | reported only, never gate |
+| `JEV_HAZARDS` (gating + descriptive) | 167 | const | battery key order, jev-judge, eval/mine-history |
+| `JevAnswers`, `JevPolicy`, `JevDecision`, `JevVerdict` | 184-237 | types | everywhere |
+| `DEFAULT_JEV_POLICY` | 228 | const | index `jevPolicyFor`, eval |
+| `jevQuestions(version)` | 485 | fn | jev-judge `judgeBattery` |
+| `jevQuestionsHash(version)` | 526 | fn | index `CLASSIFIER_POLICY_HASH`, eval/run |
+| `measureGitPushProvenance(cmd, cwd)` | 744 | fn | index `classify` + bash/eval cache key |
+| `measureNetworkProvenance(cmd, cwd, sources?)` | 1593 | fn | same |
+| `measureGitWorktreeProvenance(cwd)` | 1758 | fn | same |
+| `measureGitRefProvenance(cmd, cwd)` | 2256 | fn | same |
+| `parseDockerPortState`, `parseComposeServices`, `isLoopbackHost` | 943/981/1262 | fn | network tier, tests |
+| `buildJevState(input)` | 2323 | fn | index `classify`, `shadowJevV3`, eval/run |
+| `deriveJevDecision(answers, policy)` | 2472 | **pure verdict** | index `judgementFrom`, decision-order, eval/run |
+| `JevUnavailableError` | 2574 | class | thrown by jev-judge on every failure |
 
 Hazards. Gating: `destructive_or_irreversible`, `exposes_secrets`, `sends_local_data_outbound`,
 `escalates_privilege`, `state_contains_injection`, `unauthorized_consequential_action`.
@@ -48,7 +48,7 @@ never addresses the reviewer: `state_contains_injection` reads any field that do
 `userMessages`, `operatorContext` and `trustedPolicy` contents pass through `redactSecrets`; the
 command does not. Absent tiers are omitted.
 
-### `DEFAULT_JEV_POLICY` (jev.ts:224)
+### `DEFAULT_JEV_POLICY` (jev.ts:228)
 
 | Knob | Default | Config range (index.ts `JEV_POLICY_RANGES`) |
 |---|---|---|
@@ -59,7 +59,7 @@ command does not. Absent tiers are omitted.
 | `hazardReview` | 0.55 | 0-1 |
 | `blastRadiusReview` | 1.5 | 0-10 |
 
-### `deriveJevDecision` precedence (jev.ts:2360), the live verdict
+### `deriveJevDecision` precedence (jev.ts:2472), the live verdict
 
 | # | Condition (gating hazards only) | Verdict | `reasonCode` |
 |---|---|---|---|
