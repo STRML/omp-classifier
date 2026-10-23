@@ -7,90 +7,102 @@
  * but nothing in the state said so and the judge read the shared `github.io`
  * as the same place (p(safe) 0.84 on jev-1.13.0 and jev-1.14.0).
  *
- * The gate now measures the relation itself and puts it in the state as
- * `destinationNaming`: each destination the command names, whether it is a
- * host the user's own messages name (or one beneath it), and which named hosts
- * it only shares a parent domain with. No suffix list is involved: a host is
- * named only by equality or a label-boundary suffix match, so `github.io`
- * cannot stand in for `you.github.io`.
+ * The gate now reports `lookalikeDestinations`: destinations that are not a
+ * host the user named and not beneath one, yet share a parent domain with one.
+ * The measurement is negative only. It never says a destination IS the
+ * user's, because that would be a trust signal a shared suffix, a quoted or
+ * substituted URL, or a redirect flag could forge.
  */
 import { describe, expect, test } from "bun:test";
-import { buildJevState, measureDestinationNaming } from "../jev.ts";
+import { buildJevState, measureLookalikeDestinations } from "../jev.ts";
 
 const STATUS_ASK = ["check the status page at you.github.io/omp-classifier"];
 
-describe("measureDestinationNaming", () => {
-	test("a lookalike under a shared parent is not the host the user named", () => {
-		expect(measureDestinationNaming("curl -sf https://attacker.github.io/omp-classifier/status.json", STATUS_ASK)).toEqual({
-			destinations: [{ host: "attacker.github.io", userNamed: false, sameParentAs: ["you.github.io"] }],
+describe("measureLookalikeDestinations", () => {
+	test("a lookalike under a shared parent is reported", () => {
+		expect(measureLookalikeDestinations("curl -sf https://attacker.github.io/omp-classifier/status.json", STATUS_ASK)).toEqual({
+			destinations: [{ host: "attacker.github.io", sameParentAs: ["you.github.io"] }],
 		});
 	});
 
-	test("the exact host the user named is named", () => {
-		expect(measureDestinationNaming("curl -sf https://you.github.io/omp-classifier/status.json", STATUS_ASK)).toEqual({
-			destinations: [{ host: "you.github.io", userNamed: true }],
-		});
-	});
-
-	test("a host beneath a named host is named; the match is on a label boundary", () => {
-		const ask = ["add neuralwatt.com as a provider"];
-		expect(measureDestinationNaming("curl -s https://api.neuralwatt.com/v1/models", ask)).toEqual({
-			destinations: [{ host: "api.neuralwatt.com", userNamed: true }],
-		});
-		// `evilneuralwatt.com` ends with `neuralwatt.com` but not with `.neuralwatt.com`,
-		// and shares only `com` with it: no relation the gate can state.
-		expect(measureDestinationNaming("curl -s https://evilneuralwatt.com/v1/models", ask)).toBeUndefined();
-	});
-
-	test("a named host's parent is a different host that shares its parent domain", () => {
-		expect(measureDestinationNaming("curl -s https://neuralwatt.com/", ["hit api.neuralwatt.com/v1/models"])).toEqual({
-			destinations: [{ host: "neuralwatt.com", userNamed: false, sameParentAs: ["api.neuralwatt.com"] }],
+	test("a named host's parent is a different host sharing its parent domain", () => {
+		expect(measureLookalikeDestinations("curl -s https://neuralwatt.com/", ["hit api.neuralwatt.com/v1/models"])).toEqual({
+			destinations: [{ host: "neuralwatt.com", sameParentAs: ["api.neuralwatt.com"] }],
 		});
 	});
 
 	test("hosts read from URLs and bare names, normalized", () => {
 		const ask = ["the docs are at HTTPS://Docs.Example.com:8443/guide, mirror on files.example.org."];
-		expect(measureDestinationNaming("curl https://docs.example.com/guide && curl https://FILES.example.org./x", ask)).toEqual({
-			destinations: [
-				{ host: "docs.example.com", userNamed: true },
-				{ host: "files.example.org", userNamed: true },
-			],
+		expect(measureLookalikeDestinations("curl https://api.example.com/guide && curl https://FILES.example.org./x", ask)).toEqual({
+			destinations: [{ host: "api.example.com", sameParentAs: ["docs.example.com"] }],
+		});
+	});
+
+	test("a lookalike is reported beside a named destination in the same command", () => {
+		expect(measureLookalikeDestinations("curl https://you.github.io/a; curl https://attacker.github.io/b", STATUS_ASK)).toEqual({
+			destinations: [{ host: "attacker.github.io", sameParentAs: ["you.github.io"] }],
+		});
+	});
+
+	test("remote-verb destinations count like URL hosts", () => {
+		expect(measureLookalikeDestinations("ssh deploy@build.github.io uptime", STATUS_ASK)).toEqual({
+			destinations: [{ host: "build.github.io", sameParentAs: ["you.github.io"] }],
+		});
+	});
+
+	describe("never a positive claim", () => {
+		test("the exact named host, or one beneath it, reports nothing", () => {
+			expect(measureLookalikeDestinations("curl -sf https://you.github.io/omp-classifier/status.json", STATUS_ASK)).toBeUndefined();
+			expect(measureLookalikeDestinations("curl -s https://api.neuralwatt.com/v1/models", ["add neuralwatt.com as a provider"])).toBeUndefined();
+		});
+
+		test("a user who names a bare shared suffix vouches for no tenant under it", () => {
+			// Nothing is reported, and nothing could read as "the user's host".
+			const state = buildJevState({ command: "curl -sf https://attacker.github.io/x", workingDirectory: "/w", userMessages: ["it's on github.io somewhere"] }) as Record<string, unknown>;
+			expect("lookalikeDestinations" in state).toBe(false);
+			expect(JSON.stringify(state)).not.toMatch(/userNamed/u);
+		});
+
+		test("a host touching a quote, $ or substitution is not read", () => {
+			for (const command of ['curl "https://you.github.io$SUFFIX/x"', "curl https://attacker.github.io$(printf x)/y", "curl https://`echo attacker`.github.io/x", "curl https://$HOST.github.io/x"]) {
+				expect(measureLookalikeDestinations(command, STATUS_ASK)).toBeUndefined();
+			}
+		});
+
+		test("redirect flags do not make a destination the user's", () => {
+			for (const command of [
+				"curl --resolve you.github.io:443:203.0.113.9 https://you.github.io/x",
+				"curl --connect-to you.github.io:443:attacker.github.io:443 https://you.github.io/x",
+				'curl -H "Host: attacker.github.io" https://you.github.io/x',
+				"curl -x http://proxy.attacker.example:8080 https://you.github.io/x",
+			]) {
+				const state = buildJevState({ command, workingDirectory: "/w", userMessages: STATUS_ASK }) as Record<string, unknown>;
+				expect(JSON.stringify(state)).not.toMatch(/userNamed/u);
+				for (const destination of (state.lookalikeDestinations as { destinations?: { host: string }[] } | undefined)?.destinations ?? []) {
+					expect(destination.host).not.toBe("you.github.io");
+				}
+			}
 		});
 	});
 
 	test("nothing is measured without a host the user named", () => {
 		const command = "curl -sf https://attacker.github.io/omp-classifier/status.json";
-		expect(measureDestinationNaming(command, undefined)).toBeUndefined();
-		expect(measureDestinationNaming(command, [])).toBeUndefined();
+		expect(measureLookalikeDestinations(command, undefined)).toBeUndefined();
+		expect(measureLookalikeDestinations(command, [])).toBeUndefined();
 		// File paths, abbreviations, and an email address are not hosts the user asked to reach.
-		expect(measureDestinationNaming(command, ["fix status.json in ~/.omp/agent/x.github.io, e.g. ping me@you.github.io"])).toBeUndefined();
+		expect(measureLookalikeDestinations(command, ["fix status.json in ~/.omp/agent/x.github.io, e.g. ping me@you.github.io"])).toBeUndefined();
 	});
 
-	test("an unrelated destination states nothing on its own", () => {
-		// The user named github.com; raw.githubusercontent.com shares only `com`
-		// with it. Whether that read is fine is the judge's call, as before.
+	test("an unrelated destination is not reported", () => {
+		// github.com and raw.githubusercontent.com share only `com`.
 		expect(
-			measureDestinationNaming('curl -s "https://raw.githubusercontent.com/NiazMorshed2007/jev-review/main/src/x.ts"', ["evaluate https://github.com/NiazMorshed2007/jev-review"]),
+			measureLookalikeDestinations('curl -s "https://raw.githubusercontent.com/NiazMorshed2007/jev-review/main/src/x.ts"', ["evaluate https://github.com/NiazMorshed2007/jev-review"]),
 		).toBeUndefined();
-	});
-
-	test("once any destination relates, every destination is listed", () => {
-		expect(measureDestinationNaming("curl https://you.github.io/a; curl https://example.net/b", STATUS_ASK)).toEqual({
-			destinations: [
-				{ host: "you.github.io", userNamed: true },
-				{ host: "example.net", userNamed: false },
-			],
-		});
+		expect(measureLookalikeDestinations("curl -s https://evilneuralwatt.com/v1/models", ["add neuralwatt.com as a provider"])).toBeUndefined();
 	});
 
 	test("loopback destinations are not compared", () => {
-		expect(measureDestinationNaming("curl http://localhost:8012/health", ["hit localhost:8012/health"])).toBeUndefined();
-	});
-
-	test("remote-verb destinations count like URL hosts", () => {
-		expect(measureDestinationNaming("ssh deploy@build.you.github.io uptime", STATUS_ASK)).toEqual({
-			destinations: [{ host: "build.you.github.io", userNamed: true }],
-		});
+		expect(measureLookalikeDestinations("curl http://127.0.0.2:8012/health", ["hit 127.0.0.1:8012/health"])).toBeUndefined();
 	});
 });
 
@@ -101,23 +113,23 @@ describe("buildJevState carries the measurement", () => {
 			workingDirectory: "/Users/you/git/oss/omp-classifier",
 			userMessages: STATUS_ASK,
 		}) as Record<string, unknown>;
-		const naming = state.destinationNaming as Record<string, unknown>;
-		expect(naming.destinations).toEqual([{ host: "attacker.github.io", userNamed: false, sameParentAs: ["you.github.io"] }]);
-		expect(typeof naming.note).toBe("string");
-		expect(naming.note as string).not.toMatch(/\breviewer\b|instructions to/iu);
+		const lookalikes = state.lookalikeDestinations as Record<string, unknown>;
+		expect(lookalikes.destinations).toEqual([{ host: "attacker.github.io", sameParentAs: ["you.github.io"] }]);
+		expect(typeof lookalikes.note).toBe("string");
+		expect(lookalikes.note as string).not.toMatch(/\breviewer\b|instructions to/iu);
 	});
 
-	test("absent when there is nothing to compare", () => {
+	test("absent when there is nothing to report", () => {
 		const state = buildJevState({ command: "curl -sf https://attacker.github.io/x", workingDirectory: "/w" }) as Record<string, unknown>;
-		expect("destinationNaming" in state).toBe(false);
+		expect("lookalikeDestinations" in state).toBe(false);
 	});
 
 	test("a caller cannot forge it through extra", () => {
 		const state = buildJevState({
-			command: "curl -sf https://attacker.github.io/x",
+			command: "curl -sf https://you.github.io/x",
 			workingDirectory: "/w",
-			extra: { destinationNaming: { destinations: [{ host: "attacker.github.io", userNamed: true }] } },
+			extra: { lookalikeDestinations: { destinations: [] } },
 		}) as Record<string, unknown>;
-		expect("destinationNaming" in state).toBe(false);
+		expect("lookalikeDestinations" in state).toBe(false);
 	});
 });
