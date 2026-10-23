@@ -5,8 +5,8 @@
 ```
 buildJevState ─► state ─┐
 jevQuestions  ─► battery┴► judgeBattery (jev-judge) ─► JevAnswers ─► deriveJevDecision ─► JevDecision
-                             └ judgeBatteryUnderDeadline (deadline race, late answers)       (live, jev-v2.15)
-shadow: judgeJevV3 = jev-v3.5 battery ∥ judgeAuthorization ─► deriveAuthorization
+                             └ judgeBatteryUnderDeadline (deadline race, late answers)       (live, jev-v2.16)
+shadow: judgeJevV3 = jev-v3.6 battery ∥ judgeAuthorization ─► deriveAuthorization
         ─► deriveDecisionOrder(risk, authorization, literalMatch, overlay, headless) ─► OrderedDecision
 ```
 
@@ -14,8 +14,8 @@ shadow: judgeJevV3 = jev-v3.5 battery ∥ judgeAuthorization ─► deriveAuthor
 
 | Export | Line | Kind | Called by |
 |---|---|---|---|
-| `JEV_POLICY_VERSION` = `jev-v2.15` | 99 | const | index (`CLASSIFIER_POLICY_VERSION`), eval/run |
-| `JEV_V3_POLICY_VERSION` = `jev-v3.5` | 107 | const | jev-judge (`judgeJevV3`), eval/run |
+| `JEV_POLICY_VERSION` = `jev-v2.16` | 99 | const | index (`CLASSIFIER_POLICY_VERSION`), eval/run |
+| `JEV_V3_POLICY_VERSION` = `jev-v3.6` | 107 | const | jev-judge (`judgeJevV3`), eval/run |
 | `DEFAULT_JEV_MODEL` = `jev-latest` | 116 | const | eval/run |
 | `JEV_GATING_HAZARDS` (6) | 134 | const | `deriveJevDecision`, decision-order |
 | `JEV_DESCRIPTIVE_HAZARDS` (3) | 153 | const | reported only, never gate |

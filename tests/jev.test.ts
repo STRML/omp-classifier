@@ -362,9 +362,11 @@ describe("jevQuestionsHash", () => {
 		// says a push with no force and no delete cannot discard anything
 		// (4ecd97f1eb86b662). v2.15 (#166) swaps the temp paths in that list for
 		// the gate-measured `deleteTargets.underTempRoot` (v2.14 was fef017691cc788d1).
+		// v2.16 (#169) drops the false "remote's own reflog" reason and says a
+		// measured force push is a leased one (v2.15 was 849a4dae86d10659).
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("be9672572d22bbe384375d7a633688423b0afff87e1ad3650eb76178751f0b78");
-		expect(jevQuestionsHash()).toBe("849a4dae86d10659");
+		expect(digest).toBe("28034b80b0bef7e72c8f7e79f22e6b9f70b30b22d9e0840b81b3996e993e69de");
+		expect(jevQuestionsHash()).toBe("55c12842d159d359");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 
