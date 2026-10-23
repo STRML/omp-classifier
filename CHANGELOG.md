@@ -2,6 +2,23 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-10-24
+
+### Security: a push is measured only against the remote git sends it to
+
+- Fixes https://github.com/STRML/omp-classifier/issues/173. The 2026-10-23 entry said an earlier `git remote` or `git config` leaves a push unmeasured. That held only for the bare spelling (`git -C . remote …`, `command git remote …`, `echo … >> .git/config` all slipped through). What may run before a measured push is now an allowlist, so an unknown shape fails closed:
+  - `cd`, `pushd`, `popd`, `echo`, `true`, `pwd`, `ls`, `test`, `sleep`, `cat`, `head`, `tail`, `grep`, `wc`;
+  - plain `git <subcommand>` with no global option, for `add`, `commit`, `status`, `diff`, `log`, `show`, `rev-parse`, `fetch`, `stash`, `checkout`, `switch`, `restore`, `merge`, `cherry-pick`, `revert`, `rm`, `mv`, `branch`, `reset`, `tag`, and none of the options that run a program or write a file (`--upload-pack`, `--exec`, `--strategy`/`-s`, `--output`, and their abbreviations);
+  - with no prefix assignment (`GIT_SSH_COMMAND=…`, `GIT_CONFIG_GLOBAL=…`) and no redirect that writes a file.
+
+  Anything else before the push (a wrapper such as `env`, `command`, `xargs` or `nohup`, an interpreter such as `sh -c` or `python -c`, `git rebase -x`, `git submodule foreach`, a script, a test runner, `tee`/`cp`/`ln` into `~/.gitconfig`) leaves it unmeasured. So does every substitution and every pipeline stage after the push, which run before or alongside it. A segment after the push in a plain sequence (`git push -u origin HEAD && gh pr create …`) runs once the push is done and is not read. That order holds only when the command has no function, loop, coprocess or background job, so any of those leaves the push unmeasured.
+- Hooks (`pre-commit`, `post-merge`, the push's own `pre-push`) are installed code that the command's words never show, before or after this change. They are not read.
+- Cost: `CI=1 bun test && git push origin main` and similar are no longer measured, so they ask.
+- A remote counts as known only when `remote.<name>.url` is set, exactly once. Tracking refs alone (stale, or made by hand with `update-ref`) no longer count, since git reads such a name as a path or URL. A second url makes git push to both while `git config --get` reports one.
+- A push stays unmeasured when `remote.<name>.pushurl` or any `url.<base>.pushInsteadOf` is set. Either one sends the push somewhere the tracking refs were not fetched from.
+- A function name inside a quoted string no longer reads as a function definition. The check now walks the syntax tree, so `git commit -m "fix foo()" && git push origin main` keeps its measurement.
+- The url, pushurl and pushInsteadOf checks read every config scope, so a rewrite in `~/.gitconfig` counts too.
+
 ## 2026-10-23
 
 ### Pushes, pull requests and comments run unasked (jev-v2.14)

@@ -59,7 +59,7 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { redactSecrets } from "./redact";
-import { parseShell, type ShellJoin } from "./shell-ast";
+import { parseShell, shellRunsInSourceOrder, type ShellJoin } from "./shell-ast";
 import { maskHeredocBodiesAndAnsiSpans, segmentCwdAt, SHELL_WORD_EXPANSION } from "./shell-cwd";
 import type { TrustedPolicyDocument } from "./trust-policy";
 
@@ -639,27 +639,68 @@ function pushForces(tokens: string[], spec: string): boolean {
  *  push sends. Judged by allowlist, so an unknown shape fails closed. */
 const PLAIN_DIRECTORY_COMMANDS = new Set(["cd", "pushd", "popd"]);
 
-/** Commands that change what the shell runs for `git`, or where git's remotes
- *  point: without force syntax a push cannot discard, unless `git` is no longer
- *  git (a function, an alias, a PATH, a sourced file) or its remote was just
- *  repointed. */
-const SHELL_STATE_COMMANDS = new Set(["alias", "unalias", "export", "declare", "typeset", "readonly", "local", "source", ".", "shopt", "set", "unset", "hash", "eval", "enable", "builtin", "function", "trap"]);
-const FUNCTION_DEFINITION = /(?:^|[\s;&|(){}])(?:function\s+[^\s(){};&|]+|[^\s(){};&|=]+\s*\(\s*\))/u;
+/** Commands that can run before a measured push: they write nothing, run no
+ *  other program, and leave the shell's state alone, so `git` stays git and the
+ *  remote stays where the gate read it. With no redirect (checked per segment)
+ *  none of them can write a file. */
+const PRE_PUSH_COMMANDS = new Set([...PLAIN_DIRECTORY_COMMANDS, "echo", "true", "pwd", "ls", "test", "[", "sleep", "cat", "head", "tail", "grep", "wc"]);
+/** The git subcommands that can run before a measured push. None writes the
+ *  configuration the push reads its remote from, and none runs a program named
+ *  on its command line once PRE_PUSH_GIT_FLAG is excluded. Hooks (pre-commit,
+ *  post-merge, the push's own pre-push) are installed code the command's words
+ *  never show either way, so they are not read here. */
+const PRE_PUSH_GIT_SUBCOMMANDS = new Set(["add", "commit", "status", "diff", "log", "show", "rev-parse", "fetch", "stash", "checkout", "switch", "restore", "merge", "cherry-pick", "revert", "rm", "mv", "branch", "reset", "tag"]);
+/** Long options of those subcommands that run a program or write a file:
+ *  `--upload-pack` (fetch), `--exec`, `--strategy` (a `git-merge-<name>` from
+ *  PATH), `--output`. Matched as git matches them, by unambiguous prefix. */
+const PRE_PUSH_GIT_EXEC_OPTIONS = ["--upload-pack", "--exec", "--receive-pack", "--strategy", "--output"];
+/** Short flags with the same effect: `-s <strategy>` on merge, cherry-pick and
+ *  revert. A short cluster that contains one is refused. */
+const PRE_PUSH_GIT_EXEC_SHORT: Record<string, RegExp> = {
+	merge: /^-[a-zA-Z]*s/u,
+	"cherry-pick": /^-[a-zA-Z]*[sX]/u,
+	revert: /^-[a-zA-Z]*[sX]/u,
+};
+
+function gitOptionRunsProgram(sub: string, word: string): boolean {
+	const name = word.split("=")[0];
+	if (name.startsWith("--") && name.length > 2) return PRE_PUSH_GIT_EXEC_OPTIONS.some(option => option.startsWith(name));
+	return PRE_PUSH_GIT_EXEC_SHORT[sub]?.test(word) === true;
+}
+
+/** Whether one segment may run before a measured push. Judged by allowlist, so
+ *  a wrapper (`command`, `env`, `xargs`, `sudo`), an interpreter (`sh -c`,
+ *  `python -c`), a script, a test runner and any unknown verb fail closed. git
+ *  counts only as plain `git <subcommand>` from PRE_PUSH_GIT_SUBCOMMANDS: a
+ *  global option (`-C`, `-c`, `--git-dir`) hides which repository and which
+ *  settings it touches. A prefix assignment (`GIT_SSH_COMMAND=…`) or a redirect
+ *  that writes a file is refused on every segment. */
+function segmentMayPrecedePush(segment: ShellSegment): boolean {
+	if (segment.assignNames.length > 0 || segment.writesFile) return false;
+	const [verb = "", sub = "", ...rest] = segment.tokens;
+	if (verb !== "git") return PRE_PUSH_COMMANDS.has(verb);
+	if (!PRE_PUSH_GIT_SUBCOMMANDS.has(sub)) return false;
+	return !rest.some(word => gitOptionRunsProgram(sub, word));
+}
 
 /** Whether `git` in the push is the git binary on the user's PATH, talking to
- *  remotes as configured. Judged by what could change that, so an unknown shape
- *  (a function definition the parser flattens, a bare assignment) fails closed. */
+ *  the remote the gate reads. Every segment that can run before the push must
+ *  pass `segmentMayPrecedePush`: the ones written before it, every substitution
+ *  (the push's own words run theirs first), and every pipeline stage after it,
+ *  which runs alongside. A segment after the push in a plain sequence runs once
+ *  the push is done and is not read. That order holds only for a command with
+ *  no function, loop or background job, so any of those fails closed. */
 function shellRunsPlainGit(command: string, segments: ShellSegment[], push: ShellSegment): boolean {
-	if (FUNCTION_DEFINITION.test(maskHeredocBodiesAndAnsiSpans(command).masked)) return false;
+	if (!shellRunsInSourceOrder(command)) return false;
+	const at = segments.indexOf(push);
 	return segments.every((segment, i) => {
 		if (segment === push) return true;
 		if (i > 0 && segment.join === "first") return false;
-		if (segment.tokens.length === 0 && segment.assignNames.length > 0) return false;
-		const [verb, sub] = segment.tokens;
-		if (SHELL_STATE_COMMANDS.has(verb ?? "")) return false;
-		return !(verb === "git" && (sub === "remote" || sub === "config"));
+		const runsAfter = i > at && !segment.nested && segment.join !== "pipe";
+		return runsAfter || segmentMayPrecedePush(segment);
 	});
 }
+
 
 function forcePushContextIsPlain(segments: ShellSegment[], push: ShellSegment): boolean {
 	if (segments.at(-1) !== push) return false;
@@ -741,6 +782,22 @@ function currentBranch(repo: string): string | null {
 	return ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : null;
 }
 
+/** Whether `remote` is a remote this repository configures by name and a push
+ *  to it reaches the one repository its tracking refs were fetched from. A
+ *  name with no `remote.<name>.url` is a path or URL to git (tracking refs
+ *  alone do not make one: they can be stale or made by hand); several urls
+ *  push to every one of them; and `remote.<name>.pushurl` or any
+ *  `url.<base>.pushInsteadOf` sends the push somewhere the fetch did not read. */
+function pushGoesWhereRemoteFetches(remote: string, repo: string): boolean {
+	if (!/^[A-Za-z0-9._-]+$/u.test(remote)) return false;
+	const urls = gitPlumbing(["config", "--get-all", `remote.${remote}.url`], repo);
+	if (urls === null || urls === "" || urls.includes("\n")) return false;
+	// `git config` exits 1 for "no such key" and something else for a failure,
+	// which must not read as "not set".
+	if (gitPlumbingStatus(["config", "--get-all", `remote.${remote}.pushurl`], repo) !== 1) return false;
+	return gitPlumbingStatus(["config", "--get-regexp", "^url\\..*\\.pushinsteadof$"], repo) === 1;
+}
+
 export function measureGitPushProvenance(command: string, cwd: string): GitPushProvenance | undefined {
 	const refs = parsePushRefs(command);
 	if (refs === null) return undefined;
@@ -762,11 +819,7 @@ export function measureGitPushProvenance(command: string, cwd: string): GitPushP
 	// Only a remote this repository knows by name: a URL or a path has no
 	// tracking ref, and a null tip there would read as a new branch on the
 	// user's own remote while the commits go somewhere else.
-	if (!/^[A-Za-z0-9._-]+$/u.test(remote)) return undefined;
-	const knownRemote =
-		gitPlumbing(["config", "--get", `remote.${remote}.url`], repo) !== null ||
-		(gitPlumbing(["for-each-ref", "--count=1", "--format=%(refname)", `refs/remotes/${remote}/`], repo) ?? "") !== "";
-	if (!knownRemote) return undefined;
+	if (!pushGoesWhereRemoteFetches(remote, repo)) return undefined;
 	const remoteBranch = shorthand && headRef(rref) ? currentBranch(repo) : rref;
 	if (remoteBranch === null) return undefined;
 	// The remote tip comes from remote-tracking state when it exists; a

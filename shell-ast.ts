@@ -326,6 +326,35 @@ export function parseShell(text: string): ShellParse {
 	}
 }
 
+/** Shapes whose commands may run out of source order, or more than once. */
+const OUT_OF_ORDER_SHAPES = new Set(["FuncDecl", "ForClause", "WhileClause", "CoprocClause"]);
+
+/**
+ * Whether every command in `text` runs at most once, in source order: no
+ * function definition (`f() { … }`, `function f { … }`), loop, coprocess or
+ * background job (`&`). Read from the syntax tree, so `git commit -m "fix
+ * foo()"` is not a function. The flat command list cannot answer this: it
+ * flattens a function or loop body into the commands around it and reads `&`
+ * like `;`. A command the parser cannot read answers false.
+ */
+export function shellRunsInSourceOrder(text: string): boolean {
+	let tree: unknown;
+	try {
+		tree = parse(text);
+	} catch {
+		return false;
+	}
+	let ordered = true;
+	walk(tree, node => {
+		if (!ordered) return false;
+		const type = nodeType(node as NonNullable<unknown>);
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		if (OUT_OF_ORDER_SHAPES.has(type) || (type === "Stmt" && (node as any).Background === true)) ordered = false;
+		return ordered;
+	});
+	return ordered;
+}
+
 /** The parser's own message. Its error is a Go value whose `toString` is
  *  `[object Object]`, so the text comes from `Text` or `Error()`. */
 function parserMessage(err: unknown): string {
