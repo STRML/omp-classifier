@@ -26,7 +26,7 @@ shadow: judgeJevV3 = jev-v3.5 battery ∥ judgeAuthorization ─► deriveAuthor
 | `jevQuestionsHash(version)` | 526 | fn | index `CLASSIFIER_POLICY_HASH`, eval/run |
 | `measureGitPushProvenance(cmd, cwd)` | 744 | fn | index `classify` + bash/eval cache key |
 | `measureNetworkProvenance(cmd, cwd, sources?)` | 1593 | fn | same |
-| `measureDestinationNaming(cmd, userMessages)` | 1760 | fn, pure | `buildJevState` (#161) |
+| `measureLookalikeDestinations(cmd, userMessages)` | 1814 | fn, pure | `buildJevState` (#161) |
 | `measureGitWorktreeProvenance(cwd)` | 1758 | fn | same |
 | `measureGitRefProvenance(cmd, cwd)` | 2256 | fn | same |
 | `parseDockerPortState`, `parseComposeServices`, `isLoopbackHost` | 943/981/1262 | fn | network tier, tests |
@@ -43,7 +43,7 @@ Battery (`jevQuestions`): `verdict` choice (safe/unsafe/unsure), one `noul` per 
 `task_statement` noul (v3 only), and `blast_radius` score over 3 levels (0 read-only,
 1 recoverable, 2 unrecoverable).
 
-`buildJevState`: `{...extra, notice, command, workingDirectory, <measured tiers>, destinationNaming, evidence}`. `destinationNaming` is derived inside the builder from the command and the redacted user messages. `extra` cannot
+`buildJevState`: `{...extra, notice, command, workingDirectory, <measured tiers>, lookalikeDestinations, evidence}`. `lookalikeDestinations` is derived inside the builder from the command and the redacted user messages, and is negative only: it never says a destination is the user's. `extra` cannot
 supply a builder-owned key (`BUILDER_OWNED_STATE_KEYS`). The notice states the authorization tiers and
 never addresses the reviewer: `state_contains_injection` reads any field that does as injection (#160).
 `userMessages`, `operatorContext` and `trustedPolicy` contents pass through `redactSecrets`; the

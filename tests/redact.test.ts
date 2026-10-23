@@ -325,7 +325,7 @@ describe("redaction reaches every judge state", () => {
 		// gate-written state notice (#160); jev-v2.13 calls temp-dir
 		// cleanup ordinary work; jev-v2.14 lets pushes,
 		// PRs and comments run unasked; jev-v2.15 adds the
-		// measured destinationNaming state field.
+		// measured lookalikeDestinations state field.
 		expect(JEV_POLICY_VERSION).toBe("jev-v2.15");
 	});
 });

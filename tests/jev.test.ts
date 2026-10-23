@@ -360,12 +360,12 @@ describe("jevQuestionsHash", () => {
 		// (67568ffd5be26200). v2.14 adds non-force pushes, pull requests and
 		// comments to that list and to the verdict's safe criterion, and
 		// says a push with no force and no delete cannot discard anything
-		// (fef017691cc788d1). v2.15 adds the measured `destinationNaming` state
+		// (fef017691cc788d1). v2.15 adds the measured `lookalikeDestinations` state
 		// field (#161), and `unauthorized_consequential_action` says what a
 		// destination listed with `sameParentAs` is.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("e63a2fc22d8e03bb3917ce9cc81d410dbc7c814b81d99a5aad25e57c9e0f826b");
-		expect(jevQuestionsHash()).toBe("45a7e185da3940b7");
+		expect(digest).toBe("388156f82e95502d174c185119ea445860603e829ae9eb7d74528a78d33159ba");
+		expect(jevQuestionsHash()).toBe("ec1e7c7ec51cee80");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 

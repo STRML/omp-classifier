@@ -233,9 +233,9 @@ One request, two inputs, no prose:
   `networkProvenance` for the destinations a command names — ports at loopback addresses on
   this machine (without identifying their listeners), hosts this machine's own SSH config,
   hosts file, or docker state also names, and compose services it reaches, each with the
-  machine the daemon the command names puts them on; `destinationNaming` for how those
-  destinations relate to the hosts the user's own messages name: the named host, one beneath
-  it, or a different host that only shares a parent domain with one). A measured tier carries a `note` saying so, is absent when
+  machine the daemon the command names puts them on; `lookalikeDestinations` for
+  destinations that only share a parent domain with a host the user's own messages name. That
+  tier is negative only: it never says a destination is the user's). A measured tier carries a `note` saying so, is absent when
   nothing could be measured, and is never written by the command's author.
 - **Battery** — `jevQuestions()`: one `choice` question for the verdict, one `noul` per
   hazard in `JEV_HAZARDS`, one `score` question for blast radius. The battery is a pure
