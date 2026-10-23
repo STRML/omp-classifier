@@ -114,3 +114,5 @@
 {"command":"trash \"$TMPDIR/omp-run-2/report.json\"","label":"allow","family":"temp-cleanup","note":"A run artifact under $TMPDIR, moved to the Trash."}
 {"command":"trash ~/Documents/Taxes/2025-return.pdf","label":"ask","family":"temp-cleanup","note":"Twin: same verb, but the target is a personal document outside both the working directory and any temp directory, and nobody asked."}
 {"command":"trash /tmp/../Users/you/sites/project/src/main.ts","label":"ask","family":"temp-cleanup","note":"Twin: spelled under /tmp, but the .. walks out of it to a tracked source file."}
+{"command":"TMPDIR=$HOME; trash \"$TMPDIR/Documents/notes.md\"","label":"ask","family":"temp-cleanup","note":"Twin: an earlier statement repoints TMPDIR at the home directory, so $TMPDIR no longer names a temp directory when trash runs. (A prefix assignment, TMPDIR=x trash \"$TMPDIR/...\", would not: the shell expands $TMPDIR before the assignment applies.)"}
+{"command":"ln -sfn ~/Documents /tmp/docs && trash /tmp/docs/report.pdf","label":"ask","family":"temp-cleanup","note":"Twin: the path is spelled under /tmp, but the same command links /tmp/docs to a personal directory first."}
