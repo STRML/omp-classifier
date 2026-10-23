@@ -647,13 +647,15 @@ const PLAIN_DIRECTORY_COMMANDS = new Set(["cd", "pushd", "popd"]);
  *  other program, and leave the shell's state alone, so `git` stays git and the
  *  remote stays where the gate read it. With no redirect (checked per segment)
  *  none of them can write a file. */
-const PRE_PUSH_COMMANDS = new Set([...PLAIN_DIRECTORY_COMMANDS, "echo", "true", "pwd", "ls", "test", "[", "sleep", "cat", "head", "tail", "grep", "wc"]);
+const PRE_PUSH_COMMANDS = new Set([...PLAIN_DIRECTORY_COMMANDS, "echo", "true", "pwd", "ls", "test", "sleep", "cat", "head", "tail", "grep", "wc"]);
 /** The git subcommands that can run before a measured push. None writes the
  *  configuration the push reads its remote from, and none runs a program named
- *  on its command line once PRE_PUSH_GIT_FLAG is excluded. Hooks (pre-commit,
- *  post-merge, the push's own pre-push) are installed code the command's words
- *  never show either way, so they are not read here. */
-const PRE_PUSH_GIT_SUBCOMMANDS = new Set(["add", "commit", "status", "diff", "log", "show", "rev-parse", "fetch", "stash", "checkout", "switch", "restore", "merge", "cherry-pick", "revert", "rm", "mv", "branch", "reset", "tag"]);
+ *  on its command line once PRE_PUSH_GIT_EXEC_OPTIONS are excluded. `fetch` is
+ *  not here: a transport (`--upload-pack`, `ext::`, `core.sshCommand`) can run a
+ *  program, and it rewrites the tracking refs the measurement reads. Hooks
+ *  (pre-commit, post-merge, the push's own pre-push) are installed code the
+ *  command's words never show either way, so they are not read here. */
+const PRE_PUSH_GIT_SUBCOMMANDS = new Set(["add", "commit", "status", "diff", "log", "show", "rev-parse", "stash", "checkout", "switch", "restore", "merge", "cherry-pick", "revert", "rm", "mv", "branch", "reset", "tag"]);
 /** Long options of those subcommands that run a program or write a file:
  *  `--upload-pack` (fetch), `--exec`, `--strategy` (a `git-merge-<name>` from
  *  PATH), `--output`. Matched as git matches them, by unambiguous prefix. */
@@ -677,10 +679,13 @@ function gitOptionRunsProgram(sub: string, word: string): boolean {
  *  `python -c`), a script, a test runner and any unknown verb fail closed. git
  *  counts only as plain `git <subcommand>` from PRE_PUSH_GIT_SUBCOMMANDS: a
  *  global option (`-C`, `-c`, `--git-dir`) hides which repository and which
- *  settings it touches. A prefix assignment (`GIT_SSH_COMMAND=…`) or a redirect
- *  that writes a file is refused on every segment. */
+ *  settings it touches. A prefix assignment (`GIT_SSH_COMMAND=…`), a redirect
+ *  that writes a file, and any word the shell may rewrite (`$OPT`, `$(…)`, a
+ *  glob or a brace list, which can expand to `-x` or `rebase`) are refused on
+ *  every segment: the allowlist reads words, so each must be the word git
+ *  receives. */
 function segmentMayPrecedePush(segment: ShellSegment): boolean {
-	if (segment.assignNames.length > 0 || segment.writesFile) return false;
+	if (segment.assignNames.length > 0 || segment.writesFile || !segment.fixedWords) return false;
 	const [verb = "", sub = "", ...rest] = segment.tokens;
 	if (verb !== "git") return PRE_PUSH_COMMANDS.has(verb);
 	if (!PRE_PUSH_GIT_SUBCOMMANDS.has(sub)) return false;
@@ -749,8 +754,9 @@ function parsePushRefs(
 	const tokens = push.tokens;
 	// Exactly `git push …`: no wrapper (`env`, `command`, a path to git), no
 	// global option between `git` and `push`, and no `NAME=value` prefix, any of
-	// which can point the push at another repository.
-	if (idx !== 1 || tokens[0] !== "git" || push.assignNames.length > 0) return null;
+	// which can point the push at another repository. Every word reaches git as
+	// written: `git push origin {main,+side}` is a force push of two refs.
+	if (idx !== 1 || tokens[0] !== "git" || push.assignNames.length > 0 || !push.fixedWords) return null;
 	const operands: string[] = [];
 	for (let i = idx + 1; i < tokens.length; i++) {
 		const t = tokens[i];
@@ -1941,6 +1947,9 @@ export interface ShellSegment {
 	 *  level, so the `exit` of `echo "$(exit 1)"` ends nothing but its own
 	 *  subshell. */
 	nested: boolean;
+	/** True when every word reaches the command exactly as written: no
+	 *  expansion, substitution, glob or brace list (`ShellWord.fixed`). */
+	fixedWords: boolean;
 }
 
 /** The words of every simple command `text` runs, in source order — one array
@@ -1952,7 +1961,7 @@ function shellSegments(text: string): ShellSegment[] | null {
 	const parsed = parseShell(text);
 	if (!parsed.ok) return null;
 	if (parsed.commands.some(command => command.unreadShape !== undefined)) return null;
-	return parsed.commands.map(command => ({ tokens: command.words.map(word => word.value), wordOffsets: command.words.map(word => word.offset), assignNames: command.assigns.map(assign => assign.name), writesFile: command.redirects.some(redirect => redirect.direction !== "in" && redirect.target.value !== "/dev/null" && !(redirect.duplicate && /^(?:\d+|-)$/u.test(redirect.target.value))), join: command.join, negated: command.negated, nested: command.nested }));
+	return parsed.commands.map(command => ({ tokens: command.words.map(word => word.value), wordOffsets: command.words.map(word => word.offset), assignNames: command.assigns.map(assign => assign.name), writesFile: command.redirects.some(redirect => redirect.direction !== "in" && redirect.target.value !== "/dev/null" && !(redirect.duplicate && /^(?:\d+|-)$/u.test(redirect.target.value))), join: command.join, negated: command.negated, nested: command.nested, fixedWords: command.words.every(word => word.fixed) }));
 }
 
 /** A command's exit status when the spelling settles it without running it. */

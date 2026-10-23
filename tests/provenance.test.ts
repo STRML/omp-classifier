@@ -175,6 +175,11 @@ describe("gate-measured git push provenance (#63)", () => {
 				// git accepts unambiguous abbreviations of long options.
 				"git push --del origin feature",
 				"git push --mir origin feature",
+				// A word the shell rewrites is not the word git receives.
+				"git push origin {feature,+main}",
+				"git push origin $SPEC",
+				"git push $FLAGS origin feature",
+				"git push origin feature*",
 			]) {
 				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
 			}
@@ -350,6 +355,17 @@ describe("gate-measured git push provenance (#63)", () => {
 				"git push origin main | git remote set-url origin x",
 				// A substitution in the push's own words runs before it.
 				"git push origin $(git remote set-url origin x; echo main)",
+				// Review of #174: a word the shell rewrites can become an option or
+				// subcommand the allowlist never saw.
+				"git rebase $OPT && git push origin main",
+				"git commit $(echo -x) && git push origin main",
+				"git {rebase,-x,sh} && git push origin main",
+				"git log --oneline -1 ${X:---output=.git/config} && git push origin main",
+				"git checkout ?ebase && git push origin main",
+				"cat <(git remote set-url origin x) && git push origin main",
+				// fetch rewrites the tracking refs, and a transport can run a program.
+				"git fetch && git push origin main",
+				"git fetch 'ext::sh -c x' && git push origin main",
 			]) {
 				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
 			}
@@ -358,6 +374,8 @@ describe("gate-measured git push provenance (#63)", () => {
 				'git commit -q --allow-empty -m "fix foo()" && git push origin main',
 				"git status 2>&1 && git push origin main",
 				"git add -A && git commit -q --allow-empty -m next && git push origin main",
+				// Quoted glob and brace characters are text, not expansions.
+				'git commit -q --allow-empty -m "fix [P1] {x} *" && git push origin main',
 				"git merge --squash -q main && git push origin main",
 				"cd . && git log --oneline -1 | head -1 && git push origin main",
 				"git push origin main 2>&1 | tail -5",
