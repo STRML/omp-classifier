@@ -107,12 +107,24 @@ describe("gate-measured git push provenance (#63)", () => {
 			);
 			for (const command of [
 				"git commit --amend --no-edit && git push origin +main",
+				"git commit --amen --no-edit && git push origin +main",
+				"git branch --forc main HEAD~1 && git push origin +main",
+				"git branch -fq main HEAD~1 && git push origin +main",
 				"git reset --hard HEAD~1 && git push --force origin main",
 				"git rebase -i HEAD~2 && git push --force-with-lease origin main",
 				"git pull --rebase && git push --force origin main",
 				"git branch -f main HEAD~1 && git push origin +main",
 				"git switch b && git push origin +HEAD",
 				"git checkout b && git push --force origin HEAD",
+				// A global option hides which subcommand runs, and in which repository.
+				"git -C . reset --hard HEAD~1 && git push origin +main",
+				"git -c user.name=x rebase -i HEAD~2 && git push origin +main",
+				// Anything not known to leave refs alone: an alias, a script, an export.
+				"git amend && git push origin +main",
+				"./rewrite.sh && git push --force origin main",
+				"export GIT_DIR=/elsewhere/.git; git push --force origin main",
+				"echo 1111111111111111111111111111111111111111 > .git/refs/heads/main && git push origin +main",
+				"git switch b && git push origin main",
 			]) {
 				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
 			}
@@ -120,8 +132,7 @@ describe("gate-measured git push provenance (#63)", () => {
 			// tip, so forward-only still holds after them and the push stays measured.
 			expect(measureGitPushProvenance("git commit -q --allow-empty -m next && git push origin main", dir)?.forwardOnly).toBe(true);
 			expect(measureGitPushProvenance("git merge -q b && git push origin main", dir)?.forwardOnly).toBe(true);
-			// Switching branches does not move a ref the push names by name.
-			expect(measureGitPushProvenance("git switch b && git push origin main", dir)?.forwardOnly).toBe(true);
+			expect(measureGitPushProvenance("git add -A && git commit -q --allow-empty -m next && git push origin main", dir)?.forwardOnly).toBe(true);
 		} finally {
 			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
 		}
@@ -134,7 +145,9 @@ describe("gate-measured git push provenance (#63)", () => {
 		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
 		try {
 			git("git init -q -b main && git commit -q --allow-empty -m base && git branch feature && git update-ref refs/remotes/origin/feature HEAD", dir);
-			expect(measureGitPushProvenance("git push origin feature", dir)?.forwardOnly).toBe(true);
+			for (const measured of ["git push origin feature", "git push -fu origin feature", "git push --force-with-lease=feature origin feature"]) {
+				expect(measureGitPushProvenance(measured, dir)?.forwardOnly, measured).toBe(true);
+			}
 			for (const command of [
 				"git push --delete origin feature",
 				"git push -d origin feature",
@@ -147,6 +160,11 @@ describe("gate-measured git push provenance (#63)", () => {
 				"git push -o ci.skip origin feature",
 				"GIT_DIR=/elsewhere/.git git push --force origin feature",
 				"git --git-dir=/elsewhere/.git push --force origin feature",
+				"env GIT_DIR=/elsewhere/.git git push origin +feature",
+				"command git push --force origin feature",
+				// git accepts unambiguous abbreviations of long options.
+				"git push --del origin feature",
+				"git push --mir origin feature",
 			]) {
 				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
 			}
