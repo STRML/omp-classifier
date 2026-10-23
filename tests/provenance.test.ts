@@ -54,6 +54,52 @@ describe("gate-measured git push provenance (#63)", () => {
 		}
 	});
 
+	test("a HEAD refspec is measured against the same-named remote branch, not origin/HEAD", () => {
+		// `git push origin HEAD` pushes the current branch to the remote branch of
+		// the same name. Measured against refs/remotes/origin/HEAD (the default
+		// branch) instead, a force push that discards the remote feature branch's
+		// own commits read as forward-only whenever the branch contains main.
+		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
+		try {
+			git(
+				"git init -q -b main && git commit -q --allow-empty -m base && " +
+					"git update-ref refs/remotes/origin/main HEAD && git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main && " +
+					"git switch -q -c feature && git commit -q --allow-empty -m remote-only && git update-ref refs/remotes/origin/feature HEAD && " +
+					"git reset -q --hard main && git commit -q --allow-empty -m local-rewrite",
+				dir,
+			);
+			for (const command of ["git push --force origin HEAD", "git push -u origin HEAD", "git push --force origin @"]) {
+				const p = measureGitPushProvenance(command, dir);
+				expect(p?.forwardOnly, command).toBe(false);
+				expect(p?.behind, command).toBe(1);
+			}
+			// `HEAD:<name>` names its remote side, so only the local side is HEAD.
+			const explicit = measureGitPushProvenance("git push --force origin HEAD:feature", dir);
+			expect(explicit?.behind).toBe(1);
+			// A branch the remote does not have yet: no remote tip, nothing compared.
+			git("git switch -q -c brand-new", dir);
+			const fresh = measureGitPushProvenance("git push -u origin HEAD", dir);
+			expect(fresh?.remoteTip).toBeNull();
+			expect(fresh?.forwardOnly).toBeUndefined();
+		} finally {
+			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
+		}
+	});
+
+	test("a HEAD refspec on a detached HEAD names no remote branch, so nothing is measured", () => {
+		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
+		try {
+			git(
+				"git init -q -b main && git commit -q --allow-empty -m base && " +
+					"git update-ref refs/remotes/origin/main HEAD && git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main && git switch -q --detach",
+				dir,
+			);
+			expect(measureGitPushProvenance("git push --force origin HEAD", dir)).toBeUndefined();
+		} finally {
+			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
+		}
+	});
+
 	test("diverged tips: behind above zero, forwardOnly false", () => {
 		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
 		try {

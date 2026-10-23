@@ -662,10 +662,17 @@ export function measureGitPushProvenance(command: string, cwd: string): GitPushP
 	// text does not pin measures nothing, never a guess.
 	const repo = segmentCwdAt(maskHeredocBodiesAndAnsiSpans(command).masked, at, cwd);
 	if (repo === null) return undefined;
+	// `git push <remote> HEAD` (or `@`) updates the remote branch named like the
+	// current one. `refs/remotes/<remote>/HEAD` is the remote's default branch,
+	// and measuring against it read a force push that discards the remote
+	// feature branch's own commits as forward-only. A detached HEAD names no
+	// branch to compare, so nothing is measured.
+	const remoteBranch = rref === "HEAD" || rref === "@" ? gitPlumbing(["symbolic-ref", "--quiet", "--short", "HEAD"], repo) : rref;
+	if (remoteBranch === null) return undefined;
 	// The remote tip comes from remote-tracking state when it exists; a
 	// fresh `git fetch` is out of scope here (classification must stay
 	// fast and side-effect-free).
-	const remoteRefOid = gitPlumbing(["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${rref}`], repo);
+	const remoteRefOid = gitPlumbing(["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${remoteBranch}`], repo);
 	// A push to a remote path the repo does not track under that name (an
 	// explicit URL, or a differently-shaped ref namespace) yields null and
 	// the state carries no provenance.
