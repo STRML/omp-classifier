@@ -2,6 +2,19 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-10-24
+
+### Security: a push is measured only against the remote git sends it to
+
+- Fixes https://github.com/STRML/omp-classifier/issues/173. The 2026-10-23 entry said an earlier `git remote` or `git config` leaves a push unmeasured. That held only for the bare spelling. Any segment of the command now leaves the push unmeasured when it:
+  - calls git with a global option (`git -C . remote …`, `git -c …`, `git --git-dir=… config …`);
+  - calls `git remote` or `git config` through a wrapper or a path (`command git`, `env git`, `/usr/bin/git`) or from a shell's script string (`sh -c 'git remote set-url …'`);
+  - writes a file through a redirect (`echo … >> .git/config`), or names a path inside a `.git` directory (`sed -i … .git/config`).
+- A remote counts as known only when `remote.<name>.url` is set, exactly once. Tracking refs alone (stale, or made by hand with `update-ref`) no longer count, since git reads such a name as a path or URL. A second url makes git push to both while `git config --get` reports one.
+- A push stays unmeasured when `remote.<name>.pushurl` or any `url.<base>.pushInsteadOf` is set. Either one sends the push somewhere the tracking refs were not fetched from.
+- A function name inside a quoted string no longer reads as a function definition. The check now walks the syntax tree, so `git commit -m "fix foo()" && git push origin main` keeps its measurement.
+- Not covered: a program whose words don't show its effect (a script, a test runner) can still rewrite `.git/config` before the push. It is judged as its own text.
+
 ## 2026-10-23
 
 ### Pushes, pull requests and comments run unasked (jev-v2.14)

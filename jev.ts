@@ -59,7 +59,7 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { redactSecrets } from "./redact";
-import { parseShell, type ShellJoin } from "./shell-ast";
+import { parseShell, shellDeclaresFunction, type ShellJoin } from "./shell-ast";
 import { maskHeredocBodiesAndAnsiSpans, segmentCwdAt, SHELL_WORD_EXPANSION } from "./shell-cwd";
 import type { TrustedPolicyDocument } from "./trust-policy";
 
@@ -644,20 +644,54 @@ const PLAIN_DIRECTORY_COMMANDS = new Set(["cd", "pushd", "popd"]);
  *  git (a function, an alias, a PATH, a sourced file) or its remote was just
  *  repointed. */
 const SHELL_STATE_COMMANDS = new Set(["alias", "unalias", "export", "declare", "typeset", "readonly", "local", "source", ".", "shopt", "set", "unset", "hash", "eval", "enable", "builtin", "function", "trap"]);
-const FUNCTION_DEFINITION = /(?:^|[\s;&|(){}])(?:function\s+[^\s(){};&|]+|[^\s(){};&|=]+\s*\(\s*\))/u;
+
+/** The git subcommands that write the configuration a push reads its remote
+ *  from. */
+const GIT_CONFIG_WRITERS = new Set(["remote", "config"]);
+/** A word that is git itself (`command git`, `env git`, `xargs git`, a path to
+ *  git), and a script string that calls git (`sh -c 'git remote set-url …'`). */
+const IS_GIT = /(?:^|\/)git$/u;
+const CALLS_GIT = /(?:^|[\s;&|(/`])git(?:$|[\s;&|)`])/u;
+/** Shells whose script string is read for a git call. */
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
+/** A word that names a file under a `.git` directory, where the remote
+ *  configuration lives (`sed -i … .git/config`, `cp x .git/config`). */
+const NAMES_GIT_DIR = /(?:^|\/)\.git(?:\/|$)/u;
+
+/** Whether an earlier git call in the push's command leaves the remote
+ *  configuration alone: plain `git <subcommand>` with no global option (`-C`,
+ *  `-c`, `--git-dir` hide which repository and which settings it touches) and
+ *  a subcommand that does not write the remote configuration. */
+function gitCallLeavesRemotesAlone(tokens: string[]): boolean {
+	const verb = tokens[0] ?? "";
+	if (!IS_GIT.test(verb)) {
+		const callsGit = SHELLS.has(verb.replace(/^.*\//u, "")) ? CALLS_GIT : IS_GIT;
+		return !tokens.slice(1).some(word => callsGit.test(word));
+	}
+	const sub = tokens[1] ?? "";
+	return !sub.startsWith("-") && !GIT_CONFIG_WRITERS.has(sub);
+}
 
 /** Whether `git` in the push is the git binary on the user's PATH, talking to
  *  remotes as configured. Judged by what could change that, so an unknown shape
- *  (a function definition the parser flattens, a bare assignment) fails closed. */
+ *  (a function definition the parser flattens, a bare assignment) fails closed.
+ *
+ *  Every other segment is held to the same reading: no file write (`>>
+ *  .git/config`), no word naming a `.git` directory, and no git call that could
+ *  repoint a remote, however it is spelled (`git -C . remote`, `command git
+ *  remote`, `sh -c 'git config …'`). A program whose effect its words do not
+ *  show (a script, a test runner) is not read here; it is judged as its own
+ *  text. */
 function shellRunsPlainGit(command: string, segments: ShellSegment[], push: ShellSegment): boolean {
-	if (FUNCTION_DEFINITION.test(maskHeredocBodiesAndAnsiSpans(command).masked)) return false;
+	if (shellDeclaresFunction(command)) return false;
 	return segments.every((segment, i) => {
 		if (segment === push) return true;
 		if (i > 0 && segment.join === "first") return false;
 		if (segment.tokens.length === 0 && segment.assignNames.length > 0) return false;
-		const [verb, sub] = segment.tokens;
-		if (SHELL_STATE_COMMANDS.has(verb ?? "")) return false;
-		return !(verb === "git" && (sub === "remote" || sub === "config"));
+		if (segment.writesFile) return false;
+		if (SHELL_STATE_COMMANDS.has(segment.tokens[0] ?? "")) return false;
+		if (segment.tokens.some(word => NAMES_GIT_DIR.test(word))) return false;
+		return gitCallLeavesRemotesAlone(segment.tokens);
 	});
 }
 
@@ -741,6 +775,22 @@ function currentBranch(repo: string): string | null {
 	return ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : null;
 }
 
+/** Whether `remote` is a remote this repository configures by name and a push
+ *  to it reaches the one repository its tracking refs were fetched from. A
+ *  name with no `remote.<name>.url` is a path or URL to git (tracking refs
+ *  alone do not make one: they can be stale or made by hand); several urls
+ *  push to every one of them; and `remote.<name>.pushurl` or any
+ *  `url.<base>.pushInsteadOf` sends the push somewhere the fetch did not read. */
+function pushGoesWhereRemoteFetches(remote: string, repo: string): boolean {
+	if (!/^[A-Za-z0-9._-]+$/u.test(remote)) return false;
+	const urls = gitPlumbing(["config", "--get-all", `remote.${remote}.url`], repo);
+	if (urls === null || urls === "" || urls.includes("\n")) return false;
+	// `git config` exits 1 for "no such key" and something else for a failure,
+	// which must not read as "not set".
+	if (gitPlumbingStatus(["config", "--get-all", `remote.${remote}.pushurl`], repo) !== 1) return false;
+	return gitPlumbingStatus(["config", "--get-regexp", "^url\\..*\\.pushinsteadof$"], repo) === 1;
+}
+
 export function measureGitPushProvenance(command: string, cwd: string): GitPushProvenance | undefined {
 	const refs = parsePushRefs(command);
 	if (refs === null) return undefined;
@@ -762,11 +812,7 @@ export function measureGitPushProvenance(command: string, cwd: string): GitPushP
 	// Only a remote this repository knows by name: a URL or a path has no
 	// tracking ref, and a null tip there would read as a new branch on the
 	// user's own remote while the commits go somewhere else.
-	if (!/^[A-Za-z0-9._-]+$/u.test(remote)) return undefined;
-	const knownRemote =
-		gitPlumbing(["config", "--get", `remote.${remote}.url`], repo) !== null ||
-		(gitPlumbing(["for-each-ref", "--count=1", "--format=%(refname)", `refs/remotes/${remote}/`], repo) ?? "") !== "";
-	if (!knownRemote) return undefined;
+	if (!pushGoesWhereRemoteFetches(remote, repo)) return undefined;
 	const remoteBranch = shorthand && headRef(rref) ? currentBranch(repo) : rref;
 	if (remoteBranch === null) return undefined;
 	// The remote tip comes from remote-tracking state when it exists; a

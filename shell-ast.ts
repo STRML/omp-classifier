@@ -326,6 +326,29 @@ export function parseShell(text: string): ShellParse {
 	}
 }
 
+/**
+ * Whether `text` defines a shell function anywhere (`f() { … }` or `function
+ * f { … }`), read from the syntax tree, so `git commit -m "fix foo()"` is not
+ * one. The flat command list cannot answer this: it flattens a function body
+ * into the commands around it. A command the parser cannot read answers true,
+ * since an unread command could define anything.
+ */
+export function shellDeclaresFunction(text: string): boolean {
+	let tree: unknown;
+	try {
+		tree = parse(text);
+	} catch {
+		return true;
+	}
+	let found = false;
+	walk(tree, node => {
+		if (found) return false;
+		found = nodeType(node as NonNullable<unknown>) === "FuncDecl";
+		return !found;
+	});
+	return found;
+}
+
 /** The parser's own message. Its error is a Go value whose `toString` is
  *  `[object Object]`, so the text comes from `Text` or `Error()`. */
 function parserMessage(err: unknown): string {
