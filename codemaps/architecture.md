@@ -89,8 +89,8 @@ recognizer.ts ─► floor.ts, shell-ast.ts      (not imported by index.ts)
 
 | Name | Value | Defined |
 |---|---|---|
-| `JEV_POLICY_VERSION` (= `CLASSIFIER_POLICY_VERSION`) | `jev-v2.15` | jev.ts:99, index.ts:392 |
-| `JEV_V3_POLICY_VERSION` | `jev-v3.5` | jev.ts:107 |
+| `JEV_POLICY_VERSION` (= `CLASSIFIER_POLICY_VERSION`) | `jev-v2.16` | jev.ts:99, index.ts:392 |
+| `JEV_V3_POLICY_VERSION` | `jev-v3.6` | jev.ts:107 |
 | `AUTHORIZATION_VERSION` | `jev-auth-v2` | authorization.ts:818 |
 | `CLASSIFIER_POLICY_HASH` | `jevQuestionsHash()`: sha256 of version + battery + default policy, 16 hex | index.ts:1228 |
 | `QUESTIONS_CONTRACT` | `questions+probabilities` | index.ts:1222 |
