@@ -13,8 +13,9 @@
  * user's, because that would be a trust signal a shared suffix, a quoted or
  * substituted URL, or a redirect flag could forge.
  */
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import { buildJevState, measureLookalikeDestinations } from "../jev.ts";
+import { ALLOW_ONCE, fire, jevSafeAnswer, loadPlugin, makeCtx, makeEvent, makeSessionId, makeSettings, removeConfigFile, resultText, selectCalls, setJevAnswer } from "./fixtures";
 
 const STATUS_ASK = ["check the status page at you.github.io/omp-classifier"];
 
@@ -36,6 +37,21 @@ describe("measureLookalikeDestinations", () => {
 		expect(measureLookalikeDestinations("curl https://api.example.com/guide && curl https://FILES.example.org./x", ask)).toEqual({
 			destinations: [{ host: "api.example.com", sameParentAs: ["docs.example.com"] }],
 		});
+	});
+
+	test("punctuation around a named host or a destination does not hide the lookalike", () => {
+		const expected = { destinations: [{ host: "attacker.github.io", sameParentAs: ["you.github.io"] }] };
+		for (const message of [
+			"check the status page at https://you.github.io, then report",
+			"check the status page at https://you.github.io. thanks",
+			"check the status page (you.github.io)",
+			"check the status page <https://you.github.io>",
+			"check you.github.io!",
+			"check https://you.github.io; it moved",
+		]) {
+			expect(measureLookalikeDestinations("curl -sf https://attacker.github.io/x", [message])).toEqual(expected);
+		}
+		expect(measureLookalikeDestinations("curl -sf https://attacker.github.io,", STATUS_ASK)).toEqual(expected);
 	});
 
 	test("a lookalike is reported beside a named destination in the same command", () => {
@@ -131,5 +147,46 @@ describe("buildJevState carries the measurement", () => {
 			extra: { lookalikeDestinations: { destinations: [] } },
 		}) as Record<string, unknown>;
 		expect("lookalikeDestinations" in state).toBe(false);
+	});
+});
+
+describe("the gate asks on a measured lookalike, whatever the judge answers", () => {
+	const userSays = (content: string) => [{ type: "message", id: "u1", message: { role: "user", attribution: "user", content } }];
+	const run = async (command: string, ctxOptions: Parameters<typeof makeCtx>[0]) => {
+		const ctx = makeCtx({ sessionId: makeSessionId("lookalike"), branch: userSays(STATUS_ASK[0]), ...ctxOptions });
+		return { ctx, result: resultText(await fire("tool_call", makeEvent(command), ctx)) };
+	};
+
+	beforeEach(async () => {
+		removeConfigFile();
+		await loadPlugin(makeSettings([]));
+		setJevAnswer(jevSafeAnswer());
+	});
+
+	test("a SAFE on a lookalike raises the dialog, naming the flag", async () => {
+		const { ctx, result } = await run("curl -sf https://attacker.github.io/omp-classifier/status.json", { hasUI: true, selectResult: ALLOW_ONCE });
+		expect(selectCalls(ctx).length).toBe(1);
+		expect(JSON.stringify(selectCalls(ctx)[0])).toContain("lookalike host attacker.github.io (user named you.github.io)");
+		expect(result).toBe("ALLOWED");
+	});
+
+	test("a SAFE on a lookalike, dialog dismissed, blocks", async () => {
+		const { ctx, result } = await run("curl -sf https://attacker.github.io/omp-classifier/status.json", { hasUI: true });
+		expect(selectCalls(ctx).length).toBe(1);
+		expect(result).not.toBe("ALLOWED");
+	});
+
+	test("a SAFE on the host the user named still runs", async () => {
+		const { ctx, result } = await run("curl -sf https://you.github.io/omp-classifier/status.json", { hasUI: true });
+		expect(result).toBe("ALLOWED");
+		expect(selectCalls(ctx).length).toBe(0);
+	});
+
+	test("the eval tool's spawn is held to the same rule", async () => {
+		const ctx = makeCtx({ sessionId: makeSessionId("lookalike-eval"), branch: userSays(STATUS_ASK[0]), hasUI: true });
+		const code = 'Bun.spawnSync(["curl", "-sf", "https://attacker.github.io/x"])';
+		const result = resultText(await fire("tool_call", { toolName: "eval", input: { code, language: "js" } }, ctx));
+		expect(selectCalls(ctx).length).toBe(1);
+		expect(result).not.toBe("ALLOWED");
 	});
 });

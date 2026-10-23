@@ -123,6 +123,7 @@ import {
 	type JevAnswers,
 	type JevVerdict,
 	type NetworkProvenance,
+	lookalikeDestinationFlags,
 	measureGitPushProvenance,
 	measureGitRefProvenance,
 	measureGitWorktreeProvenance,
@@ -6587,7 +6588,7 @@ export default function (pi: ExtensionAPI) {
 					// dialoged a SAFE the judge reached on the visible spawn.
 					// A real destructive verb reads as a call or an argument
 					// (`rm -rf`, spawn(["rm", …])) and never as `token =`.
-					const flagList = evalRiskFlags(evalCode);
+					const flagList = [...evalRiskFlags(evalCode), ...lookalikeDestinationFlags(evalCode, evidenceSnapshot?.messages)];
 					const replay = replayDecision({
 						tool: "eval",
 						command: evalCode,
@@ -6666,7 +6667,7 @@ export default function (pi: ExtensionAPI) {
 					{ ...auditFields(), ...judgementAudit(judgement), ...spawnField, ...follows },
 					judgement.late === undefined
 						? undefined
-						: { handle: judgement.late, priorRefusal: prior, riskFlags: evalRiskFlags(evalCode) },
+						: { handle: judgement.late, priorRefusal: prior, riskFlags: [...evalRiskFlags(evalCode), ...lookalikeDestinationFlags(evalCode, evidenceSnapshot?.messages)] },
 				);
 			} catch (err) {
 				pi.logger.error(`classifier: ${err instanceof Error ? err.message : String(err)}`);
@@ -7125,7 +7126,9 @@ export default function (pi: ExtensionAPI) {
 				// and a judge that answers SAFE on a payload carrying an injected
 				// instruction must not auto-run rm/dd/mkfs-class commands the
 				// builtin critical list does not cover.
-				const flags = matchModerateRiskTokens(judgedCommand, cwd);
+				// Issue #161: a destination the gate measured as a lookalike of a host the
+				// user named asks, whatever the judge made of the field in its state.
+				const flags = [...matchModerateRiskTokens(judgedCommand, cwd), ...lookalikeDestinationFlags(judgedCommand, evidenceSnapshot?.messages)];
 				// Issue #67: a script body is code the classifier read verbatim —
 				// the same class of payload as an inline `-c` argument — so the
 				// same second-execution markers apply. A SAFE cannot vouch for a
@@ -7218,7 +7221,7 @@ export default function (pi: ExtensionAPI) {
 				{ ...auditFields(), ...judgementAudit(judgement), ...follows },
 				judgement.late === undefined
 					? undefined
-					: { handle: judgement.late, priorRefusal: prior, riskFlags: matchModerateRiskTokens(judgedCommand, cwd) },
+					: { handle: judgement.late, priorRefusal: prior, riskFlags: [...matchModerateRiskTokens(judgedCommand, cwd), ...lookalikeDestinationFlags(judgedCommand, evidenceSnapshot?.messages)] },
 			);
 		} catch (err) {
 			// Unexpected plugin error: fail closed rather than wave the command

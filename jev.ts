@@ -97,7 +97,8 @@ import type { TrustedPolicyDocument } from "./trust-policy";
  * user's own messages name (`attacker.github.io` against `you.github.io`), and
  * `unauthorized_consequential_action`'s yes criterion says what such a
  * destination is. The measurement is negative only: it never claims a
- * destination is the user's.
+ * destination is the user's. Each lookalike is also an overlay flag
+ * (`lookalikeDestinationFlags`), so a SAFE on one still asks.
  */
 export const JEV_POLICY_VERSION = "jev-v2.15";
 /**
@@ -1765,7 +1766,10 @@ const USER_URL_HOST_RE = /\b[a-z][a-z0-9+.-]*:\/\/(?:[^\s/@]+@)?([^\s/?#:'"`<>()
  *  letter, so `e.g.` and version numbers are not hosts. */
 const USER_BARE_HOST_RE = /(?<![\w.@/:-])((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*[a-z0-9])(?![\w-]|\.[a-z0-9])/giu;
 
-const normalizeHost = (host: string): string => host.toLowerCase().replace(/\.$/u, "");
+/** Lowercased, with the sentence punctuation a URL picks up in prose or a
+ *  command picks up from its neighbours (`https://you.github.io,`) and the DNS
+ *  root dot dropped from the end. */
+const normalizeHost = (host: string): string => host.toLowerCase().replace(/[.,;:!?]+$/u, "");
 
 /** The hosts the user's messages name, in first-seen order. */
 function userNamedHosts(messages: readonly string[]): string[] {
@@ -1774,8 +1778,7 @@ function userNamedHosts(messages: readonly string[]): string[] {
 		for (const m of message.matchAll(USER_URL_HOST_RE)) hosts.add(normalizeHost(m[1]));
 		for (const m of message.matchAll(USER_BARE_HOST_RE)) hosts.add(normalizeHost(m[1]));
 	}
-	hosts.delete("");
-	return [...hosts];
+	return [...hosts].filter(host => PLAIN_HOST_RE.test(host));
 }
 
 /** Trailing labels two hostnames share (`a.github.io`, `b.github.io` → 2). */
@@ -1823,6 +1826,21 @@ export function measureLookalikeDestinations(command: string, userMessages: read
 		if (sameParentAs.length > 0) destinations.push({ host, sameParentAs });
 	}
 	return destinations.length > 0 ? { destinations } : undefined;
+}
+
+/**
+ * The overlay flags a measured lookalike raises (issue #161). A SAFE verdict
+ * with a flag becomes a permission request, the same rule the moderate-risk
+ * token overlay follows, so the user decides whether a host they never named
+ * but that shares a parent with one they did is the one they meant. Measured
+ * in code because the judge does not act on the field reliably: on
+ * jev-1.14.0, `acme-docs.pages.dev` under "acme.pages.dev" scored p(safe)
+ * 0.81-0.86 with the field in its state. The messages are redacted exactly as
+ * the state's are, so the flag and the state describe the same words.
+ */
+export function lookalikeDestinationFlags(command: string, userMessages: readonly string[] | undefined): string[] {
+	const lookalikes = measureLookalikeDestinations(command, userMessages?.map(redactSecrets));
+	return (lookalikes?.destinations ?? []).map(({ host, sameParentAs }) => `lookalike host ${host} (user named ${sameParentAs.join(", ")})`);
 }
 
 /**

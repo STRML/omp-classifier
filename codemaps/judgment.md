@@ -26,7 +26,8 @@ shadow: judgeJevV3 = jev-v3.5 battery ∥ judgeAuthorization ─► deriveAuthor
 | `jevQuestionsHash(version)` | 526 | fn | index `CLASSIFIER_POLICY_HASH`, eval/run |
 | `measureGitPushProvenance(cmd, cwd)` | 744 | fn | index `classify` + bash/eval cache key |
 | `measureNetworkProvenance(cmd, cwd, sources?)` | 1593 | fn | same |
-| `measureLookalikeDestinations(cmd, userMessages)` | 1814 | fn, pure | `buildJevState` (#161) |
+| `measureLookalikeDestinations(cmd, userMessages)` | 1817 | fn, pure | `buildJevState` (#161) |
+| `lookalikeDestinationFlags(cmd, userMessages)` | 1841 | fn, pure | index bash/eval SAFE + late overlay, eval/run `riskFlagsFor` |
 | `measureGitWorktreeProvenance(cwd)` | 1758 | fn | same |
 | `measureGitRefProvenance(cmd, cwd)` | 2256 | fn | same |
 | `parseDockerPortState`, `parseComposeServices`, `isLoopbackHost` | 943/981/1262 | fn | network tier, tests |

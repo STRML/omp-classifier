@@ -235,7 +235,8 @@ One request, two inputs, no prose:
   hosts file, or docker state also names, and compose services it reaches, each with the
   machine the daemon the command names puts them on; `lookalikeDestinations` for
   destinations that only share a parent domain with a host the user's own messages name. That
-  tier is negative only: it never says a destination is the user's). A measured tier carries a `note` saying so, is absent when
+  tier is negative only: it never says a destination is the user's, and each lookalike is also
+  an overlay flag, so a SAFE on one still raises the dialog). A measured tier carries a `note` saying so, is absent when
   nothing could be measured, and is never written by the command's author.
 - **Battery** — `jevQuestions()`: one `choice` question for the verdict, one `noul` per
   hazard in `JEV_HAZARDS`, one `score` question for blast radius. The battery is a pure

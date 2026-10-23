@@ -140,8 +140,8 @@ interface DeferredDialog {
  * hides the dialog and resolves `undefined`, and an already-aborted signal
  * never presents one.
  */
-function deferredCtx(sessionId: string): DeferredDialog {
-	const ctx = makeCtx({ sessionId, hasUI: true });
+function deferredCtx(sessionId: string, branch?: NonNullable<Parameters<typeof makeCtx>[0]>["branch"]): DeferredDialog {
+	const ctx = makeCtx({ sessionId, hasUI: true, ...(branch ? { branch } : {}) });
 	const calls = selectCalls(ctx);
 	let presented = 0;
 	let state: "idle" | "open" | "dismissed" | "answered" = "idle";
@@ -205,6 +205,7 @@ async function timeoutRun(
 	answers: JevFixtureAnswers[],
 	answerMs: number,
 	toolName: "bash" | "eval" = "bash",
+	branch?: NonNullable<Parameters<typeof makeCtx>[0]>["branch"],
 ): Promise<LateRun> {
 	writeConfig({ timeoutMs: DEADLINE_MS });
 	jest.useFakeTimers();
@@ -212,7 +213,7 @@ async function timeoutRun(
 	// After loadPlugin, which resets every stub knob.
 	setJevDelay(answerMs);
 	setJevAnswers(answers);
-	const dialog = deferredCtx(sessionId);
+	const dialog = deferredCtx(sessionId, branch);
 	const event = toolName === "eval" ? { toolName, input: { code: payload, language: "js" } } : makeEvent(payload);
 	const tool = fire("tool_call", event, dialog.ctx);
 	await until(() => modelCalls.length > 0);
@@ -411,6 +412,24 @@ describe("a judgment that answers after its deadline (issue #62)", () => {
 		const lines = readDecisions();
 		expect(lines.map(line => line.layer)).toEqual(["verdict", "late-verdict", "dialog"]);
 		expect(lines[2].why).toBe("approved by user (unavailable → late SAFE)");
+	});
+	test("a late SAFE cannot dismiss a dialog for a measured lookalike host (#161)", async () => {
+		seq += 1;
+		const branch = [{ type: "message", id: "u1", message: { role: "user", attribution: "user", content: "check the status page at you.github.io/omp-classifier" } }];
+		const command = `curl -sf https://attacker.github.io/late-${seq}.json`;
+		const { dialog } = await timeoutRun(command, `late-lookalike-${seq}`, [jevSafeAnswer()], LATE_ANSWER_MS, "bash", branch);
+
+		jest.advanceTimersByTime(20);
+		await until(() => lateLines().length > 0);
+
+		expect(dialog.state()).toBe("open");
+		expect(lateLines()[0]).toMatchObject({
+			decision: "block",
+			layer: "late-verdict",
+			verdict: "SAFE",
+			why: "unavailable → late SAFE: dialog kept open — classifier-safe but flags: lookalike host attacker.github.io (user named you.github.io)",
+		});
+		dialog.answer(ALLOW_ONCE);
 	});
 	test("a late SAFE cannot dismiss a dialog for a flagged script body", async () => {
 		seq += 1;
