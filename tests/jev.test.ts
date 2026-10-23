@@ -359,10 +359,12 @@ describe("jevQuestionsHash", () => {
 		// work `unauthorized_consequential_action` names, so the bytes move too
 		// (67568ffd5be26200). v2.14 adds non-force pushes, pull requests and
 		// comments to that list and to the verdict's safe criterion, and
-		// says a push with no force and no delete cannot discard anything.
+		// says a push with no force and no delete cannot discard anything
+		// (4ecd97f1eb86b662). v2.15 (#166) swaps the temp paths in that list for
+		// the gate-measured `deleteTargets.underTempRoot` (v2.14 was fef017691cc788d1).
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("4ecd97f1eb86b66272670b426b38aac7dd7aba02e86b47dfecdd14144acb0159");
-		expect(jevQuestionsHash()).toBe("fef017691cc788d1");
+		expect(digest).toBe("be9672572d22bbe384375d7a633688423b0afff87e1ad3650eb76178751f0b78");
+		expect(jevQuestionsHash()).toBe("849a4dae86d10659");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 

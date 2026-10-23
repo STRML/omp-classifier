@@ -18,7 +18,7 @@ import { answerCacheKey, computeV3Summary, parseJsonl, v3InputsFor, type Case, t
 const REPO = join(import.meta.dir, "..");
 const DEFAULT_CWD = "/Users/you/sites/project";
 
-/** A jev-v3.4 answer set. Default: below the safe floor, no hazard, so the
+/** A jev-v3.5 answer set. Default: below the safe floor, no hazard, so the
  *  legacy derivation is UNSURE and branch 3 cannot fire. */
 const riskAnswers = (overrides: { safe?: number; unsafe?: number; hazards?: Partial<Record<JevHazard, number>> } = {}): JevAnswers => {
 	const safe = overrides.safe ?? 0.4;
@@ -119,7 +119,7 @@ describe("computeV3Summary — per-sample, named, disqualifying", () => {
 	});
 });
 
-describe("bun eval/run.ts --replay --battery jev-v3.4 (end to end)", () => {
+describe("bun eval/run.ts --replay --battery jev-v3.5 (end to end)", () => {
 	let cache = "";
 	let reports = "";
 	beforeEach(() => {

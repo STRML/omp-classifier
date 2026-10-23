@@ -115,6 +115,7 @@ import {
 	deriveJevDecision,
 	JEV_POLICY_VERSION,
 	jevQuestionsHash,
+	type DeleteTarget,
 	type GitPushProvenance,
 	type GitRefProvenance,
 	type GitWorktreeProvenance,
@@ -123,6 +124,7 @@ import {
 	type JevAnswers,
 	type JevVerdict,
 	type NetworkProvenance,
+	measureDeleteTargets,
 	measureGitPushProvenance,
 	measureGitRefProvenance,
 	measureGitWorktreeProvenance,
@@ -5253,6 +5255,7 @@ export default function (pi: ExtensionAPI) {
 			worktreeProvenance?: GitWorktreeProvenance;
 			refProvenance?: GitRefProvenance[];
 			networkProvenance?: NetworkProvenance;
+			deleteTargets?: DeleteTarget[];
 			trustedPolicy?: readonly TrustedPolicyDocument[];
 			recordExtras: Record<string, unknown>;
 		},
@@ -5300,6 +5303,7 @@ export default function (pi: ExtensionAPI) {
 					...(input.worktreeProvenance !== undefined ? { gitWorktreeProvenance: input.worktreeProvenance } : {}),
 					...(input.refProvenance !== undefined ? { gitRefProvenance: input.refProvenance } : {}),
 					...(input.networkProvenance !== undefined ? { networkProvenance: input.networkProvenance } : {}),
+					...(input.deleteTargets !== undefined ? { deleteTargets: input.deleteTargets } : {}),
 					...(Object.keys(input.recordExtras).length > 0 ? { extra: input.recordExtras } : {}),
 				}),
 				authorizationState: buildAuthorizationState({
@@ -5456,6 +5460,16 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			networkProvenance = undefined;
 		}
+		// Gate-measured delete targets (#166): whether each trash/rm operand
+		// really lies under a temp root, links and `..` resolved. A shell-only
+		// measurement that walks the command's own `cd` chain, so it takes
+		// `startCwd` with the unmodified text, like the push and network tiers.
+		let deleteTargets: DeleteTarget[] | undefined;
+		try {
+			deleteTargets = language === "shell" ? measureDeleteTargets(command, startCwd) : undefined;
+		} catch {
+			deleteTargets = undefined;
+		}
 		// Started before the live request so the two run in parallel; awaited
 		// on both return paths below, and it never throws.
 		const shadow = config.shadowV3
@@ -5471,6 +5485,7 @@ export default function (pi: ExtensionAPI) {
 					...(worktreeProvenance !== undefined ? { worktreeProvenance } : {}),
 					...(refProvenance !== undefined ? { refProvenance } : {}),
 					...(networkProvenance !== undefined ? { networkProvenance } : {}),
+					...(deleteTargets !== undefined ? { deleteTargets } : {}),
 				})
 			: undefined;
 		// Answers -> verdict, shared by the on-time and the late path: a late
@@ -5540,6 +5555,7 @@ export default function (pi: ExtensionAPI) {
 				...(worktreeProvenance !== undefined ? { gitWorktreeProvenance: worktreeProvenance } : {}),
 				...(refProvenance !== undefined ? { gitRefProvenance: refProvenance } : {}),
 				...(networkProvenance !== undefined ? { networkProvenance } : {}),
+				...(deleteTargets !== undefined ? { deleteTargets } : {}),
 				...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
 		});
 		if (config.logJudgedStates && decisionId !== undefined) recordJudgedState(ctx, decisionId, language === "code" ? "eval" : "bash", { risk: riskState });
@@ -6877,6 +6893,9 @@ export default function (pi: ExtensionAPI) {
 			const worktreeProvenanceForCache = measureGitWorktreeProvenance(cwd);
 			const refProvenanceForCache = measureGitRefProvenance(judgedCommand, cwd);
 			const networkProvenanceForCache = measureNetworkProvenance(judgedCommand, startCwd);
+			// A delete target swapped for a link between two calls lands somewhere
+			// else (#166), so the measured landing rides in the key too.
+			const deleteTargetsForCache = measureDeleteTargets(judgedCommand, startCwd);
 			const cacheKey = JSON.stringify([
 				config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, judgedCommand,
 				reviewEvidenceFingerprint,
@@ -6884,6 +6903,7 @@ export default function (pi: ExtensionAPI) {
 				worktreeProvenanceForCache ?? null,
 				refProvenanceForCache ?? null,
 				networkProvenanceForCache ?? null,
+				deleteTargetsForCache ?? null,
 			]);
 			// Refusal memory (issue #30): a reworded command meets its session's
 			// prior refusal. The record tells the model; the SAFE branch below
