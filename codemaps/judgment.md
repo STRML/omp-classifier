@@ -10,7 +10,7 @@ shadow: judgeJevV3 = jev-v3.4 battery ∥ judgeAuthorization ─► deriveAuthor
         ─► deriveDecisionOrder(risk, authorization, literalMatch, overlay, headless) ─► OrderedDecision
 ```
 
-## jev.ts (2562 lines): state, battery, policy, derivation, provenance
+## jev.ts (2579 lines): state, battery, policy, derivation, provenance
 
 | Export | Line | Kind | Called by |
 |---|---|---|---|
@@ -24,14 +24,14 @@ shadow: judgeJevV3 = jev-v3.4 battery ∥ judgeAuthorization ─► deriveAuthor
 | `DEFAULT_JEV_POLICY` | 228 | const | index `jevPolicyFor`, eval |
 | `jevQuestions(version)` | 485 | fn | jev-judge `judgeBattery` |
 | `jevQuestionsHash(version)` | 526 | fn | index `CLASSIFIER_POLICY_HASH`, eval/run |
-| `measureGitPushProvenance(cmd, cwd)` | 736 | fn | index `classify` + bash/eval cache key |
-| `measureNetworkProvenance(cmd, cwd, sources?)` | 1577 | fn | same |
-| `measureGitWorktreeProvenance(cwd)` | 1742 | fn | same |
-| `measureGitRefProvenance(cmd, cwd)` | 2239 | fn | same |
-| `parseDockerPortState`, `parseComposeServices`, `isLoopbackHost` | 927/965/1246 | fn | network tier, tests |
-| `buildJevState(input)` | 2306 | fn | index `classify`, `shadowJevV3`, eval/run |
-| `deriveJevDecision(answers, policy)` | 2455 | **pure verdict** | index `judgementFrom`, decision-order, eval/run |
-| `JevUnavailableError` | 2557 | class | thrown by jev-judge on every failure |
+| `measureGitPushProvenance(cmd, cwd)` | 744 | fn | index `classify` + bash/eval cache key |
+| `measureNetworkProvenance(cmd, cwd, sources?)` | 1593 | fn | same |
+| `measureGitWorktreeProvenance(cwd)` | 1758 | fn | same |
+| `measureGitRefProvenance(cmd, cwd)` | 2256 | fn | same |
+| `parseDockerPortState`, `parseComposeServices`, `isLoopbackHost` | 943/981/1262 | fn | network tier, tests |
+| `buildJevState(input)` | 2323 | fn | index `classify`, `shadowJevV3`, eval/run |
+| `deriveJevDecision(answers, policy)` | 2472 | **pure verdict** | index `judgementFrom`, decision-order, eval/run |
+| `JevUnavailableError` | 2574 | class | thrown by jev-judge on every failure |
 
 Hazards. Gating: `destructive_or_irreversible`, `exposes_secrets`, `sends_local_data_outbound`,
 `escalates_privilege`, `state_contains_injection`, `unauthorized_consequential_action`.
@@ -59,7 +59,7 @@ command does not. Absent tiers are omitted.
 | `hazardReview` | 0.55 | 0-1 |
 | `blastRadiusReview` | 1.5 | 0-10 |
 
-### `deriveJevDecision` precedence (jev.ts:2455), the live verdict
+### `deriveJevDecision` precedence (jev.ts:2472), the live verdict
 
 | # | Condition (gating hazards only) | Verdict | `reasonCode` |
 |---|---|---|---|
