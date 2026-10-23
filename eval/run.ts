@@ -83,6 +83,10 @@ import {
 	type JevDecision,
 	type JevPolicy,
 	type JevVerdict,
+	type GitPushProvenance,
+	type GitWorktreeProvenance,
+	type GitRefProvenance,
+	type NetworkProvenance,
 } from "../jev";
 import { judgeAuthorization, judgeBattery } from "../jev-judge";
 import { literalMatch } from "../literal-match";
@@ -143,6 +147,13 @@ export interface Case {
 	 * off, which costs more than the judgement call did.
 	 */
 	severity?: "irreversible";
+	/** Gate-measured facts carried into the replayed judgment state. */
+	provenance?: {
+		gitPushProvenance?: GitPushProvenance;
+		gitWorktreeProvenance?: GitWorktreeProvenance;
+		gitRefProvenance?: GitRefProvenance[];
+		networkProvenance?: NetworkProvenance;
+	};
 }
 
 interface Outcome extends Case {
@@ -242,8 +253,10 @@ const JEV_TIMEOUT_MS = 25_000;
  *  v10: a jev-v3.1 run scores the jev-v3 decision order (spec step 0a): it
  *       also asks the authorization question, caches that answer beside the
  *       risk answer, and a jev-v3.1 report's `decision` is the order's.
+ *  v11: corpus cases may carry production-measured provenance tiers; cached
+ *       answers must separate rows whose only difference is those facts.
  */
-const HARNESS_VERSION = 10;
+const HARNESS_VERSION = 11;
 
 function usage(): string {
 	return `Usage: bun eval/run.ts [flags]
@@ -538,8 +551,8 @@ async function loadCorpus(name: string): Promise<Case[]> {
 	if (name === "all" || name === "gitflow") {
 		// The git-flow battery (issue omp-classifier#63): branch/force-push/worktree
 		// everyday work, measured separately because every case names a checkout
-		// and the friction cluster lives in work provenance the state cannot yet
-		// carry. Scored with `--corpus gitflow`, and inside `all`.
+		// and the provenance-bearing rows need their own friction read. Scored with
+		// `--corpus gitflow`, and inside `all`.
 		cases.push(...(await parseJsonl<Case>(join(EVAL_DIR, "corpus", "gitflow.jsonl"))));
 	}
 	if (name === "all" || name === "history") {
@@ -608,6 +621,7 @@ export function validateCase(c: Case): void {
 	if (c.severity !== undefined && c.label !== "ask") {
 		throw new Error(`corpus: severity '${c.severity}' on a '${c.label}' case: ${c.command}`);
 	}
+	if (c.provenance !== undefined) validateProvenance(c.provenance, c.command);
 	// eval-code cases must name their kernel language: production sends the
 	// language in the record and the scan table is language-keyed.
 	if (c.kind !== undefined && c.kind !== "eval-code") {
@@ -668,6 +682,78 @@ export function validateCase(c: Case): void {
 	}
 }
 
+function validateProvenance(value: unknown, command: string): asserts value is NonNullable<Case["provenance"]> {
+	const fail = (tier: string): never => {
+		throw new Error(`corpus: malformed provenance.${tier} on: ${command}`);
+	};
+	const record = (input: unknown): input is Record<string, unknown> => typeof input === "object" && input !== null && !Array.isArray(input);
+	const asRecord = (input: unknown, tier: string): Record<string, unknown> => {
+		if (!record(input)) throw new Error(`corpus: malformed provenance.${tier} on: ${command}`);
+		return input;
+	};
+	const exactKeys = (input: Record<string, unknown>, keys: readonly string[]): boolean => Object.keys(input).every(key => keys.includes(key));
+	const strings = (input: unknown): input is string[] => Array.isArray(input) && input.every(item => typeof item === "string");
+	const provenance = asRecord(value, "object");
+	const tiers = new Set(["gitPushProvenance", "gitWorktreeProvenance", "gitRefProvenance", "networkProvenance"]);
+	for (const key of Object.keys(provenance)) if (!tiers.has(key)) throw new Error(`corpus: unknown provenance key '${key}' on: ${command}`);
+	const push = provenance.gitPushProvenance;
+	if (push !== undefined) {
+		const keys = ["remoteTip", "localTip", "ahead", "behind", "forwardOnly"];
+		const tier = asRecord(push, "gitPushProvenance");
+		if (!exactKeys(tier, keys) || !["remoteTip", "localTip", "ahead", "behind"].every(key => key in tier)) fail("gitPushProvenance");
+		if (!(tier.remoteTip === null || typeof tier.remoteTip === "string") || !(tier.localTip === null || typeof tier.localTip === "string")) fail("gitPushProvenance");
+		if (!(tier.ahead === null || typeof tier.ahead === "number") || !(tier.behind === null || typeof tier.behind === "number")) fail("gitPushProvenance");
+		if (tier.forwardOnly !== undefined && typeof tier.forwardOnly !== "boolean") fail("gitPushProvenance");
+	}
+	const worktree = provenance.gitWorktreeProvenance;
+	if (worktree !== undefined) {
+		const tier = asRecord(worktree, "gitWorktreeProvenance");
+		if (!exactKeys(tier, ["workspaceRoot", "linkedWorktree", "mainCheckoutRoot", "siblingWorktreeRoots", "worktreeCount"])) fail("gitWorktreeProvenance");
+		if (typeof tier.workspaceRoot !== "string" || !(tier.linkedWorktree === null || typeof tier.linkedWorktree === "boolean")) fail("gitWorktreeProvenance");
+		if (!(tier.mainCheckoutRoot === null || typeof tier.mainCheckoutRoot === "string") || !strings(tier.siblingWorktreeRoots) || typeof tier.worktreeCount !== "number") fail("gitWorktreeProvenance");
+	}
+	const refs = provenance.gitRefProvenance;
+	if (refs !== undefined) {
+		if (!Array.isArray(refs)) fail("gitRefProvenance");
+		for (const refValue of refs as unknown[]) {
+			const ref = asRecord(refValue, "gitRefProvenance");
+			if (typeof ref.kind !== "string" || typeof ref.target !== "string") fail("gitRefProvenance");
+			if (ref.kind === "branch-delete") {
+				if (!exactKeys(ref, ["kind", "target", "containedIn", "mergedIntoHead"]) || !(ref.containedIn === null || strings(ref.containedIn)) || !(ref.mergedIntoHead === null || typeof ref.mergedIntoHead === "boolean")) fail("gitRefProvenance");
+				continue;
+			}
+			if (ref.kind === "checkout-paths") {
+				if (!exactKeys(ref, ["kind", "target", "unstagedChanges", "stashCount"]) || !(ref.unstagedChanges === null || typeof ref.unstagedChanges === "boolean") || !(ref.stashCount === null || typeof ref.stashCount === "number")) fail("gitRefProvenance");
+				continue;
+			}
+			if (ref.kind === "rebase") {
+				if (!exactKeys(ref, ["kind", "target", "behind", "ahead"]) || !(ref.behind === null || typeof ref.behind === "number") || !(ref.ahead === null || typeof ref.ahead === "number")) fail("gitRefProvenance");
+				continue;
+			}
+			fail("gitRefProvenance");
+		}
+	}
+	const network = provenance.networkProvenance;
+	if (network !== undefined) {
+		const keys = ["localPorts", "knownHosts", "dockerNetworks", "ambientClientConfig", "directoryUnresolved", "ambientConfigUnreadable"];
+		const tier = asRecord(network, "networkProvenance");
+		if (!exactKeys(tier, keys) || !Array.isArray(tier.localPorts) || !tier.localPorts.every(port => typeof port === "number") || !Array.isArray(tier.knownHosts) || !Array.isArray(tier.dockerNetworks)) fail("networkProvenance");
+		for (const hostValue of tier.knownHosts as unknown[]) {
+			const host = asRecord(hostValue, "networkProvenance");
+			if (!exactKeys(host, ["host", "source"]) || typeof host.host !== "string" || !["ssh-config", "hosts-file", "docker"].includes(String(host.source))) fail("networkProvenance");
+		}
+		for (const targetValue of tier.dockerNetworks as unknown[]) {
+			const target = asRecord(targetValue, "networkProvenance");
+			if (!exactKeys(target, ["target", "kind", "port", "resolvesLocally"]) || typeof target.target !== "string" || !["compose-service", "published-port"].includes(String(target.kind))) fail("networkProvenance");
+			if (target.port !== undefined && typeof target.port !== "number") fail("networkProvenance");
+			if (target.resolvesLocally !== undefined && typeof target.resolvesLocally !== "boolean") fail("networkProvenance");
+		}
+		if (tier.ambientClientConfig !== undefined && Object.values(asRecord(tier.ambientClientConfig, "networkProvenance")).some(setting => typeof setting !== "string")) fail("networkProvenance");
+		if (tier.directoryUnresolved !== undefined && tier.directoryUnresolved !== true) fail("networkProvenance");
+		if (tier.ambientConfigUnreadable !== undefined && tier.ambientConfigUnreadable !== true) fail("networkProvenance");
+	}
+}
+
 /** Deterministic held-out benign traffic. It is intentionally generated rather
  * than hand-copied from private logs: the harness can always exercise 500
  * realistic multi-step routine actions without shipping user data. Each task
@@ -717,13 +803,17 @@ function stateExtras(testCase: Case): Record<string, unknown> {
 	return testCase.kind === "eval-code" ? { kind: "eval-code", language: testCase.language ?? "" } : {};
 }
 
-function caseState(testCase: Case, cwd: string): unknown {
+export function caseState(testCase: Case, cwd: string): unknown {
 	const extra = stateExtras(testCase);
 	return buildJevState({
 		command: testCase.command,
 		workingDirectory: cwd,
 		...(testCase.evidence?.userMessages ? { userMessages: testCase.evidence.userMessages } : {}),
 		...(testCase.evidence?.operatorContext ? { operatorContext: testCase.evidence.operatorContext } : {}),
+		...(testCase.provenance?.gitPushProvenance ? { gitPushProvenance: testCase.provenance.gitPushProvenance } : {}),
+		...(testCase.provenance?.gitWorktreeProvenance ? { gitWorktreeProvenance: testCase.provenance.gitWorktreeProvenance } : {}),
+		...(testCase.provenance?.gitRefProvenance ? { gitRefProvenance: testCase.provenance.gitRefProvenance } : {}),
+		...(testCase.provenance?.networkProvenance ? { networkProvenance: testCase.provenance.networkProvenance } : {}),
 		// Omitted when empty, exactly as production omits it: `extra: {}` and an
 		// absent key produce the same state, and matching the call shape keeps the
 		// two paths comparable by eye.
@@ -746,7 +836,7 @@ export function answerCacheKey(input: { battery: string; model: string; cwd: str
 	return createHash("sha256")
 		.update(
 			`${HARNESS_VERSION}\0${battery}\0${model}\0${cwd}\0${sample}\0${testCase.command}\0${testCase.kind ?? "bash"}\0` +
-				`${testCase.language ?? ""}\0${JSON.stringify(testCase.evidence ?? null)}\0${JSON.stringify(stateExtras(testCase))}`,
+				`${testCase.language ?? ""}\0${JSON.stringify(testCase.evidence ?? null)}\0${JSON.stringify(testCase.provenance ?? null)}\0${JSON.stringify(stateExtras(testCase))}`,
 		)
 		.digest("hex");
 }
@@ -754,7 +844,7 @@ export function answerCacheKey(input: { battery: string; model: string; cwd: str
 /** The authorization state production builds for this case: the actions
  *  summarized from the command (one unnamed run-code action for eval code,
  *  as `shadowJevV3` does) and the case's own user words. The corpus carries no
- *  pinned policy and no gate measurements, so neither is sent. */
+ *  pinned policy, and provenance belongs to the risk state, so neither is sent. */
 export function caseAuthorizationState(testCase: Case): unknown {
 	const actions =
 		testCase.kind === "eval-code"

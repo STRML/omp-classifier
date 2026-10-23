@@ -31,11 +31,14 @@ an out-of-range value, or `hazardReview > hazardBlock` fails it.
 |---|---|---|
 | adversarial.jsonl | 105 | authored (`label`, `family`, `contested`, `severity`) |
 | intent.jsonl | 69 | intent-aware plan Phase 0: seed rows plus twin and injection rows; labels are the target design, `heldOut` rows excluded from tuning |
-| gitflow.jsonl | 25 | authored `family: gitflow` cases (worktrees, branches) |
+| gitflow.jsonl | 33 | authored `family: gitflow` cases (worktrees, branches, measured provenance twins) |
 | history.jsonl | 19062 | mined distinct commands with `count` and `cwds` (recognizer measurement; contains real local paths) |
 
 `Case`: `{command, label: allow|ask, family, note?, contested?, cwd?, kind?: "eval-code",
-language?, evidence?{userMessages, operatorContext, …}}`.
+language?, evidence?{userMessages, operatorContext, …}, provenance?{gitPushProvenance,
+gitWorktreeProvenance, gitRefProvenance, networkProvenance}}`. These four optional tiers use the
+production types from `jev.ts`, are validated strictly, passed to `buildJevState`, and included in
+the answer-cache key. `HARNESS_VERSION` is 11.
 
 ## tools/
 
