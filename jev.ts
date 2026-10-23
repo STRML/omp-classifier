@@ -635,6 +635,28 @@ function pushForces(tokens: string[], spec: string): boolean {
  *  push sends. Judged by allowlist, so an unknown shape fails closed. */
 const PLAIN_DIRECTORY_COMMANDS = new Set(["cd", "pushd", "popd"]);
 
+/** Commands that change what the shell runs for `git`, or where git's remotes
+ *  point: without force syntax a push cannot discard, unless `git` is no longer
+ *  git (a function, an alias, a PATH, a sourced file) or its remote was just
+ *  repointed. */
+const SHELL_STATE_COMMANDS = new Set(["alias", "unalias", "export", "declare", "typeset", "readonly", "local", "source", ".", "shopt", "set", "unset", "hash", "eval", "enable", "builtin", "function", "trap"]);
+const FUNCTION_DEFINITION = /(?:^|[\s;&|(){}])(?:function\s+[^\s(){};&|]+|[^\s(){};&|=]+\s*\(\s*\))/u;
+
+/** Whether `git` in the push is the git binary on the user's PATH, talking to
+ *  remotes as configured. Judged by what could change that, so an unknown shape
+ *  (a function definition the parser flattens, a bare assignment) fails closed. */
+function shellRunsPlainGit(command: string, segments: ShellSegment[], push: ShellSegment): boolean {
+	if (FUNCTION_DEFINITION.test(maskHeredocBodiesAndAnsiSpans(command).masked)) return false;
+	return segments.every((segment, i) => {
+		if (segment === push) return true;
+		if (i > 0 && segment.join === "first") return false;
+		if (segment.tokens.length === 0 && segment.assignNames.length > 0) return false;
+		const [verb, sub] = segment.tokens;
+		if (SHELL_STATE_COMMANDS.has(verb ?? "")) return false;
+		return !(verb === "git" && (sub === "remote" || sub === "config"));
+	});
+}
+
 function forcePushContextIsPlain(segments: ShellSegment[], push: ShellSegment): boolean {
 	if (segments.at(-1) !== push) return false;
 	return segments.every((segment, i) => {
@@ -697,6 +719,7 @@ function parsePushRefs(
 	}
 	if (operands.length !== 2) return null;
 	const [remote, spec] = operands;
+	if (!shellRunsPlainGit(command, segments, push)) return null;
 	if (pushForces(tokens, spec) && !forcePushContextIsPlain(segments, push)) return null;
 	const plus = spec.replace(/^\+/u, "");
 	const colon = plus.indexOf(":");
@@ -732,6 +755,14 @@ export function measureGitPushProvenance(command: string, cwd: string): GitPushP
 	// and measuring against it read a force push that discards the remote
 	// feature branch's own commits as forward-only. A detached HEAD names no
 	// branch to compare, so nothing is measured.
+	// Only a remote this repository knows by name: a URL or a path has no
+	// tracking ref, and a null tip there would read as a new branch on the
+	// user's own remote while the commits go somewhere else.
+	if (!/^[A-Za-z0-9._-]+$/u.test(remote)) return undefined;
+	const knownRemote =
+		gitPlumbing(["config", "--get", `remote.${remote}.url`], repo) !== null ||
+		(gitPlumbing(["for-each-ref", "--count=1", "--format=%(refname)", `refs/remotes/${remote}/`], repo) ?? "") !== "";
+	if (!knownRemote) return undefined;
 	const remoteBranch = shorthand && headRef(rref) ? currentBranch(repo) : rref;
 	if (remoteBranch === null) return undefined;
 	// The remote tip comes from remote-tracking state when it exists; a
