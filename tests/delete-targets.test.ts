@@ -120,8 +120,26 @@ describe("measureDeleteTargets", () => {
 		expect(flags("trash notes.md", tmp)).toEqual([true]);
 		expect(flags("trash notes.md")).toEqual([false]);
 		expect(flags(`cd ${home} && trash notes.md`, tmp)).toEqual([false]);
+		expect(flags("cd ./run && trash report.json", tmp)).toEqual([true]);
+		expect(flags(`cd ../tmp && trash notes.md`, home)).toEqual([true]);
 		// A cd the walk cannot pin leaves the directory unknown.
 		expect(flags(`cd "$X" && trash notes.md`, tmp)).toEqual([null]);
+	});
+
+	test("a cd the shell may resolve differently from the gate leaves the line unmeasured", () => {
+		// `~` is the shell's HOME, which may not be the gate's.
+		expect(flags("cd ~/x && trash y", tmp)).toEqual([null]);
+		expect(flags("cd ~ && trash notes.md", tmp)).toEqual([null]);
+		expect(flags("HOME=/tmp; cd ~/x && trash y", tmp)).toEqual([null]);
+		expect(flags("export HOME=/tmp; cd ~/x && trash y", tmp)).toEqual([null]);
+		// A bare name is searched in CDPATH first.
+		expect(flags("cd run && trash report.json", tmp)).toEqual([null]);
+		// HOME, OLDPWD, the directory stack: all the shell's.
+		expect(flags("cd && trash notes.md", tmp)).toEqual([null]);
+		expect(flags("cd - && trash notes.md", tmp)).toEqual([null]);
+		expect(flags("popd; trash notes.md", tmp)).toEqual([null]);
+		// The walk does not follow pushd, so its directory stays unknown.
+		expect(flags(`pushd ${tmp} && trash notes.md`, home)).toEqual([null]);
 	});
 
 	test("every operand is its own entry, flags are skipped, -- ends them", () => {
@@ -130,6 +148,16 @@ describe("measureDeleteTargets", () => {
 			{ target: `${home}/notes.md`, underTempRoot: false },
 		]);
 		expect(flags(`trash ${tmp}/notes.md && trash ${home}/notes.md`)).toEqual([true, false]);
+	});
+
+	test("a line with more operands than the state carries is measured null throughout", () => {
+		const sixteen = Array.from({ length: 16 }, () => `${tmp}/notes.md`).join(" ");
+		expect(flags(`rm -rf ${sixteen}`)).toEqual(new Array(16).fill(true));
+		const entries = measure(`rm -rf ${sixteen} ${home}/notes.md`);
+		expect(entries).toHaveLength(16);
+		expect(entries?.every(entry => entry.underTempRoot === null)).toBe(true);
+		// Split across two deletes, the count is the line's, not one command's.
+		expect(flags(`trash ${sixteen}; trash ${home}/notes.md`)?.every(flag => flag === null)).toBe(true);
 	});
 
 	test("a tracked source file in the working directory measures false", () => {

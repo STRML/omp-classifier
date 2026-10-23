@@ -2372,9 +2372,29 @@ export interface DeleteTarget {
  *  (`sudo rm`, `xargs rm`, `find -delete`) is not read and carries no entry. */
 const DELETE_VERBS: Record<string, true> = { trash: true, rm: true, "/bin/rm": true, "/usr/bin/trash": true };
 /** Commands that may share a line with a measured delete: they move the shell,
- *  and none of them can create, move, or repoint a path. */
-const DELETE_NEIGHBOUR_VERBS: Record<string, true> = { ...DELETE_VERBS, cd: true, pushd: true, popd: true };
-/** A state carries at most this many entries; the rest stay unmeasured. */
+ *  and none of them can create, move, or repoint a path. A directory change
+ *  qualifies only when `pinnedDirectoryChange` says the gate's walk lands
+ *  where the shell does. */
+const DELETE_NEIGHBOUR_VERBS: Record<string, true> = { ...DELETE_VERBS, cd: true, pushd: true };
+
+/**
+ * Whether a `cd`/`pushd` goes where the gate's walk says, whatever the shell's
+ * environment holds. The walk expands `~` with the gate's own home and ignores
+ * CDPATH, while the shell uses its own HOME (direnv, the session snapshot) and
+ * searches CDPATH for a bare name. So only one literal target qualifies: an
+ * absolute path, or one spelled from `.` or `..`, which CDPATH never searches.
+ * A bare `cd` (HOME), `cd -` (OLDPWD), `~`, and a flag all leave the line
+ * unmeasured; `popd` is not a neighbour at all, since its stack is the shell's.
+ */
+function pinnedDirectoryChange(command: ShellCommand): boolean {
+	const args = command.words.slice(1);
+	if (args.length !== 1 || !args[0].literal) return false;
+	const target = args[0].source;
+	return target.startsWith("/") || target === "." || target === ".." || target.startsWith("./") || target.startsWith("../");
+}
+/** A state carries at most this many entries. A line with more operands than
+ *  this is measured null throughout, so no unlisted operand hides behind the
+ *  listed ones. */
 const DELETE_TARGET_CAP = 16;
 
 const realpathOrNull = (path: string): string | null => {
@@ -2440,7 +2460,9 @@ function deleteLineIsInert(commands: readonly ShellCommand[]): boolean {
 	return commands.every((command, index) => {
 		if (command.nested || command.unreadShape !== undefined || command.expression !== undefined) return false;
 		if (command.assigns.length > 0 || command.join === "pipe" || commands[index + 1]?.join === "pipe") return false;
-		return DELETE_NEIGHBOUR_VERBS[literalVerb(command)] === true;
+		const verb = literalVerb(command);
+		if (DELETE_NEIGHBOUR_VERBS[verb] !== true) return false;
+		return DELETE_VERBS[verb] === true || pinnedDirectoryChange(command);
 	});
 }
 
@@ -2495,18 +2517,23 @@ export function measureDeleteTargets(command: string, cwd: string, roots: readon
 	if (!parsed.ok || parsed.commands.some(entry => entry.unreadShape !== undefined)) return undefined;
 	const deletes = parsed.commands.filter(entry => DELETE_VERBS[literalVerb(entry)] === true);
 	if (deletes.length === 0) return undefined;
-	const inert = deleteLineIsInert(parsed.commands);
+	const operandCount = deletes.reduce((count, entry) => count + deleteOperands(entry).length, 0);
+	if (operandCount === 0) return undefined;
+	// Past the cap, the operands the state cannot carry would be deletes the
+	// judge never sees: sixteen `true` entries must not stand in for a
+	// seventeenth outside temp. Such a line is not measured at all.
+	const measurable = deleteLineIsInert(parsed.commands) && operandCount <= DELETE_TARGET_CAP;
 	const masked = maskHeredocBodiesAndAnsiSpans(command).masked;
 	const entries: DeleteTarget[] = [];
 	for (const entry of deletes) {
 		const at = entry.words[0]?.offset;
-		const segmentCwd = inert && at !== undefined ? segmentCwdAt(masked, at, cwd) : null;
+		const segmentCwd = measurable && at !== undefined ? segmentCwdAt(masked, at, cwd) : null;
 		for (const word of deleteOperands(entry)) {
 			if (entries.length >= DELETE_TARGET_CAP) return entries;
-			entries.push({ target: word.value, underTempRoot: inert ? measureDeleteOperand(word, segmentCwd, roots) : null });
+			entries.push({ target: word.value, underTempRoot: measurable ? measureDeleteOperand(word, segmentCwd, roots) : null });
 		}
 	}
-	return entries.length === 0 ? undefined : entries;
+	return entries;
 }
 
 /**
