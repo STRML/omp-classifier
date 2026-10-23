@@ -354,10 +354,12 @@ describe("jevQuestionsHash", () => {
 		// deliberately changes the shared battery so the user-pinned,
 		// gate-measured policy boundary remains visible in the fingerprint.
 		// v2.11 was 463716d5a2aae8f0 over these same battery bytes: #160 changes
-		// the state, not the questions, so only the version tag moves the hash.
+		// the state, not the questions, so only the version tag moved the hash
+		// (v2.12, b4379fccd9ed8e9b). v2.13 adds temp-dir cleanup to the ordinary
+		// work `unauthorized_consequential_action` names, so the bytes move too.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("b76ac7fdbbc583c19cc17ea79f0817c44acc996cf7dce77ec3ba9c2542b12500");
-		expect(jevQuestionsHash()).toBe("b4379fccd9ed8e9b");
+		expect(digest).toBe("6803e69caa6cf322f7fae7d6e091e43520cb1f09e0c64247909ab342226d679d");
+		expect(jevQuestionsHash()).toBe("67568ffd5be26200");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 

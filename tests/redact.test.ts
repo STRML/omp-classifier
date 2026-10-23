@@ -322,7 +322,8 @@ describe("redaction reaches every judge state", () => {
 		// The redaction change landed as jev-v2.2; later measured-git and
 		// trusted-policy changes move the version because a state read under one
 		// policy has different meaning from the next. jev-v2.12 drops the
-		// gate-written state notice (#160).
-		expect(JEV_POLICY_VERSION).toBe("jev-v2.12");
+		// gate-written state notice (#160); jev-v2.13 calls temp-dir
+		// cleanup ordinary work.
+		expect(JEV_POLICY_VERSION).toBe("jev-v2.13");
 	});
 });
