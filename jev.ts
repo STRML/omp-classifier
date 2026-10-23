@@ -750,8 +750,9 @@ function parsePushRefs(
 	const tokens = push.tokens;
 	// Exactly `git push …`: no wrapper (`env`, `command`, a path to git), no
 	// global option between `git` and `push`, and no `NAME=value` prefix, any of
-	// which can point the push at another repository.
-	if (idx !== 1 || tokens[0] !== "git" || push.assignNames.length > 0) return null;
+	// which can point the push at another repository. Every word reaches git as
+	// written: `git push origin {main,+side}` is a force push of two refs.
+	if (idx !== 1 || tokens[0] !== "git" || push.assignNames.length > 0 || !push.fixedWords) return null;
 	const operands: string[] = [];
 	for (let i = idx + 1; i < tokens.length; i++) {
 		const t = tokens[i];

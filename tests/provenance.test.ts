@@ -175,6 +175,11 @@ describe("gate-measured git push provenance (#63)", () => {
 				// git accepts unambiguous abbreviations of long options.
 				"git push --del origin feature",
 				"git push --mir origin feature",
+				// A word the shell rewrites is not the word git receives.
+				"git push origin {feature,+main}",
+				"git push origin $SPEC",
+				"git push $FLAGS origin feature",
+				"git push origin feature*",
 			]) {
 				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
 			}
