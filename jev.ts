@@ -618,61 +618,29 @@ const GIT_PUSH_MEASURABLE_FLAGS = new Set([
 ]);
 const GIT_PUSH_MEASURABLE_SHORT = /^-[fuqvn]+$/u;
 
-/** Earlier segments that cannot change the refs a later push sends. Every
- *  other command ahead of the push, a script, an alias or a redirect into a
- *  file included, can, so the
- *  push is left unmeasured. `git` must name its subcommand directly: a global
- *  option such as `-C` or `-c` can point the subcommand at another repository
- *  or hide which subcommand runs. Commit, merge, cherry-pick and revert only
- *  add descendants of the measured tip, which keeps a forward-only reading true. */
-const REF_NEUTRAL_COMMANDS = new Set(["cd", "pushd", "popd", "echo", "printf", "true", ":", "sleep", "cat", "ls", "pwd", "test", "["]);
-const REF_NEUTRAL_GIT_SUBCOMMANDS = new Set(["status", "log", "diff", "show", "add", "rm", "mv", "commit", "merge", "cherry-pick", "revert", "stash", "rev-parse", "branch"]);
-/** Flags that make an otherwise neutral subcommand move a ref or write a file:
- *  `commit --amend` and `branch -f/-m/-M/-C` move a branch, `--abort` on a
- *  cherry-pick, revert or merge restores the HEAD from before the sequence, and
- *  `--output` on log, show or diff writes any file, a ref file included. git
- *  accepts any unambiguous prefix of a long option (`--amen`, `--outp`), so a
- *  long word matches when it is a prefix of one of these, and a short cluster
- *  on `branch` matches when it carries a moving letter. */
-const NEVER = /$^/u;
-const REF_MOVING_GIT_FLAGS: Record<string, { long: string[]; short: RegExp }> = {
-	commit: { long: ["--amend"], short: NEVER },
-	branch: { long: ["--force", "--move", "--copy"], short: /^-[a-zA-Z]*[fmMC]/u },
-	"cherry-pick": { long: ["--abort"], short: NEVER },
-	revert: { long: ["--abort"], short: NEVER },
-	merge: { long: ["--abort"], short: NEVER },
-	log: { long: ["--output"], short: NEVER },
-	show: { long: ["--output"], short: NEVER },
-	diff: { long: ["--output"], short: NEVER },
-};
-/** `git stash` actions that leave every branch where it is: `stash branch`
- *  checks one out, and `create`/`store` are plumbing nobody types before a push. */
-const REF_NEUTRAL_STASH_ACTIONS = new Set(["push", "save", "list", "show", "pop", "apply", "drop", "clear"]);
-
-function movesRef(sub: string, word: string): boolean {
-	const flags = REF_MOVING_GIT_FLAGS[sub];
-	if (flags === undefined) return false;
-	if (word.startsWith("--")) {
-		const name = word.split("=", 1)[0];
-		return name.length >= 4 && flags.long.some(full => full.startsWith(name));
-	}
-	return flags.short.test(word);
+/** Whether a push carries force syntax: a `+` refspec, a `--force*` flag, or a
+ *  short cluster with `f`. Only such a push turns on the measurement, since
+ *  the battery reads a forward-only force push as a forward publish; without
+ *  force, git refuses any update that is not a fast-forward. */
+function pushForces(tokens: string[], spec: string): boolean {
+	return spec.startsWith("+") || tokens.some(word => word.startsWith("--force") || /^-[a-zA-Z]*f/u.test(word));
 }
 
-function earlierSegmentsKeepRefs(earlier: ShellSegment[]): boolean {
-	return earlier.every(({ tokens, assignNames, writesFile }) => {
-		// An assignment can repoint git (`GIT_DIR`), and a redirect can write a
-		// ref file directly (`echo <sha> > .git/refs/heads/main`).
-		if (assignNames.length > 0 || writesFile) return false;
-		const [verb, sub, ...rest] = tokens;
-		if (verb === undefined) return true;
-		if (REF_NEUTRAL_COMMANDS.has(verb)) return true;
-		if (verb !== "git" || sub === undefined || !REF_NEUTRAL_GIT_SUBCOMMANDS.has(sub)) return false;
-		if (sub === "stash") {
-			const action = rest.find(word => !word.startsWith("-"));
-			if (action !== undefined && !REF_NEUTRAL_STASH_ACTIONS.has(action)) return false;
-		}
-		return !rest.some(word => movesRef(sub, word));
+/** The only context in which a force push is measured: the push is the last
+ *  segment, nothing but plain `cd`/`pushd`/`popd` runs before it, and no loop,
+ *  function body, subshell, group, pipe, background job or substitution is
+ *  present. The gate reads refs before the command runs, so any other command
+ *  that could run before the push (in source order or not: the parser flattens
+ *  loops and function bodies, and `&` reads like `;`) could move the refs the
+ *  push sends. Judged by allowlist, so an unknown shape fails closed. */
+const PLAIN_DIRECTORY_COMMANDS = new Set(["cd", "pushd", "popd"]);
+
+function forcePushContextIsPlain(segments: ShellSegment[], push: ShellSegment): boolean {
+	if (segments.at(-1) !== push) return false;
+	return segments.every((segment, i) => {
+		if (segment.nested || (i > 0 && (segment.join === "first" || segment.join === "pipe"))) return false;
+		if (segment === push) return true;
+		return segment.assignNames.length === 0 && !segment.writesFile && PLAIN_DIRECTORY_COMMANDS.has(segment.tokens[0] ?? "");
 	});
 }
 
@@ -692,8 +660,9 @@ function earlierSegmentsKeepRefs(earlier: ShellSegment[]): boolean {
  *  segment's own repository, judged by allowlist so an unknown shape fails
  *  closed: a flag outside GIT_PUSH_MEASURABLE_FLAGS (a delete, `--all`, a value
  *  flag, an abbreviation), more than one refspec, anything but a bare `git push`
- *  command word, or an earlier segment that could move refs before the push
- *  runs. Each returns null rather than numbers for a push git does not run. */
+ *  command word, or a force push outside the plain context
+ *  `forcePushContextIsPlain` describes. Each returns null rather than numbers
+ *  for a push git does not run. */
 function parsePushRefs(
 	command: string,
 ): { remote: string; lref: string; rref: string; shorthand: boolean; at: number } | null {
@@ -711,11 +680,6 @@ function parsePushRefs(
 	// global option between `git` and `push`, and no `NAME=value` prefix, any of
 	// which can point the push at another repository.
 	if (idx !== 1 || tokens[0] !== "git" || push.assignNames.length > 0) return null;
-	// Everything that runs before the push: the segments ahead of it, and every
-	// substitution, which runs before the command that holds it (the push's
-	// own words included).
-	const pushIndex = segments.indexOf(push);
-	if (!earlierSegmentsKeepRefs(segments.filter((segment, i) => segment !== push && (i < pushIndex || segment.nested)))) return null;
 	const operands: string[] = [];
 	for (let i = idx + 1; i < tokens.length; i++) {
 		const t = tokens[i];
@@ -733,6 +697,7 @@ function parsePushRefs(
 	}
 	if (operands.length !== 2) return null;
 	const [remote, spec] = operands;
+	if (pushForces(tokens, spec) && !forcePushContextIsPlain(segments, push)) return null;
 	const plus = spec.replace(/^\+/u, "");
 	const colon = plus.indexOf(":");
 	const lref = colon === -1 ? plus : plus.slice(0, colon);

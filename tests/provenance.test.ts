@@ -124,7 +124,6 @@ describe("gate-measured git push provenance (#63)", () => {
 				"./rewrite.sh && git push --force origin main",
 				"export GIT_DIR=/elsewhere/.git; git push --force origin main",
 				"echo 1111111111111111111111111111111111111111 > .git/refs/heads/main && git push origin +main",
-				"git switch b && git push origin main",
 			]) {
 				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
 			}
@@ -133,6 +132,9 @@ describe("gate-measured git push provenance (#63)", () => {
 			expect(measureGitPushProvenance("git commit -q --allow-empty -m next && git push origin main", dir)?.forwardOnly).toBe(true);
 			expect(measureGitPushProvenance("git merge -q b && git push origin main", dir)?.forwardOnly).toBe(true);
 			expect(measureGitPushProvenance("git add -A && git commit -q --allow-empty -m next && git push origin main", dir)?.forwardOnly).toBe(true);
+			// Without force syntax git refuses any non-fast-forward update, so what ran
+			// before cannot make the push destructive and it stays measured.
+			expect(measureGitPushProvenance("git switch b && git push origin main", dir)?.forwardOnly).toBe(true);
 		} finally {
 			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
 		}
@@ -196,6 +198,8 @@ describe("gate-measured git push provenance (#63)", () => {
 				"git stash branch tmp && git push origin +HEAD",
 				"echo 1111111111111111111111111111111111111111 >& .git/refs/heads/main && git push origin +main",
 				"git push origin +$(git reset -q --hard HEAD~1; echo main)",
+				"git stash show --output=.git/refs/heads/main && git push origin +main",
+				"git branch -D main && git branch main HEAD~1 && git push --force origin main",
 			]) {
 				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
 			}
@@ -208,6 +212,31 @@ describe("gate-measured git push provenance (#63)", () => {
 			]) {
 				expect(measureGitPushProvenance(command, dir)?.forwardOnly, command).toBe(true);
 			}
+		} finally {
+			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
+		}
+	});
+
+	test("a force push is measured only as the last segment after plain cd", () => {
+		// The parser flattens loops and function bodies, and `&` reads like `;`,
+		// so source order is not run order: a reset written after the push can
+		// still run before it.
+		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
+		try {
+			git("git init -q -b main && git commit -q --allow-empty -m base && git update-ref refs/remotes/origin/main HEAD", dir);
+			for (const command of [
+				"for i in 1 2; do git push origin +main; git reset --hard HEAD~1; done",
+				"f(){ git push origin +main; }; git reset --hard HEAD~1; f",
+				"git push origin +main & git reset --hard HEAD~1",
+				"git push origin +main | git reset --hard HEAD~1",
+				"( git reset --hard HEAD~1 ); git push origin +main",
+				"git push --force origin main && gh pr create --fill",
+				"git status && git push --force origin main",
+			]) {
+				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
+			}
+			expect(measureGitPushProvenance("cd . && git push --force origin main", dir)?.forwardOnly).toBe(true);
+			expect(measureGitPushProvenance("git push -u origin main && gh pr create --fill", dir)?.forwardOnly).toBe(true);
 		} finally {
 			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
 		}
@@ -314,7 +343,7 @@ describe("gate-measured git push provenance (#63)", () => {
 		try {
 			git("git init -q -b main && git commit -q --allow-empty -m base && git update-ref refs/remotes/origin/main HEAD && git commit -q --allow-empty -m local", repoB);
 			git("git init -q -b main && git commit -q --allow-empty -m base && git checkout -q --detach HEAD && git commit -q --allow-empty -m remote-only && git update-ref refs/remotes/origin/main HEAD && git checkout -q main && git commit -q --allow-empty -m local-only", repoC);
-			const command = `echo "漢字"; cd ${repoB}; cat <<'EOF'\ngit push origin main\nEOF\ncd ${repoC}; git push origin main --force`;
+			const command = `echo "漢字"; cd ${repoB}; cat <<'EOF'\ngit push origin main\nEOF\ncd ${repoC}; git push origin main`;
 			expect(measureGitPushProvenance(command, session)).toMatchObject({ ahead: 1, behind: 1, forwardOnly: false });
 			await loadPlugin(makeSettings([]));
 			setJevAnswer(jevSafeAnswer());

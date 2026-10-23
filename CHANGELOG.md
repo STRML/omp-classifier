@@ -4,14 +4,12 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-23
 
-### Security: the push-neutral allowlist no longer trusts a subcommand by name alone
+### Security: a force push is measured only when nothing else can run before it
 
-- Follow-up to https://github.com/STRML/omp-classifier/pull/168. A segment before the push was neutral when its git subcommand was on the list, whatever its flags. Now:
-  - `--output` on `log`, `show` or `diff` (it writes any file, a ref file included) makes the push unmeasured
-  - so does `--abort` on `cherry-pick`, `revert` or `merge` (it restores the HEAD from before the sequence)
-  - so does `stash branch` (it checks a branch out). Abbreviations such as `--outp` and `--abo` count.
-- A substitution runs before the command that holds it, so `git push origin +$(git reset --hard HEAD~1; echo main)` is now checked like any earlier segment.
-- `>&word` with a target that is not a descriptor number is a file redirect, so `echo <sha> >& .git/refs/heads/main` before a push counts as a write.
+- Follow-up to https://github.com/STRML/omp-classifier/pull/168, which measured a push after a list of "neutral" earlier segments. Review kept finding neutral subcommands with flags that write a ref file or rewind HEAD (`log`/`stash show --output`, `cherry-pick --abort`, `branch -D` then `branch <name> <rev>`). The parser also flattens loops and function bodies, and reads `&` like `;`, so source order isn't run order.
+- Provenance only changes a verdict for a push with force syntax: the battery reads a forward-only force push as a forward publish. Without force, git refuses any non-fast-forward update, so nothing that runs first can make the push destructive.
+- So a force push (`+refspec`, `--force*`, a `-…f…` cluster) is measured only as the last segment, after nothing but plain `cd`/`pushd`/`popd`, with no loop, function body, subshell, pipe, background job, substitution, assignment or redirect anywhere in the command. Anything else leaves it unmeasured, and it keeps its destructive reading.
+- A push without force is measured as before, so `git commit … && git push origin HEAD` and `git push -u origin HEAD && gh pr create` keep their measurement.
 
 ### Security: `git push origin HEAD` is measured against the branch it pushes
 
