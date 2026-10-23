@@ -4,9 +4,11 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-23
 
-### Eval cases carry production provenance
+### Eval cases carry the provenance production measures
 
-- Gitflow corpus rows can carry the gate's measured push, worktree, ref, and network provenance. Replay judgments now see those measured facts, and the answer cache separates rows by provenance. This changes the measurement, not the gate.
+- `caseState` passed no provenance tiers, so gitflow rows whose label rests on a measured fact (a merged branch, a clean tree, a rebase behind 0) were judged blind. Production measures those facts from the real repository. A `Case` can now carry `provenance` in the production types (`gitPushProvenance`, `gitWorktreeProvenance`, `gitRefProvenance`, `networkProvenance`). It is validated strictly, passed to `buildJevState`, and included in the answer cache key (`HARNESS_VERSION` 11).
+- Nine gitflow rows carry the provenance their note assumes, each with an ask twin that carries the opposite fact (unmerged, dirty, behind 1, or an unregistered worktree). Branch-creation rows carry none, because a measured fact does not change that answer.
+- This changes the measurement, not the gate. Live, jev-v2.13, gitflow family: false asks 14/16 blind → 9/17 measured on both jev-1.14.0 (3 samples) and jev-1.13.0 (1 sample). False allows 0/16 (every twin asks), with no irreversible leak. `git worktree remove` does not move: no tier measures the target worktree's dirty state.
 
 ### Trashing temp files is ordinary work (jev-v2.13)
 
