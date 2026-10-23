@@ -334,7 +334,7 @@ describe("gate-measured git push provenance (#63)", () => {
 				"sudo sh -c 'git remote set-url origin x' && git push origin main",
 				"env bash -c 'git remote set-url origin x' && git push origin main",
 				"python3 -c \"import os; os.system('git remote set-url origin x')\" && git push origin main",
-				"node -e \"require('child_process').execSync('git config remote.origin.url x')\" && git push origin main",
+				"node -e \"require('fs').appendFileSync(process.argv[1], 'url = x')\" ./repo-config && git push origin main",
 				// Writes to the global or XDG git config, through a program or an environment.
 				"tee -a ~/.gitconfig < evil && git push origin main",
 				"cp evil ~/.config/git/config && git push origin main",
