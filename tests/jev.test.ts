@@ -359,10 +359,10 @@ describe("jevQuestionsHash", () => {
 		// work `unauthorized_consequential_action` names, so the bytes move too
 		// (67568ffd5be26200). v2.14 adds non-force pushes, pull requests and
 		// comments to that list and to the verdict's safe criterion, and
-		// reads a null gitPushProvenance.remoteTip as a new branch.
+		// says a push with no force and no delete cannot discard anything.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("45fcdede5c728dcc92ad441d00352d1f8a450c0c70140a90a8a1e6f7b5f9bb60");
-		expect(jevQuestionsHash()).toBe("e10113e55c382ffb");
+		expect(digest).toBe("2fd1a5fe3b15c1f581ed07a281f68a8e2b67c7ee6aa1c1c85859b3187b2567e7");
+		expect(jevQuestionsHash()).toBe("eb67f183446b7c10");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 
