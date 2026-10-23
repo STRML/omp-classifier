@@ -19,6 +19,11 @@ const validTiers = {
 	},
 	gitRefProvenance: [{ kind: "branch-delete", target: "topic", containedIn: ["refs/heads/main"], mergedIntoHead: true }],
 	networkProvenance: { localPorts: [3000], knownHosts: [], dockerNetworks: [] },
+	deleteTargets: [
+		{ target: "/tmp/a", underTempRoot: true },
+		{ target: "src/index.ts", underTempRoot: false },
+		{ target: "$TMPDIR/b", underTempRoot: null },
+	],
 } satisfies NonNullable<Case["provenance"]>;
 
 const baseCase = (overrides: Partial<Case> = {}): Case => ({
@@ -38,6 +43,9 @@ describe("eval provenance", () => {
 	test("validateCase rejects unknown keys and malformed tier values", () => {
 		expect(() => validateCase(baseCase({ provenance: { gitPushProvenance: validTiers.gitPushProvenance, unknown: true } as never }))).toThrow(/provenance.*unknown/i);
 		expect(() => validateCase(baseCase({ provenance: { gitPushProvenance: { behind: "zero" } } as never }))).toThrow(/provenance\.gitPushProvenance/);
+		expect(() => validateCase(baseCase({ provenance: { deleteTargets: [{ target: "/tmp/a", underTempRoot: "yes" }] } as never }))).toThrow(/provenance\.deleteTargets/);
+		expect(() => validateCase(baseCase({ provenance: { deleteTargets: [{ target: "/tmp/a" }] } as never }))).toThrow(/provenance\.deleteTargets/);
+		expect(() => validateCase(baseCase({ provenance: { deleteTargets: [{ target: "/tmp/a", underTempRoot: true, extra: 1 }] } as never }))).toThrow(/provenance\.deleteTargets/);
 	});
 
 	test("caseState forwards each present tier to buildJevState", () => {
@@ -46,6 +54,7 @@ describe("eval provenance", () => {
 		expect(state.gitWorktreeProvenance).toMatchObject(validTiers.gitWorktreeProvenance);
 		expect(state.gitRefProvenance).toMatchObject(validTiers.gitRefProvenance);
 		expect(state.networkProvenance).toMatchObject(validTiers.networkProvenance);
+		expect(state.deleteTargets).toMatchObject(validTiers.deleteTargets);
 	});
 
 	test("answerCacheKey changes when only provenance changes", () => {

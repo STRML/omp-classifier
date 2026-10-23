@@ -63,7 +63,8 @@ network tier is cacheable (no `directoryUnresolved`/`ambientConfigUnreadable`).
 measureGitPushProvenance(cmd, startCwd)    ┐ each in try/catch;
 measureGitWorktreeProvenance(cwd)          │ undefined = "not measured"
 measureGitRefProvenance(cmd, cwd)          │
-measureNetworkProvenance(cmd, startCwd)    ┘
+measureNetworkProvenance(cmd, startCwd)    │
+measureDeleteTargets(cmd, startCwd)        ┘ (shell only)
 shadowJevV3(...) started in parallel when config.shadowV3
 judgeBatteryUnderDeadline({timeoutMs, state: buildJevState(...), backend})   jev-judge.ts
   ├ answered → judgementFrom(answers)
