@@ -4,6 +4,17 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-23
 
+### Security: a force push is measured only when nothing else can run before it
+
+- Follow-up to https://github.com/STRML/omp-classifier/pull/168, which measured a push after a list of "neutral" earlier segments. Review kept finding neutral subcommands with flags that write a ref file or rewind HEAD (`log`/`stash show --output`, `cherry-pick --abort`, `branch -D` then `branch <name> <rev>`). The parser also flattens loops and function bodies, and reads `&` like `;`, so source order isn't run order.
+- Provenance only changes a verdict for a push with force syntax: the battery reads a forward-only force push as a forward publish. Without force, git refuses any non-fast-forward update, so nothing that runs first can make the push destructive.
+- So a force push (`+refspec`, `--force*`, a `-…f…` cluster) is measured only as the last segment, after nothing but plain `cd`/`pushd`/`popd`, with no loop, function body, subshell, pipe, background job, substitution, assignment or redirect anywhere in the command. Anything else leaves it unmeasured, and it keeps its destructive reading.
+- A push without force is measured as before, so `git commit … && git push origin HEAD` and `git push -u origin HEAD && gh pr create` keep their measurement.
+- Any push stays unmeasured when the shell might not run git for `git`, or when the remote might not be the one the repository knows:
+  - a function definition, `alias`, `export`, `source`/`.`, `hash`, `eval`, `set`, `shopt`, a bare assignment such as `PATH=…`, or a loop, subshell or group anywhere in the command (these could put `--force` behind a plain-looking push)
+  - an earlier `git remote` or `git config` (these could repoint the remote)
+  - a remote operand that isn't a known remote name. A URL or a path has no tracking ref, and a null remote tip there would read as a new branch on the user's own remote while the commits go somewhere else.
+
 ### Security: `git push origin HEAD` is measured against the branch it pushes
 
 - `measureGitPushProvenance` looked up `refs/remotes/<remote>/HEAD` for a `HEAD` or `@` refspec. That ref is the remote's default branch, but `git push origin HEAD` updates the remote branch named like the current one. On a feature branch that contains main, `git push --force origin HEAD` therefore measured `forwardOnly: true` even when the remote feature branch held commits the push would discard. The battery reads a forward-only force push as a forward publish, so that destructive push could run silently.
