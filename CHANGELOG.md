@@ -4,6 +4,15 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-23
 
+### Security: the push-neutral allowlist no longer trusts a subcommand by name alone
+
+- Follow-up to https://github.com/STRML/omp-classifier/pull/168. A segment before the push was neutral when its git subcommand was on the list, whatever its flags. Now:
+  - `--output` on `log`, `show` or `diff` (it writes any file, a ref file included) makes the push unmeasured
+  - so does `--abort` on `cherry-pick`, `revert` or `merge` (it restores the HEAD from before the sequence)
+  - so does `stash branch` (it checks a branch out). Abbreviations such as `--outp` and `--abo` count.
+- A substitution runs before the command that holds it, so `git push origin +$(git reset --hard HEAD~1; echo main)` is now checked like any earlier segment.
+- `>&word` with a target that is not a descriptor number is a file redirect, so `echo <sha> >& .git/refs/heads/main` before a push counts as a write.
+
 ### Security: `git push origin HEAD` is measured against the branch it pushes
 
 - `measureGitPushProvenance` looked up `refs/remotes/<remote>/HEAD` for a `HEAD` or `@` refspec. That ref is the remote's default branch, but `git push origin HEAD` updates the remote branch named like the current one. On a feature branch that contains main, `git push --force origin HEAD` therefore measured `forwardOnly: true` even when the remote feature branch held commits the push would discard. The battery reads a forward-only force push as a forward publish, so that destructive push could run silently.

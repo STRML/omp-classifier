@@ -173,6 +173,46 @@ describe("gate-measured git push provenance (#63)", () => {
 		}
 	});
 
+	test("a neutral subcommand with a flag that writes or rewinds, a fd-less >&, or a substitution inside the push leaves it unmeasured", () => {
+		// Review of #168: `log`, `cherry-pick` and `stash` are neutral by name, but
+		// `--output` writes a file (a ref file included), `--abort` restores the
+		// pre-sequence HEAD, and `stash branch` checks out a new branch. `>&word`
+		// with a non-number target is a file redirect, and a substitution inside
+		// the push's own words runs before the push does.
+		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
+		try {
+			git(
+				"git init -q -b main && git commit -q --allow-empty -m base && " +
+					"git update-ref refs/remotes/origin/main HEAD && git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main",
+				dir,
+			);
+			for (const command of [
+				"git log -1 --format=%H --output=.git/refs/heads/main && git push origin +main",
+				"git log -1 --outp=.git/refs/heads/main && git push origin +main",
+				"git diff --output=.git/refs/heads/main && git push origin +main",
+				"git cherry-pick --abort && git push origin +main",
+				"git revert --abo && git push origin +main",
+				"git merge --abort && git push origin +main",
+				"git stash branch tmp && git push origin +HEAD",
+				"echo 1111111111111111111111111111111111111111 >& .git/refs/heads/main && git push origin +main",
+				"git push origin +$(git reset -q --hard HEAD~1; echo main)",
+			]) {
+				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
+			}
+			for (const command of [
+				"git log --oneline -1 && git push origin main",
+				"git diff --output-indicator-new=+ && git push origin main",
+				"git stash -u && git push origin main",
+				"git stash pop && git push origin main",
+				"git status 2>&1 && git push origin main",
+			]) {
+				expect(measureGitPushProvenance(command, dir)?.forwardOnly, command).toBe(true);
+			}
+		} finally {
+			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
+		}
+	});
+
 	test("a HEAD refspec on a detached HEAD names no remote branch, so nothing is measured", () => {
 		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
 		try {

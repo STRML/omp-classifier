@@ -627,14 +627,27 @@ const GIT_PUSH_MEASURABLE_SHORT = /^-[fuqvn]+$/u;
  *  add descendants of the measured tip, which keeps a forward-only reading true. */
 const REF_NEUTRAL_COMMANDS = new Set(["cd", "pushd", "popd", "echo", "printf", "true", ":", "sleep", "cat", "ls", "pwd", "test", "["]);
 const REF_NEUTRAL_GIT_SUBCOMMANDS = new Set(["status", "log", "diff", "show", "add", "rm", "mv", "commit", "merge", "cherry-pick", "revert", "stash", "rev-parse", "branch"]);
-/** Flags that make an otherwise neutral subcommand rewrite or move a branch.
- *  git accepts any unambiguous prefix of a long option (`--amen` for
- *  `--amend`), so a long word matches when it is a prefix of one of these, and
- *  a short cluster on `branch` matches when it carries a moving letter. */
+/** Flags that make an otherwise neutral subcommand move a ref or write a file:
+ *  `commit --amend` and `branch -f/-m/-M/-C` move a branch, `--abort` on a
+ *  cherry-pick, revert or merge restores the HEAD from before the sequence, and
+ *  `--output` on log, show or diff writes any file, a ref file included. git
+ *  accepts any unambiguous prefix of a long option (`--amen`, `--outp`), so a
+ *  long word matches when it is a prefix of one of these, and a short cluster
+ *  on `branch` matches when it carries a moving letter. */
+const NEVER = /$^/u;
 const REF_MOVING_GIT_FLAGS: Record<string, { long: string[]; short: RegExp }> = {
-	commit: { long: ["--amend"], short: /$^/u },
+	commit: { long: ["--amend"], short: NEVER },
 	branch: { long: ["--force", "--move", "--copy"], short: /^-[a-zA-Z]*[fmMC]/u },
+	"cherry-pick": { long: ["--abort"], short: NEVER },
+	revert: { long: ["--abort"], short: NEVER },
+	merge: { long: ["--abort"], short: NEVER },
+	log: { long: ["--output"], short: NEVER },
+	show: { long: ["--output"], short: NEVER },
+	diff: { long: ["--output"], short: NEVER },
 };
+/** `git stash` actions that leave every branch where it is: `stash branch`
+ *  checks one out, and `create`/`store` are plumbing nobody types before a push. */
+const REF_NEUTRAL_STASH_ACTIONS = new Set(["push", "save", "list", "show", "pop", "apply", "drop", "clear"]);
 
 function movesRef(sub: string, word: string): boolean {
 	const flags = REF_MOVING_GIT_FLAGS[sub];
@@ -655,7 +668,10 @@ function earlierSegmentsKeepRefs(earlier: ShellSegment[]): boolean {
 		if (verb === undefined) return true;
 		if (REF_NEUTRAL_COMMANDS.has(verb)) return true;
 		if (verb !== "git" || sub === undefined || !REF_NEUTRAL_GIT_SUBCOMMANDS.has(sub)) return false;
-		// `commit --amend` and `branch -f/-m/-M/-C` rewrite or move a branch.
+		if (sub === "stash") {
+			const action = rest.find(word => !word.startsWith("-"));
+			if (action !== undefined && !REF_NEUTRAL_STASH_ACTIONS.has(action)) return false;
+		}
 		return !rest.some(word => movesRef(sub, word));
 	});
 }
@@ -695,7 +711,11 @@ function parsePushRefs(
 	// global option between `git` and `push`, and no `NAME=value` prefix, any of
 	// which can point the push at another repository.
 	if (idx !== 1 || tokens[0] !== "git" || push.assignNames.length > 0) return null;
-	if (!earlierSegmentsKeepRefs(segments.slice(0, segments.indexOf(push)))) return null;
+	// Everything that runs before the push: the segments ahead of it, and every
+	// substitution, which runs before the command that holds it (the push's
+	// own words included).
+	const pushIndex = segments.indexOf(push);
+	if (!earlierSegmentsKeepRefs(segments.filter((segment, i) => segment !== push && (i < pushIndex || segment.nested)))) return null;
 	const operands: string[] = [];
 	for (let i = idx + 1; i < tokens.length; i++) {
 		const t = tokens[i];
@@ -1846,7 +1866,8 @@ export interface ShellSegment {
 	tokens: string[];
 	/** Names of the `NAME=value` assignments that prefix the command. */
 	assignNames: string[];
-	/** Whether a redirect opens a file other than /dev/null for writing. */
+	/** Whether a redirect opens a file other than /dev/null for writing. A
+	 *  `>&word` whose target is not a descriptor number is a file redirect. */
 	writesFile: boolean;
 	/** Source offsets from the parser for those words. */
 	wordOffsets: Array<number | undefined>;
@@ -1874,7 +1895,7 @@ function shellSegments(text: string): ShellSegment[] | null {
 	const parsed = parseShell(text);
 	if (!parsed.ok) return null;
 	if (parsed.commands.some(command => command.unreadShape !== undefined)) return null;
-	return parsed.commands.map(command => ({ tokens: command.words.map(word => word.value), wordOffsets: command.words.map(word => word.offset), assignNames: command.assigns.map(assign => assign.name), writesFile: command.redirects.some(redirect => redirect.direction !== "in" && !redirect.duplicate && redirect.target.value !== "/dev/null"), join: command.join, negated: command.negated, nested: command.nested }));
+	return parsed.commands.map(command => ({ tokens: command.words.map(word => word.value), wordOffsets: command.words.map(word => word.offset), assignNames: command.assigns.map(assign => assign.name), writesFile: command.redirects.some(redirect => redirect.direction !== "in" && redirect.target.value !== "/dev/null" && !(redirect.duplicate && /^(?:\d+|-)$/u.test(redirect.target.value))), join: command.join, negated: command.negated, nested: command.nested }));
 }
 
 /** A command's exit status when the spelling settles it without running it. */
