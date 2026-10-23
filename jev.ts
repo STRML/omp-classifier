@@ -606,6 +606,60 @@ function revCountsBetween(cwd: string, a: string, b: string): { ahead: number; b
 	return counts;
 }
 
+/** The `git push` flags whose effect the measurement still describes: they
+ *  change how the one named ref is sent, never which refs are sent. Anything
+ *  else (including git's unambiguous abbreviations such as `--del` for
+ *  `--delete`) leaves the push unmeasured. */
+const GIT_PUSH_MEASURABLE_FLAGS = new Set([
+	"--force", "-f", "--force-if-includes", "--no-force-if-includes",
+	"--set-upstream", "-u", "--quiet", "-q", "--verbose", "-v",
+	"--no-verify", "--verify", "--progress", "--no-progress", "--porcelain",
+	"--dry-run", "-n", "--atomic", "--no-atomic", "--signed", "--no-signed",
+]);
+const GIT_PUSH_MEASURABLE_SHORT = /^-[fuqvn]+$/u;
+
+/** Earlier segments that cannot change the refs a later push sends. Every
+ *  other command ahead of the push, a script, an alias or a redirect into a
+ *  file included, can, so the
+ *  push is left unmeasured. `git` must name its subcommand directly: a global
+ *  option such as `-C` or `-c` can point the subcommand at another repository
+ *  or hide which subcommand runs. Commit, merge, cherry-pick and revert only
+ *  add descendants of the measured tip, which keeps a forward-only reading true. */
+const REF_NEUTRAL_COMMANDS = new Set(["cd", "pushd", "popd", "echo", "printf", "true", ":", "sleep", "cat", "ls", "pwd", "test", "["]);
+const REF_NEUTRAL_GIT_SUBCOMMANDS = new Set(["status", "log", "diff", "show", "add", "rm", "mv", "commit", "merge", "cherry-pick", "revert", "stash", "rev-parse", "branch"]);
+/** Flags that make an otherwise neutral subcommand rewrite or move a branch.
+ *  git accepts any unambiguous prefix of a long option (`--amen` for
+ *  `--amend`), so a long word matches when it is a prefix of one of these, and
+ *  a short cluster on `branch` matches when it carries a moving letter. */
+const REF_MOVING_GIT_FLAGS: Record<string, { long: string[]; short: RegExp }> = {
+	commit: { long: ["--amend"], short: /$^/u },
+	branch: { long: ["--force", "--move", "--copy"], short: /^-[a-zA-Z]*[fmMC]/u },
+};
+
+function movesRef(sub: string, word: string): boolean {
+	const flags = REF_MOVING_GIT_FLAGS[sub];
+	if (flags === undefined) return false;
+	if (word.startsWith("--")) {
+		const name = word.split("=", 1)[0];
+		return name.length >= 4 && flags.long.some(full => full.startsWith(name));
+	}
+	return flags.short.test(word);
+}
+
+function earlierSegmentsKeepRefs(earlier: ShellSegment[]): boolean {
+	return earlier.every(({ tokens, assignNames, writesFile }) => {
+		// An assignment can repoint git (`GIT_DIR`), and a redirect can write a
+		// ref file directly (`echo <sha> > .git/refs/heads/main`).
+		if (assignNames.length > 0 || writesFile) return false;
+		const [verb, sub, ...rest] = tokens;
+		if (verb === undefined) return true;
+		if (REF_NEUTRAL_COMMANDS.has(verb)) return true;
+		if (verb !== "git" || sub === undefined || !REF_NEUTRAL_GIT_SUBCOMMANDS.has(sub)) return false;
+		// `commit --amend` and `branch -f/-m/-M/-C` rewrite or move a branch.
+		return !rest.some(word => movesRef(sub, word));
+	});
+}
+
 /** Parse the push shape `git ... push [flags] <remote> [<lref>[:<rref>]]`.
  *  The `+` is stripped everywhere: provenance is measured from the ACTUAL
  *  refs, and the criteria decide the +/force semantics from the numbers.
@@ -616,44 +670,70 @@ function revCountsBetween(cwd: string, a: string, b: string): { ahead: number; b
  *  push in the second. Absent is the honest answer there, and the criteria
  *  already read "no provenance on a force-syntax push" as unrecoverable. The
  *  `at` offset is the push token's start, which lets the caller resolve the
- *  directory the git command runs in when a `cd` earlier in the segment sets it. */
-function parsePushRefs(command: string): { remote: string; lref: string; rref: string; at: number } | null {
+ *  directory the git command runs in when a `cd` earlier in the segment sets it.
+ *
+ *  The same rule covers every push the parse cannot pin to one ref pair in the
+ *  segment's own repository, judged by allowlist so an unknown shape fails
+ *  closed: a flag outside GIT_PUSH_MEASURABLE_FLAGS (a delete, `--all`, a value
+ *  flag, an abbreviation), more than one refspec, anything but a bare `git push`
+ *  command word, or an earlier segment that could move refs before the push
+ *  runs. Each returns null rather than numbers for a push git does not run. */
+function parsePushRefs(
+	command: string,
+): { remote: string; lref: string; rref: string; shorthand: boolean; at: number } | null {
 	const segments = shellSegments(command);
 	if (segments === null) return null;
 	const pushes = segments.filter(segment => gitSubcommandIndex(segment.tokens, "push") !== -1);
 	if (pushes.length !== 1) return null;
-	const idx = gitSubcommandIndex(pushes[0].tokens, "push");
+	const push = pushes[0];
+	const idx = gitSubcommandIndex(push.tokens, "push");
 	if (idx === -1) return null;
-	const pushAt = pushes[0].wordOffsets[idx];
+	const pushAt = push.wordOffsets[idx];
 	if (pushAt === undefined || pushAt < 0) return null;
-	const tokens = pushes[0].tokens;
-	let remote: string | null = null;
-	let spec: string | null = null;
+	const tokens = push.tokens;
+	// Exactly `git push …`: no wrapper (`env`, `command`, a path to git), no
+	// global option between `git` and `push`, and no `NAME=value` prefix, any of
+	// which can point the push at another repository.
+	if (idx !== 1 || tokens[0] !== "git" || push.assignNames.length > 0) return null;
+	if (!earlierSegmentsKeepRefs(segments.slice(0, segments.indexOf(push)))) return null;
+	const operands: string[] = [];
 	for (let i = idx + 1; i < tokens.length; i++) {
 		const t = tokens[i];
-		// `--force-with-lease[=...]` and friends are flags; a nonflag is the
-		// remote then the refspec.
-		if (t.startsWith("-")) continue;
-		if (remote === null) {
-			remote = t;
+		if (t === "--") {
+			operands.push(...tokens.slice(i + 1));
+			break;
+		}
+		if (!t.startsWith("-")) {
+			operands.push(t);
 			continue;
 		}
-		spec = t;
-		break;
+		if (t.startsWith("--force-with-lease")) continue;
+		if (GIT_PUSH_MEASURABLE_FLAGS.has(t) || GIT_PUSH_MEASURABLE_SHORT.test(t)) continue;
+		return null;
 	}
-	if (remote === null || spec === null) return null;
+	if (operands.length !== 2) return null;
+	const [remote, spec] = operands;
 	const plus = spec.replace(/^\+/u, "");
 	const colon = plus.indexOf(":");
 	const lref = colon === -1 ? plus : plus.slice(0, colon);
 	const rref = colon === -1 ? plus : plus.slice(colon + 1);
 	if (lref === "" || rref === "" || lref.includes("*") || rref.includes("*")) return null;
-	return { remote, lref, rref, at: pushAt };
+	return { remote, lref, rref, shorthand: colon === -1, at: pushAt };
+}
+
+/** The branch HEAD names, from its full ref so an ambiguous short name (a
+ *  branch called like a tag or a remote ref) cannot come back as `heads/x`.
+ *  Null when HEAD is detached. */
+function currentBranch(repo: string): string | null {
+	const ref = gitPlumbing(["symbolic-ref", "--quiet", "HEAD"], repo);
+	return ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : null;
 }
 
 export function measureGitPushProvenance(command: string, cwd: string): GitPushProvenance | undefined {
 	const refs = parsePushRefs(command);
 	if (refs === null) return undefined;
-	const { remote, lref, rref, at } = refs;
+	const { remote, lref, rref, shorthand, at } = refs;
+	const headRef = (ref: string): boolean => ref === "HEAD" || ref === "@";
 	// The repository measured is the one the git command itself runs in: `cd
 	// /repo && git push origin main` pushes THAT repository, and reading the
 	// session's own repository instead would report another repo's tips and
@@ -662,10 +742,17 @@ export function measureGitPushProvenance(command: string, cwd: string): GitPushP
 	// text does not pin measures nothing, never a guess.
 	const repo = segmentCwdAt(maskHeredocBodiesAndAnsiSpans(command).masked, at, cwd);
 	if (repo === null) return undefined;
+	// `git push <remote> HEAD` (or `@`) updates the remote branch named like the
+	// current one. `refs/remotes/<remote>/HEAD` is the remote's default branch,
+	// and measuring against it read a force push that discards the remote
+	// feature branch's own commits as forward-only. A detached HEAD names no
+	// branch to compare, so nothing is measured.
+	const remoteBranch = shorthand && headRef(rref) ? currentBranch(repo) : rref;
+	if (remoteBranch === null) return undefined;
 	// The remote tip comes from remote-tracking state when it exists; a
 	// fresh `git fetch` is out of scope here (classification must stay
 	// fast and side-effect-free).
-	const remoteRefOid = gitPlumbing(["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${rref}`], repo);
+	const remoteRefOid = gitPlumbing(["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${remoteBranch}`], repo);
 	// A push to a remote path the repo does not track under that name (an
 	// explicit URL, or a differently-shaped ref namespace) yields null and
 	// the state carries no provenance.
@@ -1757,6 +1844,10 @@ const GIT_REBASE_RESUME_FLAGS: Record<string, true> = {
 export interface ShellSegment {
 	/** The words the command carries, values only. */
 	tokens: string[];
+	/** Names of the `NAME=value` assignments that prefix the command. */
+	assignNames: string[];
+	/** Whether a redirect opens a file other than /dev/null for writing. */
+	writesFile: boolean;
 	/** Source offsets from the parser for those words. */
 	wordOffsets: Array<number | undefined>;
 	/** How this command was joined to the one before it, straight from the
@@ -1783,7 +1874,7 @@ function shellSegments(text: string): ShellSegment[] | null {
 	const parsed = parseShell(text);
 	if (!parsed.ok) return null;
 	if (parsed.commands.some(command => command.unreadShape !== undefined)) return null;
-	return parsed.commands.map(command => ({ tokens: command.words.map(word => word.value), wordOffsets: command.words.map(word => word.offset), join: command.join, negated: command.negated, nested: command.nested }));
+	return parsed.commands.map(command => ({ tokens: command.words.map(word => word.value), wordOffsets: command.words.map(word => word.offset), assignNames: command.assigns.map(assign => assign.name), writesFile: command.redirects.some(redirect => redirect.direction !== "in" && !redirect.duplicate && redirect.target.value !== "/dev/null"), join: command.join, negated: command.negated, nested: command.nested }));
 }
 
 /** A command's exit status when the spelling settles it without running it. */

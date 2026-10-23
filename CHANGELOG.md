@@ -4,6 +4,22 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-23
 
+### Security: `git push origin HEAD` is measured against the branch it pushes
+
+- `measureGitPushProvenance` looked up `refs/remotes/<remote>/HEAD` for a `HEAD` or `@` refspec. That ref is the remote's default branch, but `git push origin HEAD` updates the remote branch named like the current one. On a feature branch that contains main, `git push --force origin HEAD` therefore measured `forwardOnly: true` even when the remote feature branch held commits the push would discard. The battery reads a forward-only force push as a forward publish, so that destructive push could run silently.
+- The remote side of a `HEAD`/`@` refspec now resolves to the current branch (`git symbolic-ref --short HEAD`). A detached HEAD names no remote branch, so nothing is measured, and a force push without provenance keeps its destructive reading. `HEAD:<name>` already named its remote side and is unchanged.
+- The same mismatch also produced false asks: once main moved past a branch's base, a plain `git push -u origin HEAD` measured `behind` above zero against main.
+- The `--force`, `-f` and `--force-with-lease` spellings were still caught by the moderate-risk overlay, which turns a SAFE into a dialog. `git push origin +HEAD` reaches no overlay, so that spelling could run silently.
+- The measurement now stays absent whenever it can't pin the push to one ref pair in the segment's own repository. It is judged by allowlist, so an unknown shape fails closed and a force push keeps its destructive reading:
+  - any push flag outside a short list that only changes how the one ref is sent (`--force`, `--force-with-lease`, `-u`, `-q`, `-v`, `--no-verify`, `--dry-run`, …). This covers deletes, `--all`, `--mirror`, `--tags`, value flags such as `-o`, and git's abbreviations like `--del`.
+  - more than one refspec
+  - anything but a bare `git push` command word (`env …`, `command git`, a global option such as `-C` or `--git-dir=`, a `NAME=value` prefix)
+  - an earlier segment that could move refs before the push runs. Only `cd`, `echo`, `cat`, `ls`, `test` and similar, and plain `git status/log/diff/show/add/rm/mv/commit/merge/cherry-pick/revert/stash/rev-parse/branch` with no global options, are neutral. `commit --amend` (or `--amen`) and `branch -f/-m/-M/-C` are not, nor is any segment that redirects into a file.
+
+  An earlier commit, merge or cherry-pick only adds descendants of the measured tip, so the push stays measured after one.
+- `<src>:HEAD` names a destination spelled HEAD and is not rewritten. The current branch is read from `symbolic-ref HEAD`'s full ref, so an ambiguous short name can't come back as `heads/x`.
+- Not fixed here: the remote-tracking ref can be stale, because the gate never fetches. Tracked in a follow-up issue.
+
 ### Own-host commands: the corpus pins the policy
 
 - Decision (Sam, 2026-10-23): a command sent to one of his own hosts is judged by its effect there. Read-only work on a host `networkProvenance.knownHosts` names runs silent. A delete, restart or secret read there still asks unless he asked for it, and a host no local config names still asks.
