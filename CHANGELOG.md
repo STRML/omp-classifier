@@ -9,6 +9,19 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 - `measureGitPushProvenance` looked up `refs/remotes/<remote>/HEAD` for a `HEAD` or `@` refspec. That ref is the remote's default branch, but `git push origin HEAD` updates the remote branch named like the current one. On a feature branch that contains main, `git push --force origin HEAD` therefore measured `forwardOnly: true` even when the remote feature branch held commits the push would discard. The battery reads a forward-only force push as a forward publish, so that destructive push could run silently.
 - The remote side of a `HEAD`/`@` refspec now resolves to the current branch (`git symbolic-ref --short HEAD`). A detached HEAD names no remote branch, so nothing is measured, and a force push without provenance keeps its destructive reading. `HEAD:<name>` already named its remote side and is unchanged.
 - The same mismatch also produced false asks: once main moved past a branch's base, a plain `git push -u origin HEAD` measured `behind` above zero against main.
+- The `--force`, `-f` and `--force-with-lease` spellings were still caught by the moderate-risk overlay, which turns a SAFE into a dialog. `git push origin +HEAD` reaches no overlay, so that spelling could run silently.
+- The measurement now also stays absent whenever it can't pin the push to one ref pair in the segment's own repository, so a force push keeps its destructive reading:
+  - a delete (`--delete`, `-d`, a `-…d…` cluster)
+  - more than one refspec
+  - `--all`, `--branches`, `--mirror`, `--tags`, `--follow-tags`, `--prune`
+  - a value flag (`-o`, `--push-option`, `--repo`, `--receive-pack`, `--exec`)
+  - a git global option before `push`, or a `GIT_*` assignment
+  - an earlier segment that rewrites a branch (`reset`, `rebase`, `commit --amend`, `pull --rebase`, `branch -f/-M/-C/-m`, `switch -C`, `checkout -B`, `update-ref`)
+  - a HEAD refspec after any `switch` or `checkout`
+
+  An earlier commit, merge or cherry-pick only adds descendants of the measured tip, so the push stays measured.
+- `<src>:HEAD` names a destination spelled HEAD and is not rewritten. The current branch is read from `symbolic-ref HEAD`'s full ref, so an ambiguous short name can't come back as `heads/x`.
+- Not fixed here: the remote-tracking ref can be stale, because the gate never fetches. Tracked in a follow-up issue.
 
 ### Own-host commands: the corpus pins the policy
 

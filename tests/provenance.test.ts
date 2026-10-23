@@ -68,7 +68,9 @@ describe("gate-measured git push provenance (#63)", () => {
 					"git reset -q --hard main && git commit -q --allow-empty -m local-rewrite",
 				dir,
 			);
-			for (const command of ["git push --force origin HEAD", "git push -u origin HEAD", "git push --force origin @"]) {
+			// `+HEAD` matters most: the moderate-risk overlay flags `--force`
+			// spellings, so a SAFE there still asked, but `+` reaches no overlay.
+			for (const command of ["git push --force origin HEAD", "git push -u origin HEAD", "git push --force origin @", "git push origin +HEAD"]) {
 				const p = measureGitPushProvenance(command, dir);
 				expect(p?.forwardOnly, command).toBe(false);
 				expect(p?.behind, command).toBe(1);
@@ -76,11 +78,78 @@ describe("gate-measured git push provenance (#63)", () => {
 			// `HEAD:<name>` names its remote side, so only the local side is HEAD.
 			const explicit = measureGitPushProvenance("git push --force origin HEAD:feature", dir);
 			expect(explicit?.behind).toBe(1);
+			// `<src>:HEAD` names a destination spelled HEAD: it is not the
+			// current-branch shorthand, so the current branch is not swapped in.
+			const destination = measureGitPushProvenance("git push --force origin main:HEAD", dir);
+			expect(destination?.remoteTip).toBe(execSync("git rev-parse refs/remotes/origin/HEAD", { cwd: dir, env: GIT_ENV }).toString().trim());
 			// A branch the remote does not have yet: no remote tip, nothing compared.
 			git("git switch -q -c brand-new", dir);
 			const fresh = measureGitPushProvenance("git push -u origin HEAD", dir);
 			expect(fresh?.remoteTip).toBeNull();
 			expect(fresh?.forwardOnly).toBeUndefined();
+		} finally {
+			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
+		}
+	});
+
+	test("an earlier segment that rewrites refs leaves the push unmeasured", () => {
+		// The gate measures before the command runs. A segment ahead of the push
+		// that rewrites the pushed ref, or moves HEAD under a HEAD refspec, makes
+		// the push see refs the measurement never read: forward-only before an
+		// amend or a reset says nothing about the force push after it.
+		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
+		try {
+			git(
+				"git init -q -b main && git commit -q --allow-empty -m base && " +
+					"git update-ref refs/remotes/origin/main HEAD && git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main && " +
+					"git branch b && git update-ref refs/remotes/origin/b HEAD",
+				dir,
+			);
+			for (const command of [
+				"git commit --amend --no-edit && git push origin +main",
+				"git reset --hard HEAD~1 && git push --force origin main",
+				"git rebase -i HEAD~2 && git push --force-with-lease origin main",
+				"git pull --rebase && git push --force origin main",
+				"git branch -f main HEAD~1 && git push origin +main",
+				"git switch b && git push origin +HEAD",
+				"git checkout b && git push --force origin HEAD",
+			]) {
+				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
+			}
+			// Commits, merges and cherry-picks only add descendants of the measured
+			// tip, so forward-only still holds after them and the push stays measured.
+			expect(measureGitPushProvenance("git commit -q --allow-empty -m next && git push origin main", dir)?.forwardOnly).toBe(true);
+			expect(measureGitPushProvenance("git merge -q b && git push origin main", dir)?.forwardOnly).toBe(true);
+			// Switching branches does not move a ref the push names by name.
+			expect(measureGitPushProvenance("git switch b && git push origin main", dir)?.forwardOnly).toBe(true);
+		} finally {
+			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
+		}
+	});
+
+	test("a push the parse cannot pin to one ref pair in this repository is not measured", () => {
+		// Each of these would have measured the plain `feature:feature` pair as a
+		// forward push, while git deletes the remote branch, pushes other refs, or
+		// pushes another repository.
+		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
+		try {
+			git("git init -q -b main && git commit -q --allow-empty -m base && git branch feature && git update-ref refs/remotes/origin/feature HEAD", dir);
+			expect(measureGitPushProvenance("git push origin feature", dir)?.forwardOnly).toBe(true);
+			for (const command of [
+				"git push --delete origin feature",
+				"git push -d origin feature",
+				"git push origin feature --delete",
+				"git push -fd origin feature",
+				"git push --force origin feature main",
+				"git push --force --tags origin feature",
+				"git push --all origin feature",
+				"git push --mirror origin feature",
+				"git push -o ci.skip origin feature",
+				"GIT_DIR=/elsewhere/.git git push --force origin feature",
+				"git --git-dir=/elsewhere/.git push --force origin feature",
+			]) {
+				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
+			}
 		} finally {
 			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
 		}
