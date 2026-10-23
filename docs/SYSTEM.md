@@ -233,7 +233,9 @@ One request, two inputs, no prose:
   `networkProvenance` for the destinations a command names — ports at loopback addresses on
   this machine (without identifying their listeners), hosts this machine's own SSH config,
   hosts file, or docker state also names, and compose services it reaches, each with the
-  machine the daemon the command names puts them on). A measured tier carries a `note` saying so, is absent when
+  machine the daemon the command names puts them on; `destinationNaming` for how those
+  destinations relate to the hosts the user's own messages name: the named host, one beneath
+  it, or a different host that only shares a parent domain with one). A measured tier carries a `note` saying so, is absent when
   nothing could be measured, and is never written by the command's author.
 - **Battery** — `jevQuestions()`: one `choice` question for the verdict, one `noul` per
   hazard in `JEV_HAZARDS`, one `score` question for blast radius. The battery is a pure
@@ -399,7 +401,7 @@ disables it and changes the cache signature until its pinned bytes are restored 
 
 | Identity | Value | Changes when |
 | --- | --- | --- |
-| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v2.14` | the meaning of a verdict or a policy knob changes, or the state the battery reads changes |
+| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v2.15` | the meaning of a verdict or a policy knob changes, or the state the battery reads changes |
 | `jevQuestionsHash()` (`CLASSIFIER_POLICY_HASH`) | sha256 over version + serialized battery + `DEFAULT_JEV_POLICY`, first 16 hex | the battery, its question ids, or the shipped default changes |
 | `QUESTIONS_CONTRACT` | `questions+probabilities` | the answer shape the parser accepts changes |
 

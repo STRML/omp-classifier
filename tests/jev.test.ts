@@ -359,10 +359,13 @@ describe("jevQuestionsHash", () => {
 		// work `unauthorized_consequential_action` names, so the bytes move too
 		// (67568ffd5be26200). v2.14 adds non-force pushes, pull requests and
 		// comments to that list and to the verdict's safe criterion, and
-		// says a push with no force and no delete cannot discard anything.
+		// says a push with no force and no delete cannot discard anything
+		// (fef017691cc788d1). v2.15 adds the measured `destinationNaming` state
+		// field (#161), and `unauthorized_consequential_action` says what a
+		// destination listed with `sameParentAs` is.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("4ecd97f1eb86b66272670b426b38aac7dd7aba02e86b47dfecdd14144acb0159");
-		expect(jevQuestionsHash()).toBe("fef017691cc788d1");
+		expect(digest).toBe("e63a2fc22d8e03bb3917ce9cc81d410dbc7c814b81d99a5aad25e57c9e0f826b");
+		expect(jevQuestionsHash()).toBe("45a7e185da3940b7");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 
