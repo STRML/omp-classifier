@@ -59,7 +59,7 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { redactSecrets } from "./redact";
-import { parseShell, shellDeclaresFunction, type ShellJoin } from "./shell-ast";
+import { parseShell, shellRunsInSourceOrder, type ShellJoin } from "./shell-ast";
 import { maskHeredocBodiesAndAnsiSpans, segmentCwdAt, SHELL_WORD_EXPANSION } from "./shell-cwd";
 import type { TrustedPolicyDocument } from "./trust-policy";
 
@@ -639,61 +639,68 @@ function pushForces(tokens: string[], spec: string): boolean {
  *  push sends. Judged by allowlist, so an unknown shape fails closed. */
 const PLAIN_DIRECTORY_COMMANDS = new Set(["cd", "pushd", "popd"]);
 
-/** Commands that change what the shell runs for `git`, or where git's remotes
- *  point: without force syntax a push cannot discard, unless `git` is no longer
- *  git (a function, an alias, a PATH, a sourced file) or its remote was just
- *  repointed. */
-const SHELL_STATE_COMMANDS = new Set(["alias", "unalias", "export", "declare", "typeset", "readonly", "local", "source", ".", "shopt", "set", "unset", "hash", "eval", "enable", "builtin", "function", "trap"]);
+/** Commands that can run before a measured push: they write nothing, run no
+ *  other program, and leave the shell's state alone, so `git` stays git and the
+ *  remote stays where the gate read it. With no redirect (checked per segment)
+ *  none of them can write a file. */
+const PRE_PUSH_COMMANDS = new Set([...PLAIN_DIRECTORY_COMMANDS, "echo", "true", "pwd", "ls", "test", "[", "sleep", "cat", "head", "tail", "grep", "wc"]);
+/** The git subcommands that can run before a measured push. None writes the
+ *  configuration the push reads its remote from, and none runs a program named
+ *  on its command line once PRE_PUSH_GIT_FLAG is excluded. Hooks (pre-commit,
+ *  post-merge, the push's own pre-push) are installed code the command's words
+ *  never show either way, so they are not read here. */
+const PRE_PUSH_GIT_SUBCOMMANDS = new Set(["add", "commit", "status", "diff", "log", "show", "rev-parse", "fetch", "stash", "checkout", "switch", "restore", "merge", "cherry-pick", "revert", "rm", "mv", "branch", "reset", "tag"]);
+/** Long options of those subcommands that run a program or write a file:
+ *  `--upload-pack` (fetch), `--exec`, `--strategy` (a `git-merge-<name>` from
+ *  PATH), `--output`. Matched as git matches them, by unambiguous prefix. */
+const PRE_PUSH_GIT_EXEC_OPTIONS = ["--upload-pack", "--exec", "--receive-pack", "--strategy", "--output"];
+/** Short flags with the same effect: `-s <strategy>` on merge, cherry-pick and
+ *  revert. A short cluster that contains one is refused. */
+const PRE_PUSH_GIT_EXEC_SHORT: Record<string, RegExp> = {
+	merge: /^-[a-zA-Z]*s/u,
+	"cherry-pick": /^-[a-zA-Z]*[sX]/u,
+	revert: /^-[a-zA-Z]*[sX]/u,
+};
 
-/** The git subcommands that write the configuration a push reads its remote
- *  from. */
-const GIT_CONFIG_WRITERS = new Set(["remote", "config"]);
-/** A word that is git itself (`command git`, `env git`, `xargs git`, a path to
- *  git), and a script string that calls git (`sh -c 'git remote set-url …'`). */
-const IS_GIT = /(?:^|\/)git$/u;
-const CALLS_GIT = /(?:^|[\s;&|(/`])git(?:$|[\s;&|)`])/u;
-/** Shells whose script string is read for a git call. */
-const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
-/** A word that names a file under a `.git` directory, where the remote
- *  configuration lives (`sed -i … .git/config`, `cp x .git/config`). */
-const NAMES_GIT_DIR = /(?:^|\/)\.git(?:\/|$)/u;
+function gitOptionRunsProgram(sub: string, word: string): boolean {
+	const name = word.split("=")[0];
+	if (name.startsWith("--") && name.length > 2) return PRE_PUSH_GIT_EXEC_OPTIONS.some(option => option.startsWith(name));
+	return PRE_PUSH_GIT_EXEC_SHORT[sub]?.test(word) === true;
+}
 
-/** Whether an earlier git call in the push's command leaves the remote
- *  configuration alone: plain `git <subcommand>` with no global option (`-C`,
- *  `-c`, `--git-dir` hide which repository and which settings it touches) and
- *  a subcommand that does not write the remote configuration. */
-function gitCallLeavesRemotesAlone(tokens: string[]): boolean {
-	const verb = tokens[0] ?? "";
-	if (!IS_GIT.test(verb)) {
-		const callsGit = SHELLS.has(verb.replace(/^.*\//u, "")) ? CALLS_GIT : IS_GIT;
-		return !tokens.slice(1).some(word => callsGit.test(word));
-	}
-	const sub = tokens[1] ?? "";
-	return !sub.startsWith("-") && !GIT_CONFIG_WRITERS.has(sub);
+/** Whether one segment may run before a measured push. Judged by allowlist, so
+ *  a wrapper (`command`, `env`, `xargs`, `sudo`), an interpreter (`sh -c`,
+ *  `python -c`), a script, a test runner and any unknown verb fail closed. git
+ *  counts only as plain `git <subcommand>` from PRE_PUSH_GIT_SUBCOMMANDS: a
+ *  global option (`-C`, `-c`, `--git-dir`) hides which repository and which
+ *  settings it touches. A prefix assignment (`GIT_SSH_COMMAND=…`) or a redirect
+ *  that writes a file is refused on every segment. */
+function segmentMayPrecedePush(segment: ShellSegment): boolean {
+	if (segment.assignNames.length > 0 || segment.writesFile) return false;
+	const [verb = "", sub = "", ...rest] = segment.tokens;
+	if (verb !== "git") return PRE_PUSH_COMMANDS.has(verb);
+	if (!PRE_PUSH_GIT_SUBCOMMANDS.has(sub)) return false;
+	return !rest.some(word => gitOptionRunsProgram(sub, word));
 }
 
 /** Whether `git` in the push is the git binary on the user's PATH, talking to
- *  remotes as configured. Judged by what could change that, so an unknown shape
- *  (a function definition the parser flattens, a bare assignment) fails closed.
- *
- *  Every other segment is held to the same reading: no file write (`>>
- *  .git/config`), no word naming a `.git` directory, and no git call that could
- *  repoint a remote, however it is spelled (`git -C . remote`, `command git
- *  remote`, `sh -c 'git config …'`). A program whose effect its words do not
- *  show (a script, a test runner) is not read here; it is judged as its own
- *  text. */
+ *  the remote the gate reads. Every segment that can run before the push must
+ *  pass `segmentMayPrecedePush`: the ones written before it, every substitution
+ *  (the push's own words run theirs first), and every pipeline stage after it,
+ *  which runs alongside. A segment after the push in a plain sequence runs once
+ *  the push is done and is not read. That order holds only for a command with
+ *  no function, loop or background job, so any of those fails closed. */
 function shellRunsPlainGit(command: string, segments: ShellSegment[], push: ShellSegment): boolean {
-	if (shellDeclaresFunction(command)) return false;
+	if (!shellRunsInSourceOrder(command)) return false;
+	const at = segments.indexOf(push);
 	return segments.every((segment, i) => {
 		if (segment === push) return true;
 		if (i > 0 && segment.join === "first") return false;
-		if (segment.tokens.length === 0 && segment.assignNames.length > 0) return false;
-		if (segment.writesFile) return false;
-		if (SHELL_STATE_COMMANDS.has(segment.tokens[0] ?? "")) return false;
-		if (segment.tokens.some(word => NAMES_GIT_DIR.test(word))) return false;
-		return gitCallLeavesRemotesAlone(segment.tokens);
+		const runsAfter = i > at && !segment.nested && segment.join !== "pipe";
+		return runsAfter || segmentMayPrecedePush(segment);
 	});
 }
+
 
 function forcePushContextIsPlain(segments: ShellSegment[], push: ShellSegment): boolean {
 	if (segments.at(-1) !== push) return false;

