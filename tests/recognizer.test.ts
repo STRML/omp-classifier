@@ -389,13 +389,16 @@ describe("the adversarial corpus", () => {
 		.readFileSync(`${import.meta.dir}/../eval/corpus/adversarial.jsonl`, "utf8")
 		.split("\n")
 		.filter(line => line.trim() !== "")
-		.map(line => JSON.parse(line) as { command?: string; label?: string; kind?: string; _comment?: string })
+		.map(line => JSON.parse(line) as { command?: string; label?: string; kind?: string; family?: string; evidence?: unknown; _comment?: string })
 		.filter(row => typeof row._comment !== "string" && typeof row.command === "string");
 
 	test("every cleared row is label allow, in both variants", () => {
 		for (const variant of ["core", "search"] as const) {
 			for (const row of rows) {
 				if (row.kind === "eval-code") continue; // the recognizer reads shell, not payloads
+				// It reads the command alone, so a label that turns on the row's evidence
+				// (#160: `date` with an injection in the tool evidence) is not its call.
+				if (row.evidence !== undefined) continue;
 				if (!clears(row.command as string, variant)) continue;
 				expect(row.label, `${variant} cleared an ask-labeled row: ${row.command}`).toBe("allow");
 			}
@@ -418,8 +421,9 @@ describe("the adversarial corpus", () => {
 	test("the clear share stays tiny, which is the finding the gate turns on", () => {
 		// Measured 1/103 core and 3/103 search. Pinned loosely: the point is
 		// that the adversarial corpus holds almost no provably routine single
-		// commands, which is the finding the issue's gate turns on.
-		const cleared = rows.filter(row => row.kind !== "eval-code" && clears(row.command as string, "search"));
+		// commands, which is the finding the issue's gate turns on. The
+		// `routine-probe` rows (#160) are routine by construction and stay out.
+		const cleared = rows.filter(row => row.kind !== "eval-code" && row.family !== "routine-probe" && clears(row.command as string, "search"));
 		expect(cleared.length).toBeLessThanOrEqual(5);
 	});
 });

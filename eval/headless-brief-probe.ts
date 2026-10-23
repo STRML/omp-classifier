@@ -8,7 +8,7 @@
  * Three arms over the same commands: the brief as `userMessages` (today), the
  * brief omitted (candidate a), and the brief as labelled `operatorContext`
  * (candidate b). Each arm is asked N times per command on both batteries; the
- * selection reads jev-v3.1, the battery that is live after spec step 2.
+ * selection reads the jev-v3 battery, which is live after spec step 2.
  *
  * Needs a TypeSafe credential and the network unless --replay, which reads
  * eval/.cache (or OMP_EVAL_CACHE_DIR) only. A sample that never arrived is
@@ -18,8 +18,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { type Judge, NativeJudge, TYPESAFE_PROVIDER } from "@oh-my-pi/pi-ai";
-import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
+import { type Judge, NativeJudge } from "@oh-my-pi/pi-ai";
 import {
 	buildJevState,
 	DEFAULT_JEV_MODEL,
@@ -31,6 +30,7 @@ import {
 	type JevAnswers,
 	type JevBatteryVersion,
 } from "../jev";
+import { openTypesafeCredential } from "./credential";
 import { judgeBattery } from "../jev-judge";
 import { redactSecrets } from "../redact";
 
@@ -184,7 +184,7 @@ async function probe(judge: Judge | undefined, model: string, samples: number): 
 		if (battery === JEV_V3_POLICY_VERSION) rates = batteryRates;
 	}
 	const choice = chooseHeadlessArm(rates);
-	console.log(`\nselection (jev-v3.1): ${choice} — user ${rates.user}, omitted ${rates.omitted}, operator ${rates.operator}, target ${(0.1 * rates.user).toFixed(3)}`);
+	console.log(`\nselection (${JEV_V3_POLICY_VERSION}): ${choice} — user ${rates.user}, omitted ${rates.omitted}, operator ${rates.operator}, target ${(0.1 * rates.user).toFixed(3)}`);
 	return Object.values(rates).some(rate => Number.isNaN(rate)) ? 1 : 0;
 }
 
@@ -197,10 +197,10 @@ async function main(): Promise<void> {
 		process.exitCode = await probe(undefined, model, samples);
 		return;
 	}
-	const credentials = await discoverAuthStorage();
+	const credentials = await openTypesafeCredential();
 	try {
-		if (credentials.keys.source(TYPESAFE_PROVIDER) === undefined) console.error("warning: no TypeSafe credential; every sample will be UNAVAILABLE.");
-		process.exitCode = await probe(new NativeJudge({ apiKey: credentials.keys.resolver(TYPESAFE_PROVIDER), model, timeoutMs: 25_000 }), model, samples);
+		if (!credentials.present) console.error("warning: no TypeSafe credential; every sample will be UNAVAILABLE.");
+		process.exitCode = await probe(new NativeJudge({ apiKey: credentials.apiKey, model, timeoutMs: 25_000 }), model, samples);
 	} finally {
 		credentials.close();
 	}
