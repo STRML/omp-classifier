@@ -323,7 +323,8 @@ describe("redaction reaches every judge state", () => {
 		// trusted-policy changes move the version because a state read under one
 		// policy has different meaning from the next. jev-v2.12 drops the
 		// gate-written state notice (#160); jev-v2.13 calls temp-dir
-		// cleanup ordinary work.
-		expect(JEV_POLICY_VERSION).toBe("jev-v2.13");
+		// cleanup ordinary work; jev-v2.14 lets pushes,
+		// PRs and comments run unasked.
+		expect(JEV_POLICY_VERSION).toBe("jev-v2.14");
 	});
 });

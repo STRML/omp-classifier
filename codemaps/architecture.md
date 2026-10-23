@@ -89,12 +89,12 @@ recognizer.ts ─► floor.ts, shell-ast.ts      (not imported by index.ts)
 
 | Name | Value | Defined |
 |---|---|---|
-| `JEV_POLICY_VERSION` (= `CLASSIFIER_POLICY_VERSION`) | `jev-v2.13` | jev.ts:92, index.ts:392 |
-| `JEV_V3_POLICY_VERSION` | `jev-v3.3` | jev.ts:99 |
+| `JEV_POLICY_VERSION` (= `CLASSIFIER_POLICY_VERSION`) | `jev-v2.14` | jev.ts:96, index.ts:392 |
+| `JEV_V3_POLICY_VERSION` | `jev-v3.4` | jev.ts:103 |
 | `AUTHORIZATION_VERSION` | `jev-auth-v2` | authorization.ts:818 |
 | `CLASSIFIER_POLICY_HASH` | `jevQuestionsHash()`: sha256 of version + battery + default policy, 16 hex | index.ts:1228 |
 | `QUESTIONS_CONTRACT` | `questions+probabilities` | index.ts:1222 |
-| `DEFAULT_JEV_MODEL` | `jev-latest` | jev.ts:108 |
+| `DEFAULT_JEV_MODEL` | `jev-latest` | jev.ts:112 |
 | backend id | `typesafe/<model>` or `endpoint/<baseUrl>#<model>` | jev-judge.ts `judgeBackendFor` |
 
 ## Files on disk at runtime

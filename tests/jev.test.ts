@@ -356,10 +356,13 @@ describe("jevQuestionsHash", () => {
 		// v2.11 was 463716d5a2aae8f0 over these same battery bytes: #160 changes
 		// the state, not the questions, so only the version tag moved the hash
 		// (v2.12, b4379fccd9ed8e9b). v2.13 adds temp-dir cleanup to the ordinary
-		// work `unauthorized_consequential_action` names, so the bytes move too.
+		// work `unauthorized_consequential_action` names, so the bytes move too
+		// (67568ffd5be26200). v2.14 adds non-force pushes, pull requests and
+		// comments to that list and to the verdict's safe criterion, and
+		// reads a null gitPushProvenance.remoteTip as a new branch.
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("6803e69caa6cf322f7fae7d6e091e43520cb1f09e0c64247909ab342226d679d");
-		expect(jevQuestionsHash()).toBe("67568ffd5be26200");
+		expect(digest).toBe("45fcdede5c728dcc92ad441d00352d1f8a450c0c70140a90a8a1e6f7b5f9bb60");
+		expect(jevQuestionsHash()).toBe("e10113e55c382ffb");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 
