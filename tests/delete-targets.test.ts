@@ -169,6 +169,47 @@ describe("measureDeleteTargets", () => {
 	test("an unreadable command carries no field", () => {
 		expect(measure("trash 'unterminated")).toBeUndefined();
 	});
+
+	test("a word the shell may glob or brace-expand leaves the whole line unmeasured", () => {
+		// `-[a]` reads as a flag here, but the shell globs it: a file named `-a`
+		// in the cwd becomes an operand the gate never saw.
+		expect(flags(`trash -[a] ${tmp}/notes.md`)).toEqual([null]);
+		// `-{f,/Users/x}` expands to `-f /Users/x`: a second target.
+		expect(flags(`trash -{f,${home}/notes.md} ${tmp}/notes.md`)).toEqual([null]);
+		// An expansion anywhere on a delete may split into more words.
+		expect(flags(`trash $FLAGS ${tmp}/notes.md`)).toEqual([null, null]);
+		// A `~` word stays measurable: it expands to one word, toward false only.
+		expect(flags(`trash ${tmp}/notes.md ~`)).toEqual([true, false]);
+	});
+
+	test("a cd counts only when the shell is certain to have made it", () => {
+		// `;` runs the delete even when the cd failed, from the old directory.
+		expect(flags(`cd ${tmp}/missing; trash notes.md`)).toEqual([null]);
+		expect(flags(`cd ${tmp}; trash notes.md`)).toEqual([null]);
+		expect(flags(`cd ${tmp} || trash notes.md`)).toEqual([null]);
+		// A later `;` or `||` after a cd runs whether or not the cd held.
+		expect(flags(`cd ${tmp} && trash notes.md; trash notes.md`)).toEqual([null, null]);
+		expect(flags(`cd ${tmp} && trash notes.md || trash notes.md`)).toEqual([null, null]);
+		// `a || cd x && b` is `(a || cd x) && b`: when `a` succeeds the cd is
+		// skipped and `b` still runs, from the old directory.
+		expect(flags(`trash ${home}/missing || cd ${tmp} && trash notes.md`)).toEqual([null, null]);
+		// The cd target has to exist as a directory.
+		expect(flags(`cd ${tmp}/missing && trash notes.md`)).toEqual([null]);
+		expect(flags(`cd ${tmp}/notes.md && trash notes.md`)).toEqual([null]);
+		expect(flags(`cd ${tmp} && trash notes.md`)).toEqual([true]);
+	});
+
+	test("a cd whose .. resolves differently lexically and physically is not followed", () => {
+		// bash's `cd -L` drops `link/..` by name and lands in `tmp`; the
+		// filesystem walks the link and lands in `home`'s parent.
+		symlinkSync(join(home, "Documents"), join(tmp, "link-to-docs"));
+		expect(flags(`cd ${tmp}/link-to-docs/.. && trash notes.md`)).toEqual([null]);
+		// A `..` with no link in the way agrees both ways.
+		expect(flags(`cd ${tmp}/run/.. && trash notes.md`)).toEqual([true]);
+		// An operand's `..` is walked the way the kernel walks it: through the
+		// link first. Node's realpath alone reads it by name and says temp.
+		expect(flags(`trash ${tmp}/link-to-docs/../notes.md`)).toEqual([false]);
+	});
 });
 
 describe("gateTempRoots", () => {
