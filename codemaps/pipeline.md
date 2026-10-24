@@ -38,7 +38,7 @@ and the reason is JSON from `refusalPayload`. Every decision writes one audit li
 | 14 | dry-run with no cached verdict | `dryRunStop(would: classify)` | `classifier` |
 | 15 | **`classify(...)`** or a cache hit (`withoutShadow(cached)`) | Judgement (see below) | |
 | 15a | classify threw | `refuse(unclassified)` | `unclassified` |
-| 16 | verdict SAFE, no `matchModerateRiskTokens` flags, no script `INTERPRETER_CODE_RISK`, and no prior refusal or one `priorRefusalLifts` lifts (then `liftRefusals`) | allow | `verdict` / `cached` |
+| 16 | verdict SAFE, no `matchModerateRiskTokens` flags, no script `INTERPRETER_CODE_RISK`, and no prior refusal or `priorRefusalLifts` holds for this call (the record stays) | allow | `verdict` / `cached` |
 | 17 | verdict SAFE but flags, or a prior refusal that did not lift | `refuse(flagged)` / `refuse(prior-refusal)` | `verdict` |
 | 18 | UNSAFE / UNSURE / UNAVAILABLE | UNSAFE with `persistRefusal` → `addRefusal(model)`; then `refuse(unsafe/unsure/unavailable)` | `verdict` |
 | — | any throw in the try block | block, fail closed | `internal-error` |
@@ -103,5 +103,7 @@ Output `hostHandoff`: `run` | `block` | `host-prompt` (a static prompt rule: the
 
 `cap` (length or script-body), `critical`, `model` (UNSAFE with persistRefusal). Each records
 the newest user message id (`newestUserMessageId`). Fed back to the judge as
-`recordExtras.priorRefusal`. Lifted by `liftRefusals` only when `priorRefusalLifts` holds: SAFE,
-authorization `grounded`, and a user message newer than the one the refusal recorded.
+`recordExtras.priorRefusal`. A record is never erased mid-session; `priorRefusalFor` ignores evidence
+changes. One bash call runs past a model refusal when `priorRefusalLifts` holds: SAFE,
+authorization `grounded`, and `literalMatch` over the user messages after the recorded one
+(`userMessagesSince`). Critical, cap and eval refusals never yield.

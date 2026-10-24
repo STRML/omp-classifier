@@ -173,53 +173,86 @@ describe("control flow only", () => {
 	});
 });
 
-describe("the user lifts a refusal in chat", () => {
-	// The length cap refuses `cat notes.txt x x x …` under the key `cat notes.txt`,
-	// so the short spelling meets that refusal.
-	const long = `cat notes.txt ${"x ".repeat(4100)}`;
-	const short = "cat notes.txt";
+describe("a refusal and the user's words", () => {
+	const refusedBranch = "git branch -D topic";
 
-	test("a new user message plus a grounded SAFE lifts it", async () => {
+	test("a cap refusal never yields, even when the user names the target", async () => {
 		const sid = nextSession();
-		const before = [userMessage("u1", "summarize the notes")];
-		expect(refusalOf(await fire("tool_call", makeEvent(long), uiCtx(sid, before))).layer).toBe("cap");
+		const before = [userMessage("u1", "clean up the logs")];
+		// Refused by the length cap under the key `trash old.log`.
+		const longTrash = `trash old.log ${"x ".repeat(4100)}`;
+		expect(refusalOf(await fire("tool_call", makeEvent(longTrash), uiCtx(sid, before))).layer).toBe("cap");
 
 		setJevAnswer(jevSafeAnswer());
-		expect(refusalOf(await fire("tool_call", makeEvent(short), uiCtx(sid, before))).layer).toBe("prior-refusal");
+		const after = [...before, userMessage("u2", "yes, delete old.log")];
+		const payload = refusalOf(await fire("tool_call", makeEvent("trash old.log"), uiCtx(sid, after)));
+		expect(payload.layer).toBe("prior-refusal");
+		expect(payload.next).toContain("run the command themselves");
+	});
 
-		const after = [...before, userMessage("u2", "yes, go ahead and cat notes.txt")];
-		expect(resultText(await fire("tool_call", makeEvent(short), uiCtx(sid, after)))).toBe("ALLOWED");
+	test("a critical pattern stays blocked after the user says go ahead", async () => {
+		const sid = nextSession();
+		await fire("tool_call", makeEvent("rm -rf /"), uiCtx(sid, [userMessage("u1", "clean up")]));
+		const after = [userMessage("u1", "clean up"), userMessage("u2", "go ahead, run rm -rf /")];
+		expect(refusalOf(await fire("tool_call", makeEvent("rm -rf /"), uiCtx(sid, after))).layer).toBe("critical");
+	});
 
-		// Lifted: the next call no longer carries the refusal into the state.
+	test("an unrelated new message does not let a SAFE past a model refusal", async () => {
+		const sid = nextSession();
+		const before = [userMessage("u1", "tidy up the repo")];
+		setJevAnswer(jevUnsafeAnswer());
+		expect(refusalOf(await fire("tool_call", makeEvent(refusedBranch), uiCtx(sid, before))).layer).toBe("unsafe");
+
+		setJevAnswer(jevSafeAnswer());
+		const after = [...before, userMessage("u2", "thanks, looks good")];
+		expect(refusalOf(await fire("tool_call", makeEvent(refusedBranch), uiCtx(sid, after))).layer).toBe("prior-refusal");
+	});
+
+	test("a newer message that names the target runs this call only", async () => {
+		const sid = nextSession();
+		const before = [userMessage("u1", "tidy up the repo")];
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent(refusedBranch), uiCtx(sid, before));
+
+		setJevAnswer(jevSafeAnswer());
+		const named = [...before, userMessage("u2", "yes, delete the branch topic")];
+		expect(resultText(await fire("tool_call", makeEvent(refusedBranch), uiCtx(sid, named)))).toBe("ALLOWED");
+
+		// The record stays: the next call still carries the refusal to the judge
+		// and meets the same check.
 		const calls = modelCalls.length;
-		await fire("tool_call", makeEvent(`${short} `), uiCtx(sid, [...after, userMessage("u3", "and again")]));
+		await fire("tool_call", makeEvent(`${refusedBranch} `), uiCtx(sid, [...named, userMessage("u3", "and again")]));
 		expect(modelCalls.length).toBe(calls + 1);
-		expect(JSON.stringify(stateOf(calls))).not.toContain("priorRefusal");
+		expect(JSON.stringify(stateOf(calls))).toContain("priorRefusal");
 	});
 
-	test("without a newer user message it stays blocked", async () => {
+	test("words from before the refusal do not count", async () => {
 		const sid = nextSession();
-		const branch = [userMessage("u1", "summarize the notes")];
-		await fire("tool_call", makeEvent(long), uiCtx(sid, branch));
+		const before = [userMessage("u1", "delete the branch topic")];
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent(refusedBranch), uiCtx(sid, before));
 		setJevAnswer(jevSafeAnswer());
-		expect(refusalOf(await fire("tool_call", makeEvent(short), uiCtx(sid, branch))).layer).toBe("prior-refusal");
-		expect(refusalOf(await fire("tool_call", makeEvent(`${short} `), uiCtx(sid, branch))).layer).toBe("prior-refusal");
+		const after = [...before, userMessage("u2", "ok")];
+		expect(refusalOf(await fire("tool_call", makeEvent(refusedBranch), uiCtx(sid, after))).layer).toBe("prior-refusal");
 	});
 
-	test("a headless session cannot lift it", async () => {
+	test("a headless session cannot get past a refusal", async () => {
 		const sid = nextSession();
-		await fire("tool_call", makeEvent(long), uiCtx(sid, [], false));
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent(refusedBranch), uiCtx(sid, [], false));
 		setJevAnswer(jevSafeAnswer());
-		const branch = [userMessage("u1", "yes, cat notes.txt")];
-		expect(refusalOf(await fire("tool_call", makeEvent(short), uiCtx(sid, branch, false))).layer).toBe("prior-refusal");
+		const branch = [userMessage("u1", "yes, delete the branch topic")];
+		// A trailing space is a new cache key but the same refusal target.
+		expect(refusalOf(await fire("tool_call", makeEvent(`${refusedBranch} `), uiCtx(sid, branch, false))).layer).toBe("prior-refusal");
 	});
 
-	test("with evidenceUserMessages 0 the judge sees no user words, so nothing lifts", async () => {
+	test("with evidenceUserMessages 0 the judge sees no user words, so nothing yields", async () => {
 		fs.writeFileSync(path.join(dir, "omp-classifier.json"), JSON.stringify({ evidenceUserMessages: 0 }));
 		const sid = nextSession();
-		await fire("tool_call", makeEvent(long), uiCtx(sid, [userMessage("u1", "summarize")]));
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent(refusedBranch), uiCtx(sid, [userMessage("u1", "tidy up")]));
 		setJevAnswer(jevSafeAnswer());
-		const after = [userMessage("u1", "summarize"), userMessage("u2", "yes, cat notes.txt")];
-		expect(refusalOf(await fire("tool_call", makeEvent(short), uiCtx(sid, after))).layer).toBe("prior-refusal");
+		const after = [userMessage("u1", "tidy up"), userMessage("u2", "yes, delete the branch topic")];
+		expect(refusalOf(await fire("tool_call", makeEvent(`${refusedBranch} `), uiCtx(sid, after))).layer).toBe("prior-refusal");
 	});
 });

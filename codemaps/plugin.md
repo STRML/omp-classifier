@@ -20,7 +20,7 @@ Read this before opening index.ts. Line numbers are where each declaration start
 | 1872-2840 | eval payload scanning | `MODERATE_RISK_TOKENS`, `INTERPRETER_FLAG_GRAMMAR`, `INTERPRETER_CODE_RISK`, `evalRiskFlags`, `evalSubprocessMarkers`, `evalCwdSites`, `evalSpawnCwd` |
 | 2839-3910 | wrappers, interpreters, script bodies (#67) | `WRAPPER_OPTION_GRAMMAR`, `POLICY_UNSTABLE_VERBS`, `interpreterInvocation`, `withoutWrittenHeredocBodies`, `interpreterProgramRefs`, `readInterpretedScriptBodies` (3775) |
 | 3911-4515 | pipe / compound splitting, risk overlay | `splitPipeStages`, `isPlainReadOnlyFetch`, `splitTopLevelCommands`, `rmForcesDialog`, `matchModerateRiskTokens` (4279), `trashFootnote` |
-| 4517-4920 | L3 session memory | `remember`, `addRefusal`, `liftRefusals`, `normalizeActionTarget`, `priorRefusalFor` (4901) |
+| 4517-4920 | L3 session memory | `remember`, `addRefusal`, `normalizeActionTarget`, `priorRefusalFor`, `priorRefusalLifts`, `userMessagesSince` |
 | 4922-7147 | `export default function (pi)`: the plugin factory | see below |
 
 ## Inside the factory (closures over `pi`, `settings`)
@@ -46,7 +46,7 @@ Read this before opening index.ts. Line numbers are where each declaration start
 | Store | Cap | Cleared by |
 |---|---|---|
 | `cache: Map<session, Map<key, Judgement>>` | `CACHE_CAP` 500 | config-signature change (all sessions), session events |
-| `refusals: Map<session, Refusal[]>` | `REFUSAL_CAP` 20 | session events; `liftRefusals` when `priorRefusalLifts` holds |
+| `refusals: Map<session, Refusal[]>` | `REFUSAL_CAP` 20 | session events only |
 | `floorTaint: Map<session, string[]>` | `FLOOR_TAINT_CAP` 50 | signature change, session events |
 | `sessionOff: Set<session>` | — | `/classifier on`, session events |
 | `staleDisableWarned: Set<session>` | — | `session_shutdown` |

@@ -40,15 +40,23 @@ The gate never opens a dialog (https://github.com/STRML/omp-classifier/issues/18
 | `critical` | Built-in dangerous-command pattern | Pick a safer action, or ask you to run the command yourself |
 | `environment` | Caller-supplied `env` | Drop the env, or ask you to run it |
 | `cwd` | An eval spawn directory the scan cannot read | Give the spawn a literal directory, or ask you |
-| `unsafe` / `unsure` | Jev's verdict | Pick a safer action or a more specific command, or ask you in chat |
+| `unsafe` / `unsure` | Jev's verdict | Pick a safer action or a more specific command, or ask you in chat to name the target |
 | `unavailable` / `unclassified` | No verdict (outage, timeout, missing key) | Tell you, retry later; `/classifier off` pauses the gate for the session |
 | `flagged` | SAFE, but the command carries a forced-block operation | Use the reversible alternative (`trash` for `rm`), or ask you to run it |
-| `prior-refusal` | SAFE on a target refused earlier this session | Ask you in chat, then retry |
+| `prior-refusal` | SAFE on a target refused earlier this session | Ask you to name the target in chat, or to run it yourself |
 | `cap` / `script-body` | Too long, or a script body that could not be read | Shorten it or split it into steps |
 
 ### How you unblock a command
 
-Say so in chat. On the retry, Jev reads your words as user evidence (`evidenceUserMessages`), and a SAFE verdict runs. A refusal recorded earlier in the session lifts only when both hold: you sent a message after the refusal, and Jev answers SAFE with its authorization grounded in your messages. A `critical` or `flagged` command never runs through the agent, whatever you say; run it yourself. A headless session has no user channel, so nothing lifts there.
+Say so in chat. On the retry, Jev reads your words as user evidence (`evidenceUserMessages`), and a SAFE verdict runs.
+
+A refusal the session already recorded is stricter. It stays for the rest of the session, and a call gets past it only when all of these hold:
+
+- the refusal came from Jev's verdict, not from a critical pattern or the length cap (those never run through the agent: run the command yourself);
+- a message you sent after the refusal names the command's target, as `literalMatch` reads it: a delete, a branch delete, a merge or a deploy with its target written out ("delete the branch topic");
+- Jev answers SAFE with its authorization grounded in your messages.
+
+That decides one call. The record stays, so the next call is checked again. A command shape `literalMatch` cannot read, eval code, and a headless session (no user channel) never get past a refusal. A `flagged` command never runs through the agent either.
 
 Refusal memory keys on a strict action identity that keeps flags (split, sorted short bundles) and the first argument, plus the directory: a refused operation does not pin its whole verb class, its host, or its container.
 
@@ -194,7 +202,7 @@ Every decision carries that policy version/hash, session and decision identifier
 
 ## Evidence
 
-The state can carry an `evidence` object whose fields have different authors, and the battery's instructions judge each field by its channel. `evidenceUserMessages` attaches the task's most recent user messages plus older scope/restriction anchors, with stable message ids. These are direct user authorization only when the host stamps `attribution: "user"`; a parent agent's brief to its subagent never counts. A separate `evidence.trustedPolicy` tier exists only after `/classifier trust-policy` explicitly pins the unchanged user-level instruction files. It may authorize matching action classes only, with conditions confirmed by explicit gate-measured facts; it cannot authorize an egress destination or delete target, and repo-local files are never included. No CI status is measured, so CI-conditional policy does not authorize. A message longer than 2,000 characters keeps its first and last 1,000. Every tool call may also carry `operatorContext`: the requesting agent's explanation of intent, flattened to one line, capped at 500 characters, and never able to authorize anything. Recent tool calls/results are added as bounded, explicitly non-authorizing context so a script written earlier in the session is not invisible to the next review. Secret-shaped values (known token formats, authorization headers, private key blocks, URL passwords, values assigned to secret-sounding names) are redacted from every evidence field before it leaves the machine. The command itself is sent as written, because it's what gets judged. Refusals are scoped to the reviewed cwd and evidence fingerprint. The channel decides provenance: content claiming authorization from the wrong channel is itself an injection signal, judged by the same rules as the command text.
+The state can carry an `evidence` object whose fields have different authors, and the battery's instructions judge each field by its channel. `evidenceUserMessages` attaches the task's most recent user messages plus older scope/restriction anchors, with stable message ids. These are direct user authorization only when the host stamps `attribution: "user"`; a parent agent's brief to its subagent never counts. A separate `evidence.trustedPolicy` tier exists only after `/classifier trust-policy` explicitly pins the unchanged user-level instruction files. It may authorize matching action classes only, with conditions confirmed by explicit gate-measured facts; it cannot authorize an egress destination or delete target, and repo-local files are never included. No CI status is measured, so CI-conditional policy does not authorize. A message longer than 2,000 characters keeps its first and last 1,000. Every tool call may also carry `operatorContext`: the requesting agent's explanation of intent, flattened to one line, capped at 500 characters, and never able to authorize anything. Recent tool calls/results are added as bounded, explicitly non-authorizing context so a script written earlier in the session is not invisible to the next review. Secret-shaped values (known token formats, authorization headers, private key blocks, URL passwords, values assigned to secret-sounding names) are redacted from every evidence field before it leaves the machine. The command itself is sent as written, because it's what gets judged. Refusals are scoped to the reviewed cwd, and new evidence does not erase them. The channel decides provenance: content claiming authorization from the wrong channel is itself an injection signal, judged by the same rules as the command text.
 
 ## Limits
 

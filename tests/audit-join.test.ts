@@ -172,10 +172,10 @@ describe("decisions.jsonl never carries a prior refusal's secret", () => {
 		await fire("tool_call", makeEvent("mysql --password hunter2-secret -e 'drop table t'"), makeCtx({ sessionId: sid }));
 		setJevAnswer(jevSafeAnswer());
 		// Reworded (two spaces): the cache misses, the refusal rides in, SAFE is
-		// held for approval, and the why quotes the refused target.
+		// blocked, and the why quotes the refused target.
 		await fire("tool_call", makeEvent("mysql  --password hunter2-secret -e 'drop table t'"), makeCtx({ sessionId: sid }));
 		const text = fs.readFileSync(path.join(dir, "decisions.jsonl"), "utf8");
-		expect(text).toContain("despite prior refusal");
+		expect(text).toContain("despite prior model refusal");
 		expect(text).not.toContain("hunter2-secret");
 		expect(text).not.toContain("hunter2");
 	});

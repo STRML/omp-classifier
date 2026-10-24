@@ -311,12 +311,13 @@ behind it. The sweep in L5 exists to make that cheap enough to be routine.
 - **Verdict cache**: per session, keyed by command + cwd + env/pty identity + the judge's
   identity (the active backend and the model it answers with), and cleared whenever the
   effective config signature changes. `UNAVAILABLE` is never cached.
-- **Refusal memory**: what this session refused, keyed by `normalizeActionTarget`, so a lift
-  covers exactly what a refusal covers (issue #64), plus the cwd, fingerprinted by the evidence
-  the judge saw, and fed back into the state as `priorRefusal` so rewording cannot launder a
-  refusal into a fresh judgment. A SAFE under a prior refusal is not a clean bill: it blocks,
-  unless the user spoke after the refusal and the SAFE's authorization is grounded in the
-  user's words (`priorRefusalLifts`).
+- **Refusal memory**: what this session refused, keyed by `normalizeActionTarget` (issue #64)
+  plus the cwd, and fed back into the state as `priorRefusal` so rewording cannot launder a
+  refusal into a fresh judgment. A refusal stands for the session: new evidence or operator
+  context reaches the judge but does not erase it. A SAFE under a prior refusal blocks, except
+  for one call past a model refusal when the user's messages since the refusal name the
+  command's target by `literalMatch` and the SAFE's authorization is grounded
+  (`priorRefusalLifts`). Critical and cap refusals never yield.
 - **Decision audit**: one JSONL line per decision at
   `<agentDir>/omp-classifier/decisions.jsonl`, every path, with session/decision ids,
   `policyVersion`/`policyHash` (the battery hash), `modelId`, `verdict`, `reasonCode`, the
@@ -324,8 +325,8 @@ behind it. The sweep in L5 exists to make that cheap enough to be routine.
   and timing. A block writes its lead line (verdict, critical, environment, cwd) and then a
   `blocked` line.
 
-Invariant: a cache entry answers only the exact input it was made for. Refusals lift only by
-the user's own words, never by retry.
+Invariant: a cache entry answers only the exact input it was made for. Only the user's own
+words, naming the target, get one call past a refusal; a retry never does.
 
 ## L4 interaction
 

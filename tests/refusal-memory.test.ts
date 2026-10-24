@@ -214,7 +214,7 @@ describe("refusal memory", () => {
 		setJevAnswer(jevSafeAnswer());
 		const result = await fire("tool_call", makeEvent("echo bye again"), ctx);
 		expect(refusalOf(result).layer).toBe("prior-refusal");
-		expect(readDecisions().some(line => line.why.includes("despite prior refusal"))).toBe(true);
+		expect(readDecisions().some(line => line.why.includes("despite prior model refusal"))).toBe(true);
 	});
 
 	test("machine refusals are scoped to the reviewed directory", async () => {
@@ -228,27 +228,6 @@ describe("refusal memory", () => {
 		const result = await fire("tool_call", makeEvent("cd /elsewhere && git diff --stat"), elsewhere);
 		expect(result).toBeUndefined();
 		expect(modelCalls.length).toBe(2);
-	});
-
-	test("a lift in one directory does not erase a refusal in another", async () => {
-		const sid = nextSession();
-		const userEntry = (id: string, content: string) => ({ type: "message", id, message: { role: "user", attribution: "user", content } });
-		const before = [userEntry("u1", "summarize the notes")];
-		// The length cap refuses `cat notes.txt x x …` under the key `cat notes.txt`.
-		const long = `cat notes.txt ${"x ".repeat(4100)}`;
-		await fire("tool_call", makeEvent(long), makeCtx({ sessionId: sid, cwd: "/workspace", hasUI: true, branch: before }));
-		await fire("tool_call", makeEvent(long), makeCtx({ sessionId: sid, cwd: "/elsewhere", hasUI: true, branch: before }));
-
-		setJevAnswer(jevSafeAnswer());
-		const after = [...before, userEntry("u2", "yes, cat notes.txt")];
-		const lifted = makeCtx({ sessionId: sid, cwd: "/elsewhere", hasUI: true, branch: after });
-		expect(await fire("tool_call", makeEvent("cat notes.txt"), lifted)).toBeUndefined();
-
-		// The refusal in /workspace was not touched: it still rides into the
-		// state the judge sees there.
-		const original = makeCtx({ sessionId: sid, cwd: "/workspace", hasUI: true, branch: after });
-		await fire("tool_call", makeEvent("cat notes.txt"), original);
-		expect(priorRefusalOf(modelCalls.length - 1)?.target).toBe("cat notes.txt");
 	});
 
 	test("store caps at 20 per session and drops the oldest", async () => {
@@ -330,25 +309,30 @@ describe("refusal identity at the gate (issue #64)", () => {
 		expect(readDecisions().some(line => line.why.includes("prior refusal"))).toBe(true);
 	});
 
-	test("a model refusal expires when the user's words move in a UI session", async () => {
+	test("a model refusal stands when the user's words move in a UI session", async () => {
 		const sid = nextSession();
 		const userEntry = (content: string) => ({ type: "message", message: { role: "user", attribution: "user", content } });
 		setJevAnswer(jevUnsafeAnswer());
 		await fire("tool_call", makeEvent("rm -rf x"), makeCtx({ sessionId: sid, hasUI: true, branch: [userEntry("wipe the scratch build")] }));
 
 		setJevAnswer(jevSafeAnswer());
+		// New words reach the judge, but they do not erase the record: only words
+		// that name the target can let one call past it (never-prompts.test.ts).
 		const moved = makeCtx({ sessionId: sid, hasUI: true, branch: [userEntry("actually stop, keep the build")] });
 		await fire("tool_call", makeEvent("rm -rf x"), moved);
-		expect(priorRefusalOf(1)).toBeUndefined();
+		expect(priorRefusalOf(1)?.target).toBe("rm -f -r x");
 	});
 
-	test("a model refusal still expires when the evidence fingerprint moves", async () => {
+	test("agent-authored context cannot drop a model refusal", async () => {
 		const sid = nextSession();
 		setJevAnswer(jevUnsafeAnswer());
 		await fire("tool_call", makeEvent("rm -rf x", { operatorContext: "wiping the scratch build" }), makeCtx({ sessionId: sid }));
 
 		setJevAnswer(jevSafeAnswer());
+		// Before https://github.com/STRML/omp-classifier/issues/184 a changed
+		// operatorContext changed the evidence fingerprint and the refusal
+		// stopped applying (https://github.com/STRML/omp-classifier/issues/189).
 		await fire("tool_call", makeEvent("rm -rf x", { operatorContext: "keeping the build, cleaning logs" }), makeCtx({ sessionId: sid }));
-		expect(priorRefusalOf(1)).toBeUndefined();
+		expect(priorRefusalOf(1)?.target).toBe("rm -f -r x");
 	});
 });

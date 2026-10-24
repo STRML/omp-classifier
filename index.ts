@@ -280,18 +280,16 @@ interface Refusal {
 	loggableTarget: string;
 	why: string;
 	ts: number;
-	/** Refusals are not interchangeable: a model judgment is revisitable when
-	 *  the reviewed context changes, while a critical-pattern or cap refusal
-	 *  stays until the user lifts it in chat. */
+	/** Refusals are not interchangeable: a critical-pattern or cap refusal
+	 *  never yields to a verdict, while a model refusal yields for one call
+	 *  when the user's newer words name this command's target
+	 *  (`priorRefusalLifts`). */
 	source: "model" | "critical" | "cap";
 	/** The newest user message in the session when the refusal was written.
-	 *  A lift needs a user message newer than this one: the user has to have
-	 *  said something after the refusal (`priorRefusalLifts`). */
+	 *  Only messages after this one can authorize past the refusal. */
 	userMessageId?: string;
 	/** A refusal only applies to the directory whose effects were reviewed. */
 	cwd: string;
-	/** Evidence context at the time of a model judgment. */
-	evidenceFingerprint?: string;
 }
 const refusals = new Map<string, Refusal[]>();
 const REFUSAL_CAP = 20;
@@ -4513,7 +4511,6 @@ function addRefusal(
 	meta: {
 		source?: Refusal["source"];
 		cwd?: string;
-		evidenceFingerprint?: string;
 		userMessageId?: string;
 	} = {},
 ): void {
@@ -4537,27 +4534,10 @@ function addRefusal(
 			ts: Date.now(),
 			source: meta.source ?? "model",
 			cwd: refusalCwd,
-			...(meta.evidenceFingerprint === undefined ? {} : { evidenceFingerprint: meta.evidenceFingerprint }),
 			...(meta.userMessageId === undefined ? {} : { userMessageId: meta.userMessageId }),
 		});
 	} catch {
 		// No session id, no memory; the caller's decision below is unchanged.
-	}
-}
-
-/** A lift erases the memory that a target was refused. Lifting and refusing
- *  use one identity, so the lift covers exactly what the refusal remembered
- *  (issue #64). */
-function liftRefusals(ctx: ExtensionContext, command: string, cwd = ""): void {
-	try {
-		const sessionId = ctx.sessionManager.getSessionId();
-		const target = refusalKeyForCommand(command);
-		if (target === "") return;
-		const list = refusals.get(sessionId);
-		if (!list) return;
-		refusals.set(sessionId, list.filter(refusal => refusal.normalizedTarget !== target || refusal.cwd !== cwd));
-	} catch {
-		// Nothing to lift without a session id.
 	}
 }
 
@@ -4628,63 +4608,78 @@ function refusalKeyForCommand(command: string): string {
 }
 
 
-/** The session's refusal for this command's target, or undefined. */
-function priorRefusalFor(
-	ctx: ExtensionContext,
-	command: string,
-	cwd = "",
-	evidenceFingerprint?: string,
-): Refusal | undefined {
+/** The session's refusal for this command's target, or undefined. A refusal
+ *  stands for the rest of the session whatever else changes: new evidence,
+ *  new operator context and new chat all reach the judge, but none of them
+ *  erases the record (https://github.com/STRML/omp-classifier/issues/184). */
+function priorRefusalFor(ctx: ExtensionContext, command: string, cwd = ""): Refusal | undefined {
 	try {
 		const target = refusalKeyForCommand(command);
 		if (target === "") return undefined;
-		return refusals.get(ctx.sessionManager.getSessionId())?.find(refusal => {
-			if (refusal.normalizedTarget !== target || refusal.cwd !== cwd) return false;
-			// Model refusals are a warning about the facts the judge saw, not a
-			// permanent ban on a normalized verb. New evidence gets a fresh review;
-			// critical and cap refusals stay until the user lifts them in chat.
-			return refusal.source !== "model" || refusal.evidenceFingerprint === evidenceFingerprint;
-		});
+		return refusals
+			.get(ctx.sessionManager.getSessionId())
+			?.find(refusal => refusal.normalizedTarget === target && refusal.cwd === cwd);
 	} catch {
 		return undefined;
 	}
 }
 
 /**
- * Whether this verdict lifts a prior refusal: the user said something after the
- * refusal, and Jev answered SAFE with its authorization grounded in the user's
- * words (https://github.com/STRML/omp-classifier/issues/184). Anything else
- * leaves the refusal standing. A headless session has no user channel, so it
- * never lifts one.
+ * Whether this one call may run past a prior refusal
+ * (https://github.com/STRML/omp-classifier/issues/184). All of these must hold:
+ *
+ *  - the refusal is a model refusal: a critical-pattern or cap refusal never
+ *    yields to a verdict, and the user runs that command themselves;
+ *  - Jev answered SAFE with its authorization grounded in the user's words;
+ *  - the user's messages AFTER the refusal name this command's target, by the
+ *    deterministic `literalMatch` (a delete, a branch delete, a merge or a
+ *    deploy whose target the user wrote out). An unrelated "thanks", or
+ *    words from before the refusal, never count.
+ *
+ * It decides one call. The record stays, so the next call, reworded or not,
+ * meets the same check. Eval code has no shell to match, so an eval refusal
+ * never yields; nor does any command shape literalMatch cannot read.
  */
-function priorRefusalLifts(prior: Refusal, judgement: Judgement, newestUserMessageId: string | undefined): boolean {
-	return (
-		judgement.verdict === "SAFE" &&
-		judgement.authorization === "grounded" &&
-		newestUserMessageId !== undefined &&
-		newestUserMessageId !== prior.userMessageId
-	);
+function priorRefusalLifts(prior: Refusal, judgement: Judgement, command: string, cwd: string, userWordsSinceRefusal: readonly string[]): boolean {
+	if (prior.source !== "model") return false;
+	if (judgement.verdict !== "SAFE" || judgement.authorization !== "grounded") return false;
+	if (userWordsSinceRefusal.length === 0) return false;
+	return literalMatch({ command, cwd, homeDir: os.homedir(), userMessages: userWordsSinceRefusal, resolveRealPath: realPathOf }).matched;
 }
 
 /** The id of the newest user-typed message since the latest `/clear`, read the
  *  way collectTaskEvidence reads them but independent of the evidence window,
  *  so a config change cannot make an old message look new. */
 function newestUserMessageId(ctx: ExtensionContext): string | undefined {
+	const messages = userMessagesSince(ctx, undefined);
+	return messages.at(-1)?.id;
+}
+
+/** The user-typed messages since the latest `/clear` that come after the
+ *  message `afterId`; every one of them when `afterId` is undefined or no longer
+ *  on the branch. A no-UI session has no user channel and gets none. */
+function userMessagesSince(ctx: ExtensionContext, afterId: string | undefined): Array<{ id: string; text: string }> {
+	const messages: Array<{ id: string; text: string }> = [];
 	try {
 		const branch = userChannelBranch(ctx);
-		const start = branchStartAfterLatestResetBoundary(branch);
-		for (let index = branch.length - 1; index >= start; index--) {
+		for (let index = branchStartAfterLatestResetBoundary(branch); index < branch.length; index++) {
 			const entry = branch[index];
 			if (entry.type !== "message") continue;
 			const message = entry.message;
 			if (message?.role !== "user" || message.attribution !== "user") continue;
-			if (textOf(message.content).trim() === "") continue;
-			return message.id ?? entry.id ?? `user-${index}`;
+			const text = textOf(message.content);
+			if (text.trim() === "") continue;
+			const id = message.id ?? entry.id ?? `user-${index}`;
+			if (id === afterId) {
+				messages.length = 0;
+				continue;
+			}
+			messages.push({ id, text });
 		}
 	} catch {
 		// No branch in an isolated context: no user channel to read.
 	}
-	return undefined;
+	return messages;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -5474,7 +5469,7 @@ export default function (pi: ExtensionAPI) {
 		},
 		unsafe: {
 			headline: "classified unsafe",
-			next: "Choose a safer action, or explain the action and ask the user in chat whether to proceed. If they say yes, retry: the classifier reads their words.",
+			next: "Choose a safer action, or explain the action and ask the user in chat whether to proceed. A retry runs only if their reply names this command's target (the file, branch or deploy) and the classifier then judges it safe; otherwise ask them to run the command themselves.",
 			notThis: NO_DISGUISE,
 		},
 		unsure: {
@@ -5489,7 +5484,7 @@ export default function (pi: ExtensionAPI) {
 		},
 		"prior-refusal": {
 			headline: "prior refusal",
-			next: "This target was refused earlier in the session. Ask the user in chat whether to proceed. Once they answer, retry: a safe verdict their words authorize lifts the refusal.",
+			next: "This target was refused earlier in the session (why names the source). A critical or cap refusal never runs through the agent: ask the user to run the command themselves. After a model refusal, ask the user in chat; the command runs on a retry only when their reply names its target (the file, branch or deploy) and the classifier judges it safe.",
 			notThis: NO_DISGUISE,
 		},
 	};
@@ -5864,7 +5859,7 @@ export default function (pi: ExtensionAPI) {
 			// Refusal memory (issue #30): a reworded payload meets its session's
 			// prior refusal. The record tells the model; the SAFE branch below
 			// stops trusting a bare SAFE for a refused target.
-			const prior = priorRefusalFor(ctx, evalCode, cwd, reviewEvidenceFingerprint);
+			const prior = priorRefusalFor(ctx, evalCode, cwd);
 			const recordExtras: Record<string, unknown> = {
 				// The judge is told which directory the payload named for itself,
 				// because `cwd` arrives as the working directory and a spawn's own
@@ -5897,22 +5892,20 @@ export default function (pi: ExtensionAPI) {
 					// A real destructive verb reads as a call or an argument
 					// (`rm -rf`, spawn(["rm", …])) and never as `token =`.
 					const flagList = evalRiskFlags(evalCode);
-					const lifts = prior !== undefined && priorRefusalLifts(prior, judgement, newestUserId);
 					const replay = replayDecision({
 						tool: "eval",
 						command: evalCode,
 						cwd,
 						judgement,
-						priorRefusal: prior !== undefined && !lifts,
+						// Eval code has no shell for literalMatch to read, so an
+						// eval refusal never yields (priorRefusalLifts).
+						priorRefusal: prior !== undefined,
 						riskFlags: flagList,
 					});
 					if (replay.decision === "allow") {
-						// The user spoke after the refusal and the verdict reads their
-						// words as authorization: the refusal is lifted for good.
-						if (prior !== undefined) liftRefusals(ctx, evalCode, cwd);
 						// Fresh SAFE auto-run logs layer "verdict"; a replayed cached
 						// verdict logs "cached" — provenance, same allow.
-						logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", ...lead, why: prior === undefined ? judgement.reason : `${judgement.reason} (lifts the refusal of "${prior.loggableTarget}")`, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
+						logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", ...lead, why: judgement.reason, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
 						return;
 					}
 					// A SAFE on a target this session already refused is not a
@@ -5924,7 +5917,7 @@ export default function (pi: ExtensionAPI) {
 					const why =
 						flagList.length > 0
 							? `classifier-safe but flags: ${flagList.join(", ")}`
-							: `classifier-safe despite prior refusal of "${prior?.loggableTarget ?? ""}"`;
+							: `classifier-safe despite prior ${prior?.source ?? ""} refusal of "${prior?.loggableTarget ?? ""}"`;
 					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", ...lead, why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
 					return refuse(ctx, target, flagList.length > 0 ? "flagged" : "prior-refusal", why, "eval", "follows verdict", { ...auditFields(), ...judgementAudit(judgement), ...spawnField, verdict: "SAFE", ...follows });
 				}
@@ -5955,7 +5948,7 @@ export default function (pi: ExtensionAPI) {
 				// undecided, and UNAVAILABLE judged nothing at all (a transport
 				// failure is not evidence about the command).
 				if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
-					addRefusal(ctx, evalCode, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint, userMessageId: newestUserId });
+					addRefusal(ctx, evalCode, judgement.reason, { source: "model", cwd, userMessageId: newestUserId });
 				}
 				return refuse(ctx, target, cause, judgement.reason, "eval", "follows verdict", {
 					...auditFields(),
@@ -6189,7 +6182,7 @@ export default function (pi: ExtensionAPI) {
 			// prior refusal. The record tells the model; the SAFE branch below
 			// stops trusting a bare SAFE for a refused target. Computed before
 			// the cache lookup so a cached SAFE cannot outvote a newer refusal.
-			const prior = priorRefusalFor(ctx, judgedCommand, cwd, reviewEvidenceFingerprint);
+			const prior = priorRefusalFor(ctx, judgedCommand, cwd);
 			const recordExtras: Record<string, unknown> = prior
 				? { priorRefusal: { target: prior.normalizedTarget, why: prior.why, when: new Date(prior.ts).toISOString() } }
 				: {};
@@ -6369,7 +6362,9 @@ export default function (pi: ExtensionAPI) {
 				for (const body of script.bodies) {
 					if (INTERPRETER_CODE_RISK.test(body.body)) flags.push(`${body.verb} runs ${body.operand}`);
 				}
-				const lifts = prior !== undefined && priorRefusalLifts(prior, judgement, newestUserId);
+				const lifts =
+					prior !== undefined &&
+					priorRefusalLifts(prior, judgement, judgedCommand, cwd, userMessagesSince(ctx, prior.userMessageId).map(message => message.text));
 				const replay = replayDecision({
 					tool: "bash",
 					command: judgedCommand,
@@ -6379,10 +6374,9 @@ export default function (pi: ExtensionAPI) {
 					riskFlags: flags,
 				});
 				if (replay.decision === "allow") {
-					// The user spoke after the refusal and the verdict reads their
-					// words as authorization: the refusal is lifted for good.
-					if (prior !== undefined) liftRefusals(ctx, judgedCommand, cwd);
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", ...lead, why: prior === undefined ? judgement.reason : `${judgement.reason} (lifts the refusal of "${prior.loggableTarget}")`, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
+					// A lift runs this call only: the record stays, and the next
+					// call meets the same check.
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", ...lead, why: prior === undefined ? judgement.reason : `${judgement.reason} (runs past the refusal of "${prior.loggableTarget}": the user named it since)`, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
 					return;
 				}
 				// A SAFE on a target this session already refused is not a clean
@@ -6394,7 +6388,7 @@ export default function (pi: ExtensionAPI) {
 				const why =
 					flags.length > 0
 						? `classifier-safe but flags: ${flags.join(", ")}`
-						: `classifier-safe despite prior refusal of "${priorTarget}"`;
+						: `classifier-safe despite prior ${prior?.source ?? ""} refusal of "${priorTarget}"`;
 				const foot = trashFootnote(flags);
 				const agentWhy = foot === "" ? why : `${why}\n${foot}`;
 				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", ...lead, why, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
@@ -6430,7 +6424,7 @@ export default function (pi: ExtensionAPI) {
 			// undecided, and UNAVAILABLE judged nothing at all (a transport
 			// failure is not evidence about the command).
 			if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
-				addRefusal(ctx, judgedCommand, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint, userMessageId: newestUserId });
+				addRefusal(ctx, judgedCommand, judgement.reason, { source: "model", cwd, userMessageId: newestUserId });
 			}
 			return refuse(ctx, target, cause, judgement.reason, "bash", "follows verdict", {
 				...auditFields(),
