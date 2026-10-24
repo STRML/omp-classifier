@@ -77,7 +77,7 @@ async function settle(turns = 20): Promise<void> {
 }
 
 /** Track every timer armed while `body` runs and whether a clear reached it. */
-async function withTimerLedger(body: (armed: Array<{ handle: unknown; ms: number | undefined; cleared: boolean }>) => Promise<void>): Promise<void> {
+async function withTimerRecord(body: (armed: Array<{ handle: unknown; ms: number | undefined; cleared: boolean }>) => Promise<void>): Promise<void> {
 	const armed: Array<{ handle: unknown; ms: number | undefined; cleared: boolean }> = [];
 	const fakeSetTimeout = globalThis.setTimeout;
 	const fakeClearTimeout = globalThis.clearTimeout;
@@ -154,7 +154,7 @@ describe("the judgment deadline", () => {
 		await loadPlugin(makeSettings([]));
 		setJevDelay(5);
 		setJevAnswer(jevSafeAnswer());
-		await withTimerLedger(async armed => {
+		await withTimerRecord(async armed => {
 			const tool = fire("tool_call", makeEvent(`git status --in-time-${seq}`), makeCtx({ sessionId: `in-time-${seq}` }));
 			await until(() => modelCalls.length > 0);
 			jest.advanceTimersByTime(10);
@@ -173,7 +173,7 @@ describe("the judgment deadline", () => {
 		await loadPlugin(makeSettings([]));
 		setJevDelay(LATE_ANSWER_MS);
 		setJevAnswer(jevSafeAnswer());
-		await withTimerLedger(async armed => {
+		await withTimerRecord(async armed => {
 			const tool = fire("tool_call", makeEvent(`git status --no-window-${seq}`), makeCtx({ sessionId: `no-window-${seq}` }));
 			await until(() => modelCalls.length > 0);
 			jest.advanceTimersByTime(DEADLINE_MS + 5);
