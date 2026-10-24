@@ -5,7 +5,7 @@
 ```
 buildJevState ─► state ─┐
 jevQuestions  ─► battery┴► judgeBattery (jev-judge) ─► JevAnswers ─► deriveJevDecision ─► JevDecision
-                             └ judgeBatteryUnderDeadline (deadline race, late answers)       (live, jev-v2.18)
+                             └ judgeBatteryUnderDeadline (deadline aborts the request)       (live, jev-v2.18)
 shadow: judgeJevV3 = jev-v3.8 battery ∥ judgeAuthorization ─► deriveAuthorization
         ─► deriveDecisionOrder(risk, authorization, literalMatch, overlay, headless) ─► OrderedDecision
 ```
@@ -26,8 +26,8 @@ shadow: judgeJevV3 = jev-v3.8 battery ∥ judgeAuthorization ─► deriveAuthor
 | `jevQuestionsHash(version)` | 526 | fn | index `CLASSIFIER_POLICY_HASH`, eval/run |
 | `measureGitPushProvenance(cmd, cwd)` | 744 | fn | index `classify` + bash/eval cache key |
 | `measureNetworkProvenance(cmd, cwd, sources?)` | 1593 | fn | same |
-| `measureLookalikeDestinations(cmd, userMessages)` | 1817 | fn, pure | `buildJevState` (#161) |
-| `lookalikeDestinationFlags(cmd, userMessages)` | 1841 | fn, pure | index bash/eval SAFE + late overlay, eval/run `riskFlagsFor` |
+| `measureLookalikeDestinations(cmd, userMessages)` | 1925 | fn, pure | `buildJevState` (#161) |
+| `lookalikeDestinationFlags(cmd, userMessages)` | 1949 | fn, pure | index bash/eval SAFE overlay, eval/run `riskFlagsFor` |
 | `measureGitWorktreeProvenance(cwd)` | 1758 | fn | same |
 | `measureGitRefProvenance(cmd, cwd)` | 2260 | fn | same |
 | `measureDeleteTargets(cmd, startCwd, roots?)` | 2426 | fn | index `classify` (shell only) + bash cache key (#166) |
@@ -87,7 +87,7 @@ Every hazard ≥ `hazardReview` (descriptive included) lands in `decision.hazard
 | `judgeBackendFor(config)` | 245 | → `{id, judge()}`; id joins signature + cache key | index, internal |
 | `noFollowFetch` | 291 | forces `redirect:"manual"` for the endpoint kind | `endpointBackend` |
 | `judgeBattery(signal, opts)` | 354 | one call; `toJevAnswers` validates every field | eval/run, internal |
-| `judgeBatteryUnderDeadline(opts)` | 419 | → `answered` / `failed` / `deadline{late}`; listens `min(2×timeout, 30s)` | index `classify` |
+| `judgeBatteryUnderDeadline(opts)` | 388 | → `answered` / `failed` / `deadline`; the deadline aborts the request | index `classify` |
 | `judgeAuthorization(signal, opts)` | 490 | authorization question over a separate state | `judgeJevV3` |
 | `judgeJevV3(signal, opts)` | 521 | v3 risk ∥ authorization; an authorization failure → `undefined` | index `shadowJevV3` |
 

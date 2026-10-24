@@ -137,7 +137,7 @@ function outcomeOf(line: DecisionRecord): LogOutcome {
 	}
 	if (line.verdict === "UNAVAILABLE") return "unavailable";
 	if (line.decision === "block") return "blocked-static";
-	// An allow from any other layer — a static rule, a grant, the cache, an
+	// An allow from any other layer — a static rule, the cache, an
 	// approved dialog — is still the gate's own answer that this runs.
 	return line.layer === "verdict" ? "auto-allowed" : "allowed-by-layer";
 }

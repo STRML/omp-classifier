@@ -211,10 +211,9 @@ export interface CapturedJevRequest {
 	/** HTTP headers, lower-cased. Present only when the firewall below carried
 	 *  the judgement; the judge seam has no headers to show. */
 	headers?: Record<string, string>;
-	/** The signal the gate handed the request (issue #62). Its abort state is
-	 *  how a test observes that the gate STOPPED listening — a cancelled
-	 *  judgment, or one whose late window closed — because a request that is
-	 *  no longer wanted leaves no other trace. */
+	/** The signal the gate handed the request. Its abort state is how a test
+	 *  observes that the deadline aborted the request, because a request that
+	 *  is no longer wanted leaves no other trace. */
 	signal?: AbortSignal;
 }
 
@@ -568,8 +567,8 @@ export function questionsOf(index = 0): Record<string, unknown> {
 	return call.questions;
 }
 
-/** The signal one captured judgement was made under (issue #62). Aborted means
- *  the gate stopped listening — the human answered, or the late window closed. */
+/** The signal one captured judgement was made under. Aborted means the
+ *  deadline fired and the gate stopped waiting. */
 export function signalOf(index = 0): AbortSignal | undefined {
 	const call = modelCalls[index];
 	if (!call) throw new Error(`no captured Jev judgement at index ${index}`);
@@ -710,12 +709,8 @@ export interface CtxOptions {
 	artifactsDir?: string;
 }
 
-/** The labels the plugin's permission dialog offers. "Always allow" is
- *  bash-only and kill-switchable (persistentGrants config key); "Allow for
- *  session" needs a strict grant key (issue #32). */
+/** The labels the plugin's permission dialog offers. */
 export const ALLOW_ONCE = "Allow once";
-export const ALLOW_SESSION = "Allow for session";
-export const ALWAYS_ALLOW = "Always allow";
 export const DENY = "Deny";
 
 let sessionSeq = 0;

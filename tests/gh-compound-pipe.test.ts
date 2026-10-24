@@ -59,7 +59,7 @@ describe("the reported compound shapes run through the live gate", () => {
 			expect(await gate(command)).toBe("ALLOWED");
 			// The decision came from the jev battery, not a static clear: the
 			// gate asked the judge (the SAFE branch is the only path to ALLOWED
-			// here — no allow rule, grant, or carve-out exists for `rtk proxy`)
+			// here — no allow rule or carve-out exists for `rtk proxy`)
 			// and the battery carried both network questions so a low-egress
 			// answer is a real answer, not a missing one.
 			expect(modelCalls.length - before).toBe(1);

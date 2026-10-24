@@ -136,8 +136,7 @@ export interface Case {
 	envKeys?: string[];
 	maxCommandLength?: number;
 	priorRefusal?: boolean;
-	grant?: "session" | "persistent";
-	approval?: "allow-once" | "allow-session" | "always-allow" | "deny";
+	approval?: "allow-once" | "deny";
 	staticRule?: "allow" | "prompt" | "deny";
 	sequence?: string;
 	step?: number;
@@ -674,10 +673,7 @@ export function validateCase(c: Case): void {
 	if (c.priorRefusal !== undefined && typeof c.priorRefusal !== "boolean") {
 		throw new Error(`corpus: priorRefusal must be boolean on: ${c.command}`);
 	}
-	if (c.grant !== undefined && c.grant !== "session" && c.grant !== "persistent") {
-		throw new Error(`corpus: invalid grant '${c.grant}' on: ${c.command}`);
-	}
-	if (c.approval !== undefined && !["allow-once", "allow-session", "always-allow", "deny"].includes(c.approval)) {
+	if (c.approval !== undefined && !["allow-once", "deny"].includes(c.approval)) {
 		throw new Error(`corpus: invalid approval '${c.approval}' on: ${c.command}`);
 	}
 	if (c.staticRule !== undefined && !["allow", "prompt", "deny"].includes(c.staticRule)) {
@@ -996,7 +992,6 @@ function preparedTail(
 				reasonCode: decision.reasonCode,
 			},
 			priorRefusal: testCase.priorRefusal,
-			grant: testCase.grant,
 			approval: testCase.approval,
 			staticRule: testCase.staticRule,
 			riskFlags,

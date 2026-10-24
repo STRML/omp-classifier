@@ -13,7 +13,6 @@ import * as path from "node:path";
 import { evalSpawnCwd, evalSubprocessMarkers } from "../index";
 import type { DecisionRecord } from "../index";
 import {
-	ALLOW_SESSION,
 	DENY,
 	dialogText,
 	fire,
@@ -26,7 +25,6 @@ import {
 	removeConfigFile,
 	refusalOf,
 	resultText,
-	selectCalls,
 	setJevAnswer,
 	stateOf,
 	writeConfigFile,
@@ -551,50 +549,4 @@ describe("eval spawn cwd (issue #14)", () => {
 		expect(lines[1]).toMatchObject({ decision: "block", layer: "headless" });
 	});
 
-	test("a session grant covers the two directories the dialog showed, and only those", async () => {
-		setJevAnswer(jevSafeAnswer());
-		const sessionId = `eval-grant-scope-${seq}`;
-		const code = `const cp = require("child_process");\ncp.exec("rm -rf .", { cwd: "/tmp/granted" });`;
-		// The dialog names both directories the grant covers: the payload's own
-		// spawn directory, and the session's — where the payload's relative work
-		// still lands.
-		const a = fresh({ sessionId, cwd: "/workspace/a", hasUI: true, selectResult: ALLOW_SESSION });
-		expect(await fire("tool_call", evalEvent(code, "js"), a)).toBeUndefined();
-		expect(dialogText(a)).toContain("working directory: /tmp/granted (declared by the payload's spawn call)");
-		expect(dialogText(a)).toContain("session directory: /workspace/a");
-		expect(selectCalls(a)[0][1].find(item => item.label === ALLOW_SESSION)?.description).toBe(
-			"This action, in both directories above, for the rest of the session",
-		);
-		expect(modelCalls.length).toBe(1);
-		// Same workspace, same payload: the grant answers for the session, with
-		// no dialog and no model call.
-		const again = fresh({ sessionId, cwd: "/workspace/a", hasUI: true, selectResult: DENY });
-		expect(await fire("tool_call", evalEvent(code, "js"), again)).toBeUndefined();
-		expect(selectCalls(again)).toHaveLength(0);
-		expect(modelCalls.length).toBe(1);
-		// The session moved (`/move` rewrites ctx.cwd) to another workspace while
-		// this payload declares its own absolute spawn directory, so nothing but
-		// the session's directory changed — and that directory is one the human
-		// never saw when they granted. The relative `rm -rf .` would now run in
-		// /workspace/b, so the grant must not answer for it.
-		const b = fresh({ sessionId, cwd: "/workspace/b", hasUI: true, selectResult: DENY });
-		const blocked = await fire("tool_call", evalEvent(code, "js"), b);
-		expect(refusalOf(blocked).layer).toBe("dialog");
-		expect(selectCalls(b)).toHaveLength(1);
-		expect(modelCalls.length).toBe(2);
-	});
-
-	test("the ask for an unreadable spawn cwd offers no grant", async () => {
-		setJevAnswer(jevSafeAnswer());
-		const ctx = fresh({ hasUI: true, selectResult: DENY });
-		const code = `const cp = require("child_process");\ncp.exec("echo hi", { cwd: process.env.TARGET });`;
-		await fire("tool_call", evalEvent(code, "js"), ctx);
-		const labels = selectCalls(ctx)[0][1].map(item => item.label);
-		expect(labels).toContain("Allow once");
-		expect(labels).toContain("Deny");
-		// A grant names a directory, and this payload's directory was never
-		// readable, so the dialog offers no scope the gate could not honor.
-		expect(labels).not.toContain("Allow for session");
-		expect(labels).not.toContain("Always allow");
-	});
 });
