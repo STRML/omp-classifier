@@ -1,19 +1,17 @@
 /**
  * Refusal memory across rewording (issue #30): a command this session refused
- * — an UNSAFE verdict, a human denial, a critical pattern, a cap — is
- * remembered by normalizeActionTarget, the strict action identity
- * (issue #64: refusal memory keyed by the first two words made `ssh <host>`
- * one session-length trip wire), injected into the next state as
- * priorRefusal, and a SAFE that lands anyway on a refused target still prompts.
- * A user approval lifts the memory; the store holds 20 targets per session,
+ * — an UNSAFE verdict, a critical pattern, a cap — is remembered by
+ * normalizeActionTarget, the strict action identity (issue #64: refusal memory
+ * keyed by the first two words made `ssh <host>` one session-length trip
+ * wire), injected into the next state as priorRefusal, and a SAFE that lands
+ * anyway on a refused target still blocks. The user's own words lift it
+ * (tests/never-prompts.test.ts); the store holds 20 targets per session,
  * oldest dropped.
  *
  * The trigger moved with the port: a text judge's refusal-shaped prose no
  * longer exists, so memory keys off the VERDICT. UNSAFE is the only verdict
  * that both judged the content and said no — UNSURE is undecided, and
  * UNAVAILABLE judged nothing at all, so neither is evidence about the command.
- * A human denial of an undecided command is still a refusal, and the dialog
- * path records that itself.
  *
  * Unique sessions per test — the module-level refusal store outlives a test.
  */
@@ -24,9 +22,6 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { normalizeActionTarget } from "../index";
 import type { DecisionRecord } from "../index";
 import {
-	selectCalls,
-	ALLOW_ONCE,
-	DENY,
 	fire,
 	jevSafeAnswer,
 	jevUnsureAnswer,
@@ -209,19 +204,17 @@ describe("refusal memory", () => {
 		expect(priorRefusalOf(1)).toBeUndefined();
 	});
 
-	test("a SAFE that lands despite a prior refusal still prompts", async () => {
+	test("a SAFE that lands despite a prior refusal still blocks", async () => {
 		const sid = nextSession();
-		const ctx = makeCtx({ sessionId: sid, hasUI: true, selectResult: DENY });
+		const ctx = makeCtx({ sessionId: sid, hasUI: true });
 		setJevAnswer(jevUnsafeAnswer());
 		await fire("tool_call", makeEvent("echo bye"), ctx);
 		// echo is not a moderate-risk token, so without the refusal memory a
-		// SAFE here would auto-run; the dialog proves the refusal decided.
+		// SAFE here would auto-run; the block proves the refusal decided.
 		setJevAnswer(jevSafeAnswer());
 		const result = await fire("tool_call", makeEvent("echo bye again"), ctx);
-		expect(selectCalls(ctx).length).toBe(2);
-		const payload = JSON.parse((result as { block: true; reason: string }).reason) as { layer: string };
-		expect(payload.layer).toBe("dialog");
-		expect(readDecisions().some(line => line.why.startsWith("despite prior refusal"))).toBe(true);
+		expect(refusalOf(result).layer).toBe("prior-refusal");
+		expect(readDecisions().some(line => line.why.includes("despite prior refusal"))).toBe(true);
 	});
 
 	test("machine refusals are scoped to the reviewed directory", async () => {
@@ -234,42 +227,28 @@ describe("refusal memory", () => {
 		const elsewhere = makeCtx({ sessionId: sid, cwd: "/elsewhere" });
 		const result = await fire("tool_call", makeEvent("cd /elsewhere && git diff --stat"), elsewhere);
 		expect(result).toBeUndefined();
-		expect(selectCalls(elsewhere)).toHaveLength(0);
 		expect(modelCalls.length).toBe(2);
 	});
 
-	test("approval in one directory does not erase a refusal in another", async () => {
+	test("a lift in one directory does not erase a refusal in another", async () => {
 		const sid = nextSession();
-		setJevAnswer(jevUnsafeAnswer());
-		await fire("tool_call", makeEvent("git diff --stat"), makeCtx({ sessionId: sid, cwd: "/workspace" }));
+		const userEntry = (id: string, content: string) => ({ type: "message", id, message: { role: "user", attribution: "user", content } });
+		const before = [userEntry("u1", "summarize the notes")];
+		// The length cap refuses `cat notes.txt x x …` under the key `cat notes.txt`.
+		const long = `cat notes.txt ${"x ".repeat(4100)}`;
+		await fire("tool_call", makeEvent(long), makeCtx({ sessionId: sid, cwd: "/workspace", hasUI: true, branch: before }));
+		await fire("tool_call", makeEvent(long), makeCtx({ sessionId: sid, cwd: "/elsewhere", hasUI: true, branch: before }));
 
-		const elsewhereDenied = makeCtx({ sessionId: sid, cwd: "/elsewhere", hasUI: true, selectResult: DENY });
-		await fire("tool_call", makeEvent("git diff --stat"), elsewhereDenied);
 		setJevAnswer(jevSafeAnswer());
-		const elsewhere = makeCtx({ sessionId: sid, cwd: "/elsewhere", hasUI: true, selectResult: ALLOW_ONCE });
-		expect(await fire("tool_call", makeEvent("cd /elsewhere && git diff --stat"), elsewhere)).toBeUndefined();
+		const after = [...before, userEntry("u2", "yes, cat notes.txt")];
+		const lifted = makeCtx({ sessionId: sid, cwd: "/elsewhere", hasUI: true, branch: after });
+		expect(await fire("tool_call", makeEvent("cat notes.txt"), lifted)).toBeUndefined();
 
-		const original = makeCtx({ sessionId: sid, cwd: "/workspace", hasUI: true });
-		const result = await fire("tool_call", makeEvent("cd /workspace && git diff --stat"), original);
-		expect(refusalOf(result).layer).toBe("dialog");
-	});
-
-	test("user approval lifts the refusal for the target", async () => {
-		const sid = nextSession();
-		setJevAnswer(jevUnsafeAnswer());
-		await fire("tool_call", makeEvent("rm -rf x"), makeCtx({ sessionId: sid, hasUI: true }));
-		setJevAnswer(jevSafeAnswer());
-		const approved = await fire(
-			"tool_call",
-			makeEvent("rm -rf ./x"),
-			makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_ONCE }),
-		);
-		expect(approved).toBeUndefined();
-		// A same-target rewording, not a different action: under the action
-		// identity `rm -r x` is its own target, so it could not show the lift.
-		await fire("tool_call", makeEvent("rm -f -r ./x"), makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_ONCE }));
-		expect(modelCalls.length).toBe(3);
-		expect(priorRefusalOf(2)).toBeUndefined();
+		// The refusal in /workspace was not touched: it still rides into the
+		// state the judge sees there.
+		const original = makeCtx({ sessionId: sid, cwd: "/workspace", hasUI: true, branch: after });
+		await fire("tool_call", makeEvent("cat notes.txt"), original);
+		expect(priorRefusalOf(modelCalls.length - 1)?.target).toBe("cat notes.txt");
 	});
 
 	test("store caps at 20 per session and drops the oldest", async () => {
@@ -306,7 +285,6 @@ describe("refusal identity at the gate (issue #64)", () => {
 		const result = await fire("tool_call", makeEvent("ssh raw-ovh 'ls /tmp'"), readOnly);
 		expect(priorRefusalOf(1)).toBeUndefined();
 		expect(result).toBeUndefined();
-		expect(selectCalls(readOnly)).toHaveLength(0);
 	});
 
 	test("a refused container write does not refuse a read-only probe of it", async () => {
@@ -323,7 +301,6 @@ describe("refusal identity at the gate (issue #64)", () => {
 		const result = await fire("tool_call", makeEvent("docker exec raw_wordpress php -r 'var_dump(get_option(\"siteurl\"));'"), probe);
 		expect(priorRefusalOf(1)).toBeUndefined();
 		expect(result).toBeUndefined();
-		expect(selectCalls(probe)).toHaveLength(0);
 	});
 
 	test("two hosts are two targets", async () => {
@@ -346,10 +323,10 @@ describe("refusal identity at the gate (issue #64)", () => {
 		setJevAnswer(jevSafeAnswer());
 		// The same command again; the run of spaces collapses in a shell.
 		const again = makeCtx({ sessionId: sid, hasUI: true });
-		await fire("tool_call", makeEvent("ssh raw-ovh  'wp db delete --all'"), again);
+		const result = await fire("tool_call", makeEvent("ssh raw-ovh  'wp db delete --all'"), again);
+		expect(refusalOf(result).layer).toBe("prior-refusal");
 		expect(priorRefusalOf(1)?.target).toBe("ssh --all' raw-ovh");
 		// The refusal rode in the state, and a SAFE verdict is not a clean bill.
-		expect(selectCalls(again)).toHaveLength(1);
 		expect(readDecisions().some(line => line.why.includes("prior refusal"))).toBe(true);
 	});
 
@@ -357,12 +334,10 @@ describe("refusal identity at the gate (issue #64)", () => {
 		const sid = nextSession();
 		const userEntry = (content: string) => ({ type: "message", message: { role: "user", attribution: "user", content } });
 		setJevAnswer(jevUnsafeAnswer());
-		await fire("tool_call", makeEvent("rm -rf x"), makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_ONCE, branch: [userEntry("wipe the scratch build")] }));
+		await fire("tool_call", makeEvent("rm -rf x"), makeCtx({ sessionId: sid, hasUI: true, branch: [userEntry("wipe the scratch build")] }));
 
 		setJevAnswer(jevSafeAnswer());
-		// Allow once keeps the refusal a model refusal: a denied dialog would
-		// record a human refusal, which stays sticky whatever the user says next.
-		const moved = makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_ONCE, branch: [userEntry("actually stop, keep the build")] });
+		const moved = makeCtx({ sessionId: sid, hasUI: true, branch: [userEntry("actually stop, keep the build")] });
 		await fire("tool_call", makeEvent("rm -rf x"), moved);
 		expect(priorRefusalOf(1)).toBeUndefined();
 	});

@@ -3,8 +3,11 @@
  *
  * Adds a model-judged permission gate to the native `bash` tool. Commands not
  * already decided by a static deny/prompt/narrow-allow rule get classified;
- * anything risky raises a real permission request instead of executing
- * silently. Trivial commands still run with no plugin prompt.
+ * anything risky is blocked with a structured reason the agent can act on.
+ * The gate never prompts the user
+ * (https://github.com/STRML/omp-classifier/issues/184): the agent rewords,
+ * picks a safer action, or asks the user in chat, and a later SAFE verdict
+ * reads the user's answer. Trivial commands run with no friction.
  *
  * Scope: this gates the `bash` tool, and `eval` payloads that spawn a process
  * (issue #23, posture A). Expression-only eval code — compute, parse, format,
@@ -17,9 +20,8 @@
  *   - `tool_call` interceptor, NOT tool shadowing. The native bash tool keeps
  *     its schema, description, approval declaration, and execution path; this
  *     plugin only sits in front of it. `tool_call` fires before the approval
- *     gate for model-issued calls, can block with a reason, and may await a
- *     human dialog (the runner pauses its handler budget across `ctx.ui`
- *     dialogs and fails closed on handler throw/timeout).
+ *     gate for model-issued calls and can block with a reason (the runner
+ *     fails closed on handler throw/timeout).
  *   - Native approval precedence is deny > CRITICAL > allow > prompt
  *     (tools/bash.ts:557-577), and a CRITICAL hit carries `override` with no
  *     policy, which `yolo` drops (tools/approval.ts:156-171). So a critical
@@ -27,7 +29,7 @@
  *     This plugin therefore checks critical patterns FIRST, in every approval
  *     mode, before honoring any allow/prompt rule.
  *       deny rule / user deny  -> native blocks it; plugin stays out.
- *       critical pattern       -> permission request, always, no model call.
+ *       critical pattern       -> blocked, always, no model call.
  *       `prompt` pattern rule   -> native force-prompts; plugin stays out.
  *       narrow `allow` rule     -> a considered user decision; plugin stays out.
  *       blanket `*`/`**` allow  -> the "run everything" setting; classified.
@@ -38,8 +40,8 @@
  *   - Anything that selects what actually executes is part of the identity of a
  *     judgement: command, native-resolved cwd, `env`, `pty`, timeout and async.
  *     A caller-supplied `env` (`PATH`, `BASH_ENV`, `LD_PRELOAD`, `GIT_PAGER`)
- *     is never classified — its values can hold secrets — it goes straight to a
- *     permission request.
+ *     is never classified — its values can hold secrets — so the call is
+ *     blocked.
  *   - Every gate decision appends one JSON line to
  *     <config root>/omp-classifier/decisions.jsonl (issue #33): tool,
  *     decision, layer, why, command, verdict, cache provenance, timing. The
@@ -63,7 +65,7 @@
  *     (`TYPESAFE_DEFAULT_MODEL` else `jev-latest`) hence belong to the host —
  *     the plugin passes a deadline and receives a probability vector, and
  *     every deterministic check that surrounded the old judge (static rules,
- *     moderate-risk tokens, the eval spawn scan, forced dialogs,
+ *     moderate-risk tokens, the eval spawn scan, forced blocks,
  *     refusal memory) is unchanged. Which transport answers is one seam
  *     (`JudgeBackend`, issue #84): the default is that host path, and the
  *     `judgeBackend` config key can point the gate at any server speaking the
@@ -74,12 +76,11 @@
  *
  * Fail-closed points: a command too long to display is blocked outright; an
  * `env` override and a judgment that fails, times out, or answers with a
- * shape we cannot read raise a permission request when a UI exists and block
- * when headless; any unexpected plugin throw always blocks. A command the gate
- * could not judge is never silently auto-run. A SAFE verdict alone is never
- * enough to auto-run a command carrying a destructive/irreversible token
- * (matchModerateRiskTokens): those raise a permission request even when the
- * judge said SAFE.
+ * shape we cannot read are blocked; any unexpected plugin throw blocks. A
+ * command the gate could not judge is never silently auto-run. A SAFE verdict
+ * alone is never enough to auto-run a command carrying a
+ * destructive/irreversible token (matchModerateRiskTokens): those block even
+ * when the judge said SAFE.
  */
 import * as fs from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
@@ -154,8 +155,10 @@ export type ShadowV3 = (
 	  }
 	| { error: string; ms: number }
 ) & {
-	/** The live jev-v2 verdict this shadow ran beside. A dialog line carries
-	 *  no verdict of its own, so this is how a report tells a denied dialog
+	/** The live jev-v2 verdict this shadow ran beside. Logs written before
+	 *  https://github.com/STRML/omp-classifier/issues/184 have dialog lines
+	 *  that carry no verdict of their own, so this is how a report tells a
+	 *  denied dialog
 	 *  that followed a real verdict from one that followed an outage. */
 	live?: JevVerdict;
 };
@@ -177,7 +180,7 @@ interface Judgement {
 	 * Jev telemetry for this decision, taken verbatim from the response: the
 	 * probability vector and confidence the verdict was derived from, the
 	 * hazard nouls, the blast-radius score, token usage, and measured latency.
-	 * Kept because Jev returns no prose of its own — without this, a dialog or
+	 * Kept because Jev returns no prose of its own — without this, a refusal or
 	 * an audit line would have nothing to show about why a verdict landed
 	 * where it did.
 	 */
@@ -192,7 +195,7 @@ interface Judgement {
 	};
 	/**
 	 * Set when the verdict is UNAVAILABLE for a transport or answer-shape
-	 * failure: dialog, never cached, so one failed request cannot pin the
+	 * failure: blocked, never cached, so one failed request cannot pin the
 	 * session to a stale non-answer.
 	 */
 	noCache?: boolean;
@@ -204,7 +207,7 @@ interface Judgement {
 }
 
 /** A cached judgement minus its shadow. The shadow ran for the call that
- *  filled the cache; carried onto a later call's dialog line it would read as
+ *  filled the cache; carried onto a later call's blocked line it would read as
  *  a fresh shadow result for a call that asked nothing. */
 function withoutShadow(judgement: Judgement): Judgement {
 	const { v3: _shadow, ...rest } = judgement;
@@ -221,6 +224,20 @@ function judgementAudit(judgement: Judgement): Pick<DecisionRecord, "authorizati
 	};
 }
 
+/** Every way the gate blocks a judged call, as the refusal payload's `layer`. */
+type RefusalCause = "critical" | "environment" | "cwd" | "unclassified" | "unavailable" | "unsafe" | "unsure" | "flagged" | "prior-refusal";
+
+/** The cause a non-SAFE verdict blocks under. */
+const VERDICT_CAUSE: Record<Exclude<Verdict, "SAFE">, RefusalCause> = {
+	UNSAFE: "unsafe",
+	UNSURE: "unsure",
+	UNAVAILABLE: "unavailable",
+};
+
+const UNAVAILABLE_NEXT =
+	"Tell the user the classifier is unavailable (why says why) and retry once it recovers. The user can pause the gate for this session with /classifier off.";
+const NO_DISGUISE = "Do not retry the same command unchanged, and do not disguise the action to get a different verdict.";
+
 /** Per-session cache: sessionId -> `${cwd}\0${env}\0${pty}\0${command}` -> judgement. */
 const cache = new Map<string, Map<string, Judgement>>();
 // Effective-config signature of the last gate run. The classifier config
@@ -234,15 +251,16 @@ let classifierConfigSignature = "";
 // Stale-code guard: OMP binds plugin code at session start, so a fix landing
 // mid-session stays invisible to running sessions — the exact multi-day
 // confusion behind the pre-carve-out egress dialogs of Sep 9-10. The load
-// mtime is captured once at module load (= session start); dialogs and
-// blocks pay one stat to flag a session whose on-disk plugin is newer.
+// mtime is captured once at module load (= session start); every block pays
+// one stat to flag a session whose on-disk plugin is newer (`staleCode`).
 const PLUGIN_FILE = new URL(import.meta.url).pathname;
 const PLUGIN_LOAD_MTIME = fs.statSync(PLUGIN_FILE, { throwIfNoEntry: false })?.mtimeMs ?? 0;
 export const STALE_CODE_SUFFIX = " (plugin code changed since session start; restart to pick up fixes)";
 
 /**
- * The dialog subtitle suffix for a session whose plugin file changed on disk
- * since it loaded. Exported as the test seam for the mtime comparison.
+ * The stale-code marker for a session whose plugin file changed on disk since
+ * it loaded; a non-empty result sets `staleCode` on the audit line. Exported
+ * as the test seam for the mtime comparison.
  */
 export function pluginStaleSuffix(loadedMtimeMs: number, onDiskMtimeMs: number | undefined): string {
 	return onDiskMtimeMs !== undefined && onDiskMtimeMs > loadedMtimeMs ? STALE_CODE_SUFFIX : "";
@@ -256,16 +274,20 @@ const CACHE_CAP = 500;
 /** Per-session refusal memory (issue #30): sessionId -> refusals, oldest first. */
 interface Refusal {
 	normalizedTarget: string;
-	/** The target as text for a log or a dialog: normalized from the REDACTED
+	/** The target as text for a log or a refusal: normalized from the REDACTED
 	 *  command, because normalization reorders arguments and would separate a
 	 *  secret from the flag that names it. Never use normalizedTarget as text. */
 	loggableTarget: string;
 	why: string;
 	ts: number;
 	/** Refusals are not interchangeable: a model judgment is revisitable when
-	 *  the reviewed context changes, while a human denial remains a deliberate
-	 *  stop until the user explicitly approves. */
-	source: "human" | "model" | "critical" | "cap";
+	 *  the reviewed context changes, while a critical-pattern or cap refusal
+	 *  stays until the user lifts it in chat. */
+	source: "model" | "critical" | "cap";
+	/** The newest user message in the session when the refusal was written.
+	 *  A lift needs a user message newer than this one: the user has to have
+	 *  said something after the refusal (`priorRefusalLifts`). */
+	userMessageId?: string;
 	/** A refusal only applies to the directory whose effects were reviewed. */
 	cwd: string;
 	/** Evidence context at the time of a model judgment. */
@@ -294,7 +316,7 @@ const sessionOff = new Set<string>();
  *  fires the real tool_call handler once, and reads back what it recorded.
  *  While set, the gate's decision choke points record the FIRST decision they
  *  reach instead of acting on it — no decisions.jsonl write, no refusal
- *  store mutation, no cache write, no model call, no dialog — and
+ *  store mutation, no cache write, no model call — and
  *  dry-run clears the variable in a finally. Module-level on purpose: the
  *  alternative threads a flag through every hot-path decision site. The race
  *  window (a real bash call interleaving with a probe on the shared module
@@ -326,8 +348,7 @@ function recordDryRunResult(entry: DryRunResult): void {
  * (extensionHandlers.toolCallTimeoutMs) and a timeout fails closed, so the
  * default leaves the entire handler budget as slack. A larger timeoutMs is
  * legal (up to ~28s, past which the host budget bites first) but buys patience
- * on a slow network, never a better verdict. `/classifier` dialogs pause the
- * handler budget, so a human is never on this clock.
+ * on a slow network, never a better verdict.
  */
 const DEFAULT_TIMEOUT_MS = 8_000;
 const DEFAULT_MAX_COMMAND_LENGTH = 8_000;
@@ -350,67 +371,10 @@ interface BashApprovalPatternRule {
 // classify (and prompt for) commands the user already decided about.
 // ---------------------------------------------------------------------------
 
-/**
- * Characters that must never reach the dialog raw.
- *
- * C0 and DEL: the old body ran the command through JSON.stringify, which
- * incidentally escaped these; rendering raw does not. `\x1b[2J\x1b[H`, an SGR
- * run, or a bare carriage return can repaint or overwrite the approval dialog
- * while the command still executes in full.
- *
- * U+0085, U+2028, U+2029: the Markdown lexer treats these as line breaks but
- * `verbatim` split on "\n" only, so a command containing one escaped the code
- * block. The half before it disappeared from the token stream entirely and the
- * half after rendered as live Markdown. `rm -rf ~/data\u2028git status` showed
- * the user `git status` and ran the deletion. Not a regression (JSON.stringify
- * left them raw too) but this is where the helper and its invariant live.
- *
- * C1 (U+0080-U+009F): the 8-bit forms of the same escapes. U+009B IS a CSI, so
- * a raw U+009B followed by `2J` repaints the dialog on any terminal honoring
- * 8-bit C1 in UTF-8, which is xterm's default. Escaping ESC alone leaves that
- * open, which is why the class covers the whole range rather than U+0085 only.
- *
- * Bidi overrides and zero-width characters: pi-tui does not strip them, so an
- * RLO can display a command in an order it does not execute in. U+061C is the
- * Arabic-letter-mark sibling of the U+200E/200F pair.
- */
-const DIALOG_UNSAFE_CHARS =
-	/[\u0000-\u0009\u000B-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060-\u2064\u2066-\u2069\uFEFF]/gu;
-
-/**
- * The backslash is escaped FIRST, or the encoding is not injective: a command
- * carrying the four literal characters \x1b and one carrying a real ESC
- * rendered identically, so the dialog could not tell the reader which of the
- * two they were approving, and copying the displayed text got them a
- * different command than the one that executes.
- *
- * U+0009 joins the class because the Markdown renderer EXPANDS tabs, so a
- * command using them displayed as spaces and was not the command that runs.
- * Tabs are load-bearing in the constructs worth reviewing: a <<-EOF body
- * strips leading tabs and not spaces, and IFS, awk field separators and
- * Makefile recipe lines all depend on them.
- */
-function escapeControlChars(text: string): string {
-	return text.replace(/\\/gu, "\\\\").replace(DIALOG_UNSAFE_CHARS, ch => {
-		const code = ch.codePointAt(0) ?? 0;
-		return code > 0xff
-			? `\\u${code.toString(16).padStart(4, "0")}`
-			: `\\x${code.toString(16).padStart(2, "0")}`;
-	});
-}
-
-/** Four-space indent, so Markdown renders the span verbatim. */
-function verbatim(text: string): string {
-	return escapeControlChars(text)
-		.split("\n")
-		.map(line => `    ${line}`)
-		.join("\n");
-}
-
 /** Trailing-slash-insensitive directory comparison. Root stays "/". */
 function samePath(a: string, b: string | undefined): boolean {
 	// No .trim(): "/workspace " is a real and different directory on macOS and
-	// Linux, and trimming it made the dialog imply the command runs in the
+	// Linux, and trimming it would report the command as running in the
 	// session cwd when it does not. Trailing-slash insensitivity only.
 	const strip = (value: string | undefined): string => {
 		if (!value) return "";
@@ -903,24 +867,24 @@ function statusReportPath(): string {
 
 /** One decisions.jsonl line; the field order is the log contract (issue #33).
  *  `verdict` is null whenever no model verdict existed (static rules, caps,
- *  dialogs decided by a human); `ms` is wall-clock for the scope that logged
- *  the line (tool_call entry for gate lines, dialog entry for its outcome).
+ *  critical patterns); `ms` is wall-clock from tool_call entry for a lead
+ *  line, and 0 on the blocked line that follows it.
  *  `userMessageIds` and `authorization` (Phase 0 item 5) make a false
  *  positive auditable from the log alone: which user messages were in
  *  evidence for this tool call, and how the decision read them, without
  *  rebuilding the session transcript. There is no `branch`/decision-path
  *  field: `layer` already names the path that decided (critical,
- *  environment, rule, verdict, cached, unclassified, dialog,
- *  headless, cap, cwd, internal-error), so a second field would only
- *  duplicate it under different spelling. Logs written before
- *  https://github.com/STRML/omp-classifier/issues/184 also hold `granted` and
- *  `late-verdict` lines. */
+ *  environment, rule, verdict, cached, unclassified, blocked, cap, cwd,
+ *  script-body, internal-error), so a second field would only duplicate it
+ *  under different spelling. Logs written before
+ *  https://github.com/STRML/omp-classifier/issues/184 also hold `dialog`,
+ *  `headless`, `granted` and `late-verdict` lines and an `approval` field. */
 export interface DecisionRecord {
 	ts: string;
 	/** Unique line/action id for joining verdict and interaction entries. */
 	decisionId?: string;
-	/** The `decisionId` of the line that led to this one: set on every dialog,
-	 *  and headless line that follows a logged verdict, cwd,
+	/** The `decisionId` of the line that led to this one: set on every
+	 *  blocked line that follows a logged verdict, cwd,
 	 *  critical or environment line of the same tool call (spec step 0). An ask
 	 *  joins to what a human did next by id, not by session, command and time. */
 	followsDecisionId?: string;
@@ -937,19 +901,19 @@ export interface DecisionRecord {
 	reasonCode?: string;
 	/** Jev telemetry for the verdict on this line: the probability vector,
 	 *  hazard nouls, confidence, blast radius, usage and latency the decision
-	 *  was derived from. Absent on lines with no verdict (static rules, caps,
-	 *  dialogs decided by a human). */
+	 *  was derived from. Absent on lines with no verdict (static rules, caps)
+	 *  and on blocked lines, which follow the verdict line that carries it. */
 	jev?: Judgement["jev"];
 	/** Ids of the user messages that were in evidence for this tool call,
 	 *  taken verbatim from `UserEvidenceSnapshot.ids` (issue #31 plumbing).
 	 *  Ids only, never message text and never a hash of it — the log is an
 	 *  audit trail, not a second copy of the transcript. Present whenever the
 	 *  snapshot held at least one id, including every early return (critical
-	 *  pattern, env override, static rule, cap, refusal dialog) so a
+	 *  pattern, env override, static rule, cap) so a
 	 *  false positive can be traced to exactly what the gate saw. */
 	userMessageIds?: string[];
 	/** `Judgement.authorization` carried onto the line when a judgement
-	 *  existed for this decision (a verdict, or a dialog/headless outcome
+	 *  existed for this decision (a verdict, or the blocked line
 	 *  that followed one). Absent on lines with no judgement (critical, env,
 	 *  static rule, cap, unclassified). */
 	authorization?: Judgement["authorization"];
@@ -1463,7 +1427,7 @@ export function commandHasOutboundNetwork(command: string): boolean {
  * with /dev/null (and the fd aliases), /tmp and /var/tmp (both macOS and Linux
  * spellings) excluded — writing a log to /tmp is routine and must not ask.
  * Relative targets are inside cwd by definition, and anything this cannot
- * prove stays "inside": its consumer is the rm-family dialog shape, where a
+ * prove stays "inside": its consumer is the rm-family block shape, where a
  * wrong "outside" spends a human's attention on a routine deletion.
  */
 function writeTargetOutsideCwd(target: string, cwd: string): boolean {
@@ -1524,22 +1488,19 @@ export interface ReplayDecisionInput {
 	maxCommandLength?: number;
 	/** The model/post-parse result. Omitted means the model was unavailable. */
 	judgement?: Judgement;
-	/** A scoped machine refusal or prior human refusal applies. */
+	/** A prior refusal applies and this verdict did not lift it. */
 	priorRefusal?: boolean;
-	/** Optional simulated human outcome for evaluation/replay. */
-	approval?: "allow-once" | "deny";
 	/** Deterministic risk overlays discovered by the caller. */
 	riskFlags?: readonly string[];
 	/** Host-native static decision for a specific rule/approval pattern. */
 	staticRule?: "allow" | "prompt" | "deny";
-	headless?: boolean;
 }
 
 export interface ReplayDecision {
 	decision: "allow" | "block";
-	layer: "cap" | "critical" | "environment" | "rule" | "approval" | "verdict" | "unclassified";
+	layer: "cap" | "critical" | "environment" | "rule" | "verdict" | "unclassified";
 	/** What the host sees after the plugin returns. */
-	hostHandoff: "run" | "permission" | "headless-block";
+	hostHandoff: "run" | "block" | "host-prompt";
 	why: string;
 	}
 
@@ -1549,40 +1510,34 @@ export interface ReplayDecision {
 export function replayDecision(input: ReplayDecisionInput): ReplayDecision {
 	const limit = input.maxCommandLength ?? DEFAULT_MAX_COMMAND_LENGTH;
 	if (input.command.length > limit) {
-		return { decision: "block", layer: "cap", hostHandoff: "headless-block", why: `command exceeds ${limit}-character review limit` };
+		return { decision: "block", layer: "cap", hostHandoff: "block", why: `command exceeds ${limit}-character review limit` };
 	}
 	if (input.staticRule === "deny") {
-		return { decision: "block", layer: "rule", hostHandoff: "headless-block", why: "host static deny rule matched" };
+		return { decision: "block", layer: "rule", hostHandoff: "block", why: "host static deny rule matched" };
 	}
 	if (input.riskFlags?.includes("critical")) {
-		return { decision: "block", layer: "critical", hostHandoff: input.headless ? "headless-block" : "permission", why: "built-in critical pattern matched" };
+		return { decision: "block", layer: "critical", hostHandoff: "block", why: "built-in critical pattern matched" };
 	}
 	if ((input.envKeys?.length ?? 0) > 0) {
-		return { decision: "block", layer: "environment", hostHandoff: input.headless ? "headless-block" : "permission", why: "caller-supplied environment is not classified" };
+		return { decision: "block", layer: "environment", hostHandoff: "block", why: "caller-supplied environment is not classified" };
 	}
 	if (input.staticRule === "prompt") {
-		return { decision: "block", layer: "rule", hostHandoff: "permission", why: "host static prompt rule matched" };
+		return { decision: "block", layer: "rule", hostHandoff: "host-prompt", why: "host static prompt rule matched" };
 	}
 	if (input.staticRule === "allow") {
 		return { decision: "allow", layer: "rule", hostHandoff: "run", why: "host static allow rule matched" };
 	}
 	if (!input.judgement) {
-		if (input.approval && input.approval !== "deny" && !input.headless) {
-			return { decision: "allow", layer: "approval", hostHandoff: "run", why: `approved by user (${input.approval})` };
-		}
-		return { decision: "block", layer: "unclassified", hostHandoff: input.headless ? "headless-block" : "permission", why: "classifier unavailable" };
+		return { decision: "block", layer: "unclassified", hostHandoff: "block", why: "classifier unavailable" };
 	}
 	if (input.judgement.verdict === "SAFE" && !input.priorRefusal && (input.riskFlags?.length ?? 0) === 0) {
 		return { decision: "allow", layer: "verdict", hostHandoff: "run", why: input.judgement.reason };
 	}
-	if (input.approval && input.approval !== "deny" && !input.headless) {
-		return { decision: "allow", layer: "approval", hostHandoff: "run", why: `approved by user (${input.approval})` };
-	}
 	return {
 		decision: "block",
 		layer: "verdict",
-		hostHandoff: input.headless ? "headless-block" : "permission",
-		why: input.judgement.verdict === "SAFE" ? "safe verdict requires scoped approval" : input.judgement.reason,
+		hostHandoff: "block",
+		why: input.judgement.verdict === "SAFE" ? "safe verdict blocked by a flag or a prior refusal" : input.judgement.reason,
 	};
 }
 
@@ -1845,11 +1800,11 @@ function mergeOperatorContext(explicit: string | undefined, toolEvidence: string
 	return truncated(parts.join("\n"), OPERATOR_CONTEXT_MAX_CHARS + 2_500);
 }
 
-// Commands that stay in the forced-dialog set even on a classifier SAFE
+// Commands that stay in the forced-block set even on a classifier SAFE
 // verdict: raw disk/device writes (dd, ddrescue, shred, wipefs), privilege
 // elevation (sudo), dynamic evaluation (eval), and the shape-scoped rm
 // family (rm, unlink — see rmForcesDialog: recursion, globs, `..`, dotfiles
-// and provable outside-cwd targets force the dialog; plain named deletions
+// and provable outside-cwd targets force a block; plain named deletions
 // do not). Everything else this list used to carry — mv, chmod, chown,
 // chattr, truncate, tee, rmdir, curl, wget, git checkout pathspec restores —
 // is judged by the model alone ("classifiers are useless if we're just
@@ -2085,7 +2040,7 @@ const EVAL_SPAWN_MARKERS_RB_JL: Array<[RegExp, string]> = [
 // Shell tokenization does not apply to program text, so this is a plain scan
 // over the moderate-risk verbs minus "eval": the marker scan already routes
 // eval()/Function() payloads to the classifier, and flagging the token again
-// would dialog every benign dynamic-expression payload.
+// would block every benign dynamic-expression payload.
 const EVAL_CODE_FLAG_RE = new RegExp(
 	`\\b(?:${[...MODERATE_RISK_TOKENS].filter(t => t !== "eval").join("|")})\\b`,
 	"u",
@@ -2104,7 +2059,7 @@ export function evalRiskFlags(code: string): string[] {
 /**
  * Spawn/second-execution markers inside an eval payload. Empty array = the
  * payload is expression-only as far as this scan can tell, and the gate does
- * not tax it. Names are returned for the permission dialog and logs.
+ * not tax it. Names are returned for the refusal and logs.
  */
 export function evalSubprocessMarkers(code: string, language: string): string[] {
 	const scan = (table: Array<[RegExp, string]>): string[] => {
@@ -2119,7 +2074,7 @@ export function evalSubprocessMarkers(code: string, language: string): string[] 
 	if (language === "rb" || language === "jl") return scan(EVAL_SPAWN_MARKERS_RB_JL);
 	// Unknown or missing language: the payload reached us through a schema the
 	// model writes into, so do not trust the label. Scan the union — a false
-	// hit costs one dialog; a miss passes a spawn silently.
+	// hit costs one block; a miss passes a spawn silently.
 	const union = [...EVAL_SPAWN_MARKERS_JS, ...EVAL_SPAWN_MARKERS_RB_JL];
 	return scan(union);
 }
@@ -2164,7 +2119,7 @@ export function evalSubprocessMarkers(code: string, language: string): string[] 
  *  the session directory runs in two directories, and the scan has to see both
  *  to say so. Shapes that cannot name one (`os.system`, `pty.spawn`,
  *  `Function()`) are not sites: there is no directory argument to read, and
- *  listing every spawn marker here would dialog every payload that shells out
+ *  listing every spawn marker here would block every payload that shells out
  *  twice. */
 interface EvalCwdSite {
 	pattern: RegExp;
@@ -2314,7 +2269,7 @@ function scanValueEnd(masked: string, start: number, end: number): number {
 /** The directory text of a cwd argument, or null when it is not a plain string
  *  literal. Everything else — a variable, a call, an f-string, an interpolated
  *  Ruby string, a concatenation, a value with an escape this does not model —
- *  is unreadable on purpose: the caller turns that into a permission request
+ *  is unreadable on purpose: the caller turns that into a block
  *  rather than a directory it guessed. */
 function cwdLiteralText(raw: string): string | null {
 	// The body may not contain an unescaped copy of its own quote: without that
@@ -2363,8 +2318,8 @@ function resolveSpawnCwdLiteral(raw: string, base: string): string | null {
 
 /** One cwd argument found in a call's arguments. `value` is the argument's
  *  SOURCE text (quotes and all) and `detail` the source text of an unreadable
- *  one, for the dialog: the human decides what to do with a directory the scan
- *  refused to guess. Whether that source text is a literal, and what directory
+ *  one, for the refusal: the agent is told which directory the scan refused
+ *  to guess. Whether that source text is a literal, and what directory
  *  it names, is decided in one place — see evalSpawnCwd. */
 type EvalCwdArgument = { kind: "none" } | { kind: "value"; value: string } | { kind: "dynamic"; detail: string };
 
@@ -2575,7 +2530,7 @@ function evalCwdSites(masked: string): EvalCwdSiteMatch[] {
 }
 
 /** The headline the eval gate asks under when a spawn's own directory cannot be
- *  read (issue #14). Named once: the dialog title and the audit line both carry it. */
+ *  read (issue #14). Named once: the refusal and the audit line both carry it. */
 const EVAL_SPAWN_CWD_HEADLINE = "unreadable spawn cwd";
 
 /** The directory an eval payload's spawns run in (issue #14), or why the scan
@@ -2948,7 +2903,7 @@ const GIT_VALUE_OPTIONS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--na
 // ---------------------------------------------------------------------------
 // Network fetches
 //
-// `curl` and `wget` are NOT in the forced-dialog set: the judge owns network
+// `curl` and `wget` are NOT in the forced-block set: the judge owns network
 // reads like every other read. A plain URL fetch to stdout or into read-only
 // consumers is SAFE; fetch-and-execute and local-data-to-remote are what the
 // battery's egress hazards (contacts_remote_endpoint, sends_local_data_outbound)
@@ -2963,7 +2918,7 @@ const GIT_VALUE_OPTIONS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--na
 // read", which costs the fetch its clearing, never a silent run.
 //
 // The stdin-executing-interpreter scan (`cat ./installer | sh`) is a
-// different risk class and stays in the forced-dialog set.
+// different risk class and stays in the forced-block set.
 // ---------------------------------------------------------------------------
 
 /**
@@ -3330,7 +3285,7 @@ function interpretersInSegment(segment: string[], rawStage: string): Array<{ ver
  * writing `if (dd < 30) {` flagged `dd` — the tokenizer splits on `(` and
  * treats `<` as a redirect, so the body produced a segment whose verb was a
  * raw-disk-write binary, and a SAFE verdict on a plain file write hit the
- * forced dialog.
+ * forced block.
  *
  * The scope of the fix is deliberately tiny, and that is the design. Two
  * earlier cuts tried to decide, for any heredoc, whether the shell executes its
@@ -4244,9 +4199,9 @@ function splitOrFallbacks(command: string): string[] {
 const MATCHER_CWD_UNKNOWN = "/__matcher_cwd_unknown__";
 
 /**
- * rm/unlink forced-dialog shape. The token alone no longer forces a dialog —
+ * rm/unlink forced-block shape. The token alone no longer forces a block —
  * deleting a NAMED file is ordinary reversible-ish work the judge owns. The
- * forced dialog stays for the shapes where a mistake is systemic: recursion
+ * forced block stays for the shapes where a mistake is systemic: recursion
  * (a flag miss deletes a tree), glob metacharacters (the target set is the
  * shell's, not the author's), a `..` traversal (escapes the stated scope),
  * dotfiles/dot-paths (configuration and VCS state, invisible in listings),
@@ -4363,8 +4318,8 @@ export function matchModerateRiskTokens(
 			continue;
 		}
 		// rm/unlink are shape-scoped: a named-file deletion drops out of the
-		// forced-dialog set (the judge owns it); the systemic shapes above keep
-		// the dialog. The wrapper, substitution, and interpreter-code scans
+		// forced-block set (the judge owns it); the systemic shapes above keep
+		// the block. The wrapper, substitution, and interpreter-code scans
 		// below stay unconditional on the token — their domain is verbs hidden
 		// from positional parsing, where over-flagging is the safe direction.
 		if (verb === "rm" || verb === "unlink") {
@@ -4407,7 +4362,7 @@ export function matchModerateRiskTokens(
 
 		// git: global options may consume values (-C dir, -c k=v); after those,
 		// the first remaining word is the subcommand. Only the irreversible
-		// subcommands keep the SAFE-verdict dialog: `git reset --hard` and
+		// subcommands keep the SAFE-verdict block: `git reset --hard` and
 		// `git clean` erase uncommitted work (an unambiguous --hard prefix
 		// counts; an ambiguous one like --h fails closed), while pushes flag
 		// only genuine history rewrites so a steered-SAFE verdict cannot
@@ -4503,10 +4458,10 @@ function addSubstitutionFlags(text: string, flags: Set<string>): void {
 }
 
 /**
- * Dialog footnote when a forced prompt fires on the rm family: the user asked
- * for a nudge toward the reversible alternative. Empty for every other flag
- * family — a tee/dd/sudo dialog is an unrelated class. Display-only: the
- * DecisionRecord keeps the bare flags list.
+ * Refusal footnote when a forced block fires on the rm family: a nudge toward
+ * the reversible alternative. Empty for every other flag family — a
+ * tee/dd/sudo block is an unrelated class. Display-only: the DecisionRecord
+ * keeps the bare flags list.
  */
 export function trashFootnote(flags: readonly string[]): string {
 	return flags.some(f => f === "rm" || f === "unlink") ? "Reversible alternative: trash <paths>" : "";
@@ -4559,6 +4514,7 @@ function addRefusal(
 		source?: Refusal["source"];
 		cwd?: string;
 		evidenceFingerprint?: string;
+		userMessageId?: string;
 	} = {},
 ): void {
 	// Dry-run probe (issue #32): records nothing.
@@ -4569,7 +4525,7 @@ function addRefusal(
 		const list = sessionRefusals(ctx.sessionManager.getSessionId());
 		const refusalCwd = meta.cwd ?? "";
 		// A re-refusal of the same target refreshes the record and moves it to
-		// newest instead of stacking duplicates behind one dialog sequence. The
+		// newest instead of stacking duplicates. The
 		// same normalized action in two directories is two different reviews.
 		const existing = list.findIndex(refusal => refusal.normalizedTarget === target && refusal.cwd === refusalCwd);
 		if (existing !== -1) list.splice(existing, 1);
@@ -4582,15 +4538,16 @@ function addRefusal(
 			source: meta.source ?? "model",
 			cwd: refusalCwd,
 			...(meta.evidenceFingerprint === undefined ? {} : { evidenceFingerprint: meta.evidenceFingerprint }),
+			...(meta.userMessageId === undefined ? {} : { userMessageId: meta.userMessageId }),
 		});
 	} catch {
 		// No session id, no memory; the caller's decision below is unchanged.
 	}
 }
 
-/** A user approval of a target erases the memory that it was refused. Approving
- *  and refusing use one identity, so the lift covers exactly what the refusal
- *  remembered (issue #64). */
+/** A lift erases the memory that a target was refused. Lifting and refusing
+ *  use one identity, so the lift covers exactly what the refusal remembered
+ *  (issue #64). */
 function liftRefusals(ctx: ExtensionContext, command: string, cwd = ""): void {
 	try {
 		const sessionId = ctx.sessionManager.getSessionId();
@@ -4609,7 +4566,7 @@ function liftRefusals(ctx: ExtensionContext, command: string, cwd = ""): void {
  * sorted and deduped, so "-rf" and "-r -f" produce the same key) and only the
  * first non-flag argument survives. Lowercased, whitespace-collapsed, leading
  * `cd <path> &&` stripped, `./` argument spellings canonicalized. Force flags
- * leave the KEY but stay in the command text the model and the dialog see —
+ * leave the KEY but stay in the command text the model sees —
  * force-ness is judged there, not here.
  *
  * The key must NOT collapse distinct actions: "git push origin main" and
@@ -4685,12 +4642,49 @@ function priorRefusalFor(
 			if (refusal.normalizedTarget !== target || refusal.cwd !== cwd) return false;
 			// Model refusals are a warning about the facts the judge saw, not a
 			// permanent ban on a normalized verb. New evidence gets a fresh review;
-			// human/critical/cap decisions remain sticky until explicitly approved.
+			// critical and cap refusals stay until the user lifts them in chat.
 			return refusal.source !== "model" || refusal.evidenceFingerprint === evidenceFingerprint;
 		});
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Whether this verdict lifts a prior refusal: the user said something after the
+ * refusal, and Jev answered SAFE with its authorization grounded in the user's
+ * words (https://github.com/STRML/omp-classifier/issues/184). Anything else
+ * leaves the refusal standing. A headless session has no user channel, so it
+ * never lifts one.
+ */
+function priorRefusalLifts(prior: Refusal, judgement: Judgement, newestUserMessageId: string | undefined): boolean {
+	return (
+		judgement.verdict === "SAFE" &&
+		judgement.authorization === "grounded" &&
+		newestUserMessageId !== undefined &&
+		newestUserMessageId !== prior.userMessageId
+	);
+}
+
+/** The id of the newest user-typed message since the latest `/clear`, read the
+ *  way collectTaskEvidence reads them but independent of the evidence window,
+ *  so a config change cannot make an old message look new. */
+function newestUserMessageId(ctx: ExtensionContext): string | undefined {
+	try {
+		const branch = userChannelBranch(ctx);
+		const start = branchStartAfterLatestResetBoundary(branch);
+		for (let index = branch.length - 1; index >= start; index--) {
+			const entry = branch[index];
+			if (entry.type !== "message") continue;
+			const message = entry.message;
+			if (message?.role !== "user" || message.attribution !== "user") continue;
+			if (textOf(message.content).trim() === "") continue;
+			return message.id ?? entry.id ?? `user-${index}`;
+		}
+	} catch {
+		// No branch in an isolated context: no user channel to read.
+	}
+	return undefined;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -5048,8 +5042,8 @@ export default function (pi: ExtensionAPI) {
 	 * retries its own transients and falls back to the chat chain, and the
 	 * verdict is derived from the answer probabilities (jev.ts). A request
 	 * that cannot be made, answered, or read surfaces as JevUnavailableError
-	 * and becomes an UNAVAILABLE verdict, which the caller turns into a
-	 * permission request — never a silent allow.
+	 * and becomes an UNAVAILABLE verdict, which the caller blocks — never a
+	 * silent allow.
 	 *
 	 * `timeoutMs` is the deadline (judgeBatteryUnderDeadline): the gate waits
 	 * that long for the answer, then aborts the request and the call is
@@ -5268,91 +5262,6 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * The TUI renders confirm messages as Markdown, so every span this process
-	 * did not author is indented four spaces to become a verbatim code block.
-	 * That keeps `<!-- … -->`, emphasis, backticks and newlines visible instead
-	 * of changing or disappearing in the dialog. It covers the reason as much as
-	 * the command: the reason is assembled from the hazard answers, and while
-	 * Jev writes no prose itself, the command text it is derived from is
-	 * attacker-controlled, so rendering it live would hand that text control
-	 * over the dialog the user is reading.
-	 *
-	 * The body MUST start with a blank line. The host joins the two arguments as
-	 * `${title}\n${message}` (extension-ui-controller.ts:947), and in CommonMark
-	 * an indented code block cannot interrupt a paragraph, so without the blank
-	 * line the command becomes a lazy continuation of the title and its Markdown
-	 * renders. That is not cosmetic. HTML comments are stripped for the terminal,
-	 * so `echo "<!-- ok" ; rm -rf ~/data ; echo "-->"` would DISPLAY as
-	 * `echo " "` while running the deletion.
-	 *
-	 * Only fields that deviate from the default are shown. `envKeys: []`,
-	 * `pty: false` and `async: false` on every prompt are noise that pushes the
-	 * command itself out of view.
-	 */
-	const buildPermissionBody = (
-		target: {
-			command: string;
-			cwd: string;
-			/** The directory the payload named for its own spawns (issue #14),
-			 *  present only when it named one: `cwd` above IS that directory
-			 *  then, and the dialog says so on the working-directory line. */
-			spawnCwd?: string;
-			envKeys: string[];
-			pty: boolean;
-			timeout: number | undefined;
-			async: boolean;
-		},
-		reason: string,
-		sessionCwd: string | undefined,
-	): string => {
-		const sections = [verbatim(target.command)];
-		if (reason.trim() !== "") sections.push(`Reason:\n\n${verbatim(reason)}`);
-
-		// Detail VALUES are model-controlled and go on lines whose labels this
-		// code authored, so a newline in one forges a line: a cwd of
-		// "/tmp/stage\ntimeout: none (no deadline)" renders as two Details rows
-		// and the second is indistinguishable from ours. escapeControlChars
-		// deliberately keeps U+000A (it is the line separator for the command
-		// itself), so detail values are JSON-encoded instead — the same
-		// treatment cwd already gets on its way into the judge's state.
-		const detailValue = (value: string): string => JSON.stringify(value).slice(1, -1);
-
-		const details: string[] = [];
-		// Worth a line only when it is not the directory the user is already in.
-		// Compared normalized, or a caller passing "/workspace/" in a session at
-		// "/workspace" prints a line saying the cwd is the cwd, which is exactly
-		// the noise this is meant to remove.
-		if (target.cwd && !samePath(target.cwd, sessionCwd)) {
-			// An eval payload can name its own spawn directory (issue #14) — the
-			// case the whole field exists for — and a reader who cannot tell that
-			// directory from the session's is reading a detail row that lies by
-			// omission about who chose it. A literal that resolves OUTSIDE the
-			// session directory is shown exactly as resolved: never folded back.
-			details.push(`working directory: ${detailValue(target.cwd)}${target.spawnCwd === undefined ? "" : " (declared by the payload's spawn call)"}`);
-			// The second directory of an eval payload (issue #14): with a spawn
-			// directory declared, `working directory` above is that one, and the
-			// session's own directory is where the payload's own process reads
-			// and writes, so a relative write still lands there. It is part of
-			// what the human is approving, so it is on the line.
-			if (target.spawnCwd !== undefined && sessionCwd !== undefined && !samePath(target.spawnCwd, sessionCwd)) {
-				details.push(`session directory: ${detailValue(sessionCwd)} (what this payload's own code runs in)`);
-			}
-		}
-		// 0 disables the deadline (host schema, tools/bash.ts), so "0s" would
-		// read as the exact opposite of what it does.
-		if (target.timeout !== undefined) {
-			details.push(target.timeout === 0 ? "timeout: none (no deadline)" : `timeout: ${target.timeout}s`);
-		}
-		if (target.envKeys.length > 0) details.push(`env: ${detailValue(target.envKeys.join(", "))}`);
-		if (target.pty) details.push("pty: true");
-		if (target.async) details.push("async: true");
-		if (details.length > 0) sections.push(`Details:\n\n${verbatim(details.join("\n"))}`);
-
-		// Leading newline: see the block comment above.
-		return `\n${sections.join("\n\n")}`;
-	};
-
-	/**
 	 * Machine-readable refusal payload for every block site (#28). The string a
 	 * tool_call handler returns as `reason` is the only channel back to the
 	 * model, so every deny ships structured fields: which tool, which control
@@ -5392,7 +5301,7 @@ export default function (pi: ExtensionAPI) {
 	 * flattened to one line and truncated here so no call site can forget it.
 	 * Allow `why`s are short causes per the contract: "rule: <pattern>",
 	 * "approved by user", or the verdict's reason; block `why`s carry the
-	 * refusal payload's why or the headline that drove the dialog.
+	 * refusal payload's why.
 	 */
 	const logDecision = (line: DecisionLogInput): void => {
 		// Dry-run probe (issue #32): the audit write is the one side effect
@@ -5483,7 +5392,7 @@ export default function (pi: ExtensionAPI) {
 
 	/** Attach the host session to every audit line. Keeping this at the plugin
 	 * boundary makes status/replay joins useful even for static-rule, cap, and
-	 * dialog lines that never reached the model. */
+	 * blocked lines that never reached the model. */
 	const logDecisionFor = (ctx: ExtensionContext, line: DecisionLogInput): void => {
 		let sessionId: string | undefined;
 		try {
@@ -5530,141 +5439,104 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * Raise a real permission request. Returns the block result, or undefined to
-	 * let the command through. Headless (no UI) always blocks: there is nobody to
-	 * ask, and this path is only reached for commands the gate could not clear.
-	 *
-	 * Two options: "Allow once" runs this call only, and "Deny" or undefined
-	 * (cancel or timeout) denies. No answer outlives the call it answered
-	 * (https://github.com/STRML/omp-classifier/issues/184). The TUI renders a
-	 * select's TITLE as a full Markdown block — not the single truncated line
-	 * a confirm title gets — so the same title+body join confirm used keeps
-	 * the executable command visible on the dialog. Option descriptions are a bonus layer on surfaces that show them;
-	 * the title alone still carries everything needed to decide.
-	 *
-	 * Only the returned reason becomes a refusalPayload. Layers: "dialog" when a
-	 * human denies, "headless" when nobody could be asked, "unclassified" when
-	 * the classifier never returned a verdict — that cause outranks headless,
-	 * because the decisive fact is that the command was never judged.
+	 * What the agent is told for each way the gate blocks a call. `layer` in
+	 * the payload is the cause, `next` is the agent's lawful next move, and
+	 * `notThis` is the move that would game the gate. The gate never asks the
+	 * user itself (https://github.com/STRML/omp-classifier/issues/184): the
+	 * agent rewords, picks a safer action, or asks in chat, and a later SAFE
+	 * verdict reads the user's answer.
 	 */
-	const requestPermission = async (
-		ctx: ExtensionContext,
-		target: {
-			command: string;
-			cwd: string;
-			/** The directory the payload named for its own spawns (issue #14),
-			 *  present only when it named one: `cwd` above IS that directory
-			 *  then, and the dialog says so on the working-directory line. */
-			spawnCwd?: string;
-			envKeys: string[];
-			pty: boolean;
-			timeout: number | undefined;
-			async: boolean;
+	const REFUSAL_GUIDANCE: Record<RefusalCause, { headline: string; next: string; notThis: string }> = {
+		critical: {
+			headline: "critical pattern",
+			next: "The gate never runs a command that matches a built-in dangerous-command pattern. Choose a safer action, or if the user wants this exact command, ask them in chat to run the command themselves.",
+			notThis: "Do not reword the command to get around the pattern.",
 		},
-		headline: string,
+		environment: {
+			headline: "environment override",
+			next: "Run the command without a caller-supplied env. Write any variables it needs in the command text, where the classifier can read them, but never secret values. Otherwise ask the user in chat to run the command themselves.",
+			notThis: "Do not move secret values into the command text.",
+		},
+		cwd: {
+			headline: EVAL_SPAWN_CWD_HEADLINE,
+			next: "Give each spawn a literal working directory the gate can read, or ask the user in chat to run the code themselves.",
+			notThis: "Do not treat the code as reviewed or approved.",
+		},
+		unclassified: {
+			headline: "unclassified",
+			next: UNAVAILABLE_NEXT,
+			notThis: "Do not treat the command as reviewed or approved.",
+		},
+		unavailable: {
+			headline: "classifier unavailable",
+			next: UNAVAILABLE_NEXT,
+			notThis: "Do not treat the command as reviewed or approved.",
+		},
+		unsafe: {
+			headline: "classified unsafe",
+			next: "Choose a safer action, or explain the action and ask the user in chat whether to proceed. If they say yes, retry: the classifier reads their words.",
+			notThis: NO_DISGUISE,
+		},
+		unsure: {
+			headline: "classifier unsure",
+			next: "Make the command more specific, or explain the action and ask the user in chat to confirm. Retry after they answer: the classifier reads their words.",
+			notThis: NO_DISGUISE,
+		},
+		flagged: {
+			headline: "flagged",
+			next: "The classifier judged the command safe, but it carries an operation the gate never runs on a verdict alone (named in why). Use the reversible alternative when why names one, or ask the user in chat to run the command themselves.",
+			notThis: "Do not split or disguise the flagged operation to get it past the check.",
+		},
+		"prior-refusal": {
+			headline: "prior refusal",
+			next: "This target was refused earlier in the session. Ask the user in chat whether to proceed. Once they answer, retry: a safe verdict their words authorize lifts the refusal.",
+			notThis: NO_DISGUISE,
+		},
+	};
+
+	/**
+	 * Block a call the gate could not clear, and tell the agent why. This is
+	 * the only way the gate says no to a judged call: there is no dialog
+	 * (https://github.com/STRML/omp-classifier/issues/184). It writes the
+	 * call's terminal audit line, on layer `blocked` after a lead line
+	 * (verdict, critical, environment, cwd) or `unclassified` when nothing was
+	 * judged, and returns the refusal payload.
+	 */
+	const refuse = (
+		ctx: ExtensionContext,
+		target: { command: string; cwd: string },
+		cause: RefusalCause,
 		reason: string,
 		tool: "bash" | "eval" = "bash",
 		logWhyPrefix = "",
-		/** The audit fields of the tool call this dialog belongs to, passed
-		 *  through from handleToolCall so the dialog or headless-block line
-		 *  carries the same evidence ids, authorization label and shadow floor
-		 *  as the verdict line it follows. One object rather than one parameter
-		 *  per field: this list grew a field per phase, and each time a caller
-		 *  was missed the log came out half-filled. */
-		auditExtras: Pick<DecisionRecord, "userMessageIds" | "authorization" | "v3" | "floor" | "spawnCwd" | "followsDecisionId"> = {},
-	): Promise<{ block: true; reason: string } | undefined> => {
-		const subject = tool === "eval" ? "eval code" : "bash command";
-		const detail = reason ? `${headline}: ${reason}` : headline;
-		const layer = ctx.hasUI ? "dialog" : headline === "unclassified" ? "unclassified" : "headless";
+		/** The audit fields of the tool call this block belongs to, passed
+		 *  through from handleToolCall so the terminal line carries the same
+		 *  evidence ids, verdict, authorization label and shadow floor as the
+		 *  lead line it follows. */
+		auditExtras: Pick<DecisionRecord, "userMessageIds" | "authorization" | "v3" | "floor" | "spawnCwd" | "followsDecisionId"> & { verdict?: Verdict } = {},
+	): { block: true; reason: string } => {
+		const guidance = REFUSAL_GUIDANCE[cause];
+		const detail = reason ? `${guidance.headline}: ${reason}` : guidance.headline;
 		const stale = pluginStaleSuffix(PLUGIN_LOAD_MTIME, fs.statSync(PLUGIN_FILE, { throwIfNoEntry: false })?.mtimeMs);
-		const guidance: Record<typeof layer, { next: string; notThis: string }> = {
-			unclassified: {
-				next: "Retry the command once the classifier is available, or ask the user to decide.",
-				notThis: "Do not treat the command as reviewed or approved.",
-			},
-			headless: {
-				next: "Rerun interactively so the permission dialog can be answered, or allow this exact command with a static rule.",
-				notThis: "Do not retry the command unchanged and expect a different result.",
-			},
-			dialog: {
-				next: "Ask the user how to proceed, then revise the command accordingly.",
-				notThis: "Do not retry the same command without addressing the denial.",
-			},
-		};
-		const began = Date.now();
-		const audit = (decision: "allow" | "block", why: string, approval?: DecisionRecord["approval"]) =>
-			logDecisionFor(ctx, {
-				tool,
-				decision,
-				layer,
-				why,
-				cmd: target.command,
-				cwd: target.cwd,
-				verdict: null,
-				cached: 0,
-				ms: Date.now() - began,
-				...(approval ? { approval } : {}),
-				...(stale === "" ? {} : { staleCode: 1 as const }),
-				...(auditExtras.userMessageIds && auditExtras.userMessageIds.length > 0 ? { userMessageIds: auditExtras.userMessageIds } : {}),
-				...(auditExtras.authorization ? { authorization: auditExtras.authorization } : {}),
-				...(auditExtras.v3 ? { v3: auditExtras.v3 } : {}),
-				...(auditExtras.floor ? { floor: auditExtras.floor } : {}),
-				...(auditExtras.spawnCwd ? { spawnCwd: auditExtras.spawnCwd } : {}),
-				...(auditExtras.followsDecisionId ? { followsDecisionId: auditExtras.followsDecisionId } : {}),
-			});
-		const block = (whyOverride?: string, approval: DecisionRecord["approval"] = ctx.hasUI ? "deny" : "headless"): { block: true; reason: string } => {
-			// Verdict-driven callers pass "follows verdict" so the dialog/headless
-			// line is readable as the outcome of the preceding layer:"verdict" line.
-			audit("block", whyOverride ?? (logWhyPrefix === "" ? detail : `${logWhyPrefix}: ${detail}`), approval);
-			return {
-				block: true,
-				reason: refusalPayload(tool, layer, detail, guidance[layer].next, guidance[layer].notThis),
-			};
-		};
-
-		// Dry-run probe (issue #32): never open a dialog, never audit. When a
-		// decision was logged before reaching here (critical, env, a verdict),
-		// that record already won; the unclassified path arrives with none, so
-		// record the prompt itself. A racing live call gets a fail-closed block.
-		if (dryRun) {
-			recordDryRunResult({
-				would: "block",
-				layer: "dialog",
-				why: `would prompt: ${detail}`,
-				note: "the gate raises a permission dialog here",
-			});
-			return { block: true, reason: "dry-run probe: decision captured, nothing executed" };
-		}
-		if (!ctx.hasUI) {
-			// Headless: nobody can be asked.
-			return block();
-		}
-		const choice = await ctx.ui.select(
-			`Run ${subject}? (${headline}${stale})\n${buildPermissionBody(target, reason, ctx.cwd)}`,
-			[
-				{ label: "Allow once", description: "This call only" },
-				{ label: "Deny" },
-			],
-			// The old confirm default was approve; keep the cursor on it.
-			{ initialIndex: 0 },
-		);
-		if (choice === "Allow once") {
-			// The user said yes to this action (issue #30): erase the memory
-			// that its target was refused, so rewordings run clean again.
-			liftRefusals(ctx, target.command, target.cwd);
-			audit("allow", "approved by user", "allow-once");
-			return undefined;
-		}
-		// A human denial is the one decision a rewording cannot launder:
-		// remember the target so the next phrasing of this action meets the
-		// prior refusal at the classifier. A canceled/timed-out dialog counts
-		// as denial too — nothing ran and nobody approved — but the audit line
-		// says which it was.
-		addRefusal(ctx, target.command, reason.trim() !== "" ? reason : headline, {
-			source: "human",
+		logDecisionFor(ctx, {
+			tool,
+			decision: "block",
+			layer: cause === "unclassified" ? "unclassified" : "blocked",
+			why: logWhyPrefix === "" ? detail : `${logWhyPrefix}: ${detail}`,
+			cmd: target.command,
 			cwd: target.cwd,
+			verdict: auditExtras.verdict ?? null,
+			cached: 0,
+			ms: 0,
+			...(stale === "" ? {} : { staleCode: 1 as const }),
+			...(auditExtras.userMessageIds && auditExtras.userMessageIds.length > 0 ? { userMessageIds: auditExtras.userMessageIds } : {}),
+			...(auditExtras.authorization ? { authorization: auditExtras.authorization } : {}),
+			...(auditExtras.v3 ? { v3: auditExtras.v3 } : {}),
+			...(auditExtras.floor ? { floor: auditExtras.floor } : {}),
+			...(auditExtras.spawnCwd ? { spawnCwd: auditExtras.spawnCwd } : {}),
+			...(auditExtras.followsDecisionId ? { followsDecisionId: auditExtras.followsDecisionId } : {}),
 		});
-		return block(choice === undefined ? `prompt canceled: ${detail}` : undefined);
+		return { block: true, reason: refusalPayload(tool, cause, detail, guidance.next, guidance.notThis) };
 	};
 
 	/** End a dry-run probe at a decision point the gate itself passes through
@@ -5727,6 +5599,9 @@ export default function (pi: ExtensionAPI) {
 			userEvidenceSnapshot = undefined;
 		}
 		const citableUserEvidence = citableEvidence(userEvidenceSnapshot?.messages);
+		// The newest thing the user said, for refusal memory: a refusal records
+		// it, and only a newer one can lift that refusal.
+		const newestUserId = newestUserMessageId(ctx);
 		const evidenceSnapshot = userEvidenceSnapshot;
 		// Attach the same snapshot's ids to every audit line for this tool call,
 		// including the early returns before classification (issue #33 audit
@@ -5875,8 +5750,7 @@ export default function (pi: ExtensionAPI) {
 					`${PLUGIN_NAME} is marked disabled in ${verdict.path} while still bound to this session. ` +
 					`${remedy} A project-scope lockfile can re-enable it, in which case this is expected.`;
 				// Headless runs have nobody to read a toast, and this file's one
-				// rule for touching the UI is to check hasUI first (see
-				// requestPermission).
+				// rule for touching the UI is to check hasUI first.
 				if (ctx.hasUI) ctx.ui.notify(notice, "warning");
 				else pi.logger.warn(`classifier: ${notice}`);
 				staleDisableWarned.add(sessionId);
@@ -5908,14 +5782,14 @@ export default function (pi: ExtensionAPI) {
 			// back to the payload text — which the `cmd` field truncates.
 			const spawnField = declaredCwd === undefined ? {} : { spawnCwd: declaredCwd };
 			// Over-bound spawn-bearing code is blocked unseen, like bash: no
-			// classifier or dialog may approve text it did not read.
+			// classifier may approve text it did not read.
 			if (evalCode.length > config.maxCommandLength) {
 				const why =
 					`eval code blocked: ${evalCode.length} chars exceeds the ` +
 					`${config.maxCommandLength}-character review limit`;
-				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, maxCommandLength: config.maxCommandLength, headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, maxCommandLength: config.maxCommandLength });
 				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: replay.layer, why, cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields(), ...spawnField });
-				addRefusal(ctx, evalCode, why, { source: "cap", cwd });
+				addRefusal(ctx, evalCode, why, { source: "cap", cwd, userMessageId: newestUserId });
 				return {
 					block: true,
 					reason: refusalPayload(
@@ -5932,8 +5806,7 @@ export default function (pi: ExtensionAPI) {
 			// A spawn directory this scan could not read is not a reason to
 			// classify anyway: a payload judged against a directory it does not
 			// run in was judged on the wrong question, and a verdict earned that
-			// way is worth less than a human's answer. Ask, and say what could
-			// not be read — the code text on the dialog carries the rest.
+			// way is worth nothing. Block, and say what could not be read.
 			if (spawn.kind === "opaque") {
 				const headline = EVAL_SPAWN_CWD_HEADLINE;
 				// No `spawnCwd` on these lines: the whole reason this path exists
@@ -5951,7 +5824,7 @@ export default function (pi: ExtensionAPI) {
 					ms: Date.now() - started,
 					...auditFields(),
 				});
-				return await requestPermission(ctx, target, headline, spawn.why, "eval", "", { ...auditFields(), ...follows });
+				return refuse(ctx, target, "cwd", spawn.why, "eval", "", { ...auditFields(), ...follows });
 			}
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
 			// Judge identity is the model selector plus the question battery: a
@@ -5980,7 +5853,7 @@ export default function (pi: ExtensionAPI) {
 			const cacheableEval = networkProvenanceForCache?.directoryUnresolved !== true && networkProvenanceForCache?.ambientConfigUnreadable !== true;
 			const cached = cacheableEval ? scoped.get(cacheKey) : undefined;
 			if (dryRun && !cached) {
-				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, judgement: undefined, headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, judgement: undefined });
 				return dryRunStop({
 					would: "classify",
 					layer: "classifier",
@@ -6009,7 +5882,7 @@ export default function (pi: ExtensionAPI) {
 					},
 				));
 				if (!judgement) {
-					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", { ...auditFields(), ...spawnField });
+					return refuse(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", { ...auditFields(), ...spawnField });
 				}
 				if (cacheableEval && !cached && judgement.verdict !== "UNAVAILABLE" && !judgement.noCache) remember(scoped, cacheKey, judgement);
 				const logCode = truncated(redactSecrets(evalCode.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120);
@@ -6020,46 +5893,45 @@ export default function (pi: ExtensionAPI) {
 				if (judgement.verdict === "SAFE") {
 					// Assignment positions name variables, not commands: the
 					// `const rm = Bun.spawnSync(...)` shape flagged "rm" and
-					// dialoged a SAFE the judge reached on the visible spawn.
+					// blocked a SAFE the judge reached on the visible spawn.
 					// A real destructive verb reads as a call or an argument
 					// (`rm -rf`, spawn(["rm", …])) and never as `token =`.
 					const flagList = evalRiskFlags(evalCode);
+					const lifts = prior !== undefined && priorRefusalLifts(prior, judgement, newestUserId);
 					const replay = replayDecision({
 						tool: "eval",
 						command: evalCode,
 						cwd,
 						judgement,
-						priorRefusal: Boolean(prior),
+						priorRefusal: prior !== undefined && !lifts,
 						riskFlags: flagList,
-						headless: !ctx.hasUI,
 					});
 					if (replay.decision === "allow") {
+						// The user spoke after the refusal and the verdict reads their
+						// words as authorization: the refusal is lifted for good.
+						if (prior !== undefined) liftRefusals(ctx, evalCode, cwd);
 						// Fresh SAFE auto-run logs layer "verdict"; a replayed cached
 						// verdict logs "cached" — provenance, same allow.
-						logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", ...lead, why: judgement.reason, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
+						logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: cached ? "cached" : "verdict", ...lead, why: prior === undefined ? judgement.reason : `${judgement.reason} (lifts the refusal of "${prior.loggableTarget}")`, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
 						return;
 					}
 					// A SAFE on a target this session already refused is not a
 					// clean bill: the refusal rode in the state the judge saw, so a
 					// SAFE means the command looks safe, not that the refusal was
-					// wrong. The prior refusal stands until a human says otherwise,
+					// wrong. The refusal stands until the user's own words lift it,
 					// and the moderate-risk overlay keeps its own reason when both
 					// hit.
 					const why =
 						flagList.length > 0
 							? `classifier-safe but flags: ${flagList.join(", ")}`
-							: replay.why;
+							: `classifier-safe despite prior refusal of "${prior?.loggableTarget ?? ""}"`;
 					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", ...lead, why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
-					return await requestPermission(ctx, target, "flagged for approval", why, "eval", flagList.length > 0 ? "follows verdict" : "despite prior refusal", { ...auditFields(), ...judgementAudit(judgement), ...spawnField, ...follows });
+					return refuse(ctx, target, flagList.length > 0 ? "flagged" : "prior-refusal", why, "eval", "follows verdict", { ...auditFields(), ...judgementAudit(judgement), ...spawnField, verdict: "SAFE", ...follows });
 				}
-				const detail =
-					judgement.verdict === "UNSAFE"
-						? "classified unsafe"
-						: judgement.verdict === "UNAVAILABLE"
-							? "classifier unavailable"
-							: "classifier unsure";
-				// Two lines on purpose: the verdict itself, then requestPermission's
-				// dialog/headless outcome prefixed "follows verdict".
+				const cause = VERDICT_CAUSE[judgement.verdict];
+				const detail = REFUSAL_GUIDANCE[cause].headline;
+				// Two lines on purpose: the verdict itself, then the terminal
+				// `blocked` line prefixed "follows verdict".
 				logDecisionFor(ctx, {
 					tool: "eval",
 					decision: "block",
@@ -6081,21 +5953,17 @@ export default function (pi: ExtensionAPI) {
 				// A refusal record (issue #30) needs a verdict that judged the
 				// content, and with Jev that means UNSAFE outright: UNSURE is
 				// undecided, and UNAVAILABLE judged nothing at all (a transport
-				// failure is not evidence about the command). Only a human denial
-				// makes an undecided command a refusal — requestPermission
-				// records that itself.
+				// failure is not evidence about the command).
 				if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
-					addRefusal(ctx, evalCode, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
+					addRefusal(ctx, evalCode, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint, userMessageId: newestUserId });
 				}
-				return await requestPermission(
-					ctx,
-					target,
-					detail,
-					judgement.reason,
-					"eval",
-					"follows verdict",
-					{ ...auditFields(), ...judgementAudit(judgement), ...spawnField, ...follows },
-				);
+				return refuse(ctx, target, cause, judgement.reason, "eval", "follows verdict", {
+					...auditFields(),
+					...judgementAudit(judgement),
+					...spawnField,
+					verdict: judgement.verdict,
+					...follows,
+				});
 			} catch (err) {
 				pi.logger.error(`classifier: ${err instanceof Error ? err.message : String(err)}`);
 				logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "internal-error", why: "classifier failed; eval code not run", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields(), ...spawnField });
@@ -6113,14 +5981,14 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// Universal bound, before every static-rule/critical/env branch: neither
-		// the classifier nor a permission dialog may approve unseen suffix text.
+		// the classifier may approve unseen suffix text.
 		if (command.length > config.maxCommandLength) {
 			const why =
 				`bash command blocked: ${command.length} chars exceeds the ` +
 				`${config.maxCommandLength}-character review limit`;
-			const replay = replayDecision({ tool: "bash", command, cwd: ctx.cwd, maxCommandLength: config.maxCommandLength, headless: !ctx.hasUI });
+			const replay = replayDecision({ tool: "bash", command, cwd: ctx.cwd, maxCommandLength: config.maxCommandLength });
 			logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, why, cmd: command, cwd: ctx.cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
-				addRefusal(ctx, command, why, { source: "cap", cwd: ctx.cwd });
+				addRefusal(ctx, command, why, { source: "cap", cwd: ctx.cwd, userMessageId: newestUserId });
 			return {
 				block: true,
 				reason: refusalPayload(
@@ -6192,7 +6060,7 @@ export default function (pi: ExtensionAPI) {
 			// A deny rule is the one decision that outranks everything natively
 			// (tools/bash.ts:557) — the host blocks the call, nothing to add.
 			if (rule?.approval === "deny" || policy.bashPolicy === "deny") {
-				const replay = replayDecision({ tool: "bash", command, cwd: ctx.cwd, staticRule: "deny", headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "bash", command, cwd: ctx.cwd, staticRule: "deny" });
 				if (dryRun) {
 					return dryRunStop({
 						would: "allow",
@@ -6236,13 +6104,13 @@ export default function (pi: ExtensionAPI) {
 			const { trustedPolicySnapshot, reviewEvidenceFingerprint } = resolvePolicyContext(cwd, policyDirectoryStable(command));
 			// Issue #67: a command that runs a script file is judged by what the
 			// file HOLDS, not by its path. The body joins the text every layer
-			// below reads — critical patterns, the forced-dialog token scan, the
+			// below reads — critical patterns, the forced-block token scan, the
 			// verdict cache, the judge — so `python3 x.py` and
 			// `python3 /tmp/x.py` reach the same verdict, and a rename changes
 			// nothing. A body the classifier cannot read in full (over the review
 			// limit, unreadable, truncated, expanded by the shell before the
 			// interpreter sees it) fails closed here, before any static rule
-			// or dialog could approve text nobody read.
+			// could approve text nobody read.
 			// The reader is handed the directory the command STARTS in, not the
 			// one the host extracted a leading `cd X &&` into: the reader applies
 			// the command's own `cd` chain itself, segment by segment, so a `cd`
@@ -6258,7 +6126,7 @@ export default function (pi: ExtensionAPI) {
 			if (script.refusal) {
 				const why = script.refusal.why;
 				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "script-body", why, cmd: command, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
-				addRefusal(ctx, command, why, { source: "cap", cwd });
+				addRefusal(ctx, command, why, { source: "cap", cwd, userMessageId: newestUserId });
 				return {
 					block: true,
 					reason: refusalPayload(
@@ -6275,7 +6143,7 @@ export default function (pi: ExtensionAPI) {
 			// event carries the raw call input and any tool or host variant that
 			// still honors one must stay gated: a caller-supplied environment
 			// (`PATH`, `BASH_ENV`, `LD_PRELOAD`) changes what runs, so it is read
-			// defensively and still forces a permission request.
+			// defensively and still blocks the call.
 			const env = canonicalEnv((event.input as Record<string, unknown>).env);
 			const pty = event.input.pty === true;
 			const timeout = typeof event.input.timeout === "number" ? event.input.timeout : undefined;
@@ -6337,21 +6205,13 @@ export default function (pi: ExtensionAPI) {
 			// a per-session `autoApprove` (wrapper.ts:189-192) forces `yolo`
 			// without appearing in settings at all.
 			if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(judgedCommand))) {
-				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, riskFlags: ["critical"], headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, riskFlags: ["critical"] });
 				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, ...lead, why: "critical pattern: matches a built-in dangerous-command pattern", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
-				// A critical hit is a refusal (issue #30) however the dialog below
-				// ends: the pattern itself is the memory. An approval lifts it via
-				// requestPermission.
-				addRefusal(ctx, judgedCommand, "matches a built-in dangerous-command pattern", { source: "critical", cwd });
-				return await requestPermission(
-					ctx,
-					target,
-					"critical pattern",
-					"matches a built-in dangerous-command pattern",
-					"bash",
-					"",
-					{ ...auditFields(), ...follows },
-				);
+				// A critical hit is a refusal (issue #30): the pattern itself is the
+				// memory, so a rewording that dodges the pattern meets it at the
+				// classifier.
+				addRefusal(ctx, judgedCommand, "matches a built-in dangerous-command pattern", { source: "critical", cwd, userMessageId: newestUserId });
+				return refuse(ctx, target, "critical", "matches a built-in dangerous-command pattern", "bash", "", { ...auditFields(), ...follows });
 			}
 
 			// An `env` override selects which program runs (`PATH`, `BASH_ENV`,
@@ -6359,17 +6219,9 @@ export default function (pi: ExtensionAPI) {
 			// prompt/narrow-allow rule that only judged the command string. Env
 			// values are not shown to the classifier — they can hold secrets.
 			if (env.key !== "") {
-				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, envKeys: env.keys, headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, envKeys: env.keys });
 				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, ...lead, why: "environment override: command runs with caller-supplied env; not classified", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
-				return await requestPermission(
-					ctx,
-					target,
-					"environment override",
-					"command runs with caller-supplied env; not classified",
-					"bash",
-					"",
-					{ ...auditFields(), ...follows },
-				);
+				return refuse(ctx, target, "environment", "command runs with caller-supplied env; not classified", "bash", "", { ...auditFields(), ...follows });
 			}
 
 			// Not critical and no env override: the host's static pattern
@@ -6377,7 +6229,7 @@ export default function (pi: ExtensionAPI) {
 			// `tools.approval.bash` policy in native resolveApproval, so apply the
 			// user prompt only when no pattern rule decided the call.
 			if (rule?.approval === "prompt") {
-				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd: ctx.cwd, staticRule: "prompt", headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd: ctx.cwd, staticRule: "prompt" });
 				if (dryRun) {
 					return dryRunStop({
 						would: "allow",
@@ -6394,12 +6246,12 @@ export default function (pi: ExtensionAPI) {
 			// call. The rule can say nothing about the file, so the call classifies
 			// as if no rule had matched.
 			if (rule?.approval === "allow" && !isBlanketPattern(rule.match) && script.bodies.length === 0) {
-				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, staticRule: "allow", headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, staticRule: "allow" });
 				logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: `rule: ${rule.match}`, cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				return;
 			}
 			if (!rule && policy.bashPolicy === "prompt") {
-				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd: ctx.cwd, staticRule: "prompt", headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd: ctx.cwd, staticRule: "prompt" });
 				if (dryRun) {
 					return dryRunStop({
 						would: "allow",
@@ -6456,7 +6308,7 @@ export default function (pi: ExtensionAPI) {
 			// Dry-run probe (issue #32): with nothing cached, the classifier model
 			// would run — report that instead of paying the call.
 			if (dryRun && !cached) {
-				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, judgement: undefined, priorRefusal: Boolean(prior), headless: !ctx.hasUI });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, judgement: undefined, priorRefusal: Boolean(prior) });
 				return dryRunStop({
 					would: "classify",
 					layer: "classifier",
@@ -6468,22 +6320,14 @@ export default function (pi: ExtensionAPI) {
 			const judgement = cached ? withoutShadow(cached) : (await classify(ctx, judgedCommand, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot, "shell", startCwd, trustedPolicySnapshot.documents, leadDecisionId).catch((err: unknown) => {
 				// Provider errors (quota exhausted, auth, HTTP failures) previously
 				// vanished into an opaque "unavailable". Keep the message so the
-				// permission dialog says WHY.
+				// refusal says WHY.
 				classifyError = err instanceof Error ? err.message : String(err);
 				pi.logger.warn(`classifier: classify failed: ${classifyError}`);
 				return undefined;
 			}));
 			if (!judgement) {
-				// Classifier unavailable/timed out. Ask rather than silently run.
-				return await requestPermission(
-					ctx,
-					target,
-					"unclassified",
-					classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable",
-					"bash",
-					"",
-					auditFields(),
-				);
+				// Nothing was judged: block rather than silently run.
+				return refuse(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "bash", "", auditFields());
 			}
 			// A failed request is a transient failure, not a policy: do NOT
 			// cache it, or one outage pins the session to repeated prompts. Every
@@ -6492,7 +6336,7 @@ export default function (pi: ExtensionAPI) {
 			// noCache for the same reason.
 			if (cacheable && !cached && judgement.verdict !== "UNAVAILABLE" && !judgement.noCache) remember(scoped, cacheKey, judgement);
 			// Every resolved decision is logged so prompt/auto-run behavior is
-			// observable from ~/.omp/logs without watching dialogs. Verdict,
+			// observable from ~/.omp/logs. Verdict,
 			// the cache/reason provenance, and a truncated command; the full
 			// command is not echoed (it can carry secrets in flags) and what is
 			// echoed is redacted first, so a token inside the first 120
@@ -6510,7 +6354,7 @@ export default function (pi: ExtensionAPI) {
 			);
 
 			if (judgement.verdict === "SAFE") {
-				// SAFE verdicts still hit a permission request when the command
+				// SAFE verdicts still block when the command
 				// carries a destructive/irreversible token. Jev reads the command
 				// as untrusted state and can still be steered by text inside it,
 				// and a judge that answers SAFE on a payload carrying an injected
@@ -6525,23 +6369,26 @@ export default function (pi: ExtensionAPI) {
 				for (const body of script.bodies) {
 					if (INTERPRETER_CODE_RISK.test(body.body)) flags.push(`${body.verb} runs ${body.operand}`);
 				}
+				const lifts = prior !== undefined && priorRefusalLifts(prior, judgement, newestUserId);
 				const replay = replayDecision({
 					tool: "bash",
 					command: judgedCommand,
 					cwd,
 					judgement,
-					priorRefusal: Boolean(prior),
+					priorRefusal: prior !== undefined && !lifts,
 					riskFlags: flags,
-					headless: !ctx.hasUI,
 				});
 				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", ...lead, why: judgement.reason, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
+					// The user spoke after the refusal and the verdict reads their
+					// words as authorization: the refusal is lifted for good.
+					if (prior !== undefined) liftRefusals(ctx, judgedCommand, cwd);
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", ...lead, why: prior === undefined ? judgement.reason : `${judgement.reason} (lifts the refusal of "${prior.loggableTarget}")`, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
 					return;
 				}
 				// A SAFE on a target this session already refused is not a clean
 				// bill: the refusal rode in the state the judge saw, so a SAFE
 				// means the command looks safe, not that the refusal was wrong.
-				// The prior refusal stands until a human says otherwise, and the
+				// The refusal stands until the user's own words lift it, and the
 				// moderate-risk overlay keeps its own reason when both hit.
 				const priorTarget = prior?.loggableTarget ?? "";
 				const why =
@@ -6549,25 +6396,18 @@ export default function (pi: ExtensionAPI) {
 						? `classifier-safe but flags: ${flags.join(", ")}`
 						: `classifier-safe despite prior refusal of "${priorTarget}"`;
 				const foot = trashFootnote(flags);
-				const dialogWhy = foot === "" ? why : `${why}\n${foot}`;
+				const agentWhy = foot === "" ? why : `${why}\n${foot}`;
 				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", ...lead, why, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
-				return await requestPermission(
-					ctx,
-					target,
-					"flagged for approval",
-					dialogWhy,
-					"bash",
-					flags.length > 0 ? "follows verdict" : "despite prior refusal",
-					{ ...auditFields(), ...judgementAudit(judgement), ...follows },
-				);
+				return refuse(ctx, target, flags.length > 0 ? "flagged" : "prior-refusal", agentWhy, "bash", "follows verdict", {
+					...auditFields(),
+					...judgementAudit(judgement),
+					verdict: "SAFE",
+					...follows,
+				});
 			}
 			const verdict = judgement.verdict;
-			const detail =
-				verdict === "UNSAFE"
-					? "classified unsafe"
-					: verdict === "UNAVAILABLE"
-						? "classifier unavailable"
-						: "classifier unsure";
+			const cause = VERDICT_CAUSE[verdict];
+			const detail = REFUSAL_GUIDANCE[cause].headline;
 			logDecisionFor(ctx, {
 				tool: "bash",
 				decision: "block",
@@ -6588,21 +6428,16 @@ export default function (pi: ExtensionAPI) {
 			// A refusal record (issue #30) needs a verdict that judged the
 			// content, and with Jev that means UNSAFE outright: UNSURE is
 			// undecided, and UNAVAILABLE judged nothing at all (a transport
-			// failure is not evidence about the command). Only a human denial
-			// makes an undecided command a refusal — requestPermission records
-			// that itself.
+			// failure is not evidence about the command).
 			if (judgement.verdict === "UNSAFE" && judgement.persistRefusal !== false) {
-				addRefusal(ctx, judgedCommand, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint });
+				addRefusal(ctx, judgedCommand, judgement.reason, { source: "model", cwd, evidenceFingerprint: reviewEvidenceFingerprint, userMessageId: newestUserId });
 			}
-			return await requestPermission(
-				ctx,
-				target,
-				detail,
-				judgement.reason,
-				"bash",
-				"follows verdict",
-				{ ...auditFields(), ...judgementAudit(judgement), ...follows },
-			);
+			return refuse(ctx, target, cause, judgement.reason, "bash", "follows verdict", {
+				...auditFields(),
+				...judgementAudit(judgement),
+				verdict,
+				...follows,
+			});
 		} catch (err) {
 			// Unexpected plugin error: fail closed rather than wave the command
 			// through on a path we cannot vouch for.

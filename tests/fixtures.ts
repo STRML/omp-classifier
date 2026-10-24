@@ -696,22 +696,15 @@ export interface CtxOptions {
 	sessionId?: string;
 	cwd?: string;
 	hasUI?: boolean;
-	/** Selected dialog option label. undefined = canceled/timed-out dialog,
-	 *  which the gate treats as denial (issue #32). */
-	selectResult?: string | undefined;
 	tinyModel?: unknown;
 	model?: unknown;
 	/** Session branch entries for evidence collection (issue #31). Empty by
 	 *  default; the gate reads getBranch() only when evidenceUserMessages > 0. */
-	branch?: ReadonlyArray<{ type: string; message?: { role?: string; attribution?: string; content?: unknown } }>;
+	branch?: ReadonlyArray<{ type: string; id?: string; message?: { id?: string; role?: string; attribution?: string; content?: unknown } }>;
 	/** The session's artifacts directory, which the jev-v3 shadow treats as
 	 *  its scratch root. None by default. */
 	artifactsDir?: string;
 }
-
-/** The labels the plugin's permission dialog offers. */
-export const ALLOW_ONCE = "Allow once";
-export const DENY = "Deny";
 
 let sessionSeq = 0;
 
@@ -729,7 +722,6 @@ export function makeSessionId(prefix: string): string {
 }
 
 export function makeCtx(options: CtxOptions = {}): ExtensionContext {
-	const selectCalls: Array<[string, Array<{ label: string; description?: string }>]> = [];
 	const notifyCalls: string[][] = [];
 	// "model" in options distinguishes an explicit undefined (no model) from an
 	// absent option (default test model).
@@ -743,9 +735,10 @@ export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 		},
 		hasUI: options.hasUI ?? false,
 		ui: {
-			select: async (title: string, items: Array<{ label: string; description?: string }>) => {
-				selectCalls.push([title, items]);
-				return options.selectResult;
+			// The gate never prompts (https://github.com/STRML/omp-classifier/issues/184):
+			// a dialog from any path is a failing test, never a silent answer.
+			select: async (title: string) => {
+				throw new Error(`the gate opened a dialog: ${title}`);
 			},
 			notify: (message: string, type = "info") => {
 				notifyCalls.push([message, type]);
@@ -780,25 +773,8 @@ export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 			resolver: () => async (): Promise<string | undefined> => undefined,
 		},
 	} as unknown as ExtensionContext;
-	Object.defineProperty(ctx, "selectCalls", { value: selectCalls });
 	Object.defineProperty(ctx, "notifyCalls", { value: notifyCalls });
 	return ctx;
-}
-
-/**
- * The full dialog text the TUI renders as Markdown. The plugin passes the
- * title and the verbatim body as ONE string on the select dialog's title
- * (the TUI renders a select title as a full Markdown block), joined by a
- * single newline — the same join the old confirm's two arguments got
- * (extension-ui-controller.ts:947). Assert against this, not against the
- * parts, so a body that lazily continues the title paragraph is visible.
- */
-export function dialogText(ctx: ExtensionContext, index = 0): string {
-	return selectCalls(ctx)[index][0];
-}
-
-export function selectCalls(ctx: ExtensionContext): Array<[string, Array<{ label: string; description?: string }>]> {
-	return (ctx as unknown as { selectCalls: Array<[string, Array<{ label: string; description?: string }>]> }).selectCalls;
 }
 
 export function notifyCalls(ctx: ExtensionContext): string[][] {

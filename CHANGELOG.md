@@ -4,6 +4,28 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-24
 
+### The gate never prompts
+
+Part 4 of https://github.com/STRML/omp-classifier/issues/184, and the change the first three cleared the way for. No battery change: `jevQuestionsHash` stays `0561a20b8f3df930` and the policy version stays `jev-v2.17`.
+
+- Every path that opened a dialog now blocks. The refusal payload's `layer` names the cause, and `next` tells the agent what to do: reword, choose a safer action, or ask the user in chat.
+
+  | `layer` | Was | `next` points the agent at |
+  |---|---|---|
+  | `critical` | a dialog | a safer action, or the user running the command themselves |
+  | `environment` | a dialog | dropping the env |
+  | `cwd` (eval) | a dialog | a literal spawn directory |
+  | `unsafe`, `unsure` | a dialog | a safer or more specific command, or asking the user in chat |
+  | `unavailable`, `unclassified` | a dialog | telling the user; `/classifier off` pauses the gate for the session |
+  | `flagged` | a dialog | the reversible alternative, or the user running it themselves |
+  | `prior-refusal` | a dialog | asking the user in chat |
+
+- The user unblocks a command by saying so in chat. A refusal the session recorded lifts when the user has sent a message since the refusal and Jev answers SAFE with its authorization grounded in the user's words. Before, only a dialog approval lifted one. A `critical` or `flagged` command never runs through the agent. A headless session has no user channel, so nothing lifts there.
+- Host prompts stay: a `prompt` rule in `bash.patterns` and `tools.approval.bash: prompt` are the host's own dialog, and the gate still steps aside for them.
+- Audit log: a block writes its lead line, then one `blocked` line (`unclassified` when nothing was judged) that carries the verdict. The `dialog` and `headless` layers and the `approval` field are no longer written. `eval/live-report.ts` and `eval/recognizer-measure.ts` read both old and new lines; the live report's `headless-blocked` bucket is now `blocked`.
+- Dry-run reports `would: block` where it reported `would prompt`.
+- Eval: `replayDecision` drops `approval` and `headless`, and `hostHandoff` is `run`, `block` or `host-prompt`. Corpus labels stay `allow` and `ask`, and a false ask is still a labeled `allow` the gate blocks. The `approvalOverrides` report field is gone.
+
 ### A missed deadline aborts the judgment
 
 Part 3 of https://github.com/STRML/omp-classifier/issues/184. No battery change.

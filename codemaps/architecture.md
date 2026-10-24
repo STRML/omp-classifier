@@ -24,7 +24,7 @@ Runtime dep: `mvdan-sh` (shell parser, loaded lazily by `shell-ast.ts`). Dev dep
 |---|---|---|
 | L6 control plane | `/classifier` command, config bounds, kill switches, status | index.ts (plugin factory, config section) |
 | L5 self-measurement | eval harness, corpora, sweep, shadow report | eval/*.ts, eval/corpus/*.jsonl, eval/weekly-report.sh |
-| L4 interaction | dialogs, refusal payloads, dry-run | index.ts (`requestPermission`, `refusalPayload`) |
+| L4 interaction | refusal payloads, dry-run (the gate never prompts) | index.ts (`refuse`, `REFUSAL_GUIDANCE`, `refusalPayload`) |
 | L3 memory | verdict cache, refusal memory, audit log | index.ts (module state, `logDecision`) |
 | L2 judgment | state + battery, transport, derivation | jev.ts, jev-judge.ts, decision-order.ts, authorization.ts |
 | L1 recognition | critical/structural/overlay scans, floor, literal match | index.ts (overlay scanners), floor.ts, literal-match.ts, recognizer.ts |

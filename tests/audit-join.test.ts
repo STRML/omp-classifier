@@ -8,7 +8,6 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { DecisionRecord, JudgedStateRecord } from "../index";
 import {
-	DENY,
 	fire,
 	fireCommand,
 	jevSafeAnswer,
@@ -62,20 +61,21 @@ afterEach(() => {
 });
 
 describe("an ask joins to its outcome by id", () => {
-	test("a headless line carries the decisionId of the verdict line it follows", async () => {
+	test("a blocked line carries the decisionId of the verdict line it follows", async () => {
 		setJevAnswer(jevUnsureAnswer());
 		await fire("tool_call", makeEvent("echo join-unsure"), makeCtx({ sessionId: session() }));
-		const [verdict, headless] = decisions();
+		const [verdict, blocked] = decisions();
 		expect(verdict).toMatchObject({ layer: "verdict", verdict: "UNSURE" });
-		expect(headless).toMatchObject({ layer: "headless", followsDecisionId: verdict.decisionId });
-		expect(headless.decisionId).not.toBe(verdict.decisionId);
+		expect(blocked).toMatchObject({ layer: "blocked", verdict: "UNSURE", followsDecisionId: verdict.decisionId });
+		expect(blocked.decisionId).not.toBe(verdict.decisionId);
 	});
 
-	test("a dialog answer carries it too", async () => {
+	test("a session with a UI joins the same way", async () => {
 		setJevAnswer(jevUnsureAnswer());
-		await fire("tool_call", makeEvent("echo join-dialog"), makeCtx({ sessionId: session(), hasUI: true, selectResult: DENY }));
-		const [verdict, dialog] = decisions();
-		expect(dialog).toMatchObject({ layer: "dialog", approval: "deny", followsDecisionId: verdict.decisionId });
+		await fire("tool_call", makeEvent("echo join-ui"), makeCtx({ sessionId: session(), hasUI: true }));
+		const [verdict, blocked] = decisions();
+		expect(blocked).toMatchObject({ layer: "blocked", followsDecisionId: verdict.decisionId });
+		expect(blocked.approval).toBeUndefined();
 	});
 
 	test("a critical lead and an eval cwd lead join the same way", async () => {

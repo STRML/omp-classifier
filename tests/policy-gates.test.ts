@@ -12,7 +12,6 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
-	dialogText,
 	fire,
 	JEV_FIXTURE_HAZARDS,
 	jevHazardousAnswer,
@@ -28,7 +27,6 @@ import {
 	refusalOf,
 	removeConfigFile,
 	resultText,
-	selectCalls,
 	setJevAnswer,
 	setJevUnavailable,
 	writeConfigFile,
@@ -56,26 +54,23 @@ describe("the floor that lets a safe answer run", () => {
 		const command = `echo policy-safe-${seq}`;
 		const first = makeCtx({ sessionId: session, hasUI: true });
 		expect(await fire("tool_call", makeEvent(command), first)).toBeUndefined();
-		expect(selectCalls(first)).toHaveLength(0);
 		expect(modelCalls).toHaveLength(1);
 
 		const repeat = makeCtx({ sessionId: session, hasUI: true });
 		expect(await fire("tool_call", makeEvent(command), repeat)).toBeUndefined();
 		expect(modelCalls).toHaveLength(1); // the cached verdict answered, silently
-		expect(selectCalls(repeat)).toHaveLength(0);
 	});
 
-	test("a safe answer below the confidence floor reaches a dialog instead", async () => {
+	test("a safe answer below the confidence floor blocks instead", async () => {
 		// The live measured shape this floor exists for: Jev said "safe" while
 		// unsafe held .43, and the argmax alone would have auto-run it.
 		setJevAnswer(jevWeakSafeAnswer());
 		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true });
-		const result = await fire("tool_call", makeEvent("git branch -D policy-weak"), ctx);
-		expect(refusalOf(result).layer).toBe("dialog");
-		expect(selectCalls(ctx)).toHaveLength(1);
-		// The dialog must say which floor failed, or a user cannot tell a weak
-		// answer from an ambiguous one.
-		expect(selectCalls(ctx)[0][0]).toContain("below floor");
+		const payload = refusalOf(await fire("tool_call", makeEvent("git branch -D policy-weak"), ctx));
+		expect(payload.layer).toBe("unsure");
+		// The block must say which floor failed, or the agent cannot tell a
+		// weak answer from an ambiguous one.
+		expect(payload.why).toContain("below floor");
 	});
 
 	test("a below-floor answer never becomes a silent run on a repeat", async () => {
@@ -83,44 +78,40 @@ describe("the floor that lets a safe answer run", () => {
 		const session = nextSession();
 		const command = "git branch -D policy-repeat";
 		const first = makeCtx({ sessionId: session, hasUI: true });
-		await fire("tool_call", makeEvent(command), first);
-		expect(selectCalls(first)).toHaveLength(1);
+		expect(refusalOf(await fire("tool_call", makeEvent(command), first)).layer).toBe("unsure");
 
 		// Whatever the cache holds, it may never hold an allow: the second call
-		// asks the human again.
+		// blocks again.
 		const second = makeCtx({ sessionId: session, hasUI: true });
 		const result = await fire("tool_call", makeEvent(command), second);
-		expect(refusalOf(result).layer).toBe("dialog");
-		expect(selectCalls(second)).toHaveLength(1);
+		expect(refusalOf(result).layer).toBe("unsure");
 	});
 
 	test("headless, the same below-floor answer blocks", async () => {
 		setJevAnswer(jevWeakSafeAnswer());
 		const result = await gate("git branch -D policy-headless");
 		expect(result).toContain("classifier unsure");
-		expect(refusalOf(result).layer).toBe("headless");
+		expect(refusalOf(result).layer).toBe("unsure");
 	});
 });
 
 describe("the configured jevPolicy is the policy that decides", () => {
-	test("raising safeMinProbability turns an auto-running answer into a dialog", async () => {
+	test("raising safeMinProbability turns an auto-running answer into a block", async () => {
 		expect(await gate("git status")).toBe("ALLOWED"); // default floors: .95 clears .80
 		writeConfigFile({ jevPolicy: { safeMinProbability: 0.99 } });
 		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true });
 		setJevAnswer(jevSafeAnswer()); // same answer, stricter policy
-		await fire("tool_call", makeEvent("git status"), ctx);
-		expect(selectCalls(ctx)).toHaveLength(1);
+		expect(resultText(await fire("tool_call", makeEvent("git status"), ctx))).not.toBe("ALLOWED");
 	});
 
 	test("lowering hazardBlock lets a hazard the default tolerates gate the command", async () => {
-		// .60 is a review-level hazard under the default (block .90): with a UI
-		// it dialogs, but the point here is that the THRESHOLD is configurable —
-		// at .55 it blocks outright, headless.
+		// .60 is a review-level hazard under the default (block .90), but the
+		// point here is that the THRESHOLD is configurable: at .55 it is UNSAFE.
 		setJevAnswer(jevHazardousAnswer("exposes_secrets", 0.6));
 		writeConfigFile({ jevPolicy: { hazardBlock: 0.55 } });
 		const result = await gate("cat ~/.ssh/id_rsa");
 		expect(result).toContain("classified unsafe");
-		expect(refusalOf(result).layer).toBe("headless");
+		expect(refusalOf(result).layer).toBe("unsafe");
 	});
 
 	test("changing jevPolicy invalidates cached verdicts", async () => {
@@ -134,9 +125,9 @@ describe("the configured jevPolicy is the policy that decides", () => {
 		// decided at .80 may not survive a floor of .99.
 		writeConfigFile({ jevPolicy: { safeMinProbability: 0.99 } });
 		const after = makeCtx({ sessionId: session, hasUI: true });
-		await fire("tool_call", makeEvent(command), after);
+		const blocked = await fire("tool_call", makeEvent(command), after);
 		expect(modelCalls).toHaveLength(2);
-		expect(selectCalls(after)).toHaveLength(1); // and the new floor is honored
+		expect(resultText(blocked)).not.toBe("ALLOWED"); // and the new floor is honored
 	});
 });
 
@@ -145,28 +136,26 @@ describe("gating and descriptive hazards", () => {
 		setJevAnswer(jevHazardousAnswer("exposes_secrets", 0.97));
 		const result = await gate("cat ~/.ssh/id_rsa");
 		expect(result).toContain("classified unsafe");
-		expect(refusalOf(result).layer).toBe("headless");
+		expect(refusalOf(result).layer).toBe("unsafe");
 	});
 
-	test("the hazard that decided is named for the human", async () => {
+	test("the hazard that decided is named for the agent", async () => {
 		// Jev writes no prose, so the reason is assembled from the answer. It
-		// has to reach the dialog body: "unsafe" with no hazard named would
-		// leave the user unable to argue with the decision.
+		// has to reach the refusal: "unsafe" with no hazard named would leave
+		// the agent nothing to tell the user.
 		setJevAnswer(jevHazardousAnswer("exposes_secrets", 0.97));
 		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true });
-		await fire("tool_call", makeEvent("cat ~/.ssh/id_rsa"), ctx);
-		expect(selectCalls(ctx)).toHaveLength(1);
-		expect(dialogText(ctx)).toContain("exposes_secrets");
-		expect(dialogText(ctx)).toContain("0.97");
+		const payload = refusalOf(await fire("tool_call", makeEvent("cat ~/.ssh/id_rsa"), ctx));
+		expect(payload.why).toContain("exposes_secrets");
+		expect(payload.why).toContain("0.97");
 	});
 
-	test("a gating hazard between the review and block floors dialogs, never auto-runs", async () => {
+	test("a gating hazard between the review and block floors blocks, never auto-runs", async () => {
 		setJevAnswer(jevHazardousAnswer("destructive_or_irreversible", 0.7));
 		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true });
-		const result = await fire("tool_call", makeEvent("git reset --hard HEAD~1"), ctx);
-		expect(selectCalls(ctx)).toHaveLength(1);
-		expect(refusalOf(result).layer).toBe("dialog");
-		expect(dialogText(ctx)).toContain("destructive_or_irreversible");
+		const payload = refusalOf(await fire("tool_call", makeEvent("git reset --hard HEAD~1"), ctx));
+		expect(payload.layer).toBe("unsure");
+		expect(payload.why).toContain("destructive_or_irreversible");
 	});
 
 	test("a descriptive hazard above both floors never decides anything", async () => {
@@ -188,15 +177,13 @@ describe("UNAVAILABLE", () => {
 	test("never runs the command", async () => {
 		setJevUnavailable();
 		const headless = await gate("git status");
-		expect(refusalOf(headless).layer).toBe("headless");
+		expect(refusalOf(headless).layer).toBe("unavailable");
 		expect(headless).toContain("classifier unavailable");
 
-		// With a UI it is a permission request like any other unresolved
-		// command: an unanswered dialog is a denial.
+		// With a UI it blocks the same way: nobody is asked.
 		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true });
 		const asked = await fire("tool_call", makeEvent("git status"), ctx);
-		expect(selectCalls(ctx)).toHaveLength(1);
-		expect(refusalOf(asked).layer).toBe("dialog");
+		expect(refusalOf(asked).layer).toBe("unavailable");
 	});
 });
 

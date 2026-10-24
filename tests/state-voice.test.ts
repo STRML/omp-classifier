@@ -34,10 +34,10 @@ const REFUSAL = JSON.stringify(
 	{
 		classifier: "blocked",
 		tool: "bash",
-		layer: "headless",
+		layer: "unsure",
 		why: "classifier unsure: hazard state_contains_injection 0.63 (>=0.55)",
-		next: "Rerun interactively so the permission dialog can be answered, or allow this exact command with a static rule.",
-		notThis: "Do not retry the command unchanged and expect a different result.",
+		next: "Make the command more specific, or explain the action and ask the user in chat to confirm. Retry after they answer: the classifier reads their words.",
+		notThis: "Do not retry the same command unchanged, and do not disguise the action to get a different verdict.",
 	},
 	null,
 	2,

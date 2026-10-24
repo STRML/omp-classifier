@@ -71,11 +71,11 @@ describe("enabled=false", () => {
 		writeConfigFile({ enabled: false });
 		const result = await gate("rm -rf /");
 		expect(result).toContain("critical pattern");
-		expect(refusalOf(result).layer).toBe("headless");
+		expect(refusalOf(result).layer).toBe("critical");
 		expect(modelCalls.length).toBe(0);
 	});
 
-	test("env overrides still prompt", async () => {
+	test("env overrides still block", async () => {
 		writeConfigFile({ enabled: false });
 		const result = await gate("echo hi", {}, { env: { PATH: "/evil" } });
 		expect(result).toContain("environment override");
@@ -154,7 +154,7 @@ describe("bounds and garbage", () => {
 		writeConfigFile({ timeoutMs: 20 });
 		const result = await gate("git status");
 		expect(result).toContain("classifier unavailable");
-		expect(refusalOf(result).layer).toBe("headless");
+		expect(refusalOf(result).layer).toBe("unavailable");
 		// The request WAS sent: the fake captures it on arrival, before the
 		// delay. The old expectation of 0 here was an artifact of recording
 		// only completions that finished.

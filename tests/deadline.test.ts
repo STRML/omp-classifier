@@ -120,21 +120,12 @@ describe("the judgment deadline", () => {
 		await loadPlugin(makeSettings([]));
 		setJevDelay(LATE_ANSWER_MS);
 		setJevAnswer(jevSafeAnswer());
-		const ctx = makeCtx({ sessionId: `deadline-${seq}`, hasUI: true, selectResult: "Deny" });
-		// Whether the request was still running when the dialog opened.
-		let abortedWhenAsked: boolean | undefined;
-		const ui = ctx.ui as unknown as { select: (...args: unknown[]) => Promise<string | undefined> };
-		const select = ui.select;
-		ui.select = (...args: unknown[]) => {
-			abortedWhenAsked = signalOf()?.aborted;
-			return select(...args);
-		};
+		const ctx = makeCtx({ sessionId: `deadline-${seq}`, hasUI: true });
 		const tool = fire("tool_call", makeEvent(`git status --deadline-${seq}`), ctx);
 		await until(() => modelCalls.length > 0);
 		jest.advanceTimersByTime(DEADLINE_MS + 5);
 		const result = await tool;
 
-		expect(abortedWhenAsked).toBe(true);
 		expect(signalOf()?.aborted).toBe(true);
 		expect(refusalOf(resultText(result)).why).toContain(`timed out after ${DEADLINE_MS}ms`);
 

@@ -19,8 +19,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { readInterpretedScriptBodies } from "../index";
 import {
-	ALLOW_ONCE,
-	dialogText,
 	fire,
 	jevSafeAnswer,
 	loadPlugin,
@@ -108,7 +106,7 @@ describe("the body decides, wherever the file lives", () => {
 		const payload = refusalOf(result);
 		// The flag can only come from the body: the command text has no rm in it.
 		expect(payload.why).toContain("flags: rm");
-		expect(payload.layer).toBe("headless");
+		expect(payload.layer).toBe("flagged");
 	});
 
 	test("the same body is refused from outside the session's directory", async () => {
@@ -116,7 +114,7 @@ describe("the body decides, wherever the file lives", () => {
 		const result = await gate(`bash ${file}`);
 		const payload = refusalOf(result);
 		expect(payload.why).toContain("flags: rm");
-		expect(payload.layer).toBe("headless");
+		expect(payload.layer).toBe("flagged");
 	});
 
 	test("a rename does not change the verdict", async () => {
@@ -126,8 +124,8 @@ describe("the body decides, wherever the file lives", () => {
 		writeScript(root, "rs3_remove_import.py", HARMFUL_CODE);
 		const first = await gate("python3 cleanup_row.py");
 		const second = await gate("python3 rs3_remove_import.py");
-		expect(refusalOf(first).layer).toBe("headless");
-		expect(refusalOf(second).layer).toBe("headless");
+		expect(refusalOf(first).layer).toBe("flagged");
+		expect(refusalOf(second).layer).toBe("flagged");
 		expect(refusalOf(first).why).toContain("flags: python3 runs cleanup_row.py");
 		expect(refusalOf(second).why).toContain("flags: python3 runs rs3_remove_import.py");
 	});
@@ -183,7 +181,7 @@ describe("the body decides, wherever the file lives", () => {
 		// judged includes the body, so the rewrite is a new question.
 		const ctx = makeCtx({ sessionId: "script-body-cache", cwd: root });
 		writeScript(root, "probe.py", HARMFUL_CODE);
-		expect(refusalOf(await gate("python3 probe.py", ctx)).layer).toBe("headless");
+		expect(refusalOf(await gate("python3 probe.py", ctx)).layer).toBe("flagged");
 
 		setJevAnswer(jevSafeAnswer());
 		writeScript(root, "probe.py", 'print("rewritten")\n');
@@ -1069,13 +1067,11 @@ describe("sibling commands of this fix stay as they were", () => {
 		expect(result).toBe("ALLOWED");
 	});
 
-	test("an approved script still runs, and the dialog showed its body", async () => {
+	test("a UI session blocks the script too, and the judge read its body", async () => {
 		writeScript(root, "probe.sh", HARMFUL_SHELL);
-		const ctx = makeCtx({ sessionId: "script-body-allow", cwd: root, hasUI: true, selectResult: ALLOW_ONCE });
-		expect(await gate("bash probe.sh", ctx)).toBe("ALLOWED");
-		// The human approved the text the gate judged, body included: the dialog
-		// renders target.command, and that is the spliced text.
-		expect(dialogText(ctx)).toContain("rm -rf ./out");
+		const ctx = makeCtx({ sessionId: "script-body-ui", cwd: root, hasUI: true });
+		expect(await gate("bash probe.sh", ctx)).not.toBe("ALLOWED");
+		expect(JSON.stringify(stateOf(0))).toContain("rm -rf ./out");
 	});
 });
 describe("the remaining wrapper and stdin boundaries", () => {
