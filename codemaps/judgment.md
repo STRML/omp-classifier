@@ -5,7 +5,7 @@
 ```
 buildJevState ─► state ─┐
 jevQuestions  ─► battery┴► judgeBattery (jev-judge) ─► JevAnswers ─► deriveJevDecision ─► JevDecision
-                             └ judgeBatteryUnderDeadline (deadline race, late answers)       (live, jev-v2.17)
+                             └ judgeBatteryUnderDeadline (deadline aborts the request)       (live, jev-v2.17)
 shadow: judgeJevV3 = jev-v3.7 battery ∥ judgeAuthorization ─► deriveAuthorization
         ─► deriveDecisionOrder(risk, authorization, literalMatch, overlay, headless) ─► OrderedDecision
 ```

@@ -4,6 +4,13 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-24
 
+### A missed deadline aborts the judgment
+
+Part 3 of https://github.com/STRML/omp-classifier/issues/184. No battery change.
+
+- The gate waits for the verdict up to `timeoutMs`, then aborts the request and the call is UNAVAILABLE. This reverses the late-answer race from issue #62, which kept the request alive for up to `min(2 x timeoutMs, 30s)` so a late SAFE could dismiss the dialog the deadline opened. With the dialog on its way out, a late answer has nothing left to refine.
+- Removed: `LateJudgement`, `GuardedLateJudgement`, `Judgement.late`, `LateAnswers`, the listen window, and the `late-verdict` audit layer. `eval/live-report.ts` still reads `late-verdict` lines in older logs.
+
 ### Session grants are gone
 
 Part 2 of https://github.com/STRML/omp-classifier/issues/184. No battery change.
