@@ -2567,11 +2567,56 @@ function deleteLineIsInert(commands: readonly ShellCommand[]): boolean {
 	return commands.every((command, index) => {
 		if (command.nested || command.unreadShape !== undefined || command.expression !== undefined) return false;
 		if (command.assigns.length > 0 || command.join === "pipe" || commands[index + 1]?.join === "pipe") return false;
+		// Every word reaches the command as written: `-[a]` or `-{f,x}` reads as
+		// a flag here and globs or brace-expands into operands the gate never
+		// saw, and `$VAR` may split into several. `~` expands to one word and
+		// is measured toward false only, so it stays.
+		if (!command.words.every(word => word.fixed)) return false;
 		const verb = literalVerb(command);
 		if (DELETE_NEIGHBOUR_VERBS[verb] !== true) return false;
 		return DELETE_VERBS[verb] === true || pinnedDirectoryChange(command);
 	});
 }
+
+/**
+ * Whether every `cd` on the line certainly happened before any delete the walk
+ * places after it. The walk moves the shell at a `cd` whether or not it
+ * succeeds, but a `cd` that fails leaves the shell where it was, and the next
+ * statement still runs after `;` or `||`. So a line with a `cd` is measured
+ * only when the `cd` opens the line or follows `&&`, everything after the first
+ * `cd` is joined by `&&` (a failure anywhere stops the rest), and each `cd`
+ * names an existing directory whose `..` steps land in the same place read by
+ * name (bash's `cd -L`) and through the filesystem (the measurement's
+ * `realpath`): `cd /tmp/link/..` is `/tmp` to the first and the link target's
+ * parent to the second.
+ */
+function directoryChangesHold(commands: readonly ShellCommand[], masked: string, cwd: string): boolean {
+	const first = commands.findIndex(command => literalVerb(command) === "cd" || literalVerb(command) === "pushd");
+	if (first === -1) return true;
+	if (commands[first].join !== "first" && commands[first].join !== "and") return false;
+	if (commands.slice(first + 1).some(command => command.join !== "and")) return false;
+	return commands.every(command => {
+		const verb = literalVerb(command);
+		if (verb !== "cd" && verb !== "pushd") return true;
+		const at = command.words[0]?.offset;
+		const from = at === undefined ? null : segmentCwdAt(masked, at, cwd);
+		const target = command.words[1]?.value;
+		if (from === null || target === undefined) return false;
+		const spelled = isAbsolute(target) ? target : `${from}${sep}${target}`;
+		const physical = physicalRealpath(spelled);
+		if (physical === null || !isDirectory(physical)) return false;
+		if (!target.split("/").includes("..")) return true;
+		return physicalRealpath(resolve(spelled)) === physical;
+	});
+}
+
+const isDirectory = (path: string): boolean => {
+	try {
+		return statSync(path).isDirectory();
+	} catch {
+		return false;
+	}
+};
 
 /** True when `real` lies strictly inside one of `roots`. */
 const strictlyInside = (real: string, roots: readonly string[]): boolean => roots.some(root => real.startsWith(root + sep));
@@ -2600,10 +2645,34 @@ function measureDeleteOperand(word: ShellWord, cwd: string | null, roots: readon
 	return landsUnderTempRoot(isAbsolute(word.value) ? word.value : `${cwd}${sep}${word.value}`, roots);
 }
 
+/**
+ * The real path the kernel reaches for `path`, `..` included. Node's realpath
+ * normalizes `..` by name before it touches the filesystem, so `/tmp/link/..`
+ * comes back as `/tmp` while the kernel walks the link and lands in its
+ * target's parent. This walks one name at a time: each name resolves through
+ * any link from the real directory so far, and `..` steps up from that real
+ * directory, the way `rm` and `trash` see the path.
+ */
+function physicalRealpath(path: string): string | null {
+	if (!isAbsolute(path)) return null;
+	let current: string = sep;
+	for (const name of path.split(sep)) {
+		if (name === "" || name === ".") continue;
+		if (name === "..") {
+			current = dirname(current);
+			continue;
+		}
+		const next = realpathOrNull(join(current, name));
+		if (next === null) return null;
+		current = next;
+	}
+	return current;
+}
+
 function landsUnderTempRoot(path: string, roots: readonly string[]): boolean | null {
 	const joined = path.replace(/\/+$/u, "") || sep;
-	const full = realpathOrNull(joined);
-	const parent = realpathOrNull(dirname(joined));
+	const full = physicalRealpath(joined);
+	const parent = physicalRealpath(dirname(joined));
 	if (full === null || parent === null) return null;
 	return strictlyInside(full, roots) && strictlyInside(`${parent}${sep}${basename(joined)}`, roots);
 }
@@ -2629,8 +2698,8 @@ export function measureDeleteTargets(command: string, cwd: string, roots: readon
 	// Past the cap, the operands the state cannot carry would be deletes the
 	// judge never sees: sixteen `true` entries must not stand in for a
 	// seventeenth outside temp. Such a line is not measured at all.
-	const measurable = deleteLineIsInert(parsed.commands) && operandCount <= DELETE_TARGET_CAP;
 	const masked = maskHeredocBodiesAndAnsiSpans(command).masked;
+	const measurable = deleteLineIsInert(parsed.commands) && operandCount <= DELETE_TARGET_CAP && directoryChangesHold(parsed.commands, masked, cwd);
 	const entries: DeleteTarget[] = [];
 	for (const entry of deletes) {
 		const at = entry.words[0]?.offset;

@@ -4,6 +4,16 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-24
 
+### Security: delete targets measure only what the shell will delete
+
+Follow-up to https://github.com/STRML/omp-classifier/pull/175, from a security review of the merged code. No battery change.
+
+- A delete line whose words aren't all fixed is unmeasured (`null` throughout). `trash -[a] /tmp/x` read `-[a]` as a flag, but the shell globs it, and `-{f,/Users/x}` brace-expands into a second target. `~` still counts as fixed: it expands to one word, and it only ever measures `false`.
+- A `cd` counts only when the shell is certain it happened before the delete: everything after the first `cd` must be joined by `&&`, and the `cd` itself must open the line or follow `&&`. `cd /nonexistent; trash y` runs `trash` from the old directory while the walk had already moved. The target must exist as a directory.
+- A `cd` target with a `..` step must land in the same place read by name (bash's `cd -L`) and through the filesystem. `cd /tmp/link/..` is `/tmp` to bash and the link target's parent to the kernel.
+- Found while fixing that: Node's `realpath` also normalizes `..` by name before it touches the filesystem, so `trash /tmp/link-to-home/../notes.md` measured `true` while `trash` deletes `~/notes.md`. Operands now resolve one name at a time, the way the kernel walks them.
+- Eval: no change is possible. The battery is untouched (`jevQuestionsHash` `0561a20b8f3df930`, eval policy id `2175ddbe005f`, same as main) and the corpus rows carry their provenance as data, so every row's judged state is byte-identical. A live re-run on jev-1.14.0 was attempted and failed on TypeSafe billing (HTTP 402, no credits).
+
 ### A bare `git push` is measured (jev-v2.17)
 
 - Fixes https://github.com/STRML/omp-classifier/issues/171. The most common spelling, `git push` with no remote or refspec, was never measured, so it asked (0.59-0.63 on jev-1.14.0) while a measured push ran unasked.
