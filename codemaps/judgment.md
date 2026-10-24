@@ -5,7 +5,7 @@
 ```
 buildJevState ─► state ─┐
 jevQuestions  ─► battery┴► judgeBattery (jev-judge) ─► JevAnswers ─► deriveJevDecision ─► JevDecision
-                             └ judgeBatteryUnderDeadline (deadline race, late answers)       (live, jev-v2.17)
+                             └ judgeBatteryUnderDeadline (deadline aborts the request)       (live, jev-v2.17)
 shadow: judgeJevV3 = jev-v3.7 battery ∥ judgeAuthorization ─► deriveAuthorization
         ─► deriveDecisionOrder(risk, authorization, literalMatch, overlay, headless) ─► OrderedDecision
 ```
@@ -85,7 +85,7 @@ Every hazard ≥ `hazardReview` (descriptive included) lands in `decision.hazard
 | `judgeBackendFor(config)` | 245 | → `{id, judge()}`; id joins signature + cache key | index, internal |
 | `noFollowFetch` | 291 | forces `redirect:"manual"` for the endpoint kind | `endpointBackend` |
 | `judgeBattery(signal, opts)` | 354 | one call; `toJevAnswers` validates every field | eval/run, internal |
-| `judgeBatteryUnderDeadline(opts)` | 419 | → `answered` / `failed` / `deadline{late}`; listens `min(2×timeout, 30s)` | index `classify` |
+| `judgeBatteryUnderDeadline(opts)` | 388 | → `answered` / `failed` / `deadline`; the deadline aborts the request | index `classify` |
 | `judgeAuthorization(signal, opts)` | 490 | authorization question over a separate state | `judgeJevV3` |
 | `judgeJevV3(signal, opts)` | 521 | v3 risk ∥ authorization; an authorization failure → `undefined` | index `shadowJevV3` |
 

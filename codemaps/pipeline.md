@@ -70,7 +70,7 @@ judgeBatteryUnderDeadline({timeoutMs, state: buildJevState(...), backend})   jev
   │     authorization label: missing | grounded | not-required
   │     annotateJudgement(...)  fills reasonCode/risk defaults
   ├ failed   → UNAVAILABLE, noCache, reason "Jev unavailable: <err>"
-  └ deadline → UNAVAILABLE, noCache, plus `late: {answer, cancel}` (late answers go through the same judgementFrom)
+  └ deadline → request aborted; UNAVAILABLE, noCache
 ```
 
 ## `requestPermission` (index.ts:5770), L4
@@ -78,12 +78,10 @@ judgeBatteryUnderDeadline({timeoutMs, state: buildJevState(...), backend})   jev
 | Condition | Result | `layer` |
 |---|---|---|
 | dry-run | records "would prompt", block | — |
-| `!ctx.hasUI` | cancels the late handle, block | `headless`, or `unclassified` when the headline is unclassified |
+| `!ctx.hasUI` | block | `headless`, or `unclassified` when the headline is unclassified |
 | UI | `ctx.ui.select`: Allow once / Deny | `dialog` |
 | Allow once | `liftRefusals` | `dialog` + `approval` field |
 | Deny or cancel | `addRefusal(human)`, block | `dialog` |
-| late SAFE that passes the `replayDecision` guards | dismisses the dialog → allow | `late-verdict` |
-| late UNSAFE / UNSURE | dialog stays open, notify + audit only | `late-verdict` |
 
 
 ## `replayDecision` (index.ts:1537): the shared deterministic tail

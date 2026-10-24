@@ -36,7 +36,7 @@ Read this before opening index.ts. Line numbers are where each declaration start
 | 5649 | `logDecision` | appends to decisions.jsonl; redacts and truncates `cmd` to 120 chars; dry-run captures here |
 | 5706 | `shadowFloor` | `evaluateFloor` + session taint |
 | 5735 | `logDecisionFor` | adds `sessionId` |
-| 5770 | `requestPermission` | dialog / headless block / late race |
+| 5770 | `requestPermission` | dialog / headless block |
 | 6095 | `dryRunStop` | ends a dry-run probe |
 | 6100 | `handleToolCall` | the gate; `pi.on("tool_call")` at 7105 |
 | 7110 | `dropCurrent` | per-session state reset on session events |
@@ -82,12 +82,12 @@ executes · `status` writes status.json · `reset` · `trust-policy` · `enabled
 `ts, decisionId, sessionId, policyVersion, policyHash, modelId, reasonCode, jev{model,
 probabilities, hazards, confidence, blastRadius, usage, latencyMs}, userMessageIds,
 authorization, v3, approval, tool, decision, layer, why, cmd, cwd, spawnCwd, verdict, cached, ms,
-staleCode, floor{asks, entries}, followsDecisionId` (dialog/headless/late-verdict lines point at the verdict/cwd/critical/environment line before them; unclassified lines carry none).
+staleCode, floor{asks, entries}, followsDecisionId` (dialog/headless lines point at the verdict/cwd/critical/environment line before them; unclassified lines carry none).
 
 No-UI sessions: `userChannelBranch(ctx)` returns an empty branch when `!ctx.hasUI`, so `evidenceUserSnapshot` and `shadowJevV3` see no user words; tool evidence still reads the whole branch.
 
 `layer` values: `cap`, `rule`, `cwd`, `script-body`, `critical`, `environment`,
-`verdict`, `cached`, `dialog`, `headless`, `unclassified`, `late-verdict`, `internal-error`.
+`verdict`, `cached`, `dialog`, `headless`, `unclassified`, `internal-error` (older logs also hold `granted` and `late-verdict`).
 
 ## Exports consumed outside index.ts
 
