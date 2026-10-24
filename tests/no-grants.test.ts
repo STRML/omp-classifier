@@ -66,4 +66,5 @@ describe("no grants", () => {
 		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true });
 		const result = await fire("tool_call", makeEvent("git branch -D feature-dialog"), ctx);
 		expect(resultText(result)).not.toBe("ALLOWED");
-	});});
+	});
+});
