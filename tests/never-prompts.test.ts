@@ -167,9 +167,10 @@ describe("every former dialog blocks with a cause", () => {
 
 describe("control flow only", () => {
 	test("the battery hash is the one main shipped before the change", () => {
-		// 0561a20b8f3df930 is jev-v2.17's hash (CHANGELOG, 2026-10-24). This
-		// change moves no question, option or threshold.
-		expect(jevQuestionsHash()).toBe("0561a20b8f3df930");
+		// a0393345ac3364d4 is jev-v2.18's hash, from
+		// https://github.com/STRML/omp-classifier/pull/178. This change moves no
+		// question, option or threshold.
+		expect(jevQuestionsHash()).toBe("a0393345ac3364d4");
 	});
 });
 

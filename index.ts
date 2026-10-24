@@ -125,6 +125,7 @@ import {
 	type JevAnswers,
 	type JevVerdict,
 	type NetworkProvenance,
+	lookalikeDestinationFlags,
 	measureDeleteTargets,
 	measureGitPushProvenance,
 	measureGitRefProvenance,
@@ -4465,6 +4466,24 @@ export function trashFootnote(flags: readonly string[]): string {
 	return flags.some(f => f === "rm" || f === "unlink") ? "Reversible alternative: trash <paths>" : "";
 }
 
+/**
+ * Refusal footnote for a lookalike destination
+ * (https://github.com/STRML/omp-classifier/issues/161): a host the user never
+ * named that shares a parent with one they did. The flag names both hosts.
+ * Confirming in chat is a real way forward: once the user writes the exact
+ * host, it is a host they named and the measurement no longer flags it.
+ */
+export function lookalikeFootnote(flags: readonly string[]): string {
+	return flags.some(f => f.startsWith("lookalike host "))
+		? "Lookalike destination: ask the user in chat to confirm the exact host this command contacts, or ask them to run the command themselves."
+		: "";
+}
+
+/** Every footnote the flags call for, one per line, after the why. */
+function withFlagFootnotes(why: string, flags: readonly string[]): string {
+	return [why, trashFootnote(flags), lookalikeFootnote(flags)].filter(line => line !== "").join("\n");
+}
+
 function sessionCache(sessionId: string): Map<string, Judgement> {
 	let scoped = cache.get(sessionId);
 	if (!scoped) {
@@ -5891,7 +5910,7 @@ export default function (pi: ExtensionAPI) {
 					// blocked a SAFE the judge reached on the visible spawn.
 					// A real destructive verb reads as a call or an argument
 					// (`rm -rf`, spawn(["rm", …])) and never as `token =`.
-					const flagList = evalRiskFlags(evalCode);
+					const flagList = [...evalRiskFlags(evalCode), ...lookalikeDestinationFlags(evalCode, evidenceSnapshot?.messages)];
 					const replay = replayDecision({
 						tool: "eval",
 						command: evalCode,
@@ -5919,7 +5938,7 @@ export default function (pi: ExtensionAPI) {
 							? `classifier-safe but flags: ${flagList.join(", ")}`
 							: `classifier-safe despite prior ${prior?.source ?? ""} refusal of "${prior?.loggableTarget ?? ""}"`;
 					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", ...lead, why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
-					return refuse(ctx, target, flagList.length > 0 ? "flagged" : "prior-refusal", why, "eval", "follows verdict", { ...auditFields(), ...judgementAudit(judgement), ...spawnField, verdict: "SAFE", ...follows });
+					return refuse(ctx, target, flagList.length > 0 ? "flagged" : "prior-refusal", withFlagFootnotes(why, flagList), "eval", "follows verdict", { ...auditFields(), ...judgementAudit(judgement), ...spawnField, verdict: "SAFE", ...follows });
 				}
 				const cause = VERDICT_CAUSE[judgement.verdict];
 				const detail = REFUSAL_GUIDANCE[cause].headline;
@@ -6353,7 +6372,9 @@ export default function (pi: ExtensionAPI) {
 				// and a judge that answers SAFE on a payload carrying an injected
 				// instruction must not auto-run rm/dd/mkfs-class commands the
 				// builtin critical list does not cover.
-				const flags = matchModerateRiskTokens(judgedCommand, cwd);
+				// Issue #161: a destination the gate measured as a lookalike of a host the
+				// user named asks, whatever the judge made of the field in its state.
+				const flags = [...matchModerateRiskTokens(judgedCommand, cwd), ...lookalikeDestinationFlags(judgedCommand, evidenceSnapshot?.messages)];
 				// Issue #67: a script body is code the classifier read verbatim —
 				// the same class of payload as an inline `-c` argument — so the
 				// same second-execution markers apply. A SAFE cannot vouch for a
@@ -6389,8 +6410,7 @@ export default function (pi: ExtensionAPI) {
 					flags.length > 0
 						? `classifier-safe but flags: ${flags.join(", ")}`
 						: `classifier-safe despite prior ${prior?.source ?? ""} refusal of "${priorTarget}"`;
-				const foot = trashFootnote(flags);
-				const agentWhy = foot === "" ? why : `${why}\n${foot}`;
+				const agentWhy = withFlagFootnotes(why, flags);
 				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", ...lead, why, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
 				return refuse(ctx, target, flags.length > 0 ? "flagged" : "prior-refusal", agentWhy, "bash", "follows verdict", {
 					...auditFields(),

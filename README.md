@@ -42,7 +42,7 @@ The gate never opens a dialog (https://github.com/STRML/omp-classifier/issues/18
 | `cwd` | An eval spawn directory the scan cannot read | Give the spawn a literal directory, or ask you |
 | `unsafe` / `unsure` | Jev's verdict | Pick a safer action or a more specific command, or ask you in chat to name the target |
 | `unavailable` / `unclassified` | No verdict (outage, timeout, missing key) | Tell you, retry later; `/classifier off` pauses the gate for the session |
-| `flagged` | SAFE, but the command carries a forced-block operation | Use the reversible alternative (`trash` for `rm`), or ask you to run it |
+| `flagged` | SAFE, but the command carries a forced-block operation or a lookalike destination | Use the reversible alternative (`trash` for `rm`), ask you to confirm the exact host in chat (a lookalike), or ask you to run it |
 | `prior-refusal` | SAFE on a target refused earlier this session | Ask you to name the target in chat, or to run it yourself |
 | `cap` / `script-body` | Too long, or a script body that could not be read | Shorten it or split it into steps |
 
