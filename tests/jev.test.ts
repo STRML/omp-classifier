@@ -364,9 +364,11 @@ describe("jevQuestionsHash", () => {
 		// the gate-measured `deleteTargets.underTempRoot` (v2.14 was fef017691cc788d1).
 		// v2.16 (#169) drops the false "remote's own reflog" reason and says a
 		// measured force push is a leased one (v2.15 was 849a4dae86d10659).
+		// v2.17 (#171) says a measured push may be a bare `git push` sent to the
+		// destination git resolves (v2.16 was 55c12842d159d359).
 		const digest = createHash("sha256").update(JSON.stringify(jevQuestions())).digest("hex");
-		expect(digest).toBe("28034b80b0bef7e72c8f7e79f22e6b9f70b30b22d9e0840b81b3996e993e69de");
-		expect(jevQuestionsHash()).toBe("55c12842d159d359");
+		expect(digest).toBe("47c23b5b67ab4425beb0b3f6159d0e6315b1c3954808374e19b7820a97d3acea");
+		expect(jevQuestionsHash()).toBe("0561a20b8f3df930");
 		expect(jevQuestions(JEV_POLICY_VERSION)).toEqual(jevQuestions());
 	});
 
