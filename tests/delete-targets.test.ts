@@ -12,7 +12,7 @@
  * or any other command in the same line that could change the filesystem first.
  */
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildJevState, gateTempRoots, jevQuestions, JEV_POLICY_VERSION, JEV_V3_POLICY_VERSION, measureDeleteTargets } from "../jev";
@@ -197,6 +197,27 @@ describe("measureDeleteTargets", () => {
 		expect(flags(`cd ${tmp}/missing && trash notes.md`)).toEqual([null]);
 		expect(flags(`cd ${tmp}/notes.md && trash notes.md`)).toEqual([null]);
 		expect(flags(`cd ${tmp} && trash notes.md`)).toEqual([true]);
+	});
+
+	test("a negated statement or an unsearchable cd target leaves the line unmeasured", () => {
+		// `!` turns a failed cd into success, so `&&` runs the delete from the
+		// old directory.
+		expect(flags(`! cd ${tmp} && trash notes.md`)).toEqual([null]);
+		expect(flags(`cd ${tmp} && ! trash notes.md && trash notes.md`)).toEqual([null, null]);
+		// The directory exists but isn't searchable: cd fails.
+		const noperm = join(tmp, "noperm");
+		mkdirSync(noperm, { recursive: true });
+		writeFileSync(join(noperm, "notes.md"), "x");
+		chmodSync(noperm, 0o600);
+		try {
+			expect(flags(`cd ${noperm} && trash notes.md`)).toEqual([null]);
+			// `../notes.md` resolves without searching `noperm` itself, so only
+			// the cd check stands between it and a measurement.
+			expect(flags(`cd ${noperm} && trash ../notes.md`)).toEqual([null]);
+		} finally {
+			chmodSync(noperm, 0o755);
+		}
+		expect(flags(`cd ${noperm} && trash notes.md`)).toEqual([true]);
 	});
 
 	test("a cd whose .. resolves differently lexically and physically is not followed", () => {
