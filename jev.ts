@@ -55,7 +55,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants as fsConstants, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { redactSecrets } from "./redact";
@@ -2593,6 +2593,9 @@ function deleteLineIsInert(commands: readonly ShellCommand[]): boolean {
 function directoryChangesHold(commands: readonly ShellCommand[], masked: string, cwd: string): boolean {
 	const first = commands.findIndex(command => literalVerb(command) === "cd" || literalVerb(command) === "pushd");
 	if (first === -1) return true;
+	// `!` turns a failed statement into success, so `! cd x && trash y` runs the
+	// delete from the old directory. Any negation on a line with a cd loses it.
+	if (commands.some(command => command.negated)) return false;
 	if (commands[first].join !== "first" && commands[first].join !== "and") return false;
 	if (commands.slice(first + 1).some(command => command.join !== "and")) return false;
 	return commands.every(command => {
@@ -2604,15 +2607,19 @@ function directoryChangesHold(commands: readonly ShellCommand[], masked: string,
 		if (from === null || target === undefined) return false;
 		const spelled = isAbsolute(target) ? target : `${from}${sep}${target}`;
 		const physical = physicalRealpath(spelled);
-		if (physical === null || !isDirectory(physical)) return false;
+		if (physical === null || !isSearchableDirectory(physical)) return false;
 		if (!target.split("/").includes("..")) return true;
 		return physicalRealpath(resolve(spelled)) === physical;
 	});
 }
 
-const isDirectory = (path: string): boolean => {
+/** A directory `cd` can enter: it exists, and this user may search it. A
+ *  directory without execute permission makes `cd` fail. */
+const isSearchableDirectory = (path: string): boolean => {
 	try {
-		return statSync(path).isDirectory();
+		if (!statSync(path).isDirectory()) return false;
+		accessSync(path, fsConstants.X_OK);
+		return true;
 	} catch {
 		return false;
 	}

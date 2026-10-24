@@ -4,6 +4,14 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-24
 
+### Security: a negated statement or an unsearchable directory unpins a delete's cd
+
+Follow-up to https://github.com/STRML/omp-classifier/pull/182, from a security review. No battery change.
+
+- `! cd /tmp/noperm && trash notes.md`: the `cd` fails, `!` turns that into success, and `&&` runs `trash` from the old directory. A line with a `cd` and any negated statement is now unmeasured.
+- A `cd` target now has to be a directory this user may search (`X_OK`); a directory without it makes `cd` fail.
+- Eval: none possible. The battery is untouched and the corpus rows carry their provenance as data, so judged states are byte-identical; TypeSafe also returns HTTP 402 (no credits).
+
 ### Security: delete targets measure only what the shell will delete
 
 Follow-up to https://github.com/STRML/omp-classifier/pull/175, from a security review of the merged code. No battery change.
