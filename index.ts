@@ -701,24 +701,15 @@ interface ClassifierConfig {
 	 * included in classifierConfigSignature so stale verdicts cannot survive.
 	 */
 	trustPolicy: TrustPolicyPin | null;
-	/** Persistent "Always allow" grants (bash only): the dialog's Always
-	 *  option writes `{cmd, cwd}` to a JSON store at the config root, and a
-	 *  live entry lets that EXACT command text run in that directory across
-	 *  sessions (30-day TTL). Kill-switch only — a cached verdict's trust
-	 *  state never depends on it, so unlike enabled/typesafeModel/jevPolicy/
-	 *  timeoutMs/maxCommandLength/evidenceUserMessages this key is
-	 *  deliberately NOT part of classifierConfigSignature: flipping it must
-	 *  not invalidate caches. */
-	persistentGrants: boolean;
 	/** Run the jev-v3 judgment in shadow beside the live one (plan Phase 2
 	 *  step 8) and log it on the same decision line. It costs two more Jev
-	 *  requests per fresh classification and decides nothing, so, like
-	 *  persistentGrants, it stays out of classifierConfigSignature: flipping it
-	 *  changes no cached verdict. */
+	 *  requests per fresh classification and decides nothing, so it stays
+	 *  out of classifierConfigSignature: flipping it changes no cached
+	 *  verdict. */
 	shadowV3: boolean;
 	/** Write each fresh classification's judged state, redacted, to
 	 *  judged-states.jsonl (spec step 0b). Off by default. It changes no
-	 *  verdict, so like persistentGrants and shadowV3 it stays out of
+	 *  verdict, so like shadowV3 it stays out of
 	 *  classifierConfigSignature: turning it on must not flush caches. */
 	logJudgedStates: boolean;
 }
@@ -768,7 +759,6 @@ const CLASSIFIER_CONFIG_DEFAULTS: Omit<ClassifierConfig, "typesafeModel"> = {
 	maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH,
 	evidenceUserMessages: 3,
 	trustPolicy: null,
-	persistentGrants: true,
 	shadowV3: true,
 	logJudgedStates: false,
 };
@@ -776,12 +766,8 @@ const CLASSIFIER_CONFIG_DEFAULTS: Omit<ClassifierConfig, "typesafeModel"> = {
 /** The boolean keys `/classifier <key> true|false` sets, with what each value
  *  means for the operator. One table, so a new switch is a row, not another
  *  branch in the command handler. */
-type BooleanConfigKey = "persistentGrants" | "shadowV3" | "logJudgedStates";
+type BooleanConfigKey = "shadowV3" | "logJudgedStates";
 const BOOLEAN_CONFIG_NOTICES: Record<BooleanConfigKey, { on: string; off: string }> = {
-	persistentGrants: {
-		on: "classifier persistentGrants=true. Stored Always-allow grants apply again.",
-		off: "classifier persistentGrants=false. Stored grants are kept on disk but never read; the dialog hides Always allow.",
-	},
 	shadowV3: {
 		on: "classifier shadowV3=true. Each fresh classification also asks the jev-v3 judgment (two more Jev requests) and logs it; it decides nothing.",
 		off: "classifier shadowV3=false. Only the live jev-v2 judgment runs.",
@@ -844,7 +830,6 @@ function normalizeClassifierConfig(raw: Record<string, unknown>): ClassifierConf
 	};
 	if (typeof raw.enabled === "boolean") config.enabled = raw.enabled;
 	config.trustPolicy = normalizeTrustPolicyPin(raw.trustPolicy);
-	if (typeof raw.persistentGrants === "boolean") config.persistentGrants = raw.persistentGrants;
 	if (typeof raw.shadowV3 === "boolean") config.shadowV3 = raw.shadowV3;
 	if (typeof raw.logJudgedStates === "boolean") config.logJudgedStates = raw.logJudgedStates;
 	// `judgeBackend` follows the same rule as every other key: a shape the
@@ -910,7 +895,7 @@ export function readClassifierConfig(): ClassifierConfig {
 function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig {
 	const before = readClassifierConfig();
 	const raw: Record<string, unknown> = {};
-	for (const key of ["enabled", "judgeBackend", "jevPolicy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "trustPolicy", "persistentGrants", "shadowV3", "logJudgedStates"] as const) {
+	for (const key of ["enabled", "judgeBackend", "jevPolicy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "trustPolicy", "shadowV3", "logJudgedStates"] as const) {
 		if (key in patch) raw[key] = patch[key];
 	}
 	const next = normalizeClassifierConfig({ ...before, ...raw });
@@ -1281,7 +1266,6 @@ export function formatClassifierConfig(config: ClassifierConfig): string {
 		`maxCommandLength: ${config.maxCommandLength}`,
 		`evidenceUserMessages: ${config.evidenceUserMessages}`,
 		`trustPolicy: ${config.trustPolicy?.sha256 ?? "unpinned"}`,
-		`persistentGrants: ${config.persistentGrants}`,
 		`shadowV3: ${config.shadowV3}`,
 		`logJudgedStates: ${config.logJudgedStates}`,
 		`contract: ${QUESTIONS_CONTRACT}`,
@@ -1606,9 +1590,9 @@ export interface ReplayDecisionInput {
 	priorRefusal?: boolean;
 	/** A previously granted exact action outranks model verdicts, below caps and
 	 *  deterministic critical/environment overlays. */
-	grant?: "session" | "persistent";
+	grant?: "session";
 	/** Optional simulated human outcome for evaluation/replay. */
-	approval?: "allow-once" | "allow-session" | "always-allow" | "deny";
+	approval?: "allow-once" | "allow-session" | "deny";
 	/** Deterministic risk overlays discovered by the caller. */
 	riskFlags?: readonly string[];
 	/** Host-native static decision for a specific rule/approval pattern. */
@@ -4860,137 +4844,6 @@ function matchingGrant(
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Persistent grants ("Always allow", issue: identical commands re-prompting
-// across sessions for days)
-//
-// A grant records a user's "Always allow" answer: this EXACT command text, in
-// this exact directory, may run without further gating for 30 days across
-// every session. Unlike the session grant above, the key is the whole command
-// text — compounds included — because host static allow rules never match a
-// multi-segment command, so `cd X && script` shapes can never be
-// static-allowed and would re-prompt forever. Exactness is the safety
-// argument: the consent covers only text the human actually saw, so an
-// env-prefix spelling (`FOO=1 cmd`), a different cwd, or any edit to the
-// command intentionally does NOT match. Failure modes fail toward "no grant":
-// a missing or corrupt store reads as zero grants (the gate never crashes on
-// it), and a failed write leaves the just-approved call allowed while simply
-// not remembering it.
-// The store is <dirname(omp-classifier.json)>/omp-classifier-grants.json
-// — the config root, beside the config file, so the OMP_JEV_CONFIG test
-// override relocates it like every other artifact. Shape: {version: 1,
-// grants: [{cmd, cwd, ts}]}, pretty-printed for human inspection.
-// ---------------------------------------------------------------------------
-
-interface PersistentGrant {
-	/** The exact full command text as approved in the dialog. */
-	cmd: string;
-	cwd: string;
-	ts: number;
-}
-
-const PERSISTENT_GRANT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const PERSISTENT_GRANT_CAP = 500;
-
-interface PersistentGrantCache {
-	/** Path AND mtime form the key: the module cache outlives tests and
-	 *  /classifier file swaps, which point the config (and store) elsewhere. */
-	path: string;
-	mtimeMs: number;
-	grants: PersistentGrant[];
-}
-let persistentGrantCache: PersistentGrantCache | undefined;
-
-/** Validate a parsed store file: unknown shapes are corruption, not errors.
- *  Drops malformed entries, prunes expired ones (30-day TTL), orders oldest
- *  first, and caps at PERSISTENT_GRANT_CAP by evicting the oldest. A wrong
- *  version is ignored wholesale — the next dialog write rebuilds the file. */
-function sanitizePersistentGrantFile(raw: unknown): PersistentGrant[] {
-	if (typeof raw !== "object" || raw === null) return [];
-	const file = raw as { version?: unknown; grants?: unknown };
-	if (file.version !== 1 || !Array.isArray(file.grants)) return [];
-	const now = Date.now();
-	const grants: PersistentGrant[] = [];
-	for (const entry of file.grants) {
-		if (typeof entry !== "object" || entry === null) continue;
-		const grant = entry as { cmd?: unknown; cwd?: unknown; ts?: unknown };
-		if (typeof grant.cmd !== "string" || grant.cmd === "") continue;
-		if (typeof grant.cwd !== "string") continue;
-		if (typeof grant.ts !== "number" || !Number.isFinite(grant.ts)) continue;
-		if (now - grant.ts >= PERSISTENT_GRANT_TTL_MS) continue;
-		grants.push({ cmd: grant.cmd, cwd: grant.cwd, ts: grant.ts });
-	}
-	grants.sort((a, b) => a.ts - b.ts);
-	while (grants.length > PERSISTENT_GRANT_CAP) grants.shift();
-	return grants;
-}
-
-/** Read the store: mtime-cached like the config, pruned in memory (a read
- *  never writes — the file is rewritten only by a dialog approval). */
-function loadPersistentGrants(): PersistentGrant[] {
-	const filePath = path.join(path.dirname(classifierConfigPath()), "omp-classifier-grants.json");
-	try {
-		const stat = fs.statSync(filePath);
-		if (
-			persistentGrantCache &&
-			persistentGrantCache.path === filePath &&
-			persistentGrantCache.mtimeMs === stat.mtimeMs
-		) {
-			return persistentGrantCache.grants;
-		}
-		const grants = sanitizePersistentGrantFile(JSON.parse(fs.readFileSync(filePath, "utf8")));
-		persistentGrantCache = { path: filePath, mtimeMs: stat.mtimeMs, grants };
-		return grants;
-	} catch {
-		// Missing, unreadable, or corrupt JSON: zero grants, cache dropped so a
-		// later rewrite is re-read fresh. Never an error at the gate.
-		persistentGrantCache = undefined;
-		return [];
-	}
-}
-
-/** A live (unexpired) grant for this EXACT command text and directory. The
- *  kill-switch short-circuits before any filesystem read. */
-function matchingPersistentGrant(command: string, cwd: string): PersistentGrant | undefined {
-	if (!readClassifierConfig().persistentGrants) return undefined;
-	const now = Date.now();
-	return loadPersistentGrants().find(
-		grant => grant.cmd === command && grant.cwd === cwd && now - grant.ts < PERSISTENT_GRANT_TTL_MS,
-	);
-}
-
-/** Record a persistent grant: prune expired entries, refresh-and-move any
- *  duplicate (cmd, cwd), evict oldest past the cap, then write atomically
- *  (tmp + rename, so a crash never leaves a torn store). A write failure is
- *  swallowed: the dialog already allowed THIS call, the memory is a bonus. */
-function addPersistentGrant(command: string, cwd: string): void {
-	if (!readClassifierConfig().persistentGrants) return;
-	try {
-		const now = Date.now();
-		const grants = loadPersistentGrants().filter(grant => now - grant.ts < PERSISTENT_GRANT_TTL_MS);
-		const existing = grants.findIndex(grant => grant.cmd === command && grant.cwd === cwd);
-		if (existing !== -1) grants.splice(existing, 1);
-		grants.push({ cmd: command, cwd, ts: now });
-		while (grants.length > PERSISTENT_GRANT_CAP) grants.shift();
-		const filePath = path.join(path.dirname(classifierConfigPath()), "omp-classifier-grants.json");
-		fs.mkdirSync(path.dirname(filePath), { recursive: true });
-		const tmp = `${filePath}.${process.pid}.tmp`;
-		try {
-			fs.writeFileSync(tmp, `${JSON.stringify({ version: 1, grants }, null, 2)}\n`);
-			fs.renameSync(tmp, filePath);
-		} finally {
-			try {
-				fs.rmSync(tmp, { force: true });
-			} catch {
-				// Best-effort temp cleanup; rename already consumed it on success.
-			}
-		}
-		persistentGrantCache = undefined;
-	} catch {
-		// Unwritable store: this call stays allowed, nothing is remembered.
-	}
-}
-
 /** The session's refusal for this command's target, or undefined. */
 function priorRefusalFor(
 	ctx: ExtensionContext,
@@ -5026,9 +4879,9 @@ export default function (pi: ExtensionAPI) {
 	// prints the effective config and the file path.
 	pi.registerCommand("classifier", {
 		description:
-		"View or set omp-classifier options: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, trust-policy, persistentGrants, shadowV3, logJudgedStates, reset, status, dry-run, off, on",
+		"View or set omp-classifier options: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, trust-policy, shadowV3, logJudgedStates, reset, status, dry-run, off, on",
 		getArgumentCompletions: (prefix: string) => {
-			const keywords = ["enabled", "policy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "trust-policy", "persistentGrants", "shadowV3", "logJudgedStates", "reset", "status", "dry-run", "off", "on", "file"] as const;
+			const keywords = ["enabled", "policy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "trust-policy", "shadowV3", "logJudgedStates", "reset", "status", "dry-run", "off", "on", "file"] as const;
 			return keywords
 				.filter(keyword => keyword.startsWith(prefix.toLowerCase()))
 				.map(keyword => ({ label: keyword, value: keyword }));
@@ -5092,7 +4945,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (key === "reset") {
-				writeClassifierConfig({ enabled: true, judgeBackend: DEFAULT_JUDGE_BACKEND, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, trustPolicy: null, persistentGrants: true, shadowV3: true, logJudgedStates: false });
+				writeClassifierConfig({ enabled: true, judgeBackend: DEFAULT_JUDGE_BACKEND, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, trustPolicy: null, shadowV3: true, logJudgedStates: false });
 				notify(`omp-classifier reset to defaults (${classifierConfigPath()})`);
 				return;
 			}
@@ -5194,7 +5047,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			notify(
-				`unknown key "${key}". Keys: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, trust-policy, persistentGrants, shadowV3, logJudgedStates, reset, status, dry-run, off, on, file`,
+				`unknown key "${key}". Keys: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, trust-policy, shadowV3, logJudgedStates, reset, status, dry-run, off, on, file`,
 				"error",
 			);
 		},
@@ -5885,14 +5738,10 @@ export default function (pi: ExtensionAPI) {
 	 *
 	 * Option ladder, in escalating scope (issue #32): "Allow once" is the old
 	 * confirm-yes; "Allow for session" additionally records a grant so this
-	 * target, in this directory, stops gating for the session; "Always allow"
-	 * (bash only, kill-switchable) additionally writes a PERSISTENT grant —
-	 * this exact command text, in this directory, stops gating across sessions
-	 * for 30 days, compounds included, since host static rules can never
-	 * match them (eval payloads stay out of scope); "Deny" and undefined
-	 * (cancel or timeout) both deny. The TUI renders a select's TITLE as a full
-	 * Markdown
-	 * block — not the single truncated line a confirm title gets — so the same
+	 * target, in this directory, stops gating for the session; "Deny" and
+	 * undefined (cancel or timeout) both deny. No answer outlives the session
+	 * (https://github.com/STRML/omp-classifier/issues/184). The TUI renders a
+	 * select's TITLE as a full Markdown block — not the single truncated line a confirm title gets — so the same
 	 * title+body join confirm used keeps the executable command visible on the
 	 * dialog. Option descriptions are a bonus layer on surfaces that show them;
 	 * the title alone still carries everything needed to decide.
@@ -6054,7 +5903,6 @@ export default function (pi: ExtensionAPI) {
 		const grantsHonoredAtLayer =
 			headline !== "critical pattern" && headline !== "environment override" && headline !== EVAL_SPAWN_CWD_HEADLINE;
 		const sessionGrantAvailable = grantKey !== "" && grantsHonoredAtLayer;
-		const persistentGrantAvailable = tool === "bash" && readClassifierConfig().persistentGrants && grantsHonoredAtLayer;
 		// An eval payload that declared a spawn directory of its own has two
 		// directories on the Details above, and its session grant covers both:
 		// "this directory" there would name half of what the human is agreeing
@@ -6093,9 +5941,6 @@ export default function (pi: ExtensionAPI) {
 			[
 				{ label: "Allow once", description: "This call only" },
 				...(sessionGrantAvailable ? [{ label: "Allow for session", description: sessionGrantDescription }] : []),
-				...(persistentGrantAvailable
-					? [{ label: "Always allow", description: "This exact command, in this directory, for 30 days (stored alongside omp-classifier.json)" }]
-					: []),
 				{ label: "Deny" },
 			],
 			// The old confirm default was approve; keep the cursor on it. The
@@ -6174,12 +6019,9 @@ export default function (pi: ExtensionAPI) {
 		// The race, on the human's own line: calibration has to read the late
 		// answer next to the human's, and that means the same line.
 		const lateSuffix = lateRefinement === undefined ? "" : ` (unavailable → late ${lateRefinement.verdict})`;
-		if (choice === "Allow once" || choice === "Allow for session" || choice === "Always allow") {
+		if (choice === "Allow once" || choice === "Allow for session") {
 			// The user said yes to this action (issue #30): erase the memory
-			// that its target was refused, so rewordings run clean again. A
-			// persistent grant makes that durable for its exact shape: while it
-			// is live, refusal memory never fires for this text+cwd — the human
-			// outvoted the model, once, for every session.
+			// that its target was refused, so rewordings run clean again.
 			liftRefusals(ctx, target.command, target.cwd);
 			// An eval grant covers BOTH directories: the payload's own spawn
 			// directory (target.cwd) and the session directory its own process
@@ -6188,15 +6030,10 @@ export default function (pi: ExtensionAPI) {
 			// session that moves workspaces cannot ride this grant into a
 			// directory nobody approved.
 			if (choice === "Allow for session") addGrant(ctx, grantKey, target.cwd, userScopeFingerprint, tool === "eval" ? ctx.cwd : undefined);
-			if (choice === "Always allow") addPersistentGrant(target.command, target.cwd);
 			audit(
 				"allow",
-				(choice === "Allow for session"
-					? "approved by user (session grant)"
-					: choice === "Always allow"
-						? "approved by user (persistent grant)"
-						: "approved by user") + lateSuffix,
-				choice === "Allow for session" ? "allow-session" : choice === "Always allow" ? "always-allow" : "allow-once",
+				(choice === "Allow for session" ? "approved by user (session grant)" : "approved by user") + lateSuffix,
+				choice === "Allow for session" ? "allow-session" : "allow-once",
 			);
 			return undefined;
 		}
@@ -6373,10 +6210,6 @@ export default function (pi: ExtensionAPI) {
 				config.evidenceUserMessages,
 				trustedPolicySnapshot.signature,
 			].join("|");
-			// persistentGrants is deliberately absent: it gates only the grant
-			// read/write path and changes no cached verdict's trust state, so
-			// flipping it must not invalidate caches (it is a kill-switch, not a
-			// policy change).
 			if (configSignature !== classifierConfigSignature) {
 				// A dry-run probe (issue #32) touches neither the cache nor the grant
 				// stores, AND leaves the signature stale on purpose: the next live
@@ -7053,26 +6886,6 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 			}
-			// Persistent grant ("Always allow"): the user consented to this EXACT
-			// command text from this directory, across sessions, for 30 days.
-			// Same user-tier position as the session grant above — below the
-			// critical-pattern, env-override, and static-rule checks (a grant
-			// never bypasses those), above model classification, the verdict
-			// cache, and refusal memory: a live grant mutes refusal memory for
-			// its exact shape on purpose, because the human outvoted the model.
-			// Unlike the session grant, the key is the whole command text
-			// (compounds included — host static rules never match a
-			// multi-segment command, so `cd X && script` could otherwise never be
-			// remembered), which also means an env-prefixed spelling, a different
-			// cwd, or any edit to the text intentionally does NOT match.
-			if (matchingPersistentGrant(judgedCommand, cwd)) {
-				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, grant: "persistent" });
-				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "persistent grant", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
-					return;
-				}
-			}
-
 			// A client verb whose directory could not be resolved measured config
 			// that may belong to another tree, and that tree can change with
 			// nothing in the key changing: never serve such a verdict from cache.

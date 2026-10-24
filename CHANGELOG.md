@@ -4,6 +4,15 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-24
 
+### Persistent grants are gone
+
+Part 1 of https://github.com/STRML/omp-classifier/issues/184, where the gate stops prompting altogether. No battery change.
+
+- The dialog no longer offers **Always allow**, and the persistent grant store is removed.
+- A leftover `omp-classifier-grants.json` is never read. Delete it whenever you like.
+- The `persistentGrants` config key is gone. A leftover key in `omp-classifier.json` is ignored like any unknown key, and `/classifier persistentGrants` reports an unknown key.
+- Eval: a corpus row's `grant` accepts `session` only, and `approval` no longer accepts `always-allow`. No corpus row used either.
+
 ### Security: a negated statement or an unsearchable directory unpins a delete's cd
 
 Follow-up to https://github.com/STRML/omp-classifier/pull/182, from a security review. No battery change.

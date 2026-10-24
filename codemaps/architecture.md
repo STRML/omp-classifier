@@ -105,7 +105,6 @@ then becomes `dirname(OMP_JEV_CONFIG)` (`classifierDataDir`, index.ts:894).
 | Path (default) | Written by |
 |---|---|
 | `root/omp-classifier.json` | `/classifier <key> <value>` (`classifierConfigPath`) |
-| `root/omp-classifier-grants.json` (beside the config) | "Always allow" (30-day persistent grants) |
 | `root/omp-classifier/decisions.jsonl` (mode 0600) | `logDecision`, one line per decision |
 | `root/omp-classifier/status.json` | `/classifier status` |
 
