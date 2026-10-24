@@ -4,6 +4,14 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-24
 
+### Session grants are gone
+
+Part 2 of https://github.com/STRML/omp-classifier/issues/184. No battery change.
+
+- The dialog offers **Allow once** and **Deny** only. **Allow for session** and the session grant store are removed, so no answer outlives the call it answered.
+- `normalizeGrantTarget` is now `normalizeActionTarget`. It is the refusal identity and nothing else.
+- Eval: `replayDecision` no longer takes `grant`, a corpus row can no longer carry one, and `approval` accepts `allow-once` or `deny`. No corpus row used either.
+
 ### Persistent grants are gone
 
 Part 1 of https://github.com/STRML/omp-classifier/issues/184, where the gate stops prompting altogether. No battery change.

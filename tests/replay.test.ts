@@ -37,18 +37,6 @@ describe("shared replay decision pipeline", () => {
 		});
 	});
 
-	test("a scoped grant runs before model replay, but below critical overlays", () => {
-		const judgement = annotateJudgement({ verdict: "UNSAFE", reason: "remote write" });
-		expect(replayDecision({ tool: "bash", command: "git push", cwd: "/repo", judgement, grant: "session" })).toMatchObject({
-			decision: "allow",
-			layer: "granted",
-		});
-		expect(replayDecision({ tool: "bash", command: "rm -rf /", cwd: "/repo", judgement, grant: "session", riskFlags: ["critical"], headless: true })).toMatchObject({
-			decision: "block",
-			layer: "critical",
-		});
-	});
-
 	test("an interactive approval is an explicit final override; headless cannot invent one", () => {
 		const judgement = annotateJudgement({ verdict: "UNSURE", reason: "ambiguous" });
 		expect(replayDecision({ tool: "bash", command: "git push", cwd: "/repo", judgement, approval: "allow-once" })).toMatchObject({
