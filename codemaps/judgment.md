@@ -5,8 +5,8 @@
 ```
 buildJevState ─► state ─┐
 jevQuestions  ─► battery┴► judgeBattery (jev-judge) ─► JevAnswers ─► deriveJevDecision ─► JevDecision
-                             └ judgeBatteryUnderDeadline (deadline aborts the request)       (live, jev-v2.17)
-shadow: judgeJevV3 = jev-v3.7 battery ∥ judgeAuthorization ─► deriveAuthorization
+                             └ judgeBatteryUnderDeadline (deadline aborts the request)       (live, jev-v2.18)
+shadow: judgeJevV3 = jev-v3.8 battery ∥ judgeAuthorization ─► deriveAuthorization
         ─► deriveDecisionOrder(risk, authorization, literalMatch, overlay, headless) ─► OrderedDecision
 ```
 
@@ -14,8 +14,8 @@ shadow: judgeJevV3 = jev-v3.7 battery ∥ judgeAuthorization ─► deriveAuthor
 
 | Export | Line | Kind | Called by |
 |---|---|---|---|
-| `JEV_POLICY_VERSION` = `jev-v2.17` | 99 | const | index (`CLASSIFIER_POLICY_VERSION`), eval/run |
-| `JEV_V3_POLICY_VERSION` = `jev-v3.7` | 107 | const | jev-judge (`judgeJevV3`), eval/run |
+| `JEV_POLICY_VERSION` = `jev-v2.18` | 99 | const | index (`CLASSIFIER_POLICY_VERSION`), eval/run |
+| `JEV_V3_POLICY_VERSION` = `jev-v3.8` | 107 | const | jev-judge (`judgeJevV3`), eval/run |
 | `DEFAULT_JEV_MODEL` = `jev-latest` | 116 | const | eval/run |
 | `JEV_GATING_HAZARDS` (6) | 134 | const | `deriveJevDecision`, decision-order |
 | `JEV_DESCRIPTIVE_HAZARDS` (3) | 153 | const | reported only, never gate |
@@ -26,6 +26,8 @@ shadow: judgeJevV3 = jev-v3.7 battery ∥ judgeAuthorization ─► deriveAuthor
 | `jevQuestionsHash(version)` | 526 | fn | index `CLASSIFIER_POLICY_HASH`, eval/run |
 | `measureGitPushProvenance(cmd, cwd)` | 744 | fn | index `classify` + bash/eval cache key |
 | `measureNetworkProvenance(cmd, cwd, sources?)` | 1593 | fn | same |
+| `measureLookalikeDestinations(cmd, userMessages)` | 1925 | fn, pure | `buildJevState` (#161) |
+| `lookalikeDestinationFlags(cmd, userMessages)` | 1949 | fn, pure | index bash/eval SAFE overlay, eval/run `riskFlagsFor` |
 | `measureGitWorktreeProvenance(cwd)` | 1758 | fn | same |
 | `measureGitRefProvenance(cmd, cwd)` | 2260 | fn | same |
 | `measureDeleteTargets(cmd, startCwd, roots?)` | 2426 | fn | index `classify` (shell only) + bash cache key (#166) |
@@ -44,7 +46,7 @@ Battery (`jevQuestions`): `verdict` choice (safe/unsafe/unsure), one `noul` per 
 `task_statement` noul (v3 only), and `blast_radius` score over 3 levels (0 read-only,
 1 recoverable, 2 unrecoverable).
 
-`buildJevState`: `{...extra, notice, command, workingDirectory, <measured tiers>, evidence}`. `extra` cannot
+`buildJevState`: `{...extra, notice, command, workingDirectory, <measured tiers>, lookalikeDestinations, evidence}`. `lookalikeDestinations` is derived inside the builder from the command and the redacted user messages, and is negative only: it never says a destination is the user's. `extra` cannot
 supply a builder-owned key (`BUILDER_OWNED_STATE_KEYS`). The notice states the authorization tiers and
 never addresses the reviewer: `state_contains_injection` reads any field that does as injection (#160).
 `userMessages`, `operatorContext` and `trustedPolicy` contents pass through `redactSecrets`; the

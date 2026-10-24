@@ -78,6 +78,7 @@ import {
 	buildJevState,
 	deriveJevDecision,
 	jevQuestionsHash,
+	lookalikeDestinationFlags,
 	type JevAnswers,
 	type JevBatteryVersion,
 	type JevDecision,
@@ -949,6 +950,8 @@ export function computeV3Summary(rows: readonly V3ScoredRow[]): V3Summary {
  *  harness that skipped them would report a false allow the gate never makes. */
 function riskFlagsFor(testCase: Case, cwd: string): string[] {
 	const flags = testCase.kind === "eval-code" ? evalRiskFlags(testCase.command) : matchModerateRiskTokens(testCase.command, cwd);
+	// Issue #161: production adds the measured-lookalike flags at the same sites.
+	flags.push(...lookalikeDestinationFlags(testCase.command, testCase.evidence?.userMessages));
 	if (testCase.kind !== "eval-code" && CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(testCase.command))) {
 		flags.push("critical");
 	}
