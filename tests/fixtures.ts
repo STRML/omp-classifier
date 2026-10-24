@@ -710,10 +710,8 @@ export interface CtxOptions {
 	artifactsDir?: string;
 }
 
-/** The labels the plugin's permission dialog offers. "Allow for session"
- *  needs a strict grant key (issue #32). */
+/** The labels the plugin's permission dialog offers. */
 export const ALLOW_ONCE = "Allow once";
-export const ALLOW_SESSION = "Allow for session";
 export const DENY = "Deny";
 
 let sessionSeq = 0;

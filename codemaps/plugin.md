@@ -9,7 +9,7 @@ Read this before opening index.ts. Line numbers are where each declaration start
 | Lines | Section | Key symbols |
 |---|---|---|
 | 1-128 | header + imports | |
-| 130-385 | module state, `Judgement` type | `cache`, `refusals`, `grants`, `floorTaint`, `sessionOff`, `dryRun`, `STALE_CODE_SUFFIX`, `pluginStaleSuffix` |
+| 130-385 | module state, `Judgement` type | `cache`, `refusals`, `floorTaint`, `sessionOff`, `dryRun`, `STALE_CODE_SUFFIX`, `pluginStaleSuffix` |
 | 385-650 | host static rules | `BashApprovalPatternRule`, `bashApprovalRuleMatches`, `parseBashApprovalPatternRules`, `isBlanketPattern`, `canonicalEnv` |
 | 649-900 | config (L6) | `ClassifierConfig`, `JEV_POLICY_RANGES`, `CLASSIFIER_CONFIG_DEFAULTS`, `jevPolicyFor`, `normalizeClassifierConfig` (790), `readClassifierConfig` (849), `writeClassifierConfig` (866) |
 | 894-1060 | paths, audit record, status | `classifierDataDir`, `decisionsLogPath`, `DecisionRecord` (922), `StatusReport`, `buildStatusReport` (1014) |
@@ -20,7 +20,7 @@ Read this before opening index.ts. Line numbers are where each declaration start
 | 1872-2840 | eval payload scanning | `MODERATE_RISK_TOKENS`, `INTERPRETER_FLAG_GRAMMAR`, `INTERPRETER_CODE_RISK`, `evalRiskFlags`, `evalSubprocessMarkers`, `evalCwdSites`, `evalSpawnCwd` |
 | 2839-3910 | wrappers, interpreters, script bodies (#67) | `WRAPPER_OPTION_GRAMMAR`, `POLICY_UNSTABLE_VERBS`, `interpreterInvocation`, `withoutWrittenHeredocBodies`, `interpreterProgramRefs`, `readInterpretedScriptBodies` (3775) |
 | 3911-4515 | pipe / compound splitting, risk overlay | `splitPipeStages`, `isPlainReadOnlyFetch`, `splitTopLevelCommands`, `rmForcesDialog`, `matchModerateRiskTokens` (4279), `trashFootnote` |
-| 4517-4920 | L3 session memory | `remember`, `addRefusal`, `liftRefusals`, `normalizeGrantTarget`, `grantKeyForCommand`, `addGrant`, `matchingGrant`, `priorRefusalFor` (4901) |
+| 4517-4920 | L3 session memory | `remember`, `addRefusal`, `liftRefusals`, `normalizeActionTarget`, `priorRefusalFor` (4901) |
 | 4922-7147 | `export default function (pi)`: the plugin factory | see below |
 
 ## Inside the factory (closures over `pi`, `settings`)
@@ -36,7 +36,7 @@ Read this before opening index.ts. Line numbers are where each declaration start
 | 5649 | `logDecision` | appends to decisions.jsonl; redacts and truncates `cmd` to 120 chars; dry-run captures here |
 | 5706 | `shadowFloor` | `evaluateFloor` + session taint |
 | 5735 | `logDecisionFor` | adds `sessionId` |
-| 5770 | `requestPermission` | dialog / headless block / grants / late race |
+| 5770 | `requestPermission` | dialog / headless block / late race |
 | 6095 | `dryRunStop` | ends a dry-run probe |
 | 6100 | `handleToolCall` | the gate; `pi.on("tool_call")` at 7105 |
 | 7110 | `dropCurrent` | per-session state reset on session events |
@@ -47,7 +47,6 @@ Read this before opening index.ts. Line numbers are where each declaration start
 |---|---|---|
 | `cache: Map<session, Map<key, Judgement>>` | `CACHE_CAP` 500 | config-signature change (all sessions), session events |
 | `refusals: Map<session, Refusal[]>` | `REFUSAL_CAP` 20 | session events; `liftRefusals` on approval |
-| `grants: Map<session, Grant[]>` | `GRANT_CAP` 50 | signature change, session events |
 | `floorTaint: Map<session, string[]>` | `FLOOR_TAINT_CAP` 50 | signature change, session events |
 | `sessionOff: Set<session>` | — | `/classifier on`, session events |
 | `staleDisableWarned: Set<session>` | — | `session_shutdown` |
@@ -87,7 +86,7 @@ staleCode, floor{asks, entries}, followsDecisionId` (dialog/headless/late-verdic
 
 No-UI sessions: `userChannelBranch(ctx)` returns an empty branch when `!ctx.hasUI`, so `evidenceUserSnapshot` and `shadowJevV3` see no user words; tool evidence still reads the whole branch.
 
-`layer` values: `cap`, `rule`, `cwd`, `script-body`, `critical`, `environment`, `granted`,
+`layer` values: `cap`, `rule`, `cwd`, `script-body`, `critical`, `environment`,
 `verdict`, `cached`, `dialog`, `headless`, `unclassified`, `late-verdict`, `internal-error`.
 
 ## Exports consumed outside index.ts
@@ -96,6 +95,6 @@ No-UI sessions: `userChannelBranch(ctx)` returns an empty branch when `!ctx.hasU
 |---|---|
 | `replayDecision`, `evalRiskFlags`, `matchModerateRiskTokens` | eval/run.ts, tests |
 | `decisionsLogPath`, `DecisionRecord` | eval/live-report.ts, eval/recognizer-measure.ts |
-| `classifierConfigPath`, `classifierDataDir`, `readClassifierConfig`, `formatClassifierConfig`, `buildStatusReport`, `normalizeGrantTarget`, `collect*Evidence`, `operatorContextFromInput`, `annotateJudgement`, `commandHasOutboundNetwork`, `readInterpretedScriptBodies`, `withoutWrittenHeredocBodies`, `evalSpawnCwd`, `evalSubprocessMarkers`, `pluginStaleSuffix`, `STALE_CODE_SUFFIX` | tests |
+| `classifierConfigPath`, `classifierDataDir`, `readClassifierConfig`, `formatClassifierConfig`, `buildStatusReport`, `normalizeActionTarget`, `collect*Evidence`, `operatorContextFromInput`, `annotateJudgement`, `commandHasOutboundNetwork`, `readInterpretedScriptBodies`, `withoutWrittenHeredocBodies`, `evalSpawnCwd`, `evalSubprocessMarkers`, `pluginStaleSuffix`, `STALE_CODE_SUFFIX` | tests |
 | `jevPolicyFor`, `trashFootnote` | exported, but no consumer outside index.ts |
 | default export | OMP host (and tests/fixtures.ts `loadPlugin`) |

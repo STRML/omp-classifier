@@ -7,7 +7,7 @@
  * pausing is not a trust-state change, so a resume serves the cache instead
  * of re-asking the model.
  *
- * Harness conventions as session-grants.test.ts: fresh temp config dir per
+ * Harness conventions: fresh temp config dir per
  * test, unique session ids per test (the plugin's stores are module-level and
  * the module imports once per file run).
  */

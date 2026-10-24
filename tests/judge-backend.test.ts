@@ -21,8 +21,7 @@
  *     a verdict earned under one backend is not served under another. The
  *     dry-run probe is the sharpest way to see it: it reads the cache while the
  *     config signature is deliberately left stale, so only the KEY can tell the
- *     two backends apart (the same shape as the evidence-off/on test in
- *     session-grants.test.ts).
+ *     two backends apart.
  *   - The redirect is a closed door (review gate P0 on #84, issue #124): the
  *     endpoint transport forces the runtime fetch's redirect policy to
  *     `"manual"`, so a 3xx comes back as the response and the host client fails

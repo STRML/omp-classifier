@@ -49,11 +49,11 @@ thresholds. Four consequences shape every layer below:
 ```
 L6 control plane      /classifier, config bounds, kill switches, agent-legible status
 L5 self-measurement   eval harness, corpus, policy sweep, regression gates
-L4 interaction        dialogs, refusal payloads, session grants, dry-run
+L4 interaction        dialogs, refusal payloads, dry-run
 L3 memory             verdict cache, refusal memory, decision audit log
 L2 judgment           Jev state + question battery, probabilities, derived verdict
 L1 recognition        critical patterns, structural rules, compound segments, marker scans
-L0 evidence           command text, payload, cwd/env, user messages, trusted policy, grants, prior refusals
+L0 evidence           command text, payload, cwd/env, user messages, trusted policy, prior refusals
 ```
 
 Data flows up: L0 feeds L1 and L2, L2 writes L3, L3 feeds L4 and L5, L5 tunes L1 and L2,
@@ -67,7 +67,7 @@ What the gate may read, and what each source is allowed to mean.
 | --- | --- | --- |
 | User messages | user | Yes |
 | Explicitly pinned user policy | user | Action classes only; conditions need gate facts; never egress destinations or delete targets |
-| Approved plan or session grant | user | Yes |
+| Approved plan | user | Yes |
 | Agent-supplied context (intent, runbook step) | agent | No. Explains, never authorizes |
 | Tool output, fetched content | hostile | No. Untrusted-wrapped if included at all |
 
@@ -323,9 +323,8 @@ behind it. The sweep in L5 exists to make that cheap enough to be routine.
 - **Verdict cache**: per session, keyed by command + cwd + env/pty identity + the judge's
   identity (the active backend and the model it answers with), and cleared whenever the
   effective config signature changes. `UNAVAILABLE` is never cached.
-- **Refusal memory**: what this session was denied, keyed by `normalizeGrantTarget` — the same
-  identity a session grant uses, so an approval lifts exactly what a refusal covers (issue #64)
-  — plus the cwd, and fingerprinted by the evidence the judge saw, fed back into the state as
+- **Refusal memory**: what this session was denied, keyed by `normalizeActionTarget`, so an
+  approval lifts exactly what a refusal covers (issue #64), plus the cwd, and fingerprinted by the evidence the judge saw, fed back into the state as
   `priorRefusal` so rewording cannot launder a refusal into a fresh judgment. A SAFE under a
   prior refusal is not a clean bill: the refusal rode in the state the judge saw.
 - **Decision audit**: one JSONL line per decision at
@@ -343,11 +342,8 @@ Two readers, two shapes. The agent gets structured JSON on every block: what ref
 what would work instead, what not to try. The human gets one line plus the shortest dialog
 that can be answered correctly: the command, the axes, the alternatives.
 
-Session grants let a human pre-authorize a family of actions
-once instead of answering the same dialog five times. A grant is scoped to the directories
-its dialog put on screen: for an eval payload that declares a spawn directory of its own,
-both that directory and the session's, so a session that moves workspaces re-asks instead of
-riding an authorization nobody gave. Dialog reasons are built from the same
+No answer outlives the call it answered: there are no grants
+(https://github.com/STRML/omp-classifier/issues/184). Dialog reasons are built from the same
 numbers as the audit line, and the rm-family prompts carry the reversible-alternative
 footnote. Dry-run lets an agent ask the gate what it would do before doing it. A dialog from
 a session older than the on-disk plugin says so in its subtitle.

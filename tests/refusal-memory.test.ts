@@ -1,7 +1,7 @@
 /**
  * Refusal memory across rewording (issue #30): a command this session refused
  * — an UNSAFE verdict, a human denial, a critical pattern, a cap — is
- * remembered by normalizeGrantTarget, the identity a session grant uses
+ * remembered by normalizeActionTarget, the strict action identity
  * (issue #64: refusal memory keyed by the first two words made `ssh <host>`
  * one session-length trip wire), injected into the next state as
  * priorRefusal, and a SAFE that lands anyway on a refused target still prompts.
@@ -21,7 +21,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { normalizeGrantTarget } from "../index";
+import { normalizeActionTarget } from "../index";
 import type { DecisionRecord } from "../index";
 import {
 	selectCalls,
@@ -74,47 +74,45 @@ const nextSession = (): string => `refusal-memory-${(seq += 1)}`;
 const priorRefusalOf = (callIndex: number): { target: string; why: string; when: string } | undefined =>
 	stateOf(callIndex).priorRefusal as { target: string; why: string; when: string } | undefined;
 
-describe("refusal identity (issue #64): the key a session grant uses", () => {
+describe("refusal identity (issue #64)", () => {
 	// The old key kept the first two non-flag words, so every `ssh raw-ovh …`
 	// was ONE target — "ssh raw-ovh" — whatever ran behind it, and refusing one
 	// remote cleanup turned every later read of that host into a dialog for the
 	// rest of the session (152 logged blocks carried `prior refusal`). Refusals
-	// now key on normalizeGrantTarget, the identity a grant is stored under, so
-	// memory and authorization agree about what "this action" is.
+	// now key on normalizeActionTarget, so an approval lifts exactly what a
+	// refusal covers.
 	test("one host's operations are separate targets", () => {
-		expect(normalizeGrantTarget("ssh raw-ovh 'mysql --version'")).toBe("ssh --version' raw-ovh");
-		expect(normalizeGrantTarget("ssh raw-ovh 'wp db delete --all'")).toBe("ssh --all' raw-ovh");
-		expect(normalizeGrantTarget("ssh raw-ovh 'mysql --version'")).not.toBe(
-			normalizeGrantTarget("ssh raw-ovh 'wp db delete --all'"),
+		expect(normalizeActionTarget("ssh raw-ovh 'mysql --version'")).toBe("ssh --version' raw-ovh");
+		expect(normalizeActionTarget("ssh raw-ovh 'wp db delete --all'")).toBe("ssh --all' raw-ovh");
+		expect(normalizeActionTarget("ssh raw-ovh 'mysql --version'")).not.toBe(
+			normalizeActionTarget("ssh raw-ovh 'wp db delete --all'"),
 		);
 		// A different host is a different target, and so is a read-only probe
 		// of the same one.
-		expect(normalizeGrantTarget("ssh raw-ovh 'ls /tmp'")).not.toBe(normalizeGrantTarget("ssh slurper 'ls /tmp'"));
-		expect(normalizeGrantTarget("ssh raw-ovh 'ls /tmp'")).not.toBe(
-			normalizeGrantTarget("ssh raw-ovh 'grep -o RUSH_INTAKE_KEY /var/www/html/wp-config.php'"),
+		expect(normalizeActionTarget("ssh raw-ovh 'ls /tmp'")).not.toBe(normalizeActionTarget("ssh slurper 'ls /tmp'"));
+		expect(normalizeActionTarget("ssh raw-ovh 'ls /tmp'")).not.toBe(
+			normalizeActionTarget("ssh raw-ovh 'grep -o RUSH_INTAKE_KEY /var/www/html/wp-config.php'"),
 		);
 	});
 
 	test("rewordings of one action still share a target; unlike actions differ", () => {
-		expect(normalizeGrantTarget("RM   -RF\t./X")).toBe(normalizeGrantTarget("rm -rf x"));
-		expect(normalizeGrantTarget("rm -rf ./x")).toBe(normalizeGrantTarget("rm -rf x"));
-		expect(normalizeGrantTarget("cd /tmp && rm -rf x")).toBe(normalizeGrantTarget("rm -rf x"));
-		// Dropping a flag is a different action here, as it is for a grant
-		// (session-grants.test.ts pins the same distinction).
-		expect(normalizeGrantTarget("rm -rf x")).not.toBe(normalizeGrantTarget("rm x"));
-		expect(normalizeGrantTarget("rm -rf x")).not.toBe(normalizeGrantTarget("git reset --hard"));
+		expect(normalizeActionTarget("RM   -RF\t./X")).toBe(normalizeActionTarget("rm -rf x"));
+		expect(normalizeActionTarget("rm -rf ./x")).toBe(normalizeActionTarget("rm -rf x"));
+		expect(normalizeActionTarget("cd /tmp && rm -rf x")).toBe(normalizeActionTarget("rm -rf x"));
+		// Dropping a flag is a different action here.
+		expect(normalizeActionTarget("rm -rf x")).not.toBe(normalizeActionTarget("rm x"));
+		expect(normalizeActionTarget("rm -rf x")).not.toBe(normalizeActionTarget("git reset --hard"));
 	});
 
 	test("the identity keeps the first argument: a push's remote is in, its branch is not", () => {
-		// The one identity the grant path already uses keeps flags and the FIRST
-		// non-flag argument, so `origin` scopes a push and the branch behind it
-		// does not. That is the grant rule (a grant for `git push origin` is the
-		// remote, deliberately), and it is the reason branch-level provenance is
+		// The action identity keeps flags and the FIRST non-flag argument, so
+		// `origin` scopes a push and the branch behind it does not. That is
+		// deliberate, and it is the reason branch-level provenance is
 		// issue #63's work, not refusal memory's. Without a remote, the branch
 		// IS the first argument and separates two targets.
-		expect(normalizeGrantTarget("git push --force origin main")).toBe("git push --force origin");
-		expect(normalizeGrantTarget("git push --force origin main")).toBe(normalizeGrantTarget("git push --force origin feature"));
-		expect(normalizeGrantTarget("git push --force main")).not.toBe(normalizeGrantTarget("git push --force feature"));
+		expect(normalizeActionTarget("git push --force origin main")).toBe("git push --force origin");
+		expect(normalizeActionTarget("git push --force origin main")).toBe(normalizeActionTarget("git push --force origin feature"));
+		expect(normalizeActionTarget("git push --force main")).not.toBe(normalizeActionTarget("git push --force feature"));
 	});
 });
 
@@ -144,7 +142,7 @@ describe("refusal memory", () => {
 
 	test("a wrapped Git command is keyed on the git command it wraps", async () => {
 		// `command git diff …` normalizes to the broad `command git` identity
-		// under the grant rule, which would make one refusal cover every wrapped
+		// under the plain action rule, which would make one refusal cover every wrapped
 		// git command in the session. The key looks through the wrapper instead.
 		const sid = nextSession();
 		setJevAnswer(jevUnsafeAnswer());
@@ -267,7 +265,7 @@ describe("refusal memory", () => {
 			makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_ONCE }),
 		);
 		expect(approved).toBeUndefined();
-		// A same-target rewording, not a different action: under the grant
+		// A same-target rewording, not a different action: under the action
 		// identity `rm -r x` is its own target, so it could not show the lift.
 		await fire("tool_call", makeEvent("rm -f -r ./x"), makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_ONCE }));
 		expect(modelCalls.length).toBe(3);

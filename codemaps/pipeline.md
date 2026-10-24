@@ -16,7 +16,7 @@ and the reason is JSON from `refusalPayload`. Every decision writes one audit li
    accumulates session taint.
 4. `resolvePolicyContext(dir, policyDirectoryStable(text))` attaches the pinned trust policy, or
    withholds it when the command can move its own cwd. It builds the config signature, and a
-   changed signature clears `cache`, `grants` and `floorTaint`.
+   changed signature clears `cache` and `floorTaint`.
 5. Lockfile diagnostic (`lockfileDisablesPlugin`): a toast only, never decides.
 
 ## Bash path (index.ts:6560-7103), first match wins
@@ -28,14 +28,13 @@ and the reason is JSON from `refusalPayload`. Every decision writes one audit li
 | 3 | cwd input is an internal URL (`://`, `local:/`) | block | `cwd` |
 | 4 | `readInterpretedScriptBodies` refusal (an unreadable or oversized script operand) | block, `addRefusal(cap)` | `script-body` |
 |   | `judgedCommand = script.text` (bodies spliced in); measure the 4 provenance tiers; build `cacheKey`; `priorRefusalFor` | | |
-| 5 | `CRITICAL_BASH_PATTERNS` match | `addRefusal(critical)` → `requestPermission` (no grant offered) | `critical` |
-| 6 | caller-supplied `env` (`canonicalEnv`) | `requestPermission` (no grant offered) | `environment` |
+| 5 | `CRITICAL_BASH_PATTERNS` match | `addRefusal(critical)` → `requestPermission` | `critical` |
+| 6 | caller-supplied `env` (`canonicalEnv`) | `requestPermission` | `environment` |
 | 7 | static `prompt` rule | return undefined (host prompts) | — |
 | 8 | static `allow` rule, not blanket, no script bodies | allow | `rule` |
 | 9 | no rule and `tools.approval.bash: prompt` | return undefined | — |
 | 10 | `config.enabled === false` | return undefined | (dry-run: `config`) |
 | 11 | `/classifier off` for this session (`sessionOff`) | return undefined | (dry-run: `session`) |
-| 12 | `matchingGrant` (session grant, scoped by fingerprint) | allow | `granted` |
 | 14 | dry-run with no cached verdict | `dryRunStop(would: classify)` | `classifier` |
 | 15 | **`classify(...)`** or a cache hit (`withoutShadow(cached)`) | Judgement (see below) | |
 | 15a | classify threw | `requestPermission("unclassified")` | `unclassified` |
@@ -51,8 +50,7 @@ network tier is cacheable (no `directoryUnresolved`/`ambientConfigUnreadable`).
 
 `evalSubprocessMarkers(code, language)` empty → return (the host's own eval approval applies) →
 `!enabled` or `sessionOff` → return → `evalSpawnCwd` → `resolvePolicyContext` → length cap (`cap`)
-→ spawn cwd `opaque` → `requestPermission("unreadable spawn cwd")` (`cwd`) → session grant
-(`normalizeEvalGrantTarget`, both directories) → cache / dry-run → `priorRefusalFor` →
+→ spawn cwd `opaque` → `requestPermission("unreadable spawn cwd")` (`cwd`) → cache / dry-run → `priorRefusalFor` →
 `classify(..., language "code")` → SAFE + no `evalRiskFlags` + no prior → allow; otherwise
 `requestPermission`. The eval path has no critical-pattern or env step.
 
@@ -81,19 +79,18 @@ judgeBatteryUnderDeadline({timeoutMs, state: buildJevState(...), backend})   jev
 |---|---|---|
 | dry-run | records "would prompt", block | — |
 | `!ctx.hasUI` | cancels the late handle, block | `headless`, or `unclassified` when the headline is unclassified |
-| UI | `ctx.ui.select`: Allow once / Allow for session / Deny | `dialog` |
-| Allow* | `liftRefusals`; session → `addGrant` | `dialog` + `approval` field |
+| UI | `ctx.ui.select`: Allow once / Deny | `dialog` |
+| Allow once | `liftRefusals` | `dialog` + `approval` field |
 | Deny or cancel | `addRefusal(human)`, block | `dialog` |
 | late SAFE that passes the `replayDecision` guards | dismisses the dialog → allow | `late-verdict` |
 | late UNSAFE / UNSURE | dialog stays open, notify + audit only | `late-verdict` |
 
-Grants are not offered on `critical pattern`, `environment override` or `unreadable spawn cwd`.
 
 ## `replayDecision` (index.ts:1537): the shared deterministic tail
 
 Production calls it at each step to get the `layer`/`decision`; eval/run.ts calls it to score.
 Precedence: cap → static deny → `riskFlags` includes `critical` → envKeys → static prompt →
-static allow → grant → no judgement (approval or `unclassified`) → SAFE with no prior refusal and
+static allow → no judgement (approval or `unclassified`) → SAFE with no prior refusal and
 no flags (allow, `verdict`) → simulated user approval (allow, `approval`) → otherwise block `verdict`.
 Output `hostHandoff`: `run` | `permission` | `headless-block`.
 

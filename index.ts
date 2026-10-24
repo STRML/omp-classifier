@@ -63,7 +63,7 @@
  *     (`TYPESAFE_DEFAULT_MODEL` else `jev-latest`) hence belong to the host —
  *     the plugin passes a deadline and receives a probability vector, and
  *     every deterministic check that surrounded the old judge (static rules,
- *     moderate-risk tokens, the eval spawn scan, forced dialogs, grants,
+ *     moderate-risk tokens, the eval spawn scan, forced dialogs,
  *     refusal memory) is unchanged. Which transport answers is one seam
  *     (`JudgeBackend`, issue #84): the default is that host path, and the
  *     `judgeBackend` config key can point the gate at any server speaking the
@@ -310,31 +310,6 @@ interface Refusal {
 const refusals = new Map<string, Refusal[]>();
 const REFUSAL_CAP = 20;
 
-/** Per-session grants (issue #32): sessionId -> grants, oldest first. A grant
- *  records a user's "Allow for session" answer: this command's normalized
- *  target, in this exact directory, may run without further gating until the
- *  session ends. Config changes clear every store (re-arms the gate). */
-interface Grant {
-	normalizedTarget: string;
-	cwd: string;
-	/** The session's own directory at approval time, for the targets that can
-	 *  act in a second directory of their own (eval, issue #14): `cwd` above is
-	 *  the payload's spawn directory then, and this is where the payload's own
-	 *  process runs, reads and writes. The judge's cache key carries both
-	 *  directories for exactly that reason — a verdict earned under one pair
-	 *  must not be reused under another — and the grant is the same
-	 *  authorization over the same pair, so it carries both too. Absent for
-	 *  bash, whose one directory is `cwd` already (the host runs the whole
-	 *  command there). */
-	scopeCwd?: string;
-	ts: number;
-	/** User scope at approval time. A later restriction/revocation invalidates
-	 *  the grant, while ordinary tool evidence remains non-authorizing. */
-	evidenceFingerprint?: string;
-}
-const grants = new Map<string, Grant[]>();
-const GRANT_CAP = 50;
-
 /** Per-session taint for the code floor (plan Phase 2 step 1): the variables
  *  a command in this session captured a secret into, so a later `echo $KEY`
  *  is recognized as a secret reaching the transcript. Shadow state — the
@@ -348,14 +323,14 @@ const FLOOR_TAINT_CAP = 50;
  *  session — model classification skips, critical/env/static-rule checks stay
  *  on — but NOT part of classifierConfigSignature: pausing changes no trust
  *  state, so cached verdicts stay valid and a resume serves them again.
- *  Wiped at session boundaries like cache/refusals/grants. */
+ *  Wiped at session boundaries like cache/refusals. */
 const sessionOff = new Set<string>();
 
 /** Dry-run capture (issue #32): `/classifier dry-run <command>` sets this,
  *  fires the real tool_call handler once, and reads back what it recorded.
  *  While set, the gate's decision choke points record the FIRST decision they
- *  reach instead of acting on it — no decisions.jsonl write, no refusal or
- *  grant store mutation, no cache write, no model call, no dialog — and
+ *  reach instead of acting on it — no decisions.jsonl write, no refusal
+ *  store mutation, no cache write, no model call, no dialog — and
  *  dry-run clears the variable in a finally. Module-level on purpose: the
  *  alternative threads a flag through every hot-path decision site. The race
  *  window (a real bash call interleaving with a probe on the shared module
@@ -971,7 +946,7 @@ function statusReportPath(): string {
  *  evidence for this tool call, and how the decision read them, without
  *  rebuilding the session transcript. There is no `branch`/decision-path
  *  field: `layer` already names the path that decided (critical,
- *  environment, rule, granted, verdict, cached, unclassified, dialog,
+ *  environment, rule, verdict, cached, unclassified, dialog,
  *  headless, cap, cwd, internal-error, late-verdict), so a second field would
  *  only duplicate it under different spelling. `late-verdict` is the one that
  *  arrived after its deadline had already opened a dialog (issue #62): it
@@ -1007,13 +982,13 @@ export interface DecisionRecord {
 	 *  Ids only, never message text and never a hash of it — the log is an
 	 *  audit trail, not a second copy of the transcript. Present whenever the
 	 *  snapshot held at least one id, including every early return (critical
-	 *  pattern, env override, static rule, grant, cap, refusal dialog) so a
+	 *  pattern, env override, static rule, cap, refusal dialog) so a
 	 *  false positive can be traced to exactly what the gate saw. */
 	userMessageIds?: string[];
 	/** `Judgement.authorization` carried onto the line when a judgement
 	 *  existed for this decision (a verdict, or a dialog/headless outcome
 	 *  that followed one). Absent on lines with no judgement (critical, env,
-	 *  static rule, grant, cap, unclassified). */
+	 *  static rule, cap, unclassified). */
 	authorization?: Judgement["authorization"];
 	/** The jev-v3 shadow (plan Phase 2 step 8), carried like `authorization`
 	 *  onto every line that followed a judgement. Decides nothing. */
@@ -1340,7 +1315,7 @@ function userChannelBranch(ctx: ExtensionContext): ReadonlyArray<EvidenceBranchE
  * evidence.userMessages exactly as the state carries them: the newest N
  * user messages (issue #31), absent entirely when the limit is 0 or there is
  * nothing to send. classify builds its state from this, and the tool_call path
- * snapshots it once per call so the cache key, refusal memory, and grants all
+ * snapshots it once per call so the cache key and refusal memory
  * agree about what the judge actually saw.
  */
 function evidenceUserSnapshot(ctx: ExtensionContext): UserEvidenceSnapshot | undefined {
@@ -1377,8 +1352,8 @@ function citableEvidence(userMessages: string[] | undefined): string[] | undefin
  */
 function evidenceFingerprint(userMessages: readonly string[] | undefined, operatorContext?: string, userMessageIds?: readonly string[]): string {
 	// null (evidence off) and [] (on, but no user wrote anything) must hash
-	// apart: the judge was shown different states, and that list also scopes a
-	// grant, so the two must never share a cached verdict or an approval scope.
+	// apart: the judge was shown different states, so the two must never share a
+	// cached verdict.
 	const material = JSON.stringify([userMessages ?? null, operatorContext ?? "", userMessageIds ?? null]);
 	let h1 = 0x811c9dc5;
 	let h2 = 0x01000193;
@@ -1588,11 +1563,8 @@ export interface ReplayDecisionInput {
 	judgement?: Judgement;
 	/** A scoped machine refusal or prior human refusal applies. */
 	priorRefusal?: boolean;
-	/** A previously granted exact action outranks model verdicts, below caps and
-	 *  deterministic critical/environment overlays. */
-	grant?: "session";
 	/** Optional simulated human outcome for evaluation/replay. */
-	approval?: "allow-once" | "allow-session" | "deny";
+	approval?: "allow-once" | "deny";
 	/** Deterministic risk overlays discovered by the caller. */
 	riskFlags?: readonly string[];
 	/** Host-native static decision for a specific rule/approval pattern. */
@@ -1602,7 +1574,7 @@ export interface ReplayDecisionInput {
 
 export interface ReplayDecision {
 	decision: "allow" | "block";
-	layer: "cap" | "critical" | "environment" | "rule" | "granted" | "approval" | "verdict" | "unclassified";
+	layer: "cap" | "critical" | "environment" | "rule" | "approval" | "verdict" | "unclassified";
 	/** What the host sees after the plugin returns. */
 	hostHandoff: "run" | "permission" | "headless-block";
 	why: string;
@@ -1630,9 +1602,6 @@ export function replayDecision(input: ReplayDecisionInput): ReplayDecision {
 	}
 	if (input.staticRule === "allow") {
 		return { decision: "allow", layer: "rule", hostHandoff: "run", why: "host static allow rule matched" };
-	}
-	if (input.grant) {
-		return { decision: "allow", layer: "granted", hostHandoff: "run", why: `${input.grant} grant matched` };
 	}
 	if (!input.judgement) {
 		if (input.approval && input.approval !== "deny" && !input.headless) {
@@ -1740,11 +1709,6 @@ export interface UserEvidenceSnapshot {
  * refer to. The hard cap keeps the state bounded. */
 const TASK_SCOPE_RE =
 	/\b(?:allow|approve|authorized?|authorise|please|must|need(?:s)?|only|do not|don't|never|stop|cancel|revoke|withdraw|no longer|until|scope|for this task|go ahead|proceed|not allowed|forbid|deny)\b/iu;
-/** Only durable authorization/restriction language belongs in a grant scope
- * fingerprint. Progress chatter such as "continue" or "status?" must not
- * revoke an otherwise valid user approval. */
-const TASK_SCOPE_FINGERPRINT_RE =
-	/\b(?:only|must|need(?:s)?|do not|don't|never|stop|cancel|revoke|withdraw|no longer|until|scope|for this task|not allowed|forbid|deny)\b/iu;
 const TASK_EVIDENCE_MAX = 8;
 
 type EvidenceBranchEntry = {
@@ -1831,11 +1795,6 @@ export function collectTaskEvidenceV3(branch: ReadonlyArray<EvidenceBranchEntry>
 	const first = all[0];
 	if (selected.some(item => item.id === first.id)) return snapshot;
 	return { ...snapshot, pinned: { id: first.id, text: first.text } };
-}
-
-function scopeFingerprint(messages: readonly string[] | undefined): string {
-	const durable = (messages ?? []).filter(message => TASK_SCOPE_FINGERPRINT_RE.test(message));
-	return evidenceFingerprint(durable.length > 0 ? durable : undefined);
 }
 
 /**
@@ -2653,8 +2612,7 @@ function evalCwdSites(masked: string): EvalCwdSiteMatch[] {
 }
 
 /** The headline the eval gate asks under when a spawn's own directory cannot be
- *  read (issue #14). Named once because two things key on it: the dialog title,
- *  and the rule that this layer offers no grant (see requestPermission). */
+ *  read (issue #14). Named once: the dialog title and the audit line both carry it. */
 const EVAL_SPAWN_CWD_HEADLINE = "unreadable spawn cwd";
 
 /** The directory an eval payload's spawns run in (issue #14), or why the scan
@@ -4605,8 +4563,8 @@ function remember(scoped: Map<string, Judgement>, key: string, judgement: Judgem
 	// call either way) but never written.
 	if (dryRun) return;
 	// Overwriting an existing key cannot grow the map, so evict only for a new
-	// one — otherwise re-caching a key (UNSAFE verdict, then the human's
-	// session grant) throws away an unrelated command's verdict.
+	// one — otherwise re-caching a key throws away an unrelated command's
+	// verdict.
 	if (!scoped.has(key)) {
 		// Evict oldest first (Map keeps insertion order); clearing wholesale would
 		// forget every UNSAFE verdict a long session already paid for.
@@ -4684,26 +4642,21 @@ function liftRefusals(ctx: ExtensionContext, command: string, cwd = ""): void {
 }
 
 /**
- * The strict identity of one action, shared by session grants (issue #32) and
- * refusal memory (issue #64). Authorization and memory must agree on what
- * "this action" is: flag tokens are KEPT (combined short flags split, then
+ * The strict identity of one action for refusal memory (issue #64): flag tokens are KEPT (combined short flags split, then
  * sorted and deduped, so "-rf" and "-r -f" produce the same key) and only the
  * first non-flag argument survives. Lowercased, whitespace-collapsed, leading
  * `cd <path> &&` stripped, `./` argument spellings canonicalized. Force flags
  * leave the KEY but stay in the command text the model and the dialog see —
  * force-ness is judged there, not here.
  *
- * Grants are authorization, so this key must NOT collapse distinct actions:
- * "git push origin main" and "git push --force origin main" differ here;
- * refusing to notice that difference turned a grant into an overgrant.
- *
- * Refusal memory keys the same way. Its own old two-word key ("ssh raw-ovh",
+ * The key must NOT collapse distinct actions: "git push origin main" and
+ * "git push --force origin main" differ here. The old two-word key ("ssh raw-ovh",
  * "docker exec") made one refused remote cleanup a session-length trip wire
  * for every later read from that host: 152 of the blocks in the 2026-09-12
  * log window carried `prior refusal` as a reason. A refusal now covers the
  * action it names and nothing wider, and an approval lifts exactly that.
  */
-export function normalizeGrantTarget(command: string): string {
+export function normalizeActionTarget(command: string): string {
 	const collapsed = command.replace(/\s+/gu, " ").trim().toLowerCase();
 	const stripped = extractLeadingCdTarget(collapsed)?.rest || collapsed;
 	const words = stripped.split(" ").filter(word => word !== "");
@@ -4727,7 +4680,7 @@ export function normalizeGrantTarget(command: string): string {
 	return [...lead, ...[...flags].sort(), firstArg].filter(part => part !== "").join(" ");
 }
 
-/** Refusals retain the grant identity for ordinary commands, whose normalized
+/** Refusals keep the action identity for ordinary commands, whose normalized
  *  equivalences are intentional. Git subcommands are different: preserving the
  *  full normalized command prevents a refusal for one branch/remote/option set
  *  from becoming a session-wide refusal for every invocation of that subverb.
@@ -4737,7 +4690,7 @@ function refusalKeyForCommand(command: string): string {
 	// already keyed under: an ordinary command keeps exactly the key it had,
 	// including the leading-`cd` canonicalization, so nothing that used to be
 	// the same action becomes two.
-	const grantTarget = normalizeGrantTarget(command);
+	const actionTarget = normalizeActionTarget(command);
 	// Git is where the old identity was too wide: it keeps the verb, the
 	// subverb and the first argument, so `git push origin main` answered for
 	// `git push origin feature`. Key the whole command instead — the whitespace
@@ -4750,99 +4703,10 @@ function refusalKeyForCommand(command: string): string {
 	const words = stripped.split(" ").filter(word => word !== "");
 	let index = 0;
 	while (index < words.length && WRAPPER_COMMANDS.has(commandBasename(words[index].toLowerCase()))) index++;
-	if (commandBasename(words[index]?.toLowerCase() ?? "") !== "git") return grantTarget;
+	if (commandBasename(words[index]?.toLowerCase() ?? "") !== "git") return actionTarget;
 	return `git-exact:${stripped}`;
 }
 
-
-/**
- * Exact-ish grant key for eval program text: the shell verb+argument shape
- * does not apply to program code, so the whole payload — lowercased,
- * whitespace-collapsed, `./` word spellings canonicalized — is the key. A
- * grant covers this exact text and nothing shorter.
- */
-function normalizeEvalGrantTarget(code: string): string {
-	return code
-		.replace(/\s+/gu, " ")
-		.trim()
-		.toLowerCase()
-		.split(" ")
-		.map(word => word.replace(/^\.\//u, ""))
-		.join(" ");
-}
-
-/**
- * The grant key for a bash command. Simple commands use the normalized
- * verb/flag/first-argument shape above. Compounds and substitutions use an
- * exact-text key instead: the whole payload the user approved is retained, so
- * a changed argument or an added segment cannot ride an earlier grant.
- */
-function grantKeyForCommand(command: string): string {
-	if (bashCommandSegments(command).length > 1 || command.includes("$(") || command.includes("`")) {
-		// Preserve internal whitespace: inside quotes it can be payload data, and
-		// across a newline it can change which shell command executes. Only trim
-		// the outer padding that the shell ignores before parsing.
-		return `exact:${command.trim()}`;
-	}
-	return normalizeGrantTarget(command);
-}
-
-function sessionGrants(sessionId: string): Grant[] {
-	let list = grants.get(sessionId);
-	if (!list) {
-		list = [];
-		grants.set(sessionId, list);
-	}
-	return list;
-}
-
-/** Record a session grant: this command's target, in this exact directory,
- *  may run ungated for the rest of the session. `scopeCwd` is the second
- *  directory the human's dialog put on screen for eval payloads that name a
- *  spawn directory of their own; it is part of the grant's identity, so a
- *  session that moves workspaces (`/move` rewrites ctx.cwd) cannot reuse an
- *  authorization the human gave while looking at the old one. */
-function addGrant(ctx: ExtensionContext, key: string, cwd: string, evidenceFingerprint?: string, scopeCwd?: string): void {
-	try {
-		if (key === "") return;
-		const sessionId = ctx.sessionManager.getSessionId();
-		const list = sessionGrants(sessionId);
-		// One grant per (target, directory, scope directory): re-approving
-		// refreshes ts and moves the grant to newest instead of stacking
-		// duplicates.
-		const existing = list.findIndex(grant => grant.normalizedTarget === key && grant.cwd === cwd && grant.scopeCwd === scopeCwd);
-		if (existing !== -1) list.splice(existing, 1);
-		while (list.length >= GRANT_CAP) list.shift();
-		list.push({ normalizedTarget: key, cwd, ts: Date.now(), evidenceFingerprint, ...(scopeCwd === undefined ? {} : { scopeCwd }) });
-	} catch {
-		// No session id, no grant; the caller's decision below is unchanged.
-	}
-}
-
-/** The session's grant for this command's target and directories, if any. */
-function matchingGrant(
-	ctx: ExtensionContext,
-	key: string,
-	cwd: string,
-	evidenceFingerprint?: string,
-	scopeCwd?: string,
-): Grant | undefined {
-	try {
-		if (key === "") return undefined;
-		const cwdInput = cwd ?? "";
-		return grants
-			.get(ctx.sessionManager.getSessionId())
-			?.find(
-				grant =>
-					grant.normalizedTarget === key &&
-					grant.cwd === cwdInput &&
-					grant.scopeCwd === scopeCwd &&
-					grant.evidenceFingerprint === evidenceFingerprint,
-			);
-	} catch {
-		return undefined;
-	}
-}
 
 /** The session's refusal for this command's target, or undefined. */
 function priorRefusalFor(
@@ -5263,8 +5127,8 @@ export default function (pi: ExtensionAPI) {
 		// Provenance-tiered evidence (issue #31). Default 3: the newest user
 		// messages ride along by default; /classifier evidenceUserMessages 0
 		// restores the pre-#31 shape — no user messages at all. The snapshot is
-		// taken once per tool call by the caller so the cache key, the refusal
-		// memory, and the grant scope all describe the same state the judge saw.
+		// taken once per tool call by the caller so the cache key and the refusal
+		// memory describe the same state the judge saw.
 		const taskEvidence = evidenceSnapshot === undefined ? evidenceUserSnapshot(ctx) : evidenceSnapshot;
 		const userMessages = taskEvidence?.messages;
 		const hadUserEvidence = (userMessages?.length ?? 0) > 0;
@@ -5534,8 +5398,7 @@ export default function (pi: ExtensionAPI) {
 			// directory declared, `working directory` above is that one, and the
 			// session's own directory is where the payload's own process reads
 			// and writes, so a relative write still lands there. It is part of
-			// what "Allow for session" covers, so it is on the line: a grant
-			// whose scope the human cannot see is a grant nobody approved.
+			// what the human is approving, so it is on the line.
 			if (target.spawnCwd !== undefined && sessionCwd !== undefined && !samePath(target.spawnCwd, sessionCwd)) {
 				details.push(`session directory: ${detailValue(sessionCwd)} (what this payload's own code runs in)`);
 			}
@@ -5736,14 +5599,12 @@ export default function (pi: ExtensionAPI) {
 	 * let the command through. Headless (no UI) always blocks: there is nobody to
 	 * ask, and this path is only reached for commands the gate could not clear.
 	 *
-	 * Option ladder, in escalating scope (issue #32): "Allow once" is the old
-	 * confirm-yes; "Allow for session" additionally records a grant so this
-	 * target, in this directory, stops gating for the session; "Deny" and
-	 * undefined (cancel or timeout) both deny. No answer outlives the session
+	 * Two options: "Allow once" runs this call only, and "Deny" or undefined
+	 * (cancel or timeout) denies. No answer outlives the call it answered
 	 * (https://github.com/STRML/omp-classifier/issues/184). The TUI renders a
-	 * select's TITLE as a full Markdown block — not the single truncated line a confirm title gets — so the same
-	 * title+body join confirm used keeps the executable command visible on the
-	 * dialog. Option descriptions are a bonus layer on surfaces that show them;
+	 * select's TITLE as a full Markdown block — not the single truncated line
+	 * a confirm title gets — so the same title+body join confirm used keeps
+	 * the executable command visible on the dialog. Option descriptions are a bonus layer on surfaces that show them;
 	 * the title alone still carries everything needed to decide.
 	 *
 	 * Only the returned reason becomes a refusalPayload. Layers: "dialog" when a
@@ -5769,7 +5630,6 @@ export default function (pi: ExtensionAPI) {
 		reason: string,
 		tool: "bash" | "eval" = "bash",
 		logWhyPrefix = "",
-		userScopeFingerprint?: string,
 		/** The audit fields of the tool call this dialog belongs to, passed
 		 *  through from handleToolCall so the dialog or headless-block line
 		 *  carries the same evidence ids, authorization label and shadow floor
@@ -5887,30 +5747,6 @@ export default function (pi: ExtensionAPI) {
 			late?.handle.cancel();
 			return block();
 		}
-		// A grant is only OFFERED when the resolver below can honor it. Critical
-		// patterns and env overrides outrank grants, so showing a grant choice
-		// there would promise an authorization that the next call can never use.
-		// Compounds/substitutions have an exact-text key; changed payloads still
-		// miss it.
-		const grantKey = tool === "eval" ? normalizeEvalGrantTarget(target.command) : grantKeyForCommand(target.command);
-		// A grant is only OFFERED when the resolver below can honor it. Critical
-		// patterns and env overrides outrank grants, so showing a grant choice
-		// there would promise an authorization that the next call can never use.
-		// `unreadable spawn cwd` is on that list for its own reason: the eval path
-		// asks before the grant check, because a grant for this payload was scoped
-		// to a directory the payload never named — offering one would promise a
-		// scope the gate cannot honestly write down.
-		const grantsHonoredAtLayer =
-			headline !== "critical pattern" && headline !== "environment override" && headline !== EVAL_SPAWN_CWD_HEADLINE;
-		const sessionGrantAvailable = grantKey !== "" && grantsHonoredAtLayer;
-		// An eval payload that declared a spawn directory of its own has two
-		// directories on the Details above, and its session grant covers both:
-		// "this directory" there would name half of what the human is agreeing
-		// to, so the option says which pair it means.
-		const sessionGrantDescription =
-			tool === "eval" && target.spawnCwd !== undefined && !samePath(target.spawnCwd, ctx.cwd)
-				? "This action, in both directories above, for the rest of the session"
-				: "This action, in this directory, for the rest of the session";
 		// The late-answer race (issue #62). The dialog the deadline opened keeps
 		// the judgment request alive, so a verdict that lands while the human is
 		// reading can still improve the answer in front of them:
@@ -5940,7 +5776,6 @@ export default function (pi: ExtensionAPI) {
 			`Run ${subject}? (${headline}${stale})\n${buildPermissionBody(target, shownReason, ctx.cwd)}`,
 			[
 				{ label: "Allow once", description: "This call only" },
-				...(sessionGrantAvailable ? [{ label: "Allow for session", description: sessionGrantDescription }] : []),
 				{ label: "Deny" },
 			],
 			// The old confirm default was approve; keep the cursor on it. The
@@ -6019,22 +5854,11 @@ export default function (pi: ExtensionAPI) {
 		// The race, on the human's own line: calibration has to read the late
 		// answer next to the human's, and that means the same line.
 		const lateSuffix = lateRefinement === undefined ? "" : ` (unavailable → late ${lateRefinement.verdict})`;
-		if (choice === "Allow once" || choice === "Allow for session") {
+		if (choice === "Allow once") {
 			// The user said yes to this action (issue #30): erase the memory
 			// that its target was refused, so rewordings run clean again.
 			liftRefusals(ctx, target.command, target.cwd);
-			// An eval grant covers BOTH directories: the payload's own spawn
-			// directory (target.cwd) and the session directory its own process
-			// runs in (ctx.cwd). Both were on the dialog the human answered, and
-			// both are part of the identity the next call has to match, so a
-			// session that moves workspaces cannot ride this grant into a
-			// directory nobody approved.
-			if (choice === "Allow for session") addGrant(ctx, grantKey, target.cwd, userScopeFingerprint, tool === "eval" ? ctx.cwd : undefined);
-			audit(
-				"allow",
-				(choice === "Allow for session" ? "approved by user (session grant)" : "approved by user") + lateSuffix,
-				choice === "Allow for session" ? "allow-session" : "allow-once",
-			);
+			audit("allow", `approved by user${lateSuffix}`, "allow-once");
 			return undefined;
 		}
 		if (dismissedForLateSafe) {
@@ -6152,10 +5976,6 @@ export default function (pi: ExtensionAPI) {
 			...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}),
 			...(floorShadow ? { floor: floorShadow } : {}),
 		});
-		// Grants are scoped to durable authorization/restriction language, not
-		// every progress message or host-generated message id. A new "status?"
-		// must not revoke approval; a later "do not publish" must.
-		const userScopeFingerprint = scopeFingerprint(citableUserEvidence);
 		/** Whether a command's directory can move before or while it runs.
 		 *
 		 *  A regex over the text is not a proof: `. ./hop.sh` moves the directory
@@ -6211,12 +6031,11 @@ export default function (pi: ExtensionAPI) {
 				trustedPolicySnapshot.signature,
 			].join("|");
 			if (configSignature !== classifierConfigSignature) {
-				// A dry-run probe (issue #32) touches neither the cache nor the grant
+				// A dry-run probe (issue #32) touches neither the cache nor the taint
 				// stores, AND leaves the signature stale on purpose: the next live
 				// call performs exactly the invalidation it would have performed.
 				if (!dryRun) {
 					cache.clear();
-					grants.clear();
 					floorTaint.clear();
 					classifierConfigSignature = configSignature;
 				}
@@ -6351,7 +6170,7 @@ export default function (pi: ExtensionAPI) {
 					ms: Date.now() - started,
 					...auditFields(),
 				});
-				return await requestPermission(ctx, target, headline, spawn.why, "eval", "", userScopeFingerprint, { ...auditFields(), ...follows });
+				return await requestPermission(ctx, target, headline, spawn.why, "eval", "", { ...auditFields(), ...follows });
 			}
 			const scoped = sessionCache(ctx.sessionManager.getSessionId());
 			// Judge identity is the model selector plus the question battery: a
@@ -6377,19 +6196,6 @@ export default function (pi: ExtensionAPI) {
 				refProvenanceForCache ?? null,
 				networkProvenanceForCache ?? null,
 			]);
-			// Session grant (issue #32): same user-tier authorization as the bash
-			// path — "Allow for session" on this payload's dialog promised the
-			// session off, so it must hold here too, not only for bash. The
-			// session directory rides along: the grant identity is the pair the
-			// judge's cache key uses, so the payload's relative work in ctx.cwd
-			// is authorized only in the workspace the human was shown.
-			if (matchingGrant(ctx, normalizeEvalGrantTarget(evalCode), cwd, userScopeFingerprint, ctx.cwd)) {
-				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, grant: "session" });
-				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "eval", decision: "allow", layer: replay.layer, why: "session grant", cmd: evalCode, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields(), ...spawnField });
-					return;
-				}
-			}
 			const cacheableEval = networkProvenanceForCache?.directoryUnresolved !== true && networkProvenanceForCache?.ambientConfigUnreadable !== true;
 			const cached = cacheableEval ? scoped.get(cacheKey) : undefined;
 			if (dryRun && !cached) {
@@ -6422,7 +6228,7 @@ export default function (pi: ExtensionAPI) {
 					},
 				));
 				if (!judgement) {
-					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", userScopeFingerprint, { ...auditFields(), ...spawnField });
+					return await requestPermission(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "eval", "", { ...auditFields(), ...spawnField });
 				}
 				if (cacheableEval && !cached && judgement.verdict !== "UNAVAILABLE" && !judgement.noCache) remember(scoped, cacheKey, judgement);
 				const logCode = truncated(redactSecrets(evalCode.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120);
@@ -6463,7 +6269,7 @@ export default function (pi: ExtensionAPI) {
 							? `classifier-safe but flags: ${flagList.join(", ")}`
 							: replay.why;
 					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", ...lead, why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
-					return await requestPermission(ctx, target, "flagged for approval", why, "eval", flagList.length > 0 ? "follows verdict" : "despite prior refusal", userScopeFingerprint, { ...auditFields(), ...judgementAudit(judgement), ...spawnField, ...follows });
+					return await requestPermission(ctx, target, "flagged for approval", why, "eval", flagList.length > 0 ? "follows verdict" : "despite prior refusal", { ...auditFields(), ...judgementAudit(judgement), ...spawnField, ...follows });
 				}
 				const detail =
 					judgement.verdict === "UNSAFE"
@@ -6511,7 +6317,6 @@ export default function (pi: ExtensionAPI) {
 					judgement.reason,
 					"eval",
 					"follows verdict",
-					userScopeFingerprint,
 					{ ...auditFields(), ...judgementAudit(judgement), ...spawnField, ...follows },
 					judgement.late === undefined
 						? undefined
@@ -6658,12 +6463,12 @@ export default function (pi: ExtensionAPI) {
 			// Issue #67: a command that runs a script file is judged by what the
 			// file HOLDS, not by its path. The body joins the text every layer
 			// below reads — critical patterns, the forced-dialog token scan, the
-			// verdict cache, the grants, the judge — so `python3 x.py` and
+			// verdict cache, the judge — so `python3 x.py` and
 			// `python3 /tmp/x.py` reach the same verdict, and a rename changes
 			// nothing. A body the classifier cannot read in full (over the review
 			// limit, unreadable, truncated, expanded by the shell before the
-			// interpreter sees it) fails closed here, before any static rule,
-			// grant, or dialog could approve text nobody read.
+			// interpreter sees it) fails closed here, before any static rule
+			// or dialog could approve text nobody read.
 			// The reader is handed the directory the command STARTS in, not the
 			// one the host extracted a leading `cd X &&` into: the reader applies
 			// the command's own `cd` chain itself, segment by segment, so a `cd`
@@ -6771,7 +6576,6 @@ export default function (pi: ExtensionAPI) {
 					"matches a built-in dangerous-command pattern",
 					"bash",
 					"",
-					userScopeFingerprint,
 					{ ...auditFields(), ...follows },
 				);
 			}
@@ -6790,7 +6594,6 @@ export default function (pi: ExtensionAPI) {
 					"command runs with caller-supplied env; not classified",
 					"bash",
 					"",
-					userScopeFingerprint,
 					{ ...auditFields(), ...follows },
 				);
 			}
@@ -6868,24 +6671,6 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Session grant (issue #32): the user already approved this action for
-			// this directory for the rest of the session. A grant is user-tier
-			// authorization: it outranks model classification AND the refusal
-			// memory (creating it lifts the target's refusals), but sits below the
-			// critical-pattern and env-override checks above, which rank the
-			// command itself, and below host static rules, which were configured
-			// explicitly.
-			// A grant is authorization for the text the human approved. The judged
-			// text carries the script bodies (#67), so a grant recorded for one
-			// body never covers a rewrite of that file: grantKeyForCommand sees the
-			// spliced newlines and falls back to its exact-text key.
-			if (matchingGrant(ctx, grantKeyForCommand(judgedCommand), cwd, userScopeFingerprint)) {
-				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, grant: "session" });
-				if (replay.decision === "allow") {
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: "session grant", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
-					return;
-				}
-			}
 			// A client verb whose directory could not be resolved measured config
 			// that may belong to another tree, and that tree can change with
 			// nothing in the key changing: never serve such a verdict from cache.
@@ -6923,7 +6708,6 @@ export default function (pi: ExtensionAPI) {
 					classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable",
 					"bash",
 					"",
-					userScopeFingerprint,
 					auditFields(),
 				);
 			}
@@ -7000,7 +6784,6 @@ export default function (pi: ExtensionAPI) {
 					dialogWhy,
 					"bash",
 					flags.length > 0 ? "follows verdict" : "despite prior refusal",
-					userScopeFingerprint,
 					{ ...auditFields(), ...judgementAudit(judgement), ...follows },
 				);
 			}
@@ -7047,7 +6830,6 @@ export default function (pi: ExtensionAPI) {
 				judgement.reason,
 				"bash",
 				"follows verdict",
-				userScopeFingerprint,
 				{ ...auditFields(), ...judgementAudit(judgement), ...follows },
 				judgement.late === undefined
 					? undefined
@@ -7079,7 +6861,6 @@ export default function (pi: ExtensionAPI) {
 		const sessionId = ctx.sessionManager.getSessionId();
 		cache.delete(sessionId);
 		refusals.delete(sessionId);
-		grants.delete(sessionId);
 		// A session-scoped pause dies at boundaries too: a resumed session
 		// starts unpaused.
 		sessionOff.delete(sessionId);
@@ -7107,7 +6888,6 @@ export default function (pi: ExtensionAPI) {
 		cache.delete(sessionId);
 		staleDisableWarned.delete(sessionId);
 		refusals.delete(sessionId);
-		grants.delete(sessionId);
 		// Same boundary rule for the session-scoped pause.
 		sessionOff.delete(sessionId);
 		floorTaint.delete(sessionId);
