@@ -245,7 +245,7 @@ describe("the endpoint backend", () => {
 		const sid = nextSession();
 		const blocked = await fire("tool_call", makeEvent("git status"), makeCtx({ sessionId: sid }));
 		const payload = refusalOf(blocked);
-		expect(payload.layer).toBe("headless");
+		expect(payload.layer).toBe("unavailable");
 		// The message names the variable to set — the same fail-closed shape as a
 		// missing TypeSafe credential — and never carries a value.
 		expect(payload.why).toContain("classifier unavailable");
@@ -261,12 +261,12 @@ describe("the endpoint backend", () => {
 		expect(requestedUrls).toEqual([`${ENDPOINT.baseUrl}/v1/systemone`]);
 	});
 
-	test("with a UI the missing key raises a dialog instead of a silent run", async () => {
+	test("with a UI the missing key blocks instead of a silent run", async () => {
 		delete process.env.LOCAL_JUDGE_KEY;
 		writeConfigFile({ shadowV3: false, judgeBackend: ENDPOINT });
 		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true });
 		const blocked = await fire("tool_call", makeEvent("git status"), ctx);
-		expect(refusalOf(blocked).layer).toBe("dialog");
+		expect(refusalOf(blocked).layer).toBe("unavailable");
 		expect(requestedUrls).toEqual([]);
 	});
 
@@ -517,7 +517,7 @@ describe("the endpoint transport cannot follow a redirect", () => {
 			// The target answers the fixture's safe set, so a transport that
 			// followed would arrive here as ALLOWED; `refusalOf` throws on that.
 			const payload = refusalOf(blocked);
-			expect(payload.layer).toBe("headless");
+			expect(payload.layer).toBe("unavailable");
 			expect(payload.why).toContain("classifier unavailable");
 			// And the status the endpoint answered is what failed the call. The
 			// message is the host client's own (`${provider}/${model} API error`),

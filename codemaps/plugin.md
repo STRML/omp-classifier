@@ -20,33 +20,33 @@ Read this before opening index.ts. Line numbers are where each declaration start
 | 1872-2840 | eval payload scanning | `MODERATE_RISK_TOKENS`, `INTERPRETER_FLAG_GRAMMAR`, `INTERPRETER_CODE_RISK`, `evalRiskFlags`, `evalSubprocessMarkers`, `evalCwdSites`, `evalSpawnCwd` |
 | 2839-3910 | wrappers, interpreters, script bodies (#67) | `WRAPPER_OPTION_GRAMMAR`, `POLICY_UNSTABLE_VERBS`, `interpreterInvocation`, `withoutWrittenHeredocBodies`, `interpreterProgramRefs`, `readInterpretedScriptBodies` (3775) |
 | 3911-4515 | pipe / compound splitting, risk overlay | `splitPipeStages`, `isPlainReadOnlyFetch`, `splitTopLevelCommands`, `rmForcesDialog`, `matchModerateRiskTokens` (4279), `trashFootnote` |
-| 4517-4920 | L3 session memory | `remember`, `addRefusal`, `liftRefusals`, `normalizeActionTarget`, `priorRefusalFor` (4901) |
+| 4517-4920 | L3 session memory | `remember`, `addRefusal`, `normalizeActionTarget`, `priorRefusalFor`, `priorRefusalLifts`, `userMessagesSince` |
 | 4922-7147 | `export default function (pi)`: the plugin factory | see below |
 
 ## Inside the factory (closures over `pi`, `settings`)
 
 | Line | Closure | Role |
 |---|---|---|
-| 4933 | `pi.registerCommand("classifier")` | L6 subcommands (below) |
-| 5137 | `readHostPolicy` | host `bash.patterns` + `tools.approval.bash` |
-| 5168 | `shadowJevV3` | v3 shadow; never throws; result goes in `Judgement.v3` |
-| 5313 | `classify` | the live judgment (see pipeline.md) |
-| 5543 | `buildPermissionBody` | dialog body; non-authored text indented as a code block |
-| 5614 | `refusalPayload` | JSON block reason for the agent: `{classifier:"blocked", tool, layer, why, next, notThis, ...axes}` |
-| 5649 | `logDecision` | appends to decisions.jsonl; redacts and truncates `cmd` to 120 chars; dry-run captures here |
-| 5706 | `shadowFloor` | `evaluateFloor` + session taint |
-| 5735 | `logDecisionFor` | adds `sessionId` |
-| 5770 | `requestPermission` | dialog / headless block |
-| 6095 | `dryRunStop` | ends a dry-run probe |
-| 6100 | `handleToolCall` | the gate; `pi.on("tool_call")` at 7105 |
-| 7110 | `dropCurrent` | per-session state reset on session events |
+| 4701 | `pi.registerCommand("classifier")` | L6 subcommands (below) |
+| 4889 | `readHostPolicy` | host `bash.patterns` + `tools.approval.bash` |
+| 4920 | `shadowJevV3` | v3 shadow; never throws; result goes in `Judgement.v3` |
+| 5061 | `classify` | the live judgment (see pipeline.md) |
+| 5271 | `refusalPayload` | JSON block reason for the agent: `{classifier:"blocked", tool, layer, why, next, notThis, ...axes}` |
+| 5306 | `logDecision` | appends to decisions.jsonl; redacts and truncates `cmd` to 120 chars; dry-run captures here |
+| 5367 | `shadowFloor` | `evaluateFloor` + session taint |
+| 5396 | `logDecisionFor` | adds `sessionId` |
+| 5449 | `REFUSAL_GUIDANCE` | per-cause headline, `next`, `notThis` |
+| 5505 | `refuse` | the gate's only block for a judged call: terminal audit line + payload |
+| 5546 | `dryRunStop` | ends a dry-run probe |
+| 5551 | `handleToolCall` | the gate; `pi.on("tool_call")` at 6458 |
+| 6463 | `dropCurrent` | per-session state reset on session events |
 
 ## Module state (L3, per process, keyed by sessionId)
 
 | Store | Cap | Cleared by |
 |---|---|---|
 | `cache: Map<session, Map<key, Judgement>>` | `CACHE_CAP` 500 | config-signature change (all sessions), session events |
-| `refusals: Map<session, Refusal[]>` | `REFUSAL_CAP` 20 | session events; `liftRefusals` on approval |
+| `refusals: Map<session, Refusal[]>` | `REFUSAL_CAP` 20 | session events only |
 | `floorTaint: Map<session, string[]>` | `FLOOR_TAINT_CAP` 50 | signature change, session events |
 | `sessionOff: Set<session>` | — | `/classifier on`, session events |
 | `staleDisableWarned: Set<session>` | — | `session_shutdown` |
@@ -81,13 +81,13 @@ executes · `status` writes status.json · `reset` · `trust-policy` · `enabled
 
 `ts, decisionId, sessionId, policyVersion, policyHash, modelId, reasonCode, jev{model,
 probabilities, hazards, confidence, blastRadius, usage, latencyMs}, userMessageIds,
-authorization, v3, approval, tool, decision, layer, why, cmd, cwd, spawnCwd, verdict, cached, ms,
-staleCode, floor{asks, entries}, followsDecisionId` (dialog/headless lines point at the verdict/cwd/critical/environment line before them; unclassified lines carry none).
+authorization, v3, tool, decision, layer, why, cmd, cwd, spawnCwd, verdict, cached, ms,
+staleCode, floor{asks, entries}, followsDecisionId` (blocked lines point at the verdict/cwd/critical/environment line before them; unclassified lines carry none). Older logs also carry `approval`.
 
 No-UI sessions: `userChannelBranch(ctx)` returns an empty branch when `!ctx.hasUI`, so `evidenceUserSnapshot` and `shadowJevV3` see no user words; tool evidence still reads the whole branch.
 
 `layer` values: `cap`, `rule`, `cwd`, `script-body`, `critical`, `environment`,
-`verdict`, `cached`, `dialog`, `headless`, `unclassified`, `internal-error` (older logs also hold `granted` and `late-verdict`).
+`verdict`, `cached`, `blocked`, `unclassified`, `internal-error` (older logs also hold `dialog`, `headless`, `granted` and `late-verdict`).
 
 ## Exports consumed outside index.ts
 

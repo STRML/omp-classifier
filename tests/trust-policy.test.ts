@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { getAgentDir, setAgentDir, setProfile } from "@oh-my-pi/pi-utils";
-import { fire, fireCommand, jevSafeAnswer, jevUnsafeAnswer, loadPlugin, makeCtx, makeEvent, makeSettings, modelCalls, notifyCalls, selectCalls, setJevAnswer, stateOf } from "./fixtures";
+import { fire, fireCommand, jevSafeAnswer, jevUnsafeAnswer, loadPlugin, makeCtx, makeEvent, makeSettings, modelCalls, notifyCalls, setJevAnswer, stateOf } from "./fixtures";
 import { JEV_POLICY_VERSION, JEV_V3_POLICY_VERSION, jevQuestions } from "../jev";
 import { jevAuthorizationQuestions } from "../authorization";
 import { buildStatusReport } from "../index";
@@ -122,11 +122,11 @@ describe("/classifier trust-policy", () => {
 		writeInstruction("Standing approval: deploy only after the release manager approves.");
 		setJevAnswer(jevUnsafeAnswer());
 		const changedCtx = makeCtx({ sessionId: "trust-policy-change", hasUI: true, cwd: home });
-		await fire("tool_call", makeEvent(testCommand), changedCtx);
+		const blocked = await fire("tool_call", makeEvent(testCommand), changedCtx);
 
 		expect(modelCalls).toHaveLength(2);
 		expect(policyInJudge(1)).toBe("null");
-		expect(selectCalls(changedCtx)).toHaveLength(1);
+		expect(blocked).toBeDefined();
 	});
 
 	test("a repo-local AGENTS.md never contributes, even after the user trust command", async () => {

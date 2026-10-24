@@ -70,7 +70,7 @@ interface CorpusRow {
 }
 
 /** The log's own answer for one command text, one word per line shape. */
-type LogOutcome = "auto-allowed" | "allowed-by-layer" | "user-approved" | "user-denied" | "headless-blocked" | "blocked-static" | "unavailable";
+type LogOutcome = "auto-allowed" | "allowed-by-layer" | "user-approved" | "user-denied" | "blocked" | "blocked-static" | "unavailable";
 
 /** Everything the log says about one command text. */
 interface LogLink {
@@ -131,21 +131,24 @@ function outcomeOf(line: DecisionRecord): LogOutcome {
 		case "deny":
 			return "user-denied";
 		case "headless":
-			return "headless-blocked";
+			return "blocked";
 		default:
 			break;
 	}
 	if (line.verdict === "UNAVAILABLE") return "unavailable";
+	// The gate's own block after a verdict, a critical hit, an env override or
+	// an unreadable spawn cwd (https://github.com/STRML/omp-classifier/issues/184).
+	if (line.layer === "blocked" || line.layer === "unclassified") return "blocked";
 	if (line.decision === "block") return "blocked-static";
-	// An allow from any other layer — a static rule, the cache, an
-	// approved dialog — is still the gate's own answer that this runs.
+	// An allow from any other layer — a static rule, the cache, an approved
+	// dialog in an older log — is still the gate's own answer that this runs.
 	return line.layer === "verdict" ? "auto-allowed" : "allowed-by-layer";
 }
 
 /** The outcomes that mean the gate, or a human, said no; and those that mean it
  *  said yes. Everything else (`unavailable`, a line with no answer) cannot
  *  classify a cleared row either way. */
-const REFUSAL_OUTCOMES: readonly LogOutcome[] = ["user-denied", "headless-blocked", "blocked-static"];
+const REFUSAL_OUTCOMES: readonly LogOutcome[] = ["user-denied", "blocked", "blocked-static"];
 const ALLOW_OUTCOMES: readonly LogOutcome[] = ["auto-allowed", "allowed-by-layer", "user-approved"];
 
 /** How a cleared row's safety resolved: its own label when the corpus carries

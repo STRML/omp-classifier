@@ -1,6 +1,6 @@
 /**
- * The /classifier dry-run preview (issue #32), the dialog's audit lines, and
- * the action identity refusal memory keys on.
+ * The /classifier dry-run preview (issue #32) and the action identity refusal
+ * memory keys on.
  *
  * Dry-run: /classifier dry-run <command> fires the real gate once with all
  * side effects off and reports the first decision it reaches.
@@ -15,8 +15,6 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { buildStatusReport, normalizeActionTarget, type DecisionRecord } from "../index";
 import {
-	ALLOW_ONCE,
-	DENY,
 	fire,
 	fireCommand,
 	jevSafeAnswer,
@@ -28,8 +26,6 @@ import {
 	modelCalls,
 	notifyCalls,
 	refusalOf,
-	resultText,
-	selectCalls,
 	setJevAnswer,
 	writeConfigFile,
 	removeConfigFile,
@@ -72,43 +68,6 @@ const dryRunReport = async (command: string, sessionId: string, cwd?: string): P
 	expect(calls.length).toBeGreaterThan(0);
 	return JSON.parse(calls[calls.length - 1][0]) as Record<string, unknown>;
 };
-
-/** One UNSAFE dialog answered with `answer`, returning the gate result. */
-const prompted = async (command: string, answer: string, sessionId: string) => {
-	const ctx = makeCtx({ sessionId, hasUI: true, selectResult: answer });
-	const result = await fire("tool_call", makeEvent(command), ctx);
-	return { ctx, result };
-};
-
-describe("dialog outcomes", () => {
-	test("Allow once does not outlive the call: the same command prompts again", async () => {
-		const sid = nextSession();
-		const first = await prompted(`git branch -D feature-${sid}`, ALLOW_ONCE, sid);
-		expect(resultText(first.result)).toBe("ALLOWED");
-
-		const secondCtx = makeCtx({ sessionId: sid, hasUI: true });
-		const second = await fire("tool_call", makeEvent(`git branch -D feature-${sid}`), secondCtx);
-		expect(refusalOf(second).layer).toBe("dialog");
-		expect(selectCalls(secondCtx)).toHaveLength(1);
-	});
-
-	test("a canceled dialog (undefined) denies, and the audit line says so", async () => {
-		const sid = nextSession();
-		const ctx = makeCtx({ sessionId: sid, hasUI: true });
-		const result = await fire("tool_call", makeEvent(`git branch -D feature-${sid}`), ctx);
-		expect(refusalOf(result).layer).toBe("dialog");
-		const lines = readDecisions();
-		expect(lines[lines.length - 1].why.startsWith("prompt canceled")).toBe(true);
-	});
-
-	test("explicit Deny keeps the old audit why", async () => {
-		const sid = nextSession();
-		await prompted(`git branch -D feature-${sid}`, DENY, sid);
-		const lines = readDecisions();
-		expect(lines[lines.length - 1]).toMatchObject({ decision: "block", layer: "dialog" });
-		expect(lines[lines.length - 1].why.startsWith("follows verdict")).toBe(true);
-	});
-});
 
 describe("/classifier dry-run", () => {
 	test("over-cap command reports would block at the cap and writes no audit line", async () => {

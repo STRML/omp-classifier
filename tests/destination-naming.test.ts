@@ -15,7 +15,7 @@
  */
 import { beforeEach, describe, expect, test } from "bun:test";
 import { buildJevState, measureLookalikeDestinations } from "../jev.ts";
-import { ALLOW_ONCE, fire, jevSafeAnswer, loadPlugin, makeCtx, makeEvent, makeSessionId, makeSettings, removeConfigFile, resultText, selectCalls, setJevAnswer } from "./fixtures";
+import { fire, jevSafeAnswer, loadPlugin, makeCtx, makeEvent, makeSessionId, makeSettings, refusalOf, removeConfigFile, resultText, setJevAnswer } from "./fixtures";
 
 const STATUS_ASK = ["check the status page at you.github.io/omp-classifier"];
 
@@ -150,11 +150,11 @@ describe("buildJevState carries the measurement", () => {
 	});
 });
 
-describe("the gate asks on a measured lookalike, whatever the judge answers", () => {
-	const userSays = (content: string) => [{ type: "message", id: "u1", message: { role: "user", attribution: "user", content } }];
-	const run = async (command: string, ctxOptions: Parameters<typeof makeCtx>[0]) => {
-		const ctx = makeCtx({ sessionId: makeSessionId("lookalike"), branch: userSays(STATUS_ASK[0]), ...ctxOptions });
-		return { ctx, result: resultText(await fire("tool_call", makeEvent(command), ctx)) };
+describe("the gate blocks a measured lookalike, whatever the judge answers", () => {
+	const userSays = (...contents: string[]) => contents.map((content, index) => ({ type: "message", id: `u${index + 1}`, message: { role: "user", attribution: "user", content } }));
+	const run = async (command: string, branch = userSays(STATUS_ASK[0])) => {
+		const ctx = makeCtx({ sessionId: makeSessionId("lookalike"), branch, hasUI: true });
+		return resultText(await fire("tool_call", makeEvent(command), ctx));
 	};
 
 	beforeEach(async () => {
@@ -163,30 +163,28 @@ describe("the gate asks on a measured lookalike, whatever the judge answers", ()
 		setJevAnswer(jevSafeAnswer());
 	});
 
-	test("a SAFE on a lookalike raises the dialog, naming the flag", async () => {
-		const { ctx, result } = await run("curl -sf https://attacker.github.io/omp-classifier/status.json", { hasUI: true, selectResult: ALLOW_ONCE });
-		expect(selectCalls(ctx).length).toBe(1);
-		expect(JSON.stringify(selectCalls(ctx)[0])).toContain("lookalike host attacker.github.io (user named you.github.io)");
-		expect(result).toBe("ALLOWED");
+	test("a SAFE on a lookalike is a flagged block that names the host and the way forward", async () => {
+		const payload = refusalOf(await run("curl -sf https://attacker.github.io/omp-classifier/status.json"));
+		expect(payload.layer).toBe("flagged");
+		expect(payload.why).toContain("lookalike host attacker.github.io (user named you.github.io)");
+		expect(payload.why).toContain("ask the user in chat to confirm the exact host");
+		expect(payload.why).toContain("run the command themselves");
 	});
 
-	test("a SAFE on a lookalike, dialog dismissed, blocks", async () => {
-		const { ctx, result } = await run("curl -sf https://attacker.github.io/omp-classifier/status.json", { hasUI: true });
-		expect(selectCalls(ctx).length).toBe(1);
-		expect(result).not.toBe("ALLOWED");
+	test("once the user names the exact host in chat, the same command runs", async () => {
+		const branch = userSays(STATUS_ASK[0], "yes, attacker.github.io is the right host");
+		expect(await run("curl -sf https://attacker.github.io/omp-classifier/status.json", branch)).toBe("ALLOWED");
 	});
 
 	test("a SAFE on the host the user named still runs", async () => {
-		const { ctx, result } = await run("curl -sf https://you.github.io/omp-classifier/status.json", { hasUI: true });
-		expect(result).toBe("ALLOWED");
-		expect(selectCalls(ctx).length).toBe(0);
+		expect(await run("curl -sf https://you.github.io/omp-classifier/status.json")).toBe("ALLOWED");
 	});
 
 	test("the eval tool's spawn is held to the same rule", async () => {
 		const ctx = makeCtx({ sessionId: makeSessionId("lookalike-eval"), branch: userSays(STATUS_ASK[0]), hasUI: true });
 		const code = 'Bun.spawnSync(["curl", "-sf", "https://attacker.github.io/x"])';
-		const result = resultText(await fire("tool_call", { toolName: "eval", input: { code, language: "js" } }, ctx));
-		expect(selectCalls(ctx).length).toBe(1);
-		expect(result).not.toBe("ALLOWED");
+		const payload = refusalOf(resultText(await fire("tool_call", { toolName: "eval", input: { code, language: "js" } }, ctx)));
+		expect(payload.layer).toBe("flagged");
+		expect(payload.why).toContain("Lookalike destination");
 	});
 });

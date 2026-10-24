@@ -14,7 +14,6 @@ import {
 	makeSettings,
 	modelCalls,
 	resultText,
-	selectCalls,
 	setJevAnswer,
 	removeConfigFile,
 } from "./fixtures";
@@ -31,7 +30,7 @@ const gate = async (command: string, opts: { sessionId?: string; cwd?: string; i
 	seq += 1;
 	const ctx = makeCtx({ sessionId: opts.sessionId ?? `cache-${seq}`, cwd: opts.cwd, hasUI: opts.hasUI ?? false });
 	const result = await fire("tool_call", makeEvent(command, opts.input ?? {}), ctx);
-	return { text: resultText(result), modelCalls: modelCalls.length, selects: selectCalls(ctx).length };
+	return { text: resultText(result), modelCalls: modelCalls.length };
 };
 
 describe("identical execution identity is judged once", () => {
@@ -52,7 +51,6 @@ describe("identical execution identity is judged once", () => {
 
 		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), makeCtx({ sessionId: "cache-session", hasUI: true }));
 		expect(modelCalls.length).toBe(1);
-		expect(selectCalls(ctx).length).toBe(0);
 	});
 });
 
@@ -79,7 +77,7 @@ describe("every execution-affecting input is part of the identity", () => {
 		expect(second.modelCalls).toBe(2);
 	});
 
-	test("env override commands prompt and never classify (no cache entry)", async () => {
+	test("env override commands block and never classify (no cache entry)", async () => {
 		// Environment overrides are decided by a permission request before any
 		// classifier path — env values can select the program that runs — so
 		// they never reach the cache at all.
@@ -163,7 +161,6 @@ describe("cache keys include the evidence fingerprint", () => {
 		});
 		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), ctx);
 		expect(modelCalls.length).toBe(1);
-		expect(selectCalls(ctx).length).toBe(0);
 
 		const drifted = makeCtx({
 			sessionId: "evidence-drift",
@@ -176,14 +173,12 @@ describe("cache keys include the evidence fingerprint", () => {
 		// so the judgement is made again — against the state, and the evidence,
 		// the gate actually saw this time.
 		expect(modelCalls.length).toBe(2);
-		expect(selectCalls(drifted).length).toBe(0);
 
 		// The re-judged verdict is cached under the new evidence: repeating the
 		// drifted identity costs no third request and does not re-enter the
 		// dialog path — the cached judgement answers it.
 		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), drifted);
 		expect(modelCalls.length).toBe(2);
-		expect(selectCalls(drifted).length).toBe(0);
 	});
 
 	test("identical evidence stays one cached decision", async () => {
@@ -194,6 +189,5 @@ describe("cache keys include the evidence fingerprint", () => {
 		const again = makeCtx({ sessionId: "evidence-stable", cwd: "/repo", hasUI: true, branch });
 		await fire("tool_call", makeEvent("git status", { cwd: "/repo" }), again);
 		expect(modelCalls.length).toBe(1);
-		expect(selectCalls(again).length).toBe(0);
 	});
 });

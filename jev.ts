@@ -1938,9 +1938,9 @@ export function measureLookalikeDestinations(command: string, userMessages: read
 
 /**
  * The overlay flags a measured lookalike raises (issue #161). A SAFE verdict
- * with a flag becomes a permission request, the same rule the moderate-risk
- * token overlay follows, so the user decides whether a host they never named
- * but that shares a parent with one they did is the one they meant. Measured
+ * with a flag is blocked, the same rule the moderate-risk token overlay
+ * follows, and the agent is told to have the user confirm the exact host in
+ * chat: a host the user names stops being a lookalike. Measured
  * in code because the judge does not act on the field reliably: on
  * jev-1.14.0, `acme-docs.pages.dev` under "acme.pages.dev" scored p(safe)
  * 0.81-0.86 with the field in its state. The messages are redacted exactly as
@@ -3122,8 +3122,8 @@ export function deriveJevDecision(answers: JevAnswers, policy: JevPolicy): JevDe
 
 /**
  * Every way the judgment can be missing. The caller's only safe reading is "no
- * verdict exists" — the gate turns this into a permission request (or a block
- * when headless), so this class must never be caught and treated as an answer.
+ * verdict exists" — the gate turns this into a block, so this class must never
+ * be caught and treated as an answer.
  */
 export class JevUnavailableError extends Error {
 	constructor(message: string) {

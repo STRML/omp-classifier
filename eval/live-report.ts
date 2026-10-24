@@ -7,16 +7,21 @@
  *
  * It reads the decision log and counts terminal lines only: every gated call
  * ends in exactly one, either an auto-allow (`layer: verdict`, decision allow)
- * or a line carrying `approval` (a human's answer, or `headless`). Lines have
- * no shared id to join a verdict to its dialog, and the terminal line carries
- * the same `v3` as the verdict line before it, so counting terminals counts
- * each call once. Cached lines are skipped: their `v3` belongs to the call
- * that filled the cache.
+ * or a `blocked` / `unclassified` line. The terminal line carries the same
+ * `v3` as the verdict line before it, so counting terminals counts each call
+ * once. Cached lines are skipped: their `v3` belongs to the call that filled
+ * the cache.
+ *
+ * Logs written before https://github.com/STRML/omp-classifier/issues/184 end a
+ * call on a line carrying `approval` instead (a human's dialog answer, or
+ * `headless`), and may hold `late-verdict` allows. Those still count, so a
+ * window that spans the change reads whole.
  *
  * The flip criterion (plan "Flip"): no call the user denied under jev-v2 that
  * jev-v3 would have allowed. Those rows are listed in full. A call whose live
- * judgment was an outage (`v3.live` UNAVAILABLE) is its own bucket: the user
- * answered a dialog that no judge had decided.
+ * judgment was an outage (`v3.live` UNAVAILABLE) is its own bucket. Since
+ * https://github.com/STRML/omp-classifier/issues/184 nobody is asked, so new
+ * logs hold no user denials: the criterion only reads the older lines.
  *
  * A missing log or any line that fails to parse makes the report INCOMPLETE,
  * and the command exits 1: a flip decision can't rest on a log it couldn't read.
@@ -26,7 +31,7 @@ import { parseArgs } from "node:util";
 import { decisionsLogPath, type DecisionRecord } from "../index";
 
 /** How the live gate ended one call. */
-export type LiveOutcome = "auto-allowed" | "user-approved" | "user-denied" | "headless-blocked" | "unavailable";
+export type LiveOutcome = "auto-allowed" | "user-approved" | "user-denied" | "blocked" | "unavailable";
 
 export interface ShadowReport {
 	since: string;
@@ -42,7 +47,8 @@ export interface ShadowReport {
 	/** Denied during a live outage, allowed by v3: listed, but no regression,
 	 *  because jev-v2 never judged them. */
 	deniedDuringOutage: Array<{ ts: string; cmd: string; branch: number; reasonCode: string }>;
-	/** Blocked headless live, allowed by v3: the subagent case the plan targets. */
+	/** Blocked live with nobody asked, allowed by v3. Since
+	 *  https://github.com/STRML/omp-classifier/issues/184 that is every block. */
 	unblocked: Array<{ ts: string; cmd: string; branch: number; reasonCode: string }>;
 }
 
@@ -53,11 +59,16 @@ function liveOutcome(line: DecisionRecord): LiveOutcome | undefined {
 	// auto-allow. Its block lines — a late UNSAFE or UNSURE that left the dialog
 	// open — are not terminal: the human's own dialog line, when they answer,
 	// counts for that call.
-	const terminal = line.approval !== undefined || (line.decision === "allow" && (line.layer === "verdict" || line.layer === "late-verdict"));
+	const terminal =
+		line.approval !== undefined ||
+		line.layer === "blocked" ||
+		line.layer === "unclassified" ||
+		(line.decision === "allow" && (line.layer === "verdict" || line.layer === "late-verdict"));
 	if (!terminal) return undefined;
 	// A decision with no live verdict can't be told from an outage: not counted.
 	if (line.v3 !== undefined && !("error" in line.v3) && line.v3.live === undefined) return undefined;
-	if (line.v3?.live === "UNAVAILABLE" || line.approval === "unavailable") return "unavailable";
+	if (line.v3?.live === "UNAVAILABLE" || line.approval === "unavailable" || line.verdict === "UNAVAILABLE") return "unavailable";
+	if (line.layer === "blocked" || line.layer === "unclassified") return "blocked";
 	switch (line.approval) {
 		case "allow-once":
 		case "allow-session":
@@ -66,14 +77,14 @@ function liveOutcome(line: DecisionRecord): LiveOutcome | undefined {
 		case "deny":
 			return "user-denied";
 		case "headless":
-			return "headless-blocked";
+			return "blocked";
 		case undefined:
 			return "auto-allowed";
 	}
 }
 
 export function summarizeShadow(lines: readonly DecisionRecord[], sinceMs: number): ShadowReport {
-	const outcomes: LiveOutcome[] = ["auto-allowed", "user-approved", "user-denied", "headless-blocked", "unavailable"];
+	const outcomes: LiveOutcome[] = ["auto-allowed", "user-approved", "user-denied", "blocked", "unavailable"];
 	const report: ShadowReport = {
 		since: new Date(sinceMs).toISOString(),
 		calls: 0,
@@ -100,7 +111,7 @@ export function summarizeShadow(lines: readonly DecisionRecord[], sinceMs: numbe
 		const row = { ts: line.ts, cmd: line.cmd, branch: v3.branch, reasonCode: v3.reasonCode };
 		if (allows && outcome === "user-denied") report.regressions.push(row);
 		if (allows && outcome === "unavailable" && line.approval === "deny") report.deniedDuringOutage.push(row);
-		if (allows && outcome === "headless-blocked") report.unblocked.push(row);
+		if (allows && outcome === "blocked") report.unblocked.push(row);
 	}
 	return report;
 }
@@ -112,7 +123,10 @@ const VERDICTS = new Set(["SAFE", "UNSAFE", "UNSURE", "UNAVAILABLE"]);
  *  carries v3 contradicts itself and is malformed. */
 const LEGACY_VERDICTS = new Set(["PARSE_ERROR"]);
 /** DecisionRecord["approval"], value for value: an unknown answer is no answer
- *  this report can count, so the line is unreadable rather than skipped. */
+ *  this report can count, so the line is unreadable rather than skipped. The
+ *  gate stopped writing `approval` with
+ *  https://github.com/STRML/omp-classifier/issues/184; these are the values
+ *  older lines hold. */
 const APPROVALS = new Set(["allow-once", "allow-session", "always-allow", "deny", "headless", "unavailable"]);
 
 /** The fields only a decision carries. An error record with any of them is
@@ -220,7 +234,7 @@ export function render(report: ShadowReport, options: { countsOnly?: boolean } =
 		"",
 		...list("REGRESSIONS (denied live, v3 would allow)", report.regressions),
 		...list("denied during a live outage, v3 would allow", report.deniedDuringOutage),
-		...list("headless blocks v3 would allow", report.unblocked),
+		...list("blocks v3 would allow", report.unblocked),
 	].join("\n");
 }
 

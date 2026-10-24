@@ -36,6 +36,32 @@ const line = (over: Partial<DecisionRecord>): DecisionRecord => ({
 });
 
 describe("summarizeShadow", () => {
+	test("a log that spans the no-prompt change counts old and new terminal lines once each", () => {
+		const live = (verdict: "SAFE" | "UNSURE" | "UNSAFE" | "UNAVAILABLE", shadow: ShadowV3): ShadowV3 => ({ ...shadow, live: verdict });
+		const report = summarizeShadow(
+			[
+				// Legacy: a verdict line, then the human's dialog answer.
+				line({ decision: "block", layer: "verdict", verdict: "UNSURE", v3: v3("SAFE", 4) }),
+				line({ approval: "deny", cmd: "old deny", v3: v3("SAFE", 4) }),
+				// New: a verdict line, then the gate's own blocked line.
+				line({ decision: "block", layer: "verdict", verdict: "UNSAFE", v3: live("UNSAFE", v3("SAFE", 4)) }),
+				line({ decision: "block", layer: "blocked", verdict: "UNSAFE", cmd: "new block", v3: live("UNSAFE", v3("SAFE", 4)) }),
+				// New: an outage block is an outage, not a refusal.
+				line({ decision: "block", layer: "verdict", verdict: "UNAVAILABLE", v3: live("UNAVAILABLE", v3("UNSURE", 5)) }),
+				line({ decision: "block", layer: "blocked", verdict: "UNAVAILABLE", v3: live("UNAVAILABLE", v3("UNSURE", 5)) }),
+				// New: an auto-allow is unchanged.
+				line({ decision: "allow", layer: "verdict", verdict: "SAFE", v3: live("SAFE", v3("SAFE", 3)) }),
+			],
+			NOW - 24 * 3_600_000,
+		);
+		expect(report.calls).toBe(4);
+		expect(report.matrix["user-denied"]).toEqual({ v3Allow: 1, v3Ask: 0 });
+		expect(report.matrix.blocked).toEqual({ v3Allow: 1, v3Ask: 0 });
+		expect(report.matrix.unavailable).toEqual({ v3Allow: 0, v3Ask: 1 });
+		expect(report.matrix["auto-allowed"]).toEqual({ v3Allow: 1, v3Ask: 0 });
+		expect(report.unblocked.map(row => row.cmd)).toEqual(["new block"]);
+	});
+
 	test("every live outcome lands in its cell, once per call", () => {
 		const report = summarizeShadow(
 			[
@@ -54,7 +80,7 @@ describe("summarizeShadow", () => {
 		expect(report.matrix["auto-allowed"]).toEqual({ v3Allow: 1, v3Ask: 1 });
 		expect(report.matrix["user-approved"]).toEqual({ v3Allow: 1, v3Ask: 0 });
 		expect(report.matrix["user-denied"]).toEqual({ v3Allow: 1, v3Ask: 0 });
-		expect(report.matrix["headless-blocked"]).toEqual({ v3Allow: 1, v3Ask: 1 });
+		expect(report.matrix.blocked).toEqual({ v3Allow: 1, v3Ask: 1 });
 		expect(report.byBranch).toEqual({ "3": 1, "4": 3, "5": 1, "7": 1 });
 		// The flip criterion's violation is listed, with the branch that caused it.
 		expect(report.regressions).toEqual([{ ts: "2026-09-22T11:00:00Z", cmd: "trash build", branch: 4, reasonCode: "jev-v3:4:x" }]);
@@ -170,7 +196,7 @@ describe("render", () => {
 		expect(counts).not.toContain("leaky");
 		expect(counts).not.toContain("gh pr merge");
 		expect(counts).toContain("REGRESSIONS (denied live, v3 would allow): 1");
-		expect(counts).toContain("headless blocks v3 would allow: 1");
+		expect(counts).toContain("blocks v3 would allow: 1");
 	});
 
 	test("a prompt-era PARSE_ERROR line is history, not a malformed line", () => {

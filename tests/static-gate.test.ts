@@ -17,8 +17,6 @@ import {
 	removeConfigFile,
 	resultText,
 	refusalOf,
-	selectCalls,
-	ALLOW_ONCE,
 	setJevAnswer,
 	writeConfigFile,
 	makeSessionId,
@@ -74,7 +72,7 @@ describe("critical patterns outrank everything", () => {
 		await loadPlugin(makeSettings([{ match: "rm -rf *", approval: "allow" }]));
 		const result = await gate("rm -rf /");
 		expect(result).toContain("critical pattern");
-		expect(refusalOf(result).layer).toBe("headless");
+		expect(refusalOf(result).layer).toBe("critical");
 		expect(modelCalls.length).toBe(0);
 	});
 
@@ -91,11 +89,11 @@ describe("critical patterns outrank everything", () => {
 		expect(modelCalls.length).toBe(0);
 	});
 
-	test("critical with a UI raises a real dialog, not a silent run", async () => {
-		const ctx = makeCtx({ hasUI: true, selectResult: ALLOW_ONCE });
-		const result = resultText(await fire("tool_call", makeEvent("mkfs.ext4 /dev/sdb1"), ctx));
-		expect(result).toBe("ALLOWED"); // user approved
-		expect(selectCalls(ctx)[0][0]).toContain("critical pattern");
+	test("critical with a UI blocks and tells the agent to hand it to the user", async () => {
+		const ctx = makeCtx({ hasUI: true });
+		const payload = refusalOf(resultText(await fire("tool_call", makeEvent("mkfs.ext4 /dev/sdb1"), ctx)));
+		expect(payload.layer).toBe("critical");
+		expect(payload.next).toContain("run the command themselves");
 		expect(modelCalls.length).toBe(0);
 	});
 });
@@ -378,7 +376,7 @@ describe("the refusal payload is structured at every deterministic layer", () =>
 		const payload = refusalOf(await gate("rm -rf /"));
 		expect(payload.classifier).toBe("blocked");
 		expect(payload.tool).toBe("bash");
-		expect(payload.layer).toBe("headless");
+		expect(payload.layer).toBe("critical");
 		expect(payload.why).toContain("critical pattern");
 		expect(payload.next.length).toBeGreaterThan(0);
 		expect(modelCalls.length).toBe(0);

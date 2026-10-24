@@ -26,7 +26,7 @@ thresholds. Four consequences shape every layer below:
   answers and the same policy always decide the same thing. A threshold change can therefore
   be scored against recorded answers offline instead of re-asking the model (L5).
 - **Fail-closed is a code path, not a promise.** A missing key, a non-2xx, a timeout, or an
-  answer that does not match the battery yields `UNAVAILABLE`, which raises a dialog and is
+  answer that does not match the battery yields `UNAVAILABLE`, which blocks and is
   never cached. Nothing admits a guess in place of an answer.
 - **A missed deadline is unavailable.** The gate waits for the answer up to `timeoutMs`, then
   aborts the request and the call is `UNAVAILABLE`. Nothing keeps listening behind the
@@ -37,7 +37,7 @@ thresholds. Four consequences shape every layer below:
 ```
 L6 control plane      /classifier, config bounds, kill switches, agent-legible status
 L5 self-measurement   eval harness, corpus, policy sweep, regression gates
-L4 interaction        dialogs, refusal payloads, dry-run
+L4 interaction        refusal payloads, dry-run
 L3 memory             verdict cache, refusal memory, decision audit log
 L2 judgment           Jev state + question battery, probabilities, derived verdict
 L1 recognition        critical patterns, structural rules, compound segments, marker scans
@@ -102,7 +102,7 @@ The deterministic layer. Answers only "is this shape provably X": critical patte
 structural routine shapes, compound-command segments, interpreter scoping, shape-scoped
 `rm`/`unlink` forcing, eval spawn markers, heredoc handling. Its findings reach the tail as
 `riskFlags`, and they outrank the verdict: a destructive-token command that Jev reads as SAFE
-still raises a dialog, because Jev judges the command as untrusted state and can be steered
+still blocks, because Jev judges the command as untrusted state and can be steered
 by text inside it. This is why the port did not make L1 redundant: Jev removed the need to
 parse prose, not the need to notice shapes without asking anyone.
 
@@ -224,7 +224,7 @@ One request, two inputs, no prose:
   machine the daemon the command names puts them on; `lookalikeDestinations` for
   destinations that only share a parent domain with a host the user's own messages name. That
   tier is negative only: it never says a destination is the user's, and each lookalike is also
-  an overlay flag, so a SAFE on one still raises the dialog). A measured tier carries a `note` saying so, is absent when
+  an overlay flag, so a SAFE on one still blocks). A measured tier carries a `note` saying so, is absent when
   nothing could be measured, and is never written by the command's author.
 - **Battery** — `jevQuestions()`: one `choice` question for the verdict, one `noul` per
   hazard in `JEV_HAZARDS`, one `score` question for blast radius. The battery is a pure
@@ -269,7 +269,7 @@ move: the battery and the policy. The answers are still probabilities (a `choice
 `probabilities` + `confidence`, one `noul` per hazard, a `score` for blast radius), so the same
 floors read them, and one-hot handling stays reserved for a text bridge. A missing credential,
 an unreachable baseUrl, a 3xx, a non-2xx, and an unparseable body are all outages:
-`JevUnavailableError` → permission request.
+`JevUnavailableError` → block.
 
 The backend's **id** (`typesafe/<model>`, `endpoint/<baseUrl>#<model>`) is the judge's identity.
 It joins the config signature and every cache key, so a verdict earned from one judge can never
@@ -278,7 +278,7 @@ Credentials are deliberately not part of that identity — the TypeSafe key is n
 signature either, and another key for the same endpoint is another login, not another judge.
 
 Invariant: nothing that reached L2 can end in silence. `UNAVAILABLE` behaves exactly like
-`UNSURE` at L4 (a dialog) and is excluded from the cache, so an outage cannot pin a session
+`UNSURE` at L4 (a block) and is excluded from the cache, so an outage cannot pin a session
 to a stale non-answer.
 
 ## Policy: where the thresholds live
@@ -314,42 +314,46 @@ behind it. The sweep in L5 exists to make that cheap enough to be routine.
 - **Verdict cache**: per session, keyed by command + cwd + env/pty identity + the judge's
   identity (the active backend and the model it answers with), and cleared whenever the
   effective config signature changes. `UNAVAILABLE` is never cached.
-- **Refusal memory**: what this session was denied, keyed by `normalizeActionTarget`, so an
-  approval lifts exactly what a refusal covers (issue #64), plus the cwd, and fingerprinted by the evidence the judge saw, fed back into the state as
-  `priorRefusal` so rewording cannot launder a refusal into a fresh judgment. A SAFE under a
-  prior refusal is not a clean bill: the refusal rode in the state the judge saw.
+- **Refusal memory**: what this session refused, keyed by `normalizeActionTarget` (issue #64)
+  plus the cwd, and fed back into the state as `priorRefusal` so rewording cannot launder a
+  refusal into a fresh judgment. A refusal stands for the session: new evidence or operator
+  context reaches the judge but does not erase it. A SAFE under a prior refusal blocks, except
+  for one call past a model refusal when the user's messages since the refusal name the
+  command's target by `literalMatch` and the SAFE's authorization is grounded
+  (`priorRefusalLifts`). Critical and cap refusals never yield.
 - **Decision audit**: one JSONL line per decision at
   `<agentDir>/omp-classifier/decisions.jsonl`, every path, with session/decision ids,
   `policyVersion`/`policyHash` (the battery hash), `modelId`, `verdict`, `reasonCode`, the
   `jev` telemetry block (probabilities, hazards, confidence, blast radius, usage, latency),
-  approval outcome, and timing.
+  and timing. A block writes its lead line (verdict, critical, environment, cwd) and then a
+  `blocked` line.
 
-Invariant: a cache entry answers only the exact input it was made for. Refusals lift only by
-user action, never by retry.
+Invariant: a cache entry answers only the exact input it was made for. Only the user's own
+words, naming the target, get one call past a refusal; a retry never does.
 
 ## L4 interaction
 
-Two readers, two shapes. The agent gets structured JSON on every block: what refused it, why,
-what would work instead, what not to try. The human gets one line plus the shortest dialog
-that can be answered correctly: the command, the axes, the alternatives.
+One reader. The gate never prompts the user
+(https://github.com/STRML/omp-classifier/issues/184): the agent gets structured JSON on every
+block, with the cause as `layer`, the reason, a lawful next move, and what not to try. The
+agent's moves are to reword, pick a safer action, or ask the user in chat; the user's answer
+reaches the next judgment as evidence.
 
-No answer outlives the call it answered: there are no grants
-(https://github.com/STRML/omp-classifier/issues/184). Dialog reasons are built from the same
-numbers as the audit line, and the rm-family prompts carry the reversible-alternative
-footnote. Dry-run lets an agent ask the gate what it would do before doing it. A dialog from
-a session older than the on-disk plugin says so in its subtitle.
+No answer outlives the call it answered: there are no grants. Refusal reasons are built from
+the same numbers as the audit line, and rm-family blocks carry the reversible-alternative
+footnote. Dry-run lets an agent ask the gate what it would do before doing it. A block from a
+session older than the on-disk plugin sets `staleCode` on its audit line.
 
-Invariant: a block must always leave the agent a lawful next move, and a prompt must cost the
-human one glance when everything is normal. Because the reason is derived rather than written,
-a dialog can also say *which hazard* and *how strongly* it fired — the human sees
-`contacts_remote_endpoint 0.96` instead of a paraphrase of it.
+Invariant: a block must always leave the agent a lawful next move. Because the reason is
+derived rather than written, a refusal can say *which hazard* and *how strongly* it fired —
+the agent sees `contacts_remote_endpoint 0.96` instead of a paraphrase of it.
 
 ## L5 self-measurement
 
 The corpus is the immune system. `eval/run.ts` scores a policy against labeled corpora by
 making the same calls production makes — `buildJevState`, `jevQuestions`, `askJev`,
 `deriveJevDecision`, and production's own `replayDecision` tail — and reports both error kinds
-by name: a **false ask** (a labeled-`allow` case that would raise a dialog) and a **false
+by name: a **false ask** (a labeled-`allow` case the gate would block) and a **false
 allow** (a labeled-`ask` case that would run silently). False allows are never aggregated away;
 any allow on a case tiered `irreversible` fails the run.
 
@@ -393,7 +397,7 @@ disables it and changes the cache signature until its pinned bytes are restored 
 The battery hash is what makes mixed-version decisions visible: cache entries, audit lines,
 and harness reports all carry it, so a long session that spans a plugin update can be told
 apart from a clean one. Since the battery is code, a changed battery reaches running sessions
-only through a reload — and the stale-code suffix says so in the dialog. The harness's answer
+only through a reload — and `staleCode` on the audit line says so. The harness's answer
 cache is keyed on the battery hash too, so answers recorded under an older battery are not
 silently re-scored under a new one.
 
@@ -403,9 +407,9 @@ The agent driving this system is owed three things:
 
 1. **Every block is actionable.** A refusal names its layer, its reason, and a lawful next
    step. A block the agent can only evade is a failure of the gate, not the agent.
-2. **Every prompt is cheap to answer.** The human's attention is the scarcest resource in the
-   system. Over-flagging is a tax paid in human turns; the measurement tracks it as such, and
-   the sweep exists to spend that tax deliberately instead of by default.
+2. **Every block is worth its cost.** A block costs the agent a detour and often costs the
+   user a chat turn. Over-flagging is a tax paid in those turns; the measurement tracks it as
+   such, and the sweep exists to spend that tax deliberately instead of by default.
 3. **Every judgment is replayable.** Any verdict can be re-derived later from its record: the
    same answers, the same battery hash, the same policy, the same deterministic tail. Nothing
    in the record is prose a later reader has to interpret.

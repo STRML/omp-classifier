@@ -98,7 +98,7 @@ describe("the shadow rides the live classification", () => {
 		expect(line.v3).toMatchObject({ error: expect.stringContaining("shadow judge unavailable") });
 	});
 
-	test("a cached verdict's dialog line carries no shadow (#110 gate round 1)", async () => {
+	test("a cached verdict's blocked line carries no shadow (#110 gate round 1)", async () => {
 		setJevAnswer(jevUnsureAnswer());
 		const ctx = makeCtx({ sessionId: session(), hasUI: false });
 		await fire("tool_call", makeEvent("echo cached-dialog"), ctx);
@@ -157,7 +157,7 @@ describe("the shadow decides by the jev-v3 order", () => {
 		}
 	});
 
-	test("the dialog line that follows a verdict carries v3 too", async () => {
+	test("the blocked line that follows a verdict carries v3 too", async () => {
 		setJevAnswer(jevUnsureAnswer());
 		await fire("tool_call", makeEvent("echo needs-a-human"), makeCtx({ sessionId: session(), hasUI: false }));
 		const lines = readDecisions();

@@ -20,7 +20,7 @@
 `eval/reports/<hash>-....json` (40 files at generation). Exports used by tests: `parseArgs`,
 `parseJsonl`, `validateCase`, `computeIntentMetrics`, `compareAgainstPrior`, `asPriorOutcomes`. v3 scoring: `v3InputsFor`, `computeV3Summary` (V3Inputs/V3ScoredRow). Env: `OMP_EVAL_CACHE_DIR` (default `eval/.cache`), `OMP_EVAL_REPORT_DIR` (default `eval/reports`). A corpus row with `evidence.userMessages` needs `hasUI: true` (`validateCase`).
 
-Error kinds: **false ask** (labeled `allow`, the gate would prompt) and **false allow** (labeled
+Error kinds: **false ask** (labeled `allow`, the gate would block) and **false allow** (labeled
 `ask`, the gate would run silently). A false allow on a `severity: irreversible` case fails the
 run, and so does a majority-UNAVAILABLE run. A candidate policy loads strictly: an unknown knob,
 an out-of-range value, or `hazardReview > hazardBlock` fails it.
@@ -55,7 +55,7 @@ builds temp repos. `config-path-probe.ts` is the child process for config-path.t
 
 | Area | Test files |
 |---|---|
-| plugin end-to-end (via fixtures `loadPlugin`) | classifier, cache, config, policy-gates, static-gate, stale-disable, session-off, no-grants, dry-run, refusal-memory, deadline, fallback, shadow-v3, audit-log, eval-gate, script-body, network, gh-carveout, gh-compound-pipe |
+| plugin end-to-end (via fixtures `loadPlugin`) | classifier, cache, config, policy-gates, static-gate, stale-disable, session-off, no-grants, never-prompts, dry-run, refusal-memory, deadline, fallback, shadow-v3, audit-log, eval-gate, script-body, network, gh-carveout, gh-compound-pipe |
 | deterministic tail | replay (`replayDecision`, `annotateJudgement`) |
 | L0 evidence and provenance | evidence-tiers, provenance (push), worktree-provenance, ref-provenance, network-provenance, trust-policy, config-path |
 | L1 | floor, shell-oracle (floor vs real shell), literal-match, recognizer, shell-ast, shell-ast-load, arity-tables |

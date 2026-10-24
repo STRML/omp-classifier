@@ -18,7 +18,6 @@ import {
 	loggerInfos,
 	resultText,
 	refusalOf,
-	selectCalls,
 	stateOf,
 	questionsOf,
 	JEV_FIXTURE_HAZARDS,
@@ -26,7 +25,6 @@ import {
 	jevUnsafeAnswer,
 	jevUnsureAnswer,
 	setJevAnswer,
-	ALLOW_ONCE,
 	removeConfigFile,
 	makeSessionId,
 } from "./fixtures";
@@ -44,12 +42,11 @@ const gate = async (command: string, ctxOptions: Parameters<typeof makeCtx>[0] =
 	resultText(await fire("tool_call", makeEvent(command, input), fresh(ctxOptions)));
 
 describe("verdict routing", () => {
-	test("SAFE passes through without a prompt", async () => {
+	test("SAFE passes through", async () => {
 		setJevAnswer(jevSafeAnswer());
 		const ctx = fresh({ hasUI: true });
 		const result = resultText(await fire("tool_call", makeEvent("git status"), ctx));
 		expect(result).toBe("ALLOWED");
-		expect(selectCalls(ctx).length).toBe(0);
 		expect(modelCalls.length).toBe(1);
 	});
 	test("SAFE auto-run is recorded in the decision log", async () => {
@@ -59,36 +56,27 @@ describe("verdict routing", () => {
 		expect(loggerInfos.some(m => m.includes("verdict=SAFE") && m.includes("git status"))).toBe(true);
 	});
 
-	test("UNSAFE with UI + approve runs", async () => {
-		setJevAnswer(jevUnsafeAnswer());
-		const ctx = fresh({ hasUI: true, selectResult: ALLOW_ONCE });
-		const result = resultText(await fire("tool_call", makeEvent("git branch -D feature"), ctx));
-		expect(result).toBe("ALLOWED");
-		expect(selectCalls(ctx)[0][0]).toContain("classified unsafe");
-	});
-
-	test("UNSAFE with UI + deny blocks", async () => {
+	test("UNSAFE with a UI blocks without asking", async () => {
 		setJevAnswer(jevUnsafeAnswer());
 		const ctx = fresh({ hasUI: true });
 		const result = resultText(await fire("tool_call", makeEvent("git branch -D feature"), ctx));
 		const payload = refusalOf(result);
 		expect(result).toContain("classified unsafe");
-		expect(payload.layer).toBe("dialog");
-		expect(selectCalls(ctx).length).toBe(1);
+		expect(payload.layer).toBe("unsafe");
 	});
 
 	test("UNSAFE headless fails closed", async () => {
 		setJevAnswer(jevUnsafeAnswer());
 		const result = await gate("git push --force origin main");
 		expect(result).toContain("classified unsafe");
-		expect(refusalOf(result).layer).toBe("headless");
+		expect(refusalOf(result).layer).toBe("unsafe");
 	});
 
 	test("UNSURE headless fails closed", async () => {
 		setJevAnswer(jevUnsureAnswer());
 		const result = await gate("make deploy");
 		expect(result).toContain("classifier unsure");
-		expect(refusalOf(result).layer).toBe("headless");
+		expect(refusalOf(result).layer).toBe("unsure");
 	});
 
 	test("one model call per fresh classification", async () => {
@@ -141,7 +129,7 @@ describe("moderate-risk overlay", () => {
 		// path and does not match `rm -rf ./build`).
 		expect(await gate("rm /tmp/scratch && echo done")).toBe("ALLOWED");
 		const flagged = await gate("rm -rf ./build");
-		expect(flagged).toContain("flagged for approval");
+		expect(refusalOf(flagged).layer).toBe("flagged");
 		expect(flagged).toContain("flags: rm");
 	});
 
@@ -159,7 +147,7 @@ describe("moderate-risk overlay", () => {
 			"python3 -c \"exec(base64.b64decode('cHJpbnQoMSkp'))\"",
 		]) {
 			const result = await gate(command);
-			expect(result).toContain("flagged for approval");
+			expect(refusalOf(result).layer).toBe("flagged");
 		}
 	});
 
@@ -171,13 +159,12 @@ describe("moderate-risk overlay", () => {
 		expect(await gate("git reset --soft HEAD~1")).toBe("ALLOWED");
 	});
 
-	test("flagged SAFE still runs when the user approves interactively", async () => {
+	test("flagged SAFE blocks in a UI session too, naming the flag", async () => {
 		setJevAnswer(jevSafeAnswer());
-		const ctx = fresh({ hasUI: true, selectResult: ALLOW_ONCE });
-		const result = await fire("tool_call", makeEvent("git push --force origin main", {}), ctx);
-		// requestPermission -> ui.select "Allow once" -> undefined (run).
-		expect(result).toBeUndefined();
-		expect(selectCalls(ctx).length).toBe(1);
+		const ctx = fresh({ hasUI: true });
+		const payload = refusalOf(await fire("tool_call", makeEvent("git push --force origin main", {}), ctx));
+		expect(payload.layer).toBe("flagged");
+		expect(payload.why).toContain("git push --force");
 	});
 });
 
@@ -390,16 +377,14 @@ describe("rm/unlink shape scoping", () => {
 	});
 });
 
-describe("rm-family dialog footnote (trash alternative)", () => {
-	test("rm dialog carries the footnote; an unrelated flags dialog does not", async () => {
+describe("rm-family footnote (trash alternative)", () => {
+	test("an rm block names the reversible alternative; an unrelated flag does not", async () => {
 		setJevAnswer(jevSafeAnswer());
-		const rmCtx = fresh({ hasUI: true, selectResult: ALLOW_ONCE });
-		await fire("tool_call", makeEvent("rm -rf ./build"), rmCtx);
-		expect(selectCalls(rmCtx)[0][0]).toContain("Reversible alternative: trash <paths>");
+		const rm = refusalOf(await fire("tool_call", makeEvent("rm -rf ./build"), fresh({ hasUI: true })));
+		expect(rm.why).toContain("Reversible alternative: trash <paths>");
 
-		const sudoCtx = fresh({ hasUI: true, selectResult: ALLOW_ONCE });
-		await fire("tool_call", makeEvent("sudo make install"), sudoCtx);
-		expect(selectCalls(sudoCtx)[0][0]).not.toContain("trash <paths>");
+		const sudo = refusalOf(await fire("tool_call", makeEvent("sudo make install"), fresh({ hasUI: true })));
+		expect(sudo.why).not.toContain("trash <paths>");
 	});
 });
 

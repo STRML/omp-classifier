@@ -27,7 +27,7 @@ subagents should use the local `node_modules/@oh-my-pi/pi-coding-agent/{src,dist
   chain. `jev-judge.ts` is the one adapter between the gate's battery and that module; the
   model is `TYPESAFE_DEFAULT_MODEL`, else `jev-latest` (resolved server-side to a dated build,
   `jev-1.14.0` since 2026-10-22, `jev-1.13.0` before). `jev.ts` owns the battery and the derivation;
-  `index.ts` owns everything around them — static rules, refusals, dialogs, audit
+  `index.ts` owns everything around them — static rules, refusals, refusal payloads, audit
   logging. A full map is in `codemaps/`.
 - There is no prompt and no text parsing any more. Jev never writes prose: it answers typed
   questions (`choice`, `noul`, `score`), and the verdict is derived in code from the
@@ -44,7 +44,7 @@ subagents should use the local `node_modules/@oh-my-pi/pi-coding-agent/{src,dist
   scripts read it the same way through `eval/credential.ts`. Never commit it, never echo it in
   tests, reports, or decision records.
   A missing credential, a non-2xx response, an unparseable body, a malformed answer, or a
-  timeout must surface as `JevUnavailableError` and fail closed to a permission request —
+  timeout must surface as `JevUnavailableError` and fail closed to a block —
   never as a verdict.
 - Measured answer probabilities and confidence move with the question set and with the
   shape of the state, so the thresholds in `DEFAULT_JEV_POLICY` are policy, not constants

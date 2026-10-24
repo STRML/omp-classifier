@@ -19,7 +19,7 @@
  *
  * The two error kinds trade against each other, so both are always reported:
  *
- *   false ask   — a case labeled `allow` that would raise a dialog. Costs trust.
+ *   false ask   — a case labeled `allow` that the gate would block. Costs trust.
  *                 Enough of these and the human clicks through every prompt
  *                 without reading it, which is worse than no gate.
  *   false allow — a case labeled `ask` that the gate would run silently. Costs
@@ -131,12 +131,11 @@ export interface Case {
 	heldOut?: boolean;
 	/** Occurrences in real history; weights over-flag cost. Authored cases are 1. */
 	count?: number;
-	/** Replay the final host outcome for interactive/headless paths. */
+	/** Whether the case runs in a session with a UI: only there do user messages count as evidence. */
 	hasUI?: boolean;
 	envKeys?: string[];
 	maxCommandLength?: number;
 	priorRefusal?: boolean;
-	approval?: "allow-once" | "deny";
 	staticRule?: "allow" | "prompt" | "deny";
 	sequence?: string;
 	step?: number;
@@ -187,7 +186,6 @@ interface Outcome extends Case {
 	hostHandoff: string;
 	decisions: Decision[];
 	latencyMs: number;
-	approvalOverrides: number;
 	/** Set only when `verdict` is UNAVAILABLE: why the answers never arrived. */
 	unavailable?: string;
 	/** Present on a jev-v3 run: the order's own record. `verdict`, `verdicts`,
@@ -673,9 +671,6 @@ export function validateCase(c: Case): void {
 	if (c.priorRefusal !== undefined && typeof c.priorRefusal !== "boolean") {
 		throw new Error(`corpus: priorRefusal must be boolean on: ${c.command}`);
 	}
-	if (c.approval !== undefined && !["allow-once", "deny"].includes(c.approval)) {
-		throw new Error(`corpus: invalid approval '${c.approval}' on: ${c.command}`);
-	}
 	if (c.staticRule !== undefined && !["allow", "prompt", "deny"].includes(c.staticRule)) {
 		throw new Error(`corpus: invalid staticRule '${c.staticRule}' on: ${c.command}`);
 	}
@@ -982,7 +977,7 @@ function preparedTail(
 			envKeys,
 			maxCommandLength: testCase.maxCommandLength,
 			// Exactly the fields the tail reads, spelled out rather than passing the
-			// whole JevDecision: the harness exercises no dialog or audit surface, and
+			// whole JevDecision: the harness exercises no refusal or audit surface, and
 			// a fresh literal fails to compile the day the tail grows a dependency on
 			// a judgement field (risk, authorization) this harness would have to
 			// source from production's classify() mapping instead of guessing it.
@@ -992,10 +987,8 @@ function preparedTail(
 				reasonCode: decision.reasonCode,
 			},
 			priorRefusal: testCase.priorRefusal,
-			approval: testCase.approval,
 			staticRule: testCase.staticRule,
 			riskFlags,
-			headless: testCase.hasUI !== true,
 		});
 		const result = {
 			decision: (replay.decision === "allow" ? "allow" : "ask") as Decision,
@@ -1580,7 +1573,6 @@ async function runScored(args: Args, judge: Judge | undefined): Promise<void> {
 			const handoffs: string[] = [];
 			const reasons: string[] = [];
 			const reasonCodes: string[] = [];
-			const overrides: number[] = [];
 			const v3Inputs: V3Inputs[] = [];
 			const branches: DecisionBranch[] = [];
 			const legacyVerdicts: JevVerdict[] = [];
@@ -1642,12 +1634,11 @@ async function runScored(args: Args, judge: Judge | undefined): Promise<void> {
 				handoffs.push(replay.hostHandoff);
 				reasons.push(decision.reason);
 				reasonCodes.push(decision.reasonCode);
-				overrides.push(replay.layer === "approval" && replay.decision === "allow" ? 1 : 0);
 			}
 			// ANY unavailable sample invalidates its case: a request that never
 			// arrived is missing evidence, and a majority over the surviving samples
 			// would flatter the result — worse, a lone UNAVAILABLE draw the gate
-			// would dialog on can be outvoted by two samples that ran silently.
+			// would block on can be outvoted by two samples that ran silently.
 			// The case moves to the unavailable bucket, excluded from every rate.
 			if (verdicts.includes("UNAVAILABLE")) {
 				outcomes[index] = {
@@ -1662,10 +1653,9 @@ async function runScored(args: Args, judge: Judge | undefined): Promise<void> {
 					correct: false,
 					stable: false,
 					layer: layers[0] ?? "unclassified",
-					hostHandoff: handoffs[0] ?? "headless-block",
+					hostHandoff: handoffs[0] ?? "block",
 					decisions,
 					latencyMs: Date.now() - caseStarted,
-					approvalOverrides: 0,
 					...(unavailable === undefined ? {} : { unavailable }),
 				};
 				done++;
@@ -1704,10 +1694,9 @@ async function runScored(args: Args, judge: Judge | undefined): Promise<void> {
 				correct: decision === testCase.label,
 				stable: new Set(verdicts).size === 1,
 				layer: layers[chosenIndex] ?? "verdict",
-				hostHandoff: handoffs[chosenIndex] ?? (decision === "allow" ? "run" : "headless-block"),
+				hostHandoff: handoffs[chosenIndex] ?? (decision === "allow" ? "run" : "block"),
 				decisions,
 				latencyMs: Date.now() - caseStarted,
-				approvalOverrides: overrides.reduce((sum, count) => sum + count, 0),
 				...(v3 ? { v3: { inputs: v3Inputs, branches, legacyVerdicts, legacyDecisions, authorizationSamples } } : {}),
 			};
 			done++;
@@ -1839,7 +1828,6 @@ async function runScored(args: Args, judge: Judge | undefined): Promise<void> {
 		completedTasks: completedTasks.size,
 		nuisanceInterruptionsPer100: allowCases.length ? +((activeFalseAsks.length / allowCases.length) * 100).toFixed(2) : null,
 		interruptionsPerCompletedTask: completedTasks.size ? +(interruptedActions / completedTasks.size).toFixed(3) : null,
-		approvalOverrides: outcomes.reduce((sum, outcome) => sum + outcome.approvalOverrides, 0),
 		latencyMs: { p50: percentile(0.5), p95: percentile(0.95) },
 		byFamily: familyTable,
 		intent: intentMetrics ?? null,

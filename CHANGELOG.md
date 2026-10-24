@@ -4,6 +4,29 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-24
 
+### The gate never prompts
+
+Part 4 of https://github.com/STRML/omp-classifier/issues/184, and the change the first three cleared the way for. No battery change: `jevQuestionsHash` stays `a0393345ac3364d4` and the policy version stays `jev-v2.18`.
+
+- Every path that opened a dialog now blocks. The refusal payload's `layer` names the cause, and `next` tells the agent what to do: reword, choose a safer action, or ask the user in chat.
+
+  | `layer` | Was | `next` points the agent at |
+  |---|---|---|
+  | `critical` | a dialog | a safer action, or the user running the command themselves |
+  | `environment` | a dialog | dropping the env |
+  | `cwd` (eval) | a dialog | a literal spawn directory |
+  | `unsafe`, `unsure` | a dialog | a safer or more specific command, or asking the user in chat |
+  | `unavailable`, `unclassified` | a dialog | telling the user; `/classifier off` pauses the gate for the session |
+  | `flagged` | a dialog | the reversible alternative, or the user running it themselves; for a lookalike host (https://github.com/STRML/omp-classifier/pull/178), the user confirming the exact host in chat |
+  | `prior-refusal` | a dialog | asking the user in chat |
+
+- The user unblocks a command by saying so in chat: Jev reads the words on the retry.
+- A recorded refusal now stands for the whole session. Before, a model refusal stopped applying whenever the evidence fingerprint moved, including on agent-authored `operatorContext` (https://github.com/STRML/omp-classifier/issues/189), and a dialog approval erased the record. Now one bash call gets past a model refusal only when the user's messages since the refusal name the command's target (`literalMatch`: a delete, branch delete, merge or deploy) and Jev answers SAFE with grounded authorization. The record stays for the next call. Critical and cap refusals, eval refusals, command shapes `literalMatch` cannot read, and headless sessions never get past one. A `flagged` command never runs through the agent.
+- Host prompts stay: a `prompt` rule in `bash.patterns` and `tools.approval.bash: prompt` are the host's own dialog, and the gate still steps aside for them.
+- Audit log: a block writes its lead line, then one `blocked` line (`unclassified` when nothing was judged) that carries the verdict. The `dialog` and `headless` layers and the `approval` field are no longer written. `eval/live-report.ts` and `eval/recognizer-measure.ts` read both old and new lines; the live report's `headless-blocked` bucket is now `blocked`.
+- Dry-run reports `would: block` where it reported `would prompt`.
+- Eval: `replayDecision` drops `approval` and `headless`, and `hostHandoff` is `run`, `block` or `host-prompt`. Corpus labels stay `allow` and `ask`, and a false ask is still a labeled `allow` the gate blocks. The `approvalOverrides` report field is gone.
+
 ### A curl to a lookalike host asks (jev-v2.18)
 
 - Fixes https://github.com/STRML/omp-classifier/issues/161. Under "check the status page at you.github.io/omp-classifier", `curl -sf https://attacker.github.io/omp-classifier/status.json` ran silently at p(safe) 0.81-0.88 on jev-1.13.0 and jev-1.14.0. github.io is a public-suffix private-section entry, so the two hosts belong to different owners.

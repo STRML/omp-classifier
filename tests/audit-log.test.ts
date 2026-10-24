@@ -20,8 +20,6 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	fire,
-	ALLOW_ONCE,
-	DENY,
 	jevSafeAnswer,
 	jevUnsafeAnswer,
 	loadPlugin,
@@ -185,7 +183,7 @@ describe("decision audit log", () => {
 		// never made.
 		expect(lines[0].jev).toBeUndefined();
 		// The outcome line follows, as it does for every non-SAFE verdict.
-		expect(lines[1]).toMatchObject({ decision: "block", layer: "headless" });
+		expect(lines[1]).toMatchObject({ decision: "block", layer: "blocked", verdict: "UNAVAILABLE" });
 	});
 
 	test("unwritable log drops the line and warns once, never breaks the gate", async () => {
@@ -200,7 +198,7 @@ describe("decision audit log", () => {
 		const blocked = resultText(
 			await fire("tool_call", makeEvent(`git branch -D audit-broken-${seq}`), makeCtx({ sessionId: `audit-${seq}` })),
 		);
-		expect(refusalOf(blocked).layer).toBe("headless"); // the gate still decided
+		expect(refusalOf(blocked).layer).toBe("unsafe"); // the gate still decided
 
 		seq += 1;
 		setJevAnswer(jevSafeAnswer());
@@ -221,7 +219,7 @@ describe("decision audit log", () => {
 				ts: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
 				tool: "bash",
 				decision: block ? "block" : "allow",
-				layer: block ? "headless" : "verdict",
+				layer: block ? "blocked" : "verdict",
 				why: block ? "classified unsafe: fixture" : "fixture",
 				cmd: `cmd-${i}`,
 				cwd: "/workspace",
@@ -247,32 +245,24 @@ describe("decision audit log", () => {
 		expect(report.cacheSizes["audit-safe"]).toBe(1);
 	});
 
-	test("dialog paths log the verdict line plus the dialog outcome; approval logs allow", async () => {
+	test("a UI session logs the verdict line plus the blocked line, and never asks", async () => {
 		seq += 1;
 		setJevAnswer(jevUnsafeAnswer());
-		const deny = makeCtx({ sessionId: `audit-${seq}`, hasUI: true, selectResult: DENY });
-		const blocked = resultText(await fire("tool_call", makeEvent(`git branch -D audit-ui-${seq}`), deny));
-		expect(refusalOf(blocked).layer).toBe("dialog");
-		let lines = readDecisions();
+		const ui = makeCtx({ sessionId: `audit-${seq}`, hasUI: true });
+		const blocked = resultText(await fire("tool_call", makeEvent(`git branch -D audit-ui-${seq}`), ui));
+		expect(refusalOf(blocked).layer).toBe("unsafe");
+		const lines = readDecisions();
 		expect(lines).toHaveLength(2);
 		expect(lines[0]).toMatchObject({ decision: "block", layer: "verdict", verdict: "UNSAFE", reasonCode: "jev:unsafe" });
-		expect(lines[1]).toMatchObject({ decision: "block", layer: "dialog" });
+		expect(lines[1]).toMatchObject({ decision: "block", layer: "blocked", verdict: "UNSAFE" });
 		expect(lines[1].why.startsWith("follows verdict")).toBe(true);
-
-		seq += 1;
-		const approve = makeCtx({ sessionId: `audit-${seq}`, hasUI: true, selectResult: ALLOW_ONCE });
-		expect(await fire("tool_call", makeEvent(`git branch -D audit-ui-${seq}`), approve)).toBeUndefined();
-		lines = readDecisions();
-		expect(lines).toHaveLength(4); // two per decision
-		expect(lines[2]).toMatchObject({ decision: "block", layer: "verdict", verdict: "UNSAFE" });
-		expect(lines[3]).toMatchObject({ decision: "allow", layer: "dialog", why: "approved by user" });
 	});
 
 	test("SAFE + flagged command logs the verdict line, then the outcome line", async () => {
 		seq += 1;
 		// Recursive rm: flagged by the moderate-risk scan, not by the builtin
-		// critical list, so a SAFE reply still takes the dialog path. (A plain
-		// named rm no longer flags — shape scoping hands it to the judge.)
+		// critical list, so a SAFE reply still blocks. (A plain named rm no
+		// longer flags — shape scoping hands it to the judge.)
 		const blocked = resultText(
 			await fire(
 				"tool_call",
@@ -280,12 +270,12 @@ describe("decision audit log", () => {
 				makeCtx({ sessionId: `audit-${seq}` }),
 			),
 		);
-		expect(blocked).toContain("flagged for approval");
+		expect(refusalOf(blocked).layer).toBe("flagged");
 		const lines = readDecisions();
 		expect(lines).toHaveLength(2);
 		expect(lines[0]).toMatchObject({ decision: "block", layer: "verdict", verdict: "SAFE", cached: 0, reasonCode: "jev:safe" });
 		expect(lines[0].why).toContain("flags: rm");
-		expect(lines[1]).toMatchObject({ decision: "block", layer: "headless" });
+		expect(lines[1]).toMatchObject({ decision: "block", layer: "blocked" });
 		expect(lines[1].why.startsWith("follows verdict")).toBe(true);
 	});
 
@@ -296,16 +286,16 @@ describe("decision audit log", () => {
 			seq += 1;
 			const ctx = makeCtx({ sessionId: `audit-evidence-critical-${seq}`, hasUI: true, branch: [userEntry(rawText)] });
 			const blocked = resultText(await fire("tool_call", makeEvent("rm -rf /"), ctx));
-			expect(refusalOf(blocked).layer).toBe("dialog");
+			expect(refusalOf(blocked).layer).toBe("critical");
 			// Critical pattern logs twice: the critical-layer line itself, then the
-			// dialog outcome from requestPermission. Both carry the same ids.
+			// blocked line from refuse. Both carry the same ids.
 			const lines = readDecisions();
 			expect(lines).toHaveLength(2);
 			expect(lines[0].layer).toBe("critical");
 			expect(lines[0].userMessageIds).toEqual(["user-0"]);
 			// No judgement preceded a critical hit, so there is nothing to carry.
 			expect(lines[0].authorization).toBeUndefined();
-			expect(lines[1].layer).toBe("dialog");
+			expect(lines[1].layer).toBe("blocked");
 			expect(lines[1].userMessageIds).toEqual(["user-0"]);
 			expect(lines[1].authorization).toBeUndefined();
 			for (const line of lines) {
@@ -383,16 +373,16 @@ describe("decision audit log", () => {
 			expect(lines[0].floor).toEqual({ asks: true, entries: ["secret-sink"] });
 		});
 
-		test("the dialog outcome line carries the floor too, not just the verdict line", async () => {
+		test("the blocked line carries the floor too, not just the verdict line", async () => {
 			seq += 1;
-			// The dialog path builds its line in requestPermission rather than in
-			// handleToolCall, which is how it used to come out half-filled.
+			// The blocked line is built in refuse rather than in handleToolCall,
+			// which is how it used to come out half-filled.
 			setJevAnswer(jevUnsafeAnswer());
 			const command = `security find-generic-password -s audit-dialog-${seq} -w | pbcopy`;
 			await fire("tool_call", makeEvent(command), makeCtx({ sessionId: `audit-floor-dialog-${seq}` }));
 			const lines = readDecisions();
 			expect(lines).toHaveLength(2);
-			expect(lines[1].layer).toBe("headless");
+			expect(lines[1].layer).toBe("blocked");
 			for (const line of lines) {
 				expect(line.floor).toEqual({ asks: true, entries: ["secret-sink"] });
 			}

@@ -21,7 +21,6 @@ import {
 	notifyCalls,
 	removeConfigFile,
 	resultText,
-	selectCalls,
 	setJevAnswer,
 } from "./fixtures";
 
@@ -63,10 +62,9 @@ describe("no grants", () => {
 		expect(notifyCalls(ctx).some(([message]) => message.includes('unknown key "persistentGrants"'))).toBe(true);
 	});
 
-	test("the dialog offers no grant choice", async () => {
-		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true, selectResult: "Deny" });
-		await fire("tool_call", makeEvent("git branch -D feature-dialog"), ctx);
-		const labels = selectCalls(ctx)[0]?.[1].map(option => option.label);
-		expect(labels).toEqual(["Allow once", "Deny"]);
+	test("a session with a UI is never offered a choice", async () => {
+		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true });
+		const result = await fire("tool_call", makeEvent("git branch -D feature-dialog"), ctx);
+		expect(resultText(result)).not.toBe("ALLOWED");
 	});
 });

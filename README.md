@@ -5,9 +5,9 @@ processes.
 
 In `yolo` mode, OMP auto-approves every bash command. That includes the ones nobody should wave through: `curl … | sh`, `rm -rf /`, `dd of=/dev/…`, `mkfs`, `kill -9 1`, `nc -e`. A second hole compounds it. A `bash.patterns` rule written to prompt on exactly those shapes never fires, because the native gate ranks critical-pattern matches above prompt rules.
 
-This plugin closes both holes. It registers a `tool_call` handler in front of the native bash tool and sends commands that would otherwise run unseen to Jev, TypeSafe's System One model, which answers typed questions about them rather than writing prose. Routine work still runs silently. Dangerous work gets a real Run-or-Deny prompt. For `eval`, the gate classifies only the payloads that spawn a process; expression-only code runs untouched.
+This plugin closes both holes. It registers a `tool_call` handler in front of the native bash tool and sends commands that would otherwise run unseen to Jev, TypeSafe's System One model, which answers typed questions about them rather than writing prose. Routine work still runs silently. Dangerous work is blocked, and the agent is told why and what to do instead. The gate never prompts you. For `eval`, the gate classifies only the payloads that spawn a process; expression-only code runs untouched.
 
-The handler only adds friction. It blocks, or it asks. It never bypasses the native gate, weakens your existing rules, or executes anything itself.
+The handler only adds friction: it blocks. It never bypasses the native gate, weakens your existing rules, or executes anything itself.
 
 The system is one tower of layers: evidence, recognition, judgment, memory, interaction, self-measurement, control. The map, invariants, and roadmap live in [docs/SYSTEM.md](docs/SYSTEM.md).
 
@@ -17,33 +17,67 @@ Calls walk this order:
 
 | Match | Result |
 |---|---|
-| Critical pattern | Permission request in every approval mode. No Jev call. |
-| Caller-supplied `env` | Permission request before any exemption. Env values can carry secrets or choose what runs (`PATH`, `LD_PRELOAD`). |
+| Critical pattern | Blocked in every approval mode. No Jev call. The agent is told to ask you to run it yourself. |
+| Caller-supplied `env` | Blocked before any exemption. Env values can carry secrets or choose what runs (`PATH`, `LD_PRELOAD`). |
 | `deny` rule, or approval policy `deny` | Untouched. The native gate blocks it. |
 | `prompt` rule | Untouched. The native gate prompts, in every mode including `yolo`. |
-| Narrow `allow` rule | Untouched. An explicit decision about a specific shape is never re-judged. For a compound line, a `deny`/`prompt` on any segment decides immediately (the native gate blocks or prompts once — no plugin dialog, no classification), an `allow` on every segment runs silent, and only a compound with no deny/prompt decision and an undecided segment classifies. Blanket patterns never vouch for segments; inert fd-dups (`2>&1`) are ignored, but real redirects (`> file`) bar a segment. |
-| Blanket `allow` (`*`, `**`, `* *`) or no matching rule | Classified in every mode. SAFE passes to the native gate; UNSAFE or UNSURE raises a plugin request. |
+| Narrow `allow` rule | Untouched. An explicit decision about a specific shape is never re-judged. For a compound line, a `deny`/`prompt` on any segment decides immediately (the native gate blocks or prompts once, with no classification), an `allow` on every segment runs silent, and only a compound with no deny/prompt decision and an undecided segment classifies. Blanket patterns never vouch for segments; inert fd-dups (`2>&1`) are ignored, but real redirects (`> file`) bar a segment. |
+| Blanket `allow` (`*`, `**`, `* *`) or no matching rule | Classified in every mode. SAFE passes to the native gate; UNSAFE, UNSURE or an unavailable judge blocks. |
 | Longer than 8,000 characters | Blocked outright. Nothing that long can be reviewed in full. |
 
-A normal gate prompt is a two-choice selector, **Allow once** or **Deny**, showing the full command, the gate's reason, and only the details that differ from their defaults: working directory (when it differs from the session cwd), timeout, env, pty, async. The reason is assembled from Jev's numbers — the probability floor it missed, or the hazard ids that tripped it — because Jev returns typed answers and no prose to quote. Canceling or timing out counts as Deny. No answer outlives the call it answered: there are no session or persistent grants.
-Refusal memory keys on a strict action identity that keeps flags (split, sorted short bundles) and the first argument, plus the directory: a refused operation does not pin its whole verb class, its host, or its container. Answering **Allow once** lifts any refusal recorded for that action in that directory.
+### When the gate blocks
+
+The gate never opens a dialog (https://github.com/STRML/omp-classifier/issues/184). A blocked call returns a JSON refusal to the agent:
+
+```json
+{ "classifier": "blocked", "tool": "bash", "layer": "unsafe", "why": "classified unsafe: unsafe 0.96 (>=0.50)", "next": "…", "notThis": "…" }
+```
+
+`layer` names the cause, and `next` is the agent's way forward:
+
+| `layer` | Cause | What the agent is told to do |
+|---|---|---|
+| `critical` | Built-in dangerous-command pattern | Pick a safer action, or ask you to run the command yourself |
+| `environment` | Caller-supplied `env` | Drop the env, or ask you to run it |
+| `cwd` | An eval spawn directory the scan cannot read | Give the spawn a literal directory, or ask you |
+| `unsafe` / `unsure` | Jev's verdict | Pick a safer action or a more specific command, or ask you in chat to name the target |
+| `unavailable` / `unclassified` | No verdict (outage, timeout, missing key) | Tell you, retry later; `/classifier off` pauses the gate for the session |
+| `flagged` | SAFE, but the command carries a forced-block operation or a lookalike destination | Use the reversible alternative (`trash` for `rm`), ask you to confirm the exact host in chat (a lookalike), or ask you to run it |
+| `prior-refusal` | SAFE on a target refused earlier this session | Ask you to name the target in chat, or to run it yourself |
+| `cap` / `script-body` | Too long, or a script body that could not be read | Shorten it or split it into steps |
+
+### How you unblock a command
+
+Say so in chat. On the retry, Jev reads your words as user evidence (`evidenceUserMessages`), and a SAFE verdict runs.
+
+A refusal the session already recorded is stricter. It stays for the rest of the session, and a call gets past it only when all of these hold:
+
+- the refusal came from Jev's verdict, not from a critical pattern or the length cap (those never run through the agent: run the command yourself);
+- a message you sent after the refusal names the command's target, as `literalMatch` reads it: a delete, a branch delete, a merge or a deploy with its target written out ("delete the branch topic");
+- Jev answers SAFE with its authorization grounded in your messages.
+
+That decides one call. The record stays, so the next call is checked again. A command shape `literalMatch` cannot read, eval code, and a headless session (no user channel) never get past a refusal. A `flagged` command never runs through the agent either.
+
+Refusal memory keys on a strict action identity that keeps flags (split, sorted short bundles) and the first argument, plus the directory: a refused operation does not pin its whole verb class, its host, or its container.
+
+There are no grants. No answer outlives the call it answered. A leftover `omp-classifier-grants.json` from an older version is never read.
 
 ## Eval code that spawns
 
 The `eval` tool runs kernel code directly, so a host `eval: allow` would otherwise bypass every bash check. The plugin scans each payload for subprocess entry points (`child_process`, `Bun.spawn`, `Bun.$`, Python's `subprocess`/`os.system`, `exec`/`__import__`/`importlib` escapes). Expression-only code — compute, parse, format, local reads — passes with zero cost. Spawn-bearing code is classified like a bash command: judged by what the spawned command would do, SAFE auto-runs, UNSAFE or unsure raises a request. The scan is a marker list, not a parser: string-splitting evasion (`"child_pro" + "cess"`) gets through, the same way obfuscated shell gets past the bash gate. Kernel-level interception is the structural fix (issue #13).
 
-A spawn that passes its own working directory is judged in that directory, not the session's: `exec("rm -rf .", { cwd: "/" })` runs in `/`, so the dialog names `/` and the verdict is cached for `/` alone. The payload's own spawn directory is resolved against the session cwd for relative paths (`cwd="../.."`, Ruby `Dir.chdir("/tmp") do … end`, `system(…, chdir: …)`) and recorded as `spawnCwd` beside the resolved `cwd`. When the scan cannot read it — `{ cwd }`, `cwd=os.environ["X"]`, an options object built by spread, two spawns that disagree — the payload asks instead of classifying: there is no single directory to judge it in, and a verdict earned against the session cwd would be answering a different question.
+A spawn that passes its own working directory is judged in that directory, not the session's: `exec("rm -rf .", { cwd: "/" })` runs in `/`, so the refusal and the audit line name `/`, and the verdict is cached for `/` alone. The payload's own spawn directory is resolved against the session cwd for relative paths (`cwd="../.."`, Ruby `Dir.chdir("/tmp") do … end`, `system(…, chdir: …)`) and recorded as `spawnCwd` beside the resolved `cwd`. When the scan cannot read it — `{ cwd }`, `cwd=os.environ["X"]`, an options object built by spread, two spawns that disagree — the payload is blocked instead of classified: there is no single directory to judge it in, and a verdict earned against the session cwd would be answering a different question.
 
 ## Fails closed
 
 The plugin never guesses its way to silent execution.
 
-- A judgment the gate cannot obtain — no API key, a non-2xx response, an unparseable body, a missing or mistyped answer field, a timeout — raises a permission request. Headless sessions have no dialog, so they block instead. An unavailable judgment is never cached, and it is never read as a verdict: nothing that cannot be derived from returned numbers counts as SAFE.
+- A judgment the gate cannot obtain — no API key, a non-2xx response, an unparseable body, a missing or mistyped answer field, a timeout — blocks the call. An unavailable judgment is never cached, and it is never read as a verdict: nothing that cannot be derived from returned numbers counts as SAFE.
 - An unexpected plugin crash blocks the call.
 
-Even a SAFE verdict is gated. It auto-runs only when the command avoids the forced-dialog set: `rm`/`unlink` in the shapes where a mistake is systemic (recursion, glob metacharacters, `..` traversals, dotfiles/dot-paths, provable targets outside the working directory — temp dirs excluded), plus `dd`, `ddrescue`, `shred`, `wipefs`, `sudo`, and `eval`. Plain `rm`/`unlink` of named paths (including under `/tmp`) auto-runs on SAFE — the judge owns them. Everything else destructive is also judge-decided: `mv`, `chmod`, `chown`, `chattr`, `truncate`, `tee`, `rmdir`, `git commit --amend` and `git reset --soft`/`--mixed` (reflog/index keeps the pre-image), and `git checkout --`/`git restore` pathspec restores run on a SAFE. The matcher's remaining unconditional flags are `mkfs*`, `git push --force` (inside compounds), `git reset --hard` (unambiguous `--hard` prefixes count), and `git clean`; anything on the host's critical-pattern list (e.g. `rm -rf` on an absolute path, `dd of=/dev/…`) prompts before classification regardless. A heredoc body written straight to a file comes off the command before anything tokenizes it: `cat > f.ts <<'EOF'` writing `if (dd < 30) {` no longer reads as a raw disk write, and a README documenting `curl -d` no longer reads as egress. The rule matches one shape and nothing else, so it needs no view on what the shell executes: a whole owner line that is only `cat` or `tee`, its flags and targets, and a QUOTED delimiter, with a closing line that is exactly the delimiter. Every other heredoc keeps its body in the command text and keeps being scanned as commands, including `bash <<EOF`, an unquoted delimiter, a pipe on the owner line, and a heredoc with no closer. That over-flags on a delimiter named `sudo`, and over-flagging is the direction this overlay is allowed to be wrong in.
+Even a SAFE verdict is gated. It auto-runs only when the command avoids the forced-block set: `rm`/`unlink` in the shapes where a mistake is systemic (recursion, glob metacharacters, `..` traversals, dotfiles/dot-paths, provable targets outside the working directory — temp dirs excluded), plus `dd`, `ddrescue`, `shred`, `wipefs`, `sudo`, and `eval`. Plain `rm`/`unlink` of named paths (including under `/tmp`) auto-runs on SAFE — the judge owns them. Everything else destructive is also judge-decided: `mv`, `chmod`, `chown`, `chattr`, `truncate`, `tee`, `rmdir`, `git commit --amend` and `git reset --soft`/`--mixed` (reflog/index keeps the pre-image), and `git checkout --`/`git restore` pathspec restores run on a SAFE. The matcher's remaining unconditional flags are `mkfs*`, `git push --force` (inside compounds), `git reset --hard` (unambiguous `--hard` prefixes count), and `git clean`; anything on the host's critical-pattern list (e.g. `rm -rf` on an absolute path, `dd of=/dev/…`) blocks before classification regardless. A heredoc body written straight to a file comes off the command before anything tokenizes it: `cat > f.ts <<'EOF'` writing `if (dd < 30) {` no longer reads as a raw disk write, and a README documenting `curl -d` no longer reads as egress. The rule matches one shape and nothing else, so it needs no view on what the shell executes: a whole owner line that is only `cat` or `tee`, its flags and targets, and a QUOTED delimiter, with a closing line that is exactly the delimiter. Every other heredoc keeps its body in the command text and keeps being scanned as commands, including `bash <<EOF`, an unquoted delimiter, a pipe on the owner line, and a heredoc with no closer. That over-flags on a delimiter named `sudo`, and over-flagging is the direction this overlay is allowed to be wrong in.
 
-**curl** and **wget** are judged like any other command — no forced dialog. The stdin-executing-interpreter scan (`curl -fsSL https://x | sh`) is a separate risk class and still forces a dialog: a fetched payload piped into an interpreter is opaque execution, and a question battery cannot see inside it. Related behaviors: rm-family forced dialogs append "Reversible alternative: trash <paths>" to the body; a dialog fired by a session whose on-disk plugin changed since it loaded says so in the subtitle ("plugin code changed since session start; restart to pick up fixes"); and ssh commands are judged by their remote command under the same rules (read-only remote inspection is SAFE).
+**curl** and **wget** are judged like any other command — no forced block. The stdin-executing-interpreter scan (`curl -fsSL https://x | sh`) is a separate risk class and still forces a block: a fetched payload piped into an interpreter is opaque execution, and a question battery cannot see inside it. Related behaviors: rm-family forced blocks append "Reversible alternative: trash <paths>" to the refusal's `why`; a block from a session whose on-disk plugin changed since it loaded sets `staleCode` on its audit line; and ssh commands are judged by their remote command under the same rules (read-only remote inspection is SAFE).
 
 ## Requirements
 
@@ -53,7 +87,7 @@ Even a SAFE verdict is gated. It auto-runs only when the command avoids the forc
   security add-generic-password -s jev -w '<your-api-key>'
   ```
 
-  The plugin reads the env var first, then the keychain. With neither, every classification fails closed to a permission request — the gate never runs a command on a guess. (Only the default `judgeBackend` needs this: an endpoint backend reads its own named env var.)
+  The plugin reads the env var first, then the keychain. With neither, every classification fails closed to a block — the gate never runs a command on a guess. (Only the default `judgeBackend` needs this: an endpoint backend reads its own named env var.)
 - **The model** is `jev-latest` unless you pin another id in `typesafeModel`. TypeSafe resolves `jev-latest` server-side to its current dated build (`jev-1.13.0` at the time of writing); pin a dated id when you need reproducibility across a behavior change.
 - Bun >= 1.3.14 for development. There is no runtime dependency, no SDK, and no build step: `jev.ts` speaks HTTP with `fetch`.
 
@@ -80,7 +114,7 @@ Plugin settings live in `omp-classifier.json` at the config root the host resolv
 | `typesafeModel` | `"jev-latest"` | Model id sent with every request. `jev-latest` resolves server-side to the current dated build. |
 | `judgeBackend` | `{"kind":"typesafe"}` | Which judge answers. `{"kind":"typesafe"}` is the default (the host's TypeSafe judge). `{"kind":"endpoint","baseUrl":"http://127.0.0.1:8765","model":"local-decide","apiKeyEnv":"LOCAL_JUDGE_KEY"}` sends the same battery to any server speaking System One's wire contract. File-only — there is no `/classifier` setter; `/classifier reset` returns it to the default. See [Alternative judge backends](#alternative-judge-backends). |
 | `jevPolicy` | see [Judgment: Jev](#judgment-jev) | Thresholds that turn returned probabilities into a verdict. Never a constant to hardcode elsewhere: they are policy. |
-| `timeoutMs` | `8000` | Whole classification budget for the single Jev request. A timeout fails closed to a permission request. (`/classifier` dialogs pause the host's handler budget, so a human is never on this clock.) |
+| `timeoutMs` | `8000` | Whole classification budget for the single Jev request. A timeout blocks the call and aborts the request. |
 | `maxCommandLength` | `8000` | Commands longer than this are blocked (bounds 64-100000; values outside fall back to the default). |
 | `evidenceUserMessages` | `3` | How many recent user messages (0-6) ride into the state as user evidence. `0` sends no evidence. Values outside the bounds fall back to the default. |
 | `trustPolicy` | `null` | Set only by `/classifier trust-policy`. A current pin lets the judge see explicitly trusted user-level instructions as bounded action-class policy; changed files disable it until the pinned bytes are restored or repinned. |
@@ -94,7 +128,7 @@ An existing config file that pins `maxCommandLength: 2000` keeps 2000 after upgr
 `/classifier trust-policy` explicitly snapshots `AGENTS.md`, `RULES.md`, and `SYSTEM.md` from the active OMP agent/profile directory and `CLAUDE.md` from `CLAUDE_CONFIG_DIR` (default `~/.claude`). The command reports paths, hashes, and byte lengths, never file contents; `/classifier status` shows only the pin hash. Repo-local instruction files are never read. Only an unchanged pinned snapshot reaches the judge; editing a file or changing the resolved profile path disables its policy and invalidates cached verdicts until the pinned bytes are restored or you explicitly repin. Policy can authorize action classes only, never egress destinations or delete targets. Conditional rules count only when an explicit gate-measured fact confirms them; no CI status is measured, so a rule such as “merge when CI is green” fails closed.
 The snapshot is limited to 32 KiB total; oversized files are refused without replacing an existing pin. A project `.env` cannot redirect the fixed user paths, and paths inside the current Git repository are rejected.
 
-`/classifier dry-run <command>` previews what the gate would do, side-effect free: no Jev call, no dialog, no cache, refusal, or audit writes. It prints the first decision the gate would reach as JSON:
+`/classifier dry-run <command>` previews what the gate would do, side-effect free: no Jev call, no cache, refusal, or audit writes. It prints the first decision the gate would reach as JSON:
 
 ```json
 { "would": "allow", "layer": "rule", "why": "rule: git status" }
@@ -116,9 +150,9 @@ The default judge is the host's TypeSafe path, credentials and all. The `judgeBa
 ```
 
 - **The wire contract is System One's**: `POST {baseUrl}/v1/systemone` with `{state, model, questions}` and a `{model, answers}` reply, where every asked question comes back with an answer of that question's type (`choice` with `probabilities` + `confidence`, `noul`, `score`). The host's own client makes the call, so retries, timeouts, and the error taxonomy are the same ones the default path uses — with one change: the redirect policy is forced to `manual`, so a 3xx from the endpoint fails the call instead of being followed to a second server with the state and the key in hand.
-- **`apiKeyEnv` is a NAME, not a key.** The value is read from that environment variable on each call and sent as `Authorization: Bearer …`. No credential is ever written to the config file, the audit log, or `/classifier status`. A variable that is unset (or a value pasted into `apiKeyEnv` instead of a variable name) fails closed: no request, no verdict, a permission request.
+- **`apiKeyEnv` is a NAME, not a key.** The value is read from that environment variable on each call and sent as `Authorization: Bearer …`. No credential is ever written to the config file, the audit log, or `/classifier status`. A variable that is unset (or a value pasted into `apiKeyEnv` instead of a variable name) fails closed: no request, no verdict, a block.
 - **Fail closed, unchanged.** An unreachable `baseUrl`, a non-2xx, an unparseable body, a missing answer field, or a timeout is an outage, never a verdict — exactly as the TypeSafe path behaves.
-- **Answers are read as probabilities**, not as a one-hot parse: the floors in `jevPolicy` apply exactly as they do to Jev, so a low-confidence "safe" still asks.
+- **Answers are read as probabilities**, not as a one-hot parse: the floors in `jevPolicy` apply exactly as they do to Jev, so a low-confidence "safe" still blocks.
 - **Backend identity is part of the cache.** The active backend's id joins the config signature and every cache key, so switching backends (or endpoints, or models) can never serve a verdict produced by the other judge. `/classifier` and `/classifier status` show it as `backendId` (`typesafe/jev-latest`, `endpoint/http://127.0.0.1:8765#local-decide`).
 - **`shadowV3` follows the backend**, because a shadow that measured a different judge than the live one would report transport differences as policy disagreements.
 
@@ -147,28 +181,28 @@ the fields the gate reads:
 
 The envelope wraps them as `{ "model": "jev-1.13.0", "answers": { "<id>": <Answer> }, "usage": { "input_tokens": N, "output_tokens": N } }`. A 6-question probe of one state cost ~0.6s and 528 input / 126 output tokens, and extra questions in the same request are cheap — System One answers every question in the request in parallel over the same state — which is why the battery asks them all at once instead of in rounds.
 
-**The verdict is derived, not read.** The `choice` answer above — `safe` at 0.52 with confidence 0.29 — does not clear the default floor (`safeMinProbability` 0.80, `safeMinConfidence` 0.50), so the gate asks the human instead of running the command. That is the whole point of a probability judge: the argmax is not a decision, and `choice: "safe"` alongside `unsafe: 0.43` is a command the gate should not wave through. The same command answered `safe` at 0.61 / confidence 0.42 when it was asked alone: the numbers move with the battery and with the shape of the state, so the thresholds are tunable policy rather than constants copied from a vendor. Measure across a corpus before touching them.
+**The verdict is derived, not read.** The `choice` answer above — `safe` at 0.52 with confidence 0.29 — does not clear the default floor (`safeMinProbability` 0.80, `safeMinConfidence` 0.50), so the gate blocks instead of running the command. That is the whole point of a probability judge: the argmax is not a decision, and `choice: "safe"` alongside `unsafe: 0.43` is a command the gate should not wave through. The same command answered `safe` at 0.61 / confidence 0.42 when it was asked alone: the numbers move with the battery and with the shape of the state, so the thresholds are tunable policy rather than constants copied from a vendor. Measure across a corpus before touching them.
 
 The policy knobs, all inside `jevPolicy`:
 
 | Key | Default | Meaning |
 |---|---|---|
 | `safeMinProbability` | `0.80` | p(safe) required before the gate auto-runs a command. |
-| `safeMinConfidence` | `0.50` | Confidence floor paired with it: a high p(safe) on a low-confidence answer still asks. |
+| `safeMinConfidence` | `0.50` | Confidence floor paired with it: a high p(safe) on a low-confidence answer still blocks. |
 | `unsafeMinProbability` | `0.50` | p(unsafe) at or above this forces UNSAFE. |
 | `hazardBlock` | `0.90` | Any hazard at or above this forces UNSAFE. |
 | `hazardReview` | `0.55` | Any hazard at or above this — below the block line — forces UNSURE. |
 | `blastRadiusReview` | `1.5` | Blast-radius score at or above this forces UNSURE. |
 
-SAFE requires `p(safe) >= safeMinProbability` **and** `confidence >= safeMinConfidence`, with no hazard at or above `hazardReview` and a blast radius below `blastRadiusReview`. UNSAFE comes from `p(unsafe) >= unsafeMinProbability` or any hazard at or above `hazardBlock`. Everything else is UNSURE, which asks. A decision carries a stable `reasonCode` (`jev:safe`, `jev:unsafe`, `jev:hazard:<name>`, `jev:blast-radius`, `jev:below-floor`, `jev:unavailable`) and a sentence built from the numbers and the hazard ids.
+SAFE requires `p(safe) >= safeMinProbability` **and** `confidence >= safeMinConfidence`, with no hazard at or above `hazardReview` and a blast radius below `blastRadiusReview`. UNSAFE comes from `p(unsafe) >= unsafeMinProbability` or any hazard at or above `hazardBlock`. Everything else is UNSURE, which blocks. A decision carries a stable `reasonCode` (`jev:safe`, `jev:unsafe`, `jev:hazard:<name>`, `jev:blast-radius`, `jev:below-floor`, `jev:unavailable`) and a sentence built from the numbers and the hazard ids.
 
 The policy version (`jev-v1`), the serialized battery, and the default policy hash into `jevQuestionsHash()`, which participates in the cache key. Change a question or a threshold and every cached verdict is invalidated — a verdict is only valid for the questions that produced it, and a stale one would be a verdict about a judge that no longer exists. Otherwise verdicts cache for the session, keyed by cwd, env, pty, timeout, async, the evidence fingerprint, and the command text, so reruns cost nothing while a changed user scope invalidates the cache.
 
-Every decision carries that policy version/hash, session and decision identifiers, the model id, timing, and the derived hazards in `decisions.jsonl`. `/classifier status` exposes the live policy hash and the recent tail. The deterministic replay tail is shared by the live gate and the evaluation harness, so caps, environment overrides, risk overlays, prior refusals, interactive prompts, and headless blocks are measured the same way.
+Every decision carries that policy version/hash, session and decision identifiers, the model id, timing, and the derived hazards in `decisions.jsonl`. `/classifier status` exposes the live policy hash and the recent tail. The deterministic replay tail is shared by the live gate and the evaluation harness, so caps, environment overrides, risk overlays and prior refusals are measured the same way.
 
 ## Evidence
 
-The state can carry an `evidence` object whose fields have different authors, and the battery's instructions judge each field by its channel. `evidenceUserMessages` attaches the task's most recent user messages plus older scope/restriction anchors, with stable message ids. These are direct user authorization only when the host stamps `attribution: "user"`; a parent agent's brief to its subagent never counts. A separate `evidence.trustedPolicy` tier exists only after `/classifier trust-policy` explicitly pins the unchanged user-level instruction files. It may authorize matching action classes only, with conditions confirmed by explicit gate-measured facts; it cannot authorize an egress destination or delete target, and repo-local files are never included. No CI status is measured, so CI-conditional policy does not authorize. A message longer than 2,000 characters keeps its first and last 1,000. Every tool call may also carry `operatorContext`: the requesting agent's explanation of intent, flattened to one line, capped at 500 characters, and never able to authorize anything. Recent tool calls/results are added as bounded, explicitly non-authorizing context so a script written earlier in the session is not invisible to the next review. Secret-shaped values (known token formats, authorization headers, private key blocks, URL passwords, values assigned to secret-sounding names) are redacted from every evidence field before it leaves the machine. The command itself is sent as written, because it's what gets judged. Refusals are scoped to the reviewed cwd and evidence fingerprint. Human denials remain sticky until approval in that same scope. The channel decides provenance: content claiming authorization from the wrong channel is itself an injection signal, judged by the same rules as the command text.
+The state can carry an `evidence` object whose fields have different authors, and the battery's instructions judge each field by its channel. `evidenceUserMessages` attaches the task's most recent user messages plus older scope/restriction anchors, with stable message ids. These are direct user authorization only when the host stamps `attribution: "user"`; a parent agent's brief to its subagent never counts. A separate `evidence.trustedPolicy` tier exists only after `/classifier trust-policy` explicitly pins the unchanged user-level instruction files. It may authorize matching action classes only, with conditions confirmed by explicit gate-measured facts; it cannot authorize an egress destination or delete target, and repo-local files are never included. No CI status is measured, so CI-conditional policy does not authorize. A message longer than 2,000 characters keeps its first and last 1,000. Every tool call may also carry `operatorContext`: the requesting agent's explanation of intent, flattened to one line, capped at 500 characters, and never able to authorize anything. Recent tool calls/results are added as bounded, explicitly non-authorizing context so a script written earlier in the session is not invisible to the next review. Secret-shaped values (known token formats, authorization headers, private key blocks, URL passwords, values assigned to secret-sounding names) are redacted from every evidence field before it leaves the machine. The command itself is sent as written, because it's what gets judged. Refusals are scoped to the reviewed cwd, and new evidence does not erase them. The channel decides provenance: content claiming authorization from the wrong channel is itself an injection signal, judged by the same rules as the command text.
 
 ## Limits
 
@@ -180,7 +214,7 @@ The state can carry an `evidence` object whose fields have different authors, an
 
 ## Privacy
 
-The command text (up to 8,000 characters), its resolved working directory, recent user messages when `evidenceUserMessages` is non-zero, requesting-agent operator context, and any current explicitly pinned user-level policy snapshot go to TypeSafe's System One API (`api.typesafe.ai`) by default. The fixed policy paths are re-read on each classification only to verify the pin; changed bytes are never interpreted as policy. `/classifier trust-policy` reports paths, hashes, and byte lengths; `/classifier status` shows only the pin hash. An `endpoint` `judgeBackend` sends the same judge state to that endpoint instead: it is the operator's own server, with its own logging and retention. TypeSafe's logging and retention policies apply to the default path. Command text is sent as written and may contain private paths, proprietary snippets, inline env assignments, or secrets; secret-shaped values in evidence and policy contents are redacted before they leave the machine. Caller-supplied `env` values are never sent; that path asks the human instead.
+The command text (up to 8,000 characters), its resolved working directory, recent user messages when `evidenceUserMessages` is non-zero, requesting-agent operator context, and any current explicitly pinned user-level policy snapshot go to TypeSafe's System One API (`api.typesafe.ai`) by default. The fixed policy paths are re-read on each classification only to verify the pin; changed bytes are never interpreted as policy. `/classifier trust-policy` reports paths, hashes, and byte lengths; `/classifier status` shows only the pin hash. An `endpoint` `judgeBackend` sends the same judge state to that endpoint instead: it is the operator's own server, with its own logging and retention. TypeSafe's logging and retention policies apply to the default path. Command text is sent as written and may contain private paths, proprietary snippets, inline env assignments, or secrets; secret-shaped values in evidence and policy contents are redacted before they leave the machine. Caller-supplied `env` values are never sent; that path blocks instead.
 
 ## Development
 
@@ -203,7 +237,7 @@ bun eval/run.ts --policy eval/policies/x.json     # score a candidate policy
 bun eval/run.ts --replay                          # cache only: no API calls
 ```
 
-Reports include final host handoff, review/recovery counts, approval overrides,
+Reports include final host handoff (`run`, `block`, `host-prompt`), review/recovery counts,
 interruption rates, and p50/p95 latency. Treat generated held-out numbers as a
 repeatable regression fixture, not as a substitute for fresh production history.
 

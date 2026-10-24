@@ -87,7 +87,7 @@ describe("/classifier off (per-session pause)", () => {
 		const ctx = makeCtx({ sessionId: other });
 		const result = await fire("tool_call", makeEvent(`git branch -D feature-${other}`), ctx);
 		expect(resultText(result)).not.toBe("ALLOWED");
-		expect(refusalOf(result).layer).toBe("headless");
+		expect(refusalOf(result).layer).toBe("unsafe");
 		expect(modelCalls.length).toBe(1);
 	});
 
@@ -103,7 +103,7 @@ describe("/classifier off (per-session pause)", () => {
 
 		const ctx = makeCtx({ sessionId: sid });
 		const result = await fire("tool_call", makeEvent("git status"), ctx);
-		expect(refusalOf(result).layer).toBe("headless");
+		expect(refusalOf(result).layer).toBe("unsafe");
 		expect(modelCalls.length).toBe(1);
 	});
 
@@ -115,7 +115,7 @@ describe("/classifier off (per-session pause)", () => {
 		// The session never paused, so nothing about the gate changed.
 		const ctx = makeCtx({ sessionId: sid });
 		const result = await fire("tool_call", makeEvent(`git branch -D feature-${sid}`), ctx);
-		expect(refusalOf(result).layer).toBe("headless");
+		expect(refusalOf(result).layer).toBe("unsafe");
 		expect(modelCalls.length).toBe(1);
 	});
 
@@ -163,7 +163,7 @@ describe("pause scope and cache", () => {
 		const resumed = makeCtx({ sessionId: sid });
 		const evalResult = await fire("tool_call", evalEvent(code), resumed);
 		expect(refusalOf(evalResult).tool).toBe("eval");
-		expect(refusalOf(evalResult).layer).toBe("headless");
+		expect(refusalOf(evalResult).layer).toBe("unsafe");
 		expect(modelCalls.length).toBe(1);
 	});
 
@@ -187,7 +187,7 @@ describe("pause scope and cache", () => {
 
 		const ctx = makeCtx({ sessionId: sid });
 		const result = await fire("tool_call", makeEvent("git status"), ctx);
-		expect(refusalOf(result).layer).toBe("headless");
+		expect(refusalOf(result).layer).toBe("unsafe");
 		expect(modelCalls.length).toBe(1);
 	});
 

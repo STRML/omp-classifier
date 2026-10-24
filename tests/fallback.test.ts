@@ -18,7 +18,6 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { DecisionRecord } from "../index";
 import {
-	ALLOW_ONCE,
 	clearJevApiKey,
 	fire,
 	loadPlugin,
@@ -30,7 +29,6 @@ import {
 	removeConfigFile,
 	restoreJevApiKey,
 	resultText,
-	selectCalls,
 	setJevAnswer,
 	setJevDelay,
 	setJevFailures,
@@ -92,7 +90,7 @@ describe("every unavailability reaches UNAVAILABLE", () => {
 		clearJevApiKey();
 		const blocked = await gate("make build");
 		expect(blocked).toContain("classifier unavailable");
-		expect(refusalOf(blocked).layer).toBe("headless");
+		expect(refusalOf(blocked).layer).toBe("unavailable");
 		// The key is resolved before the request is built, so an unconfigured
 		// gate must not even open a socket — a request here would mean the gate
 		// tried to authenticate with something it did not have.
@@ -138,7 +136,7 @@ describe("every unavailability reaches UNAVAILABLE", () => {
 		setJevDelay(10_000);
 		const blocked = await gate("git status");
 		expect(blocked).toContain("classifier unavailable");
-		expect(refusalOf(blocked).layer).toBe("headless");
+		expect(refusalOf(blocked).layer).toBe("unavailable");
 		expect(modelCalls).toHaveLength(1);
 	});
 
@@ -167,33 +165,18 @@ describe("UNAVAILABLE is never a silent allow", () => {
 		setJevUnavailable();
 		const blocked = await gate("git status");
 		const payload = refusalOf(blocked);
-		expect(payload.layer).toBe("headless");
+		expect(payload.layer).toBe("unavailable");
 		expect(payload.why).toContain("classifier unavailable");
 		expect(payload.notThis.length).toBeGreaterThan(0);
 	});
 
-	test("with a UI the gate raises a dialog and runs nothing unless a human says so", async () => {
+	test("with a UI the gate blocks too, and tells the agent how to proceed", async () => {
 		setJevUnavailable();
-		const ctx = makeCtx({ sessionId: "outage-dialog", hasUI: true });
-		const blocked = await fire("tool_call", makeEvent("git status"), ctx);
-		expect(selectCalls(ctx)).toHaveLength(1);
-		expect(selectCalls(ctx)[0][0]).toContain("classifier unavailable");
-		// The dialog was not answered, which the host reports as undefined —
-		// the gate must read that as denial, not as "no objection".
-		expect(refusalOf(blocked).layer).toBe("dialog");
-	});
-
-	test("a dialog approval is an explicit human decision, and it runs", async () => {
-		setJevUnavailable();
-		const ctx = makeCtx({ sessionId: "outage-approve", hasUI: true, selectResult: ALLOW_ONCE });
-		expect(await fire("tool_call", makeEvent("git status"), ctx)).toBeUndefined();
-	});
-
-	test("a canceled dialog denies, as any unanswered permission request does", async () => {
-		setJevUnavailable();
-		const ctx = makeCtx({ sessionId: "outage-cancel", hasUI: true });
-		const result = await fire("tool_call", makeEvent("git status"), ctx);
-		expect(refusalOf(result).layer).toBe("dialog");
+		const ctx = makeCtx({ sessionId: "outage-ui", hasUI: true });
+		const payload = refusalOf(await fire("tool_call", makeEvent("git status"), ctx));
+		expect(payload.layer).toBe("unavailable");
+		expect(payload.why).toContain("classifier unavailable");
+		expect(payload.next).toContain("/classifier off");
 	});
 });
 
@@ -202,16 +185,16 @@ describe("the outage is visible in the audit trail", () => {
 		setJevUnavailable();
 		await gate("make build");
 		const lines = readDecisions();
-		// Headless denial is the documented two-line pair ("Two lines on
-		// purpose"): the verdict line, then requestPermission's outcome line.
+		// A block is the documented two-line pair ("Two lines on purpose"):
+		// the verdict line, then refuse's blocked line.
 		expect(lines).toHaveLength(2);
 		expect(lines[0]).toMatchObject({ tool: "bash", decision: "block", layer: "verdict", verdict: "UNAVAILABLE", cached: 0 });
 		expect(lines[0].why).toContain("classifier unavailable");
-		expect(lines[1]).toMatchObject({ tool: "bash", decision: "block", layer: "headless", verdict: null });
+		expect(lines[1]).toMatchObject({ tool: "bash", decision: "block", layer: "blocked", verdict: "UNAVAILABLE" });
 		expect(lines[1].why).toContain("classifier unavailable");
 		// The verdict line names the rejection (reviewer-visible), the outcome
 		// line keeps the empty-`jev` contract; asserting the outcome's layer
-		// rather than its absence keeps the headless path observable.
+		// rather than its absence keeps the block observable.
 		expect(lines[1].jev).toBeUndefined();
 	});
 
@@ -224,21 +207,21 @@ describe("the outage is visible in the audit trail", () => {
 		setJevAnswer(jevUnsafeAnswer());
 		await fire("tool_call", makeEvent(command), makeCtx({ sessionId: session }));
 		const lines = readDecisions();
-		// Two decisions, each the documented headless pair: verdict line, then
-		// requestPermission's outcome line. The first pair is the outage, the
+		// Two decisions, each the documented pair: verdict line, then refuse's
+		// blocked line. The first pair is the outage, the
 		// second the recovered verdict.
 		expect(lines).toHaveLength(4);
 		expect(lines[0].verdict).toBe("UNAVAILABLE");
 		// Nothing arrived, so there is no telemetry to report — an outage line
 		// claiming probabilities would be inventing them.
 		expect(lines[0].jev).toBeUndefined();
-		expect(lines[1]).toMatchObject({ decision: "block", layer: "headless", verdict: null });
+		expect(lines[1]).toMatchObject({ decision: "block", layer: "blocked", verdict: "UNAVAILABLE" });
 		expect(lines[2].verdict).toBe("UNSAFE");
 		expect(lines[2].reasonCode).toMatch(/^jev:/u);
 		expect(lines[2].jev?.model).toBeTruthy();
 		expect(lines[2].jev?.hazards).toBeDefined();
 		// The recovered decision's outcome line heads the same way.
-		expect(lines[3]).toMatchObject({ decision: "block", layer: "headless", verdict: null });
+		expect(lines[3]).toMatchObject({ decision: "block", layer: "blocked", verdict: "UNSAFE" });
 		expect(lines[3].jev).toBeUndefined();
 	});
 });
