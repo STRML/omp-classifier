@@ -471,6 +471,73 @@ describe("gate-measured git push provenance (#63)", () => {
 		}
 	});
 
+	test("a bare git push is measured against the destination git resolves for it (#171)", () => {
+		const dir = mkdtempSync(join(tmpdir(), "jev171-"));
+		const origin = join(dir, "origin.git");
+		const repo = join(dir, "repo");
+		const other = join(dir, "other");
+		try {
+			git(`git init -q --bare -b main ${JSON.stringify(origin)}`, dir);
+			git(`git init -q -b main ${JSON.stringify(repo)}`, dir);
+			git(`git remote add origin ${JSON.stringify(origin)} && git commit -q --allow-empty -m base && git push -q -u origin main`, repo);
+			git("git switch -q -c feature && git commit -q --allow-empty -m f1 && git push -q -u origin feature && git commit -q --allow-empty -m f2", repo);
+			// The common spelling: the current branch to its upstream.
+			for (const command of ["git push", "git push -q", "git add -A && git commit -q --allow-empty -m wip && git push", "git push --force-with-lease"]) {
+				expect(measureGitPushProvenance(command, repo), command).toMatchObject({ ahead: 1, behind: 0, forwardOnly: true });
+			}
+			// upstream mode sends the branch to its upstream even when the names differ.
+			git("git switch -q -c renamed && git commit -q --allow-empty -m r1 && git branch -q -u origin/main && git config push.default upstream", repo);
+			expect(measureGitPushProvenance("git push", repo)).toMatchObject({ ahead: 3, behind: 0, forwardOnly: true });
+			// simple refuses a differently named upstream, and @{push} does too.
+			git("git config --unset push.default", repo);
+			expect(measureGitPushProvenance("git push", repo)).toBeUndefined();
+			git("git switch -q feature", repo);
+			// Someone else pushed to the branch, and this repository fetched it.
+			git(`git clone -q -b feature ${JSON.stringify(origin)} ${JSON.stringify(other)}`, dir);
+			git("git commit -q --allow-empty -m theirs && git push -q origin feature", other);
+			git("git fetch -q origin", repo);
+			expect(measureGitPushProvenance("git push", repo)).toMatchObject({ ahead: 1, behind: 1, forwardOnly: false });
+			git("git reset -q --hard origin/feature && git commit -q --allow-empty -m mine", repo);
+			expect(measureGitPushProvenance("git push", repo)?.forwardOnly).toBe(true);
+			// Every shape where git would push something else, or the gate cannot tell.
+			for (const [setup, undo] of [
+				["git config push.default matching", "git config --unset push.default"],
+				["git config push.default nothing", "git config --unset push.default"],
+				["git config remote.origin.mirror true", "git config --unset remote.origin.mirror"],
+				["git config remote.origin.push +refs/heads/*:refs/heads/*", "git config --unset remote.origin.push"],
+				["git config branch.feature.pushRemote nosuch", "git config --unset branch.feature.pushRemote"],
+				["git config remote.pushDefault nosuch", "git config --unset remote.pushDefault"],
+				["git config remote.origin.pushurl https://attacker.example/x.git", "git config --unset remote.origin.pushurl"],
+			]) {
+				git(setup, repo);
+				expect(measureGitPushProvenance("git push", repo), setup).toBeUndefined();
+				git(undo, repo);
+			}
+			expect(measureGitPushProvenance("git push", repo)?.forwardOnly).toBe(true);
+			for (const command of [
+				// Force without a lease, as for an explicit refspec (#169).
+				"git push --force",
+				"git push -f",
+				// An earlier segment can change which branch is current or where it pushes.
+				"git switch main && git push",
+				"git checkout main && git push",
+				"git branch -u origin/main && git push",
+				"git stash branch tmp && git push",
+				// One operand is neither a bare push nor a remote and refspec.
+				"git push origin",
+			]) {
+				expect(measureGitPushProvenance(command, repo), command).toBeUndefined();
+			}
+			// A branch with no upstream under simple: git refuses, @{push} cannot resolve.
+			git("git switch -q -c fresh", repo);
+			expect(measureGitPushProvenance("git push", repo)).toBeUndefined();
+			git("git switch -q --detach", repo);
+			expect(measureGitPushProvenance("git push", repo)).toBeUndefined();
+		} finally {
+			execSync(`trash ${JSON.stringify(dir)} 2>/dev/null || rm -rf ${JSON.stringify(dir)}`);
+		}
+	});
+
 	test("a HEAD refspec on a detached HEAD names no remote branch, so nothing is measured", () => {
 		const dir = mkdtempSync(join(tmpdir(), "jev63-"));
 		try {
