@@ -373,7 +373,7 @@ describe("grant target strictness (gate fix)", () => {
 		const sid = nextSession();
 		const first = await prompted("pkill -f MyApp", ALLOW_SESSION, sid);
 		expect(resultText(first.result)).toBe("ALLOWED");
-		expect(selectCalls(first.ctx)[0][1]).toHaveLength(4); // grantable: Allow once/session/always, Deny
+		expect(selectCalls(first.ctx)[0][1]).toHaveLength(3); // grantable: Allow once/session, Deny
 
 		const secondCtx = makeCtx({ sessionId: sid, hasUI: true });
 		const second = await fire("tool_call", makeEvent("pkill -f MyApp"), secondCtx);
@@ -407,7 +407,7 @@ describe("grant target strictness (gate fix)", () => {
 		const ctx = makeCtx({ sessionId: sid, hasUI: true, selectResult: ALLOW_SESSION });
 		const result = await fire("tool_call", makeEvent("git status && git push --force"), ctx);
 		expect(result).toBeUndefined();
-		expect(selectCalls(ctx)[0][1].map(option => option.label)).toEqual(["Allow once", "Allow for session", "Always allow", "Deny"]);
+		expect(selectCalls(ctx)[0][1].map(option => option.label)).toEqual(["Allow once", "Allow for session", "Deny"]);
 
 		const same = makeCtx({ sessionId: sid, hasUI: true });
 		expect(await fire("tool_call", makeEvent("git status && git push --force"), same)).toBeUndefined();

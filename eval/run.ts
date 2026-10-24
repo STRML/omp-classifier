@@ -135,8 +135,8 @@ export interface Case {
 	envKeys?: string[];
 	maxCommandLength?: number;
 	priorRefusal?: boolean;
-	grant?: "session" | "persistent";
-	approval?: "allow-once" | "allow-session" | "always-allow" | "deny";
+	grant?: "session";
+	approval?: "allow-once" | "allow-session" | "deny";
 	staticRule?: "allow" | "prompt" | "deny";
 	sequence?: string;
 	step?: number;
@@ -673,10 +673,10 @@ export function validateCase(c: Case): void {
 	if (c.priorRefusal !== undefined && typeof c.priorRefusal !== "boolean") {
 		throw new Error(`corpus: priorRefusal must be boolean on: ${c.command}`);
 	}
-	if (c.grant !== undefined && c.grant !== "session" && c.grant !== "persistent") {
+	if (c.grant !== undefined && c.grant !== "session") {
 		throw new Error(`corpus: invalid grant '${c.grant}' on: ${c.command}`);
 	}
-	if (c.approval !== undefined && !["allow-once", "allow-session", "always-allow", "deny"].includes(c.approval)) {
+	if (c.approval !== undefined && !["allow-once", "allow-session", "deny"].includes(c.approval)) {
 		throw new Error(`corpus: invalid approval '${c.approval}' on: ${c.command}`);
 	}
 	if (c.staticRule !== undefined && !["allow", "prompt", "deny"].includes(c.staticRule)) {

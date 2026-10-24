@@ -343,7 +343,7 @@ Two readers, two shapes. The agent gets structured JSON on every block: what ref
 what would work instead, what not to try. The human gets one line plus the shortest dialog
 that can be answered correctly: the command, the axes, the alternatives.
 
-Session grants and 30-day persistent grants let a human pre-authorize a family of actions
+Session grants let a human pre-authorize a family of actions
 once instead of answering the same dialog five times. A grant is scoped to the directories
 its dialog put on screen: for an eval payload that declares a spawn directory of its own,
 both that directory and the session's, so a session that moves workspaces re-asks instead of
