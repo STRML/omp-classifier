@@ -11,7 +11,7 @@ and the reason is JSON from `refusalPayload`. Every decision writes one audit li
 
 1. Return unless the tool is `bash` or `eval` with non-empty input.
 2. Evidence snapshot, taken once per call: `operatorContextFromInput` + `collectToolEvidence`
-   → `mergeOperatorContext`; `evidenceUserSnapshot(ctx)` → `citableEvidence` → `scopeFingerprint`.
+   → `mergeOperatorContext`; `evidenceUserSnapshot(ctx)` → `citableEvidence`.
 3. `shadowFloor(...)` runs `evaluateFloor` and records the `floor` audit field. Shadow only, and it
    accumulates session taint.
 4. `resolvePolicyContext(dir, policyDirectoryStable(text))` attaches the pinned trust policy, or

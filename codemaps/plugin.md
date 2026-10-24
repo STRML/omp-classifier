@@ -16,7 +16,7 @@ Read this before opening index.ts. Line numbers are where each declaration start
 | 1060-1230 | plugin lockfile diagnostic, config format | `lockfileDisablesPlugin`, `formatClassifierConfig`, `QUESTIONS_CONTRACT`, `CLASSIFIER_POLICY_HASH` |
 | 1230-1475 | evidence fingerprinting, outbound network | `evidenceUserSnapshot`, `citableEvidence`, `evidenceFingerprint`, `commandHasOutboundNetwork` |
 | 1474-1580 | judgement tail | `annotateJudgement`, `ReplayDecisionInput`, `replayDecision` (1537) |
-| 1580-1870 | provenance-tiered evidence (#31) | `collectUserEvidence`, `collectTaskEvidence`, `collectTaskEvidenceV3`, `scopeFingerprint`, `operatorContextFromInput`, `collectToolEvidence`, `mergeOperatorContext` |
+| 1580-1870 | provenance-tiered evidence (#31) | `collectUserEvidence`, `collectTaskEvidence`, `collectTaskEvidenceV3`, `operatorContextFromInput`, `collectToolEvidence`, `mergeOperatorContext` |
 | 1872-2840 | eval payload scanning | `MODERATE_RISK_TOKENS`, `INTERPRETER_FLAG_GRAMMAR`, `INTERPRETER_CODE_RISK`, `evalRiskFlags`, `evalSubprocessMarkers`, `evalCwdSites`, `evalSpawnCwd` |
 | 2839-3910 | wrappers, interpreters, script bodies (#67) | `WRAPPER_OPTION_GRAMMAR`, `POLICY_UNSTABLE_VERBS`, `interpreterInvocation`, `withoutWrittenHeredocBodies`, `interpreterProgramRefs`, `readInterpretedScriptBodies` (3775) |
 | 3911-4515 | pipe / compound splitting, risk overlay | `splitPipeStages`, `isPlainReadOnlyFetch`, `splitTopLevelCommands`, `rmForcesDialog`, `matchModerateRiskTokens` (4279), `trashFootnote` |

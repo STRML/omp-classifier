@@ -55,7 +55,7 @@ builds temp repos. `config-path-probe.ts` is the child process for config-path.t
 
 | Area | Test files |
 |---|---|
-| plugin end-to-end (via fixtures `loadPlugin`) | classifier, cache, config, policy-gates, static-gate, stale-disable, session-off, no-grants, refusal-memory, late-verdict, fallback, shadow-v3, audit-log, eval-gate, script-body, network, gh-carveout, gh-compound-pipe |
+| plugin end-to-end (via fixtures `loadPlugin`) | classifier, cache, config, policy-gates, static-gate, stale-disable, session-off, no-grants, dry-run, refusal-memory, late-verdict, fallback, shadow-v3, audit-log, eval-gate, script-body, network, gh-carveout, gh-compound-pipe |
 | deterministic tail | replay (`replayDecision`, `annotateJudgement`) |
 | L0 evidence and provenance | evidence-tiers, provenance (push), worktree-provenance, ref-provenance, network-provenance, trust-policy, config-path |
 | L1 | floor, shell-oracle (floor vs real shell), literal-match, recognizer, shell-ast, shell-ast-load, arity-tables |
