@@ -356,11 +356,26 @@ describe("a failed review keeps the stage-1 block", () => {
 		["an extra field", JSON.stringify({ decision: "allow", rule: "none", reason: "x", user_quote: "fetch", confidence: 1 })],
 		["an unknown decision", JSON.stringify({ decision: "maybe", rule: "none", reason: "x", user_quote: "" })],
 		["a provider error", new Error("503 overloaded")],
-	])("%s", async (_name, reply) => {
-		scriptReviewer(reply);
+	])("%s, twice", async (_name, reply) => {
+		// A malformed reply is retried once; two in a row fail the review.
+		scriptReviewer(reply, reply);
 		const result = await fire("tool_call", makeEvent("git fetch upstream"), uiCtx(nextSession(), [user("u1", "fetch")]));
 		expect(refusalOf(result).layer).toBe("unsure");
 		expect(reviewerAudit()).toMatchObject({ failed: expect.any(String) });
+	});
+
+	test("one malformed reply is retried, and the next answer counts", async () => {
+		scriptReviewer("Sure, this looks fine.", reviewerReply("allow", "fetch upstream"));
+		const result = await fire("tool_call", makeEvent("git fetch upstream"), uiCtx(nextSession(), [user("u1", "fetch upstream")]));
+		expect(resultText(result)).toBe("ALLOWED");
+		expect(reviewerCalls).toHaveLength(2);
+	});
+
+	test("a block is final: it is never retried for a better answer", async () => {
+		scriptReviewer(reviewerReply("block"), reviewerReply("allow", "fetch upstream"));
+		const result = await fire("tool_call", makeEvent("git fetch upstream"), uiCtx(nextSession(), [user("u1", "fetch upstream")]));
+		expect(refusalOf(result).layer).toBe("unsure");
+		expect(reviewerCalls).toHaveLength(1);
 	});
 
 	test("the deadline", async () => {
