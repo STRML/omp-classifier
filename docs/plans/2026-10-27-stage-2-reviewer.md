@@ -73,6 +73,8 @@ Outside the transcript it also gets:
   - **The read:** it goes through `realpath`. The body is unread when either path is on the secret-file list, the file is not regular, it is binary or over 64 KB, or it runs another local file. "Runs another local file" means a program named by a non-system path, a wrapper or interpreter handed a local path, a runner running a file, `awk -f`, or a script-dir assignment. An unread body means no review.
   - **Hashing:** the body is hashed at read time. Before an allow counts, the spelled path is re-resolved and the file re-hashed, and any change fails the review.
   - **Not covered:** build runners and git hooks run repository code nobody read. That is the ordinary development work Jev's safe criterion already covers.
+  - **Not covered:** a user-writable binary under an innocent name, such as a copy of `bash` saved as `~/bin/git`. Trusting only root-owned PATH binaries would refuse `gh`, `bun` and every Homebrew tool, because Homebrew's prefix is user-owned on Apple Silicon. Planting such a binary is itself a command the gate judges first.
+  - **Interpreters inside a body:** any interpreter or `source` in a script body is a hand-off, whatever carries the code: a file, a bare name, stdin, a pipe, a here-document or `-c` text. Program names are matched both as spelled and as the file they resolve to, through PATH for a bare name.
 - The pinned trust policy (`evidence.trustedPolicy`), when present: the CLAUDE.md analogue.
 
 ### What the reviewer is told

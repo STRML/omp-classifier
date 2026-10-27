@@ -108,11 +108,15 @@ describe("which commands stage 2 can vouch for", () => {
 		["a wrapper running a local program", "xargs -n 1 ./update.sh"],
 		["a local script run by bare name on PATH", "omp-reviewer-test-local.sh"],
 		["a local script disguised behind a system prefix and ..", "/usr/..__DIR__/wrap.sh"],
+		["an interpreter behind a link with an innocent name", "__DIR__/bin/tool payload.txt"],
+		["a script whose body runs an interpreter through a PATH link", "./linkwrap.sh"],
 	])("refuses %s", async (_name, command) => {
 		script("update.sh", "#!/bin/bash\necho ok\n");
 		script("wrap.sh", "#!/bin/bash\nsource lib.sh\n");
 		fs.mkdirSync(path.join(dir, "bin"));
 		script("bin/omp-reviewer-test-local.sh", "#!/bin/bash\necho ok\n");
+		fs.symlinkSync("/bin/sh", path.join(dir, "bin", "tool"));
+		script("linkwrap.sh", "#!/bin/bash\ntool payload.txt\n");
 		const previous = process.env.PATH;
 		process.env.PATH = `${path.join(dir, "bin")}${path.delimiter}${previous ?? ""}`;
 		try {
@@ -233,6 +237,10 @@ describe("what never reaches the reviewer", () => {
 		["a script written inside a cd's substitution", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "cd \"$(printf 'x' > gen.sh; echo .)\" && ./gen.sh"],
 		["a script written by a substitution in its own arguments", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "./gen.sh \"$(printf 'x' > gen.sh)\""],
 		["a script that sources a file by bare name", () => script("wrap.sh", "#!/bin/bash\nsource lib.sh\n"), "./wrap.sh"],
+		["a script that feeds a file to an interpreter's stdin", () => script("wrap.sh", "#!/bin/bash\nbash < payload.txt\n"), "./wrap.sh"],
+		["a script that runs a here-document through an interpreter", () => script("wrap.sh", "#!/bin/bash\nsh <<'EOF'\nrm -rf ~\nEOF\n"), "./wrap.sh"],
+		["a script that pipes into an interpreter", () => script("wrap.sh", "#!/bin/bash\ncat payload.txt | bash\n"), "./wrap.sh"],
+		["a script that runs inline interpreter code", () => script("wrap.sh", "#!/bin/bash\npython3 -c 'import os'\n"), "./wrap.sh"],
 		["a script that interprets a file by bare name", () => script("wrap.sh", "#!/bin/bash\npython3 helper.py\n"), "./wrap.sh"],
 		["a script that runs a local program behind a system prefix and ..", () => script("wrap.sh", "#!/bin/bash\n/usr/../tmp/evil.sh\n"), "./wrap.sh"],
 		["a script that runs an indented relative program", () => script("wrap.sh", "#!/bin/bash\nif true; then\n    ./lib/real.sh\nfi\n"), "./wrap.sh"],

@@ -54,17 +54,33 @@ const INTERPRETERS = /^(?:bash|sh|zsh|dash|ksh|fish|csh|tcsh|python[\d.]*|pypy[\
 const PROGRAM_FILE_FLAG_TOOLS = new Set(["awk", "gawk", "mawk", "nawk", "jq", "sed", "gsed"]);
 /** Runners whose operand may be a program file rather than a script name. */
 const FILE_RUNNERS = new Set(["bun", "bunx", "npx", "pnpx", "tsx", "ts-node"]);
+/** Whether `target` and every directory above it is owned by root and
+ *  writable by no one else, read without following the last link, so nothing
+ *  on that chain can be replaced by the agent or the user's own tooling. */
+function rootOwnedChain(target: string): boolean {
+	for (let current = target; ; current = path.dirname(current)) {
+		try {
+			const stat = fs.lstatSync(current);
+			if (stat.uid !== 0 || (!stat.isSymbolicLink() && (stat.mode & 0o022) !== 0)) return false;
+		} catch {
+			return false;
+		}
+		if (current === path.dirname(current)) return true;
+	}
+}
+
 /**
- * Whether a path names a system program: absolute, no `..` segment, and its
- * real file is owned by root, so neither the agent nor the user's other
- * tooling could have written it. A directory prefix alone proves nothing
- * (`/usr/../tmp/x`, a user-writable `/opt/homebrew`).
+ * Whether a path names a system program: absolute, no `..` segment, and both
+ * the path as spelled and the file it resolves to sit on a root-owned chain
+ * no one else can write. A directory prefix alone proves nothing
+ * (`/usr/../tmp/x`, a user-writable `/opt/homebrew`), and neither does a
+ * root-owned target behind a link in a user-writable directory.
  */
 function isSystemProgram(value: string): boolean {
 	const expanded = expandHome(value);
 	if (!path.isAbsolute(expanded) || expanded.split("/").includes("..")) return false;
 	try {
-		return fs.statSync(fs.realpathSync(expanded)).uid === 0;
+		return rootOwnedChain(expanded) && rootOwnedChain(fs.realpathSync(expanded));
 	} catch {
 		return false;
 	}
@@ -81,6 +97,23 @@ const unread = (spelled: string, why: string): ReadScript => ({ path: spelled, b
 const refuse = (why: string): CommandScripts => ({ kind: "refuse", why });
 const expandHome = (value: string): string => (value === "~" ? os.homedir() : value.startsWith("~/") ? path.join(os.homedir(), value.slice(2)) : value);
 const verbName = (command: ShellCommand): string => path.basename(command.words[0]?.value ?? "");
+/** The names a command's program goes by: as spelled, and, for a path, the
+ *  file it resolves to, so `~/x -> /bin/sh` is still an interpreter. */
+function programNames(command: ShellCommand): string[] {
+	const spelled = command.words[0]?.value ?? "";
+	const names = [path.basename(spelled)];
+	// A path resolves as written; a bare name resolves through PATH, so a
+	// `tool -> /bin/sh` link on PATH is known as `sh` too.
+	const located = isPathWord(spelled) ? expandHome(spelled) : spelled === "" ? undefined : onPath(spelled);
+	if (located !== undefined) {
+		try {
+			names.push(path.basename(fs.realpathSync(located)));
+		} catch {
+			// A path that does not resolve runs nothing under another name.
+		}
+	}
+	return names;
+}
 const isLiteral = (word: ShellWord): boolean => word.fixed;
 
 /** Whether a word names a file by path rather than by a bare name. */
@@ -168,14 +201,17 @@ function bodyHandOff(body: string): string | undefined {
 		if (command.unreadShape !== undefined) return `a shell construct the gate cannot read (${command.unreadShape})`;
 		const program = command.words[0]?.value ?? "";
 		const name = verbName(command);
+		const names = programNames(command);
 		if (isPathWord(program) && !isSystemProgram(program)) return `runs ${program}`;
-		// Sourcing or interpreting anything runs a file, whether named by path or by bare name.
-		if ((name === "source" || name === "." || INTERPRETERS.test(name)) && command.words.slice(1).some(word => !word.value.startsWith("-") && !isSystemProgram(word.value))) {
-			return `${name} runs ${command.words.slice(1).find(word => !word.value.startsWith("-"))?.value ?? "a file"}`;
-		}
-		if (PROGRAM_FILE_FLAG_TOOLS.has(name) && command.words.some(word => /^(?:-f|--from-file|--file)(?:=|$)/u.test(word.value))) return `${name} runs a program file`;
-		if (FILE_RUNNERS.has(name) && runnerRunsFile(name, command.words)) return `${name} runs a program file`;
-		const handsPaths = WRAPPERS.has(name) || INTERPRETERS.test(name);
+		// Sourcing or interpreting anything runs code: a file named by path or
+		// bare name, or whatever stdin carries (`bash < x.sh`, a here-document).
+		// An interpreter or `source` in a body runs code this read did not cover,
+		// whatever carries it: a file, a bare name, stdin, a pipe, a here-document
+		// or `-c` text. Each of those was a bypass in turn, so none is allowed.
+		if (names.some(n => n === "source" || n === "." || INTERPRETERS.test(n))) return `${name} runs code the gate did not read`;
+		if (names.some(n => PROGRAM_FILE_FLAG_TOOLS.has(n)) && command.words.some(word => /^(?:-f|--from-file|--file)(?:=|$)/u.test(word.value))) return `${name} runs a program file`;
+		if (names.some(n => FILE_RUNNERS.has(n) && runnerRunsFile(n, command.words))) return `${name} runs a program file`;
+		const handsPaths = names.some(n => WRAPPERS.has(n) || INTERPRETERS.test(n));
 		if (handsPaths && command.words.slice(1).some(word => isPathWord(word.value) && !isSystemProgram(word.value))) {
 			return `hands a local path to ${name}`;
 		}
@@ -204,13 +240,14 @@ function shapeARefusal(commands: readonly ShellCommand[]): string | undefined {
 			return "changes PATH";
 		}
 		if (command.words.length === 0) continue;
-		if (WRAPPERS.has(name)) return `${name} runs another program`;
-		if (INTERPRETERS.test(name)) return `${name} runs a program the gate does not read`;
-		if (PROGRAM_FILE_FLAG_TOOLS.has(name) && command.words.some(word => /^(?:-f|--from-file|--file)(?:=|$)/u.test(word.value))) return `${name} runs a program file`;
-		if (FILE_RUNNERS.has(name) && runnerRunsFile(name, command.words)) return `${name} runs a program file`;
 		const program = command.words[0];
 		if (!isLiteral(program)) return "the program is built at run time";
-		const resolved = onPath(program.value);
+		const resolved = isPathWord(program.value) ? undefined : onPath(program.value);
+		const names = programNames(command);
+		if (names.some(n => WRAPPERS.has(n))) return `${name} runs another program`;
+		if (names.some(n => INTERPRETERS.test(n))) return `${name} runs a program the gate does not read`;
+		if (names.some(n => PROGRAM_FILE_FLAG_TOOLS.has(n)) && command.words.some(word => /^(?:-f|--from-file|--file)(?:=|$)/u.test(word.value))) return `${name} runs a program file`;
+		if (names.some(n => FILE_RUNNERS.has(n) && runnerRunsFile(n, command.words))) return `${name} runs a program file`;
 		if (resolved !== undefined && isScriptFile(resolved)) return `${program.value} is a local script run by name`;
 	}
 	return undefined;
