@@ -132,6 +132,18 @@ describe("consent is checked in code", () => {
 		expect(reviewerAudit()).toMatchObject({ failed: expect.stringContaining("quote") });
 	});
 
+	test("an allow quoting a one-word fragment of a longer message blocks", async () => {
+		scriptReviewer(reviewerReply("allow", "it"));
+		const result = await fire("tool_call", makeEvent("git fetch upstream"), uiCtx(nextSession(), [user("u1", "don't touch it until I review")]));
+		expect(refusalOf(result).layer).toBe("unsure");
+	});
+
+	test("an allow quoting a whole short answer counts", async () => {
+		scriptReviewer(reviewerReply("allow", "Yes"));
+		const branch = [user("u1", "update fork main"), askAnswer("a1", "Fetch upstream first?", "Yes")];
+		expect(resultText(await fire("tool_call", makeEvent("git fetch upstream"), uiCtx(nextSession(), branch)))).toBe("ALLOWED");
+	});
+
 	test("an allow quoting the agent's own ask question blocks", async () => {
 		scriptReviewer(reviewerReply("allow", "Force-push fork main?"));
 		const branch = [user("u1", "update fork main"), askAnswer("a1", "Force-push fork main?", "Yes")];

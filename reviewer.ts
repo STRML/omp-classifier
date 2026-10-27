@@ -176,14 +176,23 @@ export function parseReviewerReply(text: string): ReviewerDecision {
 
 const squashed = (value: string): string => value.replace(/\s+/gu, " ").trim().toLowerCase();
 
-/** Whether `quote` is, whitespace and case aside, a substring of one of the user's own entries. */
+/** A quote that is only part of an entry must carry at least this many words, so "it" or "ok" lifted out of a long message cites nothing. */
+const QUOTE_MIN_WORDS = 3;
+
+/**
+ * Whether `quote` is, whitespace and case aside, one of the user's own
+ * entries whole, or a span of one at least QUOTE_MIN_WORDS words long. This
+ * proves the cited consent exists; whether it covers the command is the
+ * reviewer's judgment, which the rest of the gate still checks.
+ */
 export function quotesUserWords(quote: string, transcript: readonly ReviewerTranscriptEntry[]): boolean {
 	const needle = squashed(quote);
 	if (needle.length < 2) return false;
+	const longEnough = needle.split(" ").length >= QUOTE_MIN_WORDS;
 	return transcript.some(entry => {
-		if (entry.from === "user") return squashed(redactSecrets(entry.text)).includes(needle);
-		if (entry.from === "ask") return squashed(redactSecrets(entry.userAnswer)).includes(needle);
-		return false;
+		if (entry.from === "agent-tool-call") return false;
+		const haystack = squashed(redactSecrets(entry.from === "user" ? entry.text : entry.userAnswer));
+		return haystack === needle || (longEnough && haystack.includes(needle));
 	});
 }
 
