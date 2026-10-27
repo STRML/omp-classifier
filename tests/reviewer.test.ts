@@ -242,6 +242,7 @@ describe("what never reaches the reviewer", () => {
 		["a script that pipes into an interpreter", () => script("wrap.sh", "#!/bin/bash\ncat payload.txt | bash\n"), "./wrap.sh"],
 		["a script that runs an interpreter through a wrapper", () => script("wrap.sh", "#!/bin/bash\ntimeout 30 bash payload\n"), "./wrap.sh"],
 		["a script that changes PATH", () => script("wrap.sh", "#!/bin/bash\nexport PATH=/tmp/evil:$PATH\ngit status\n"), "./wrap.sh"],
+		["a script that assigns PATH through a parameter expansion", () => script("wrap.sh", "#!/bin/bash\n: \"${PATH:=/tmp/evil}\"\ngit status\n"), "./wrap.sh"],
 		["a script that reads PATH from input", () => script("wrap.sh", "#!/bin/bash\nread -r PATH < /tmp/p\ngit status\n"), "./wrap.sh"],
 		["a script that repoints a command with hash -p", () => script("wrap.sh", "#!/bin/bash\nhash -p /tmp/evil git\ngit status\n"), "./wrap.sh"],
 		["a script that runs inline interpreter code", () => script("wrap.sh", "#!/bin/bash\npython3 -c 'import os'\n"), "./wrap.sh"],

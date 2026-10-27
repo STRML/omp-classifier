@@ -198,7 +198,7 @@ function bodyHandOff(body: string): string | undefined {
 	// PATH written any way at all (`read PATH`, `printf -v PATH`, `PATH+=`):
 	// later bare names would resolve where this check did not look. Reading
 	// `$PATH` or `${PATH}` is fine.
-	if (/(?<![$\w{])(?:PATH|BASH_ENV|ENV|CDPATH)\b/u.test(code)) return "changes PATH or what a shell loads";
+	if (/(?<![$\w{])(?:PATH|BASH_ENV|ENV|CDPATH)\b|\$\{(?:PATH|BASH_ENV|ENV|CDPATH):?=/u.test(code)) return "changes PATH or what a shell loads";
 	const shebang = body.startsWith("#!") ? body.split("\n", 1)[0] : "";
 	if (shebang !== "" && !/\b(?:ba|z|da|k)?sh\b/u.test(shebang)) return undefined;
 	const parsed = parseShell(body);
@@ -216,7 +216,6 @@ function bodyHandOff(body: string): string | undefined {
 		// A wrapper starts another program (`timeout 30 bash x`), and `hash -p`,
 		// `alias` or `enable` repoint a command name without touching PATH.
 		if (names.some(n => WRAPPERS.has(n) || REPOINT_COMMANDS.has(n))) return `${name} runs or repoints another program`;
-		if (changesPath(command)) return "changes PATH";
 		if (names.some(n => PROGRAM_FILE_FLAG_TOOLS.has(n)) && command.words.some(word => /^(?:-f|--from-file|--file)(?:=|$)/u.test(word.value))) return `${name} runs a program file`;
 		if (names.some(n => FILE_RUNNERS.has(n) && runnerRunsFile(n, command.words))) return `${name} runs a program file`;
 	}
