@@ -48,7 +48,21 @@ The gate never opens a dialog (https://github.com/STRML/omp-classifier/issues/18
 
 ### How you unblock a command
 
-Say so in chat. On the retry, Jev reads your words as user evidence (`evidenceUserMessages`), and a SAFE verdict runs.
+Say so in chat, or click an answer when the agent asks. On the retry, Jev reads your words as user evidence (`evidenceUserMessages`), and a SAFE verdict runs.
+
+When Jev is unsure and `reviewerModel` is set, a second stage reviews the command before it blocks. That second stage is a reasoning model reading your messages, the agent's tool calls and the scripts the command runs. It is modelled on Claude Code's auto-mode classifier:
+
+```
+command ─▶ Jev ─▶ SAFE ─────────────────────────────────▶ runs
+             └──▶ UNSURE ─▶ eligible? ─▶ reviewer ─▶ allow ─▶ runs (not cached)
+                               │                 └─▶ block ─▶ blocked, remembered
+                               └─ no ──────────────────────▶ blocked
+```
+
+- **What it reads:** your messages and ask answers, the agent's tool calls, and the body of every script the command runs, read by the gate. It never sees tool results, skill text or the agent's prose.
+- **When it can allow:** only when Jev's verdict is UNSURE (never UNSAFE) and no secrets, exfiltration, privilege or injection hazard is raised. Every script must be readable: a script that is binary, over 64 KB, behind a secret path, or that hands off to another local file means no review.
+- **What an allow needs:** a verbatim quote of your own words asking for the work, which code checks. An allow still passes through the forced-block overlay and any refusal already recorded, and it is never cached.
+- **Blocks and failures:** a block is remembered until you write again. A failed review (timeout, malformed reply, a script that changed after it was read) leaves the block in place.
 
 A refusal the session already recorded is stricter. It stays for the rest of the session, and a call gets past it only when all of these hold:
 
@@ -119,6 +133,8 @@ Plugin settings live in `omp-classifier.json` at the config root the host resolv
 | `evidenceUserMessages` | `3` | How many recent user messages (0-6) ride into the state as user evidence. `0` sends no evidence. Values outside the bounds fall back to the default. |
 | `trustPolicy` | `null` | Set only by `/classifier trust-policy`. A current pin lets the judge see explicitly trusted user-level instructions as bounded action-class policy; changed files disable it until the pinned bytes are restored or repinned. |
 | `shadowV3` | `true` | Runs the jev-v3 judgment in shadow beside the live one and logs it on the same decision line as `v3`. It decides nothing, and it costs two more Jev requests per fresh classification. `bun eval/live-report.ts` shows where the two disagree. |
+| `reviewerModel` | unset | The stage 2 reviewer's model as `provider/id` from the OMP model registry, for example `anthropic/claude-sonnet-5-5`. Read from this file only, so a project's settings cannot choose it. Unset turns stage 2 off. |
+| `reviewerTimeoutMs` | `15000` | The reviewer's deadline, cut further to fit the host's 30-second handler budget. A timeout keeps the block. |
 | `logJudgedStates` | `false` | Writes each fresh classification's judged state, every string redacted, to `judged-states.jsonl` beside `decisions.jsonl`, keyed by the verdict line's `decisionId`, so a probe can replay it. The file holds user messages and tool output (up to 6 x 700 chars), redacted by shape only, so it is a second copy of the transcript; it has no rotation, is mode 0600, and is keyed by the tool call's lead id (which may have no verdict line if classify threw). Changes no verdict and flushes no cache. |
 
 Changing any key flushes the verdict cache. To silence the judge quickly, `/classifier enabled false` takes effect on the very next command. `omp plugin disable` needs a session restart, since interceptors bind when a session begins.
@@ -215,6 +231,8 @@ The state can carry an `evidence` object whose fields have different authors, an
 ## Privacy
 
 The command text (up to 8,000 characters), its resolved working directory, recent user messages when `evidenceUserMessages` is non-zero, requesting-agent operator context, and any current explicitly pinned user-level policy snapshot go to TypeSafe's System One API (`api.typesafe.ai`) by default. The fixed policy paths are re-read on each classification only to verify the pin; changed bytes are never interpreted as policy. `/classifier trust-policy` reports paths, hashes, and byte lengths; `/classifier status` shows only the pin hash. An `endpoint` `judgeBackend` sends the same judge state to that endpoint instead: it is the operator's own server, with its own logging and retention. TypeSafe's logging and retention policies apply to the default path. Command text is sent as written and may contain private paths, proprietary snippets, inline env assignments, or secrets; secret-shaped values in evidence and policy contents are redacted before they leave the machine. Caller-supplied `env` values are never sent; that path blocks instead.
+
+With `reviewerModel` set, a command Jev is unsure of also goes to that model's provider. It sends the command, the bodies of the scripts it runs (up to 64 KB each), your recent messages and ask answers, the agent's recent tool calls, and the pinned policy snapshot. Secret-shaped values are redacted, and a file on the secret-path list is never read.
 
 ## Development
 
