@@ -109,6 +109,8 @@ import { buildAuthorizationState, DEFAULT_AUTHORIZATION_POLICY, deriveAuthorizat
 import { deriveDecisionOrder, type DecisionBranch } from "./decision-order";
 import { literalMatch } from "./literal-match";
 import { redactSecrets, redactValue } from "./redact";
+import { reviewerModelCall, runReviewer, type ReviewerOutcome, type ReviewerTranscriptEntry } from "./reviewer";
+import { forgetReviewerBlocks, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged } from "./stage-two";
 import { formatTrustPolicyPin, normalizeTrustPolicyPin, pinUserInstructionFiles, resolvePinnedUserPolicy, type TrustPolicyPin, type TrustedPolicyDocument } from "./trust-policy";
 import {
 	buildJevState,
@@ -628,6 +630,12 @@ interface ClassifierConfig {
 	 *  verdict, so like shadowV3 it stays out of
 	 *  classifierConfigSignature: turning it on must not flush caches. */
 	logJudgedStates: boolean;
+	/** The stage 2 reviewer's model, `provider/id` (docs/plans/2026-10-27-stage-2-reviewer.md).
+	 *  Read from this user-level file only, never from a project's settings, so
+	 *  a repository cannot choose who reviews its commands. Unset: no stage 2. */
+	reviewerModel: string | null;
+	/** The reviewer's own deadline. It is cut further to fit the host's 30 s handler budget. */
+	reviewerTimeoutMs: number;
 }
 
 /** Bounds for the `maxCommandLength` config key and the `/classifier` setter. */
@@ -677,6 +685,8 @@ const CLASSIFIER_CONFIG_DEFAULTS: Omit<ClassifierConfig, "typesafeModel"> = {
 	trustPolicy: null,
 	shadowV3: true,
 	logJudgedStates: false,
+	reviewerModel: null,
+	reviewerTimeoutMs: 15_000,
 };
 
 /** The boolean keys `/classifier <key> true|false` sets, with what each value
@@ -748,6 +758,10 @@ function normalizeClassifierConfig(raw: Record<string, unknown>): ClassifierConf
 	config.trustPolicy = normalizeTrustPolicyPin(raw.trustPolicy);
 	if (typeof raw.shadowV3 === "boolean") config.shadowV3 = raw.shadowV3;
 	if (typeof raw.logJudgedStates === "boolean") config.logJudgedStates = raw.logJudgedStates;
+	if (typeof raw.reviewerModel === "string" && /^[^/\s]+\/\S+$/u.test(raw.reviewerModel.trim())) config.reviewerModel = raw.reviewerModel.trim();
+	if (typeof raw.reviewerTimeoutMs === "number" && Number.isFinite(raw.reviewerTimeoutMs) && raw.reviewerTimeoutMs > 0) {
+		config.reviewerTimeoutMs = raw.reviewerTimeoutMs;
+	}
 	// `judgeBackend` follows the same rule as every other key: a shape the
 	// loader does not understand (a string, an unknown kind, an endpoint with no
 	// model or a non-URL baseUrl) keeps the default rather than half-applying an
@@ -878,6 +892,13 @@ function statusReportPath(): string {
 	return path.join(classifierDataDir(), "status.json");
 }
 
+/** The stage 2 reviewer on an audit line: what it decided, why it failed, or
+ *  which eligibility check kept it from running. */
+export type ReviewerAudit =
+	| { decision: "allow" | "block"; rule: string; reason: string; model: string; ms: number }
+	| { failed: string; model?: string; ms: number }
+	| { skipped: string };
+
 /** One decisions.jsonl line; the field order is the log contract (issue #33).
  *  `verdict` is null whenever no model verdict existed (static rules, caps,
  *  critical patterns); `ms` is wall-clock from tool_call entry for a lead
@@ -893,6 +914,8 @@ function statusReportPath(): string {
  *  https://github.com/STRML/omp-classifier/issues/184 also hold `dialog`,
  *  `headless`, `granted` and `late-verdict` lines and an `approval` field. */
 export interface DecisionRecord {
+	/** Stage 2 (docs/plans/2026-10-27-stage-2-reviewer.md), when the verdict reached it. */
+	reviewer?: ReviewerAudit;
 	ts: string;
 	/** Unique line/action id for joining verdict and interaction entries. */
 	decisionId?: string;
@@ -1262,23 +1285,81 @@ const nonEmptyString = (value: unknown): string | undefined => (typeof value ===
  *  evidence. A pick the host made because the question timed out is nobody's
  *  words, so it yields nothing. */
 function askAnswerLine(answer: Record<string, unknown>): string | undefined {
-	if (answer.timedOut === true) return undefined;
+	// A cancelled ask (Esc after toggling options) and an arrow-key navigation
+	// carry selections the user never confirmed.
+	if (answer.timedOut === true || answer.cancelled === true || answer.navigation !== undefined) return undefined;
 	const picked = Array.isArray(answer.selectedOptions) ? answer.selectedOptions.filter(option => nonEmptyString(option) !== undefined) : [];
 	const reply = [picked.join(", "), nonEmptyString(answer.customInput), nonEmptyString(answer.note)].filter(part => part !== undefined && part !== "");
 	return reply.length > 0 ? reply.join("\n") : undefined;
 }
 
-/** The user's words in an ask tool result's details, one line per answered
- *  question; undefined when the user answered nothing by hand. The host
- *  records a single question flat and several under `results`. */
-export function askAnswerText(details: unknown): string | undefined {
-	if (typeof details !== "object" || details === null) return undefined;
+/** Each question the user answered by hand in an ask tool result's details,
+ *  with the agent's question beside the user's answer. The host records a
+ *  single question flat and several under `results`. */
+export function askAnswerPairs(details: unknown): Array<{ question: string; answer: string }> {
+	if (typeof details !== "object" || details === null) return [];
 	const results = (details as { results?: unknown }).results;
 	const answers = Array.isArray(results) ? results : [details];
-	const lines = answers
-		.map(answer => (typeof answer === "object" && answer !== null ? askAnswerLine(answer as Record<string, unknown>) : undefined))
-		.filter(line => line !== undefined);
+	const pairs: Array<{ question: string; answer: string }> = [];
+	for (const answer of answers) {
+		if (typeof answer !== "object" || answer === null) continue;
+		const record = answer as Record<string, unknown>;
+		const line = askAnswerLine(record);
+		if (line !== undefined) pairs.push({ question: nonEmptyString(record.question) ?? "", answer: line });
+	}
+	return pairs;
+}
+
+/** The user's words in an ask tool result's details, one line per answered
+ *  question; undefined when the user answered nothing by hand. */
+export function askAnswerText(details: unknown): string | undefined {
+	const lines = askAnswerPairs(details).map(pair => pair.answer);
 	return lines.length > 0 ? lines.join("\n") : undefined;
+}
+
+/** How much of the transcript the reviewer reads: the newest user turns and tool calls. */
+const REVIEWER_USER_ENTRIES = 12;
+const REVIEWER_TOOL_CALLS = 15;
+
+/**
+ * The stage 2 reviewer's transcript, oldest first, since the latest `/clear`:
+ * the user's messages, each hand-given ask answer beside the agent's question,
+ * and the agent's tool calls. Tool results and assistant prose never enter,
+ * as in Claude Code's classifier: an agent or a hostile file controls them.
+ * Calls the gate refused, and the ask calls themselves (their questions ride
+ * with the answers), are left out.
+ */
+export function reviewerTranscript(branch: ReadonlyArray<EvidenceBranchEntry>, refusedCallIds: ReadonlySet<string> = new Set()): ReviewerTranscriptEntry[] {
+	const entries: Array<{ entry: ReviewerTranscriptEntry; user: boolean }> = [];
+	for (const item of branch.slice(branchStartAfterLatestResetBoundary(branch))) {
+		if (item.type !== "message") continue;
+		const message = item.message as (Record<string, unknown> & { role?: string }) | undefined;
+		if (message?.role === "user" && message.attribution === "user") {
+			const text = textOf(message.content);
+			if (text.trim() !== "") entries.push({ entry: { from: "user", text }, user: true });
+			continue;
+		}
+		if (message?.role === "toolResult" && message.toolName === "ask") {
+			for (const pair of askAnswerPairs(message.details)) entries.push({ entry: { from: "ask", agentQuestion: pair.question, userAnswer: pair.answer }, user: true });
+			continue;
+		}
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+		for (const block of message.content as Array<Record<string, unknown> | null>) {
+			if (block?.type !== "toolCall" || block.name === "ask") continue;
+			if (typeof block.id === "string" && refusedCallIds.has(block.id)) continue;
+			const name = typeof block.name === "string" ? block.name : "tool";
+			let args: string;
+			try {
+				args = JSON.stringify(redactValue(block.arguments ?? {})) ?? "{}";
+			} catch {
+				args = "[unserializable tool arguments]";
+			}
+			entries.push({ entry: { from: "agent-tool-call", text: `${name} ${args}` }, user: false });
+		}
+	}
+	const userKept = new Set(entries.filter(item => item.user).slice(-REVIEWER_USER_ENTRIES));
+	const callsKept = new Set(entries.filter(item => !item.user).slice(-REVIEWER_TOOL_CALLS));
+	return entries.filter(item => userKept.has(item) || callsKept.has(item)).map(item => item.entry);
 }
 
 /** The branch with each hand-given ask answer recast as the user message it
@@ -4763,6 +4844,92 @@ function priorRefusalFor(ctx: ExtensionContext, command: string, cwd = ""): Refu
 	}
 }
 
+/** The host bounds a tool_call handler at 30 s and fails it closed; stage 2 keeps this much clear of that. */
+const HANDLER_BUDGET_MS = 30_000;
+const HANDLER_MARGIN_MS = 2_000;
+/**
+ * The hazards no reviewer may clear. The secret and exfiltration protections
+ * live only in these answers (floor.ts is shadow), so an UNSURE that raises
+ * one of them stays a block whatever the reviewer would say.
+ */
+const REVIEWER_HARD_HAZARDS = ["exposes_secrets", "sends_local_data_outbound", "escalates_privilege", "state_contains_injection"] as const;
+
+export interface StageTwoInput {
+	ctx: ExtensionContext;
+	judgement: Judgement;
+	/** The command as the agent wrote it, with no script bodies spliced in. */
+	command: string;
+	/** The directory a leading `cd` points at, for the audit and the block key. */
+	cwd: string;
+	/** The directory the command starts in, before any `cd` it runs. */
+	startCwd: string;
+	config: ClassifierConfig;
+	/** When the gate started on this call: the deadline is measured from it. */
+	started: number;
+	trustedPolicy: readonly TrustedPolicyDocument[];
+}
+
+/**
+ * Stage 2 (docs/plans/2026-10-27-stage-2-reviewer.md): send a Jev UNSURE to
+ * the reviewer when every check below holds, and return the verdict to act
+ * on. Only an allow changes it, and an allow is never cached. Every other
+ * outcome keeps the stage-1 judgement, so a reviewer that is missing, slow,
+ * wrong-shaped or quoting words the user never wrote leaves the block in place.
+ */
+async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; audit?: ReviewerAudit }> {
+	const { ctx, judgement, command, cwd, config } = input;
+	const model = config.reviewerModel;
+	if (judgement.verdict !== "UNSURE" || model === null) return { judgement };
+	const skip = (why: string) => ({ judgement, audit: { skipped: why } });
+	if (!ctx.hasUI) return skip("headless session");
+	if (judgement.persistRefusal === false) return skip("one-hot answers");
+	if (judgement.jev === undefined) return skip("no stage-1 answers");
+	const hazardReview = jevPolicyFor(config).hazardReview;
+	const hard = REVIEWER_HARD_HAZARDS.find(hazard => (judgement.jev?.hazards[hazard] ?? 0) >= hazardReview);
+	if (hard !== undefined) return skip(`hazard ${hard}`);
+	const transcript = reviewerTranscript(ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>, refusedToolCallIds);
+	const userWords = transcript.flatMap(entry => (entry.from === "user" ? [entry.text] : entry.from === "ask" ? [entry.userAnswer] : []));
+	if (userWords.length === 0) return skip("no user words");
+	const programs = scriptsForReview(command, input.startCwd);
+	if (programs.kind === "refuse") return skip(`unread script: ${programs.why}`);
+	const scripts = programs.scripts;
+	const sessionId = ctx.sessionManager.getSessionId();
+	// The coarse action target, not the refusal key: for git the refusal key is
+	// the whole text, and a block must survive a reworded retry. Siblings such
+	// as `x.sh start` and `x.sh finish` share it, which errs toward blocking.
+	const blockKey = reviewerBlockKey(normalizeActionTarget(command), cwd, model, userWords);
+	if (reviewerBlocked(sessionId, blockKey)) {
+		return { judgement: { ...judgement, reason: `${judgement.reason}; the stage 2 reviewer already blocked this under the same user words` }, audit: { skipped: "blocked before under the same user words" } };
+	}
+	const call = reviewerModelCall(ctx.modelRegistry, model, sessionId);
+	if (call === undefined) return skip(`model ${model} is not in the registry`);
+	const timeoutMs = Math.min(config.reviewerTimeoutMs, HANDLER_BUDGET_MS - HANDLER_MARGIN_MS - (Date.now() - input.started));
+	const outcome: ReviewerOutcome = await runReviewer(
+		{
+			command,
+			workingDirectory: cwd,
+			transcript,
+			scriptBodies: scripts.map(({ path: spelled, body }) => ({ path: spelled, body })),
+			stage1: { verdict: judgement.verdict, reason: judgement.reason },
+			...(input.trustedPolicy.length > 0 ? { trustedPolicy: input.trustedPolicy } : {}),
+		},
+		call,
+		timeoutMs,
+	);
+	if (outcome.kind === "failed") return { judgement, audit: { failed: outcome.why, ...(outcome.model === undefined ? {} : { model: outcome.model }), ms: outcome.ms } };
+	const audit: ReviewerAudit = { ...outcome.decision, model: outcome.model, ms: outcome.ms };
+	delete (audit as { userQuote?: string }).userQuote;
+	if (outcome.decision.decision === "block") {
+		rememberReviewerBlock(sessionId, blockKey);
+		return { judgement: { ...judgement, reason: `${judgement.reason}; the stage 2 reviewer blocked it` }, audit };
+	}
+	if (!scriptsUnchanged(scripts)) return { judgement, audit: { failed: "a script changed after it was read", model: outcome.model, ms: outcome.ms } };
+	return {
+		judgement: { ...judgement, verdict: "SAFE", reason: `the stage 2 reviewer allowed what stage 1 left unsure (${judgement.reason})`, reasonCode: "reviewer:allow", noCache: true },
+		audit,
+	};
+}
+
 /**
  * Whether this one call may run past a prior refusal
  * (https://github.com/STRML/omp-classifier/issues/184). All of these must hold:
@@ -6449,7 +6616,7 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			let classifyError = "";
-			const judgement = cached ? withoutShadow(cached) : (await classify(ctx, judgedCommand, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot, "shell", startCwd, trustedPolicySnapshot.documents, leadDecisionId).catch((err: unknown) => {
+			const stage1 = cached ? withoutShadow(cached) : (await classify(ctx, judgedCommand, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot, "shell", startCwd, trustedPolicySnapshot.documents, leadDecisionId).catch((err: unknown) => {
 				// Provider errors (quota exhausted, auth, HTTP failures) previously
 				// vanished into an opaque "unavailable". Keep the message so the
 				// refusal says WHY.
@@ -6457,7 +6624,7 @@ export default function (pi: ExtensionAPI) {
 				pi.logger.warn(`classifier: classify failed: ${classifyError}`);
 				return undefined;
 			}));
-			if (!judgement) {
+			if (!stage1) {
 				// Nothing was judged: block rather than silently run.
 				return refuse(ctx, target, "unclassified", classifyError ? `classifier unavailable: ${truncated(classifyError, 160)}` : "classifier unavailable", "bash", "", auditFields());
 			}
@@ -6466,7 +6633,13 @@ export default function (pi: ExtensionAPI) {
 			// real verdict caches (including UNSURE, whose cached entry keeps a
 			// nondeterministic judge from flapping verdicts); UNAVAILABLE sets
 			// noCache for the same reason.
-			if (cacheable && !cached && judgement.verdict !== "UNAVAILABLE" && !judgement.noCache) remember(scoped, cacheKey, judgement);
+			if (cacheable && !cached && stage1.verdict !== "UNAVAILABLE" && !stage1.noCache) remember(scoped, cacheKey, stage1);
+			// Stage 2 runs after the cache, on a fresh or a cached UNSURE alike, and
+			// what it allows is never cached: the next call reviews again. Dry run
+			// reports the stage-1 decision and pays for no review.
+			const reviewed = dryRun ? { judgement: stage1 } : await stageTwo({ ctx, judgement: stage1, command, cwd, startCwd, config, started, trustedPolicy: trustedPolicySnapshot.documents });
+			const judgement = reviewed.judgement;
+			const reviewerAudit = reviewed.audit === undefined ? {} : { reviewer: reviewed.audit };
 			// Every resolved decision is logged so prompt/auto-run behavior is
 			// observable from ~/.omp/logs. Verdict,
 			// the cache/reason provenance, and a truncated command; the full
@@ -6517,7 +6690,7 @@ export default function (pi: ExtensionAPI) {
 				if (replay.decision === "allow") {
 					// A lift runs this call only: the record stays, and the next
 					// call meets the same check.
-					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", ...lead, why: prior === undefined ? judgement.reason : `${judgement.reason} (runs past the refusal of "${prior.loggableTarget}": the user named it since)`, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
+					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", ...lead, why: prior === undefined ? judgement.reason : `${judgement.reason} (runs past the refusal of "${prior.loggableTarget}": the user named it since)`, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...reviewerAudit });
 					return;
 				}
 				// A SAFE on a target this session already refused is not a clean
@@ -6531,10 +6704,11 @@ export default function (pi: ExtensionAPI) {
 						? `classifier-safe but flags: ${flags.join(", ")}`
 						: `classifier-safe despite prior ${prior?.source ?? ""} refusal of "${priorTarget}"`;
 				const agentWhy = withFlagFootnotes(why, flags);
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", ...lead, why, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement) });
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", ...lead, why, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...reviewerAudit });
 				return refuse(ctx, target, flags.length > 0 ? "flagged" : "prior-refusal", agentWhy, "bash", "follows verdict", {
 					...auditFields(),
 					...judgementAudit(judgement),
+					...reviewerAudit,
 					verdict: "SAFE",
 					...follows,
 				});
@@ -6558,6 +6732,7 @@ export default function (pi: ExtensionAPI) {
 				...(judgement.jev ? { jev: judgement.jev } : {}),
 				...auditFields(),
 				...judgementAudit(judgement),
+				...reviewerAudit,
 			});
 			// A refusal record (issue #30) needs a verdict that judged the
 			// content, and with Jev that means UNSAFE outright: UNSURE is
@@ -6569,6 +6744,7 @@ export default function (pi: ExtensionAPI) {
 			return refuse(ctx, target, cause, judgement.reason, "bash", "follows verdict", {
 				...auditFields(),
 				...judgementAudit(judgement),
+				...reviewerAudit,
 				verdict,
 				...follows,
 			});
@@ -6606,6 +6782,7 @@ export default function (pi: ExtensionAPI) {
 		// starts unpaused.
 		sessionOff.delete(sessionId);
 		floorTaint.delete(sessionId);
+		forgetReviewerBlocks(sessionId);
 	};
 	pi.on("session_start", dropCurrent);
 	pi.on("session_before_switch", dropCurrent);

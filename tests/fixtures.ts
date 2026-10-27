@@ -27,6 +27,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { JudgeDeps } from "@oh-my-pi/pi-coding-agent/judgment";
 import * as hostJudgment from "@oh-my-pi/pi-coding-agent/judgment";
+import * as hostAi from "@oh-my-pi/pi-ai";
 import { JEV_V3_POLICY_VERSION, jevQuestions } from "../jev";
 
 export type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "UNAVAILABLE";
@@ -523,6 +524,48 @@ mock.module("@oh-my-pi/pi-coding-agent/judgment", () => ({
 	},
 }));
 
+// ---------------------------------------------------------------------------
+// The stage 2 reviewer boundary.
+//
+// The reviewer reaches its model through pi-ai's `completeSimple`. The mock
+// spreads the real module, snapshotted eagerly for the same reason as the
+// judgment mock above, and answers from a script. Every call is captured, so a
+// test can assert that a path never reached the reviewer. The fake model is
+// `test/reviewer` in the ctx registry below; a config naming it turns stage 2 on.
+// ---------------------------------------------------------------------------
+
+export const REVIEWER_TEST_MODEL = "test/reviewer";
+export const reviewerCalls: Array<{ system: string; input: Record<string, unknown> }> = [];
+type ReviewerReply = string | Error | ((signal: AbortSignal | undefined) => Promise<string>);
+let reviewerScript: ReviewerReply[] = [];
+
+/** Queue the reviewer's replies, in call order. An unscripted call blocks. */
+export function scriptReviewer(...replies: ReviewerReply[]): void {
+	reviewerScript = [...replies];
+}
+
+export function resetReviewer(): void {
+	reviewerScript = [];
+	reviewerCalls.length = 0;
+}
+
+/** A well-formed reviewer reply. */
+export function reviewerReply(decision: "allow" | "block", userQuote = "", rule = decision === "allow" ? "none" : "scope"): string {
+	return JSON.stringify({ decision, rule, reason: `test ${decision}`, user_quote: userQuote });
+}
+
+const realAiExports = { ...hostAi };
+mock.module("@oh-my-pi/pi-ai", () => ({
+	...realAiExports,
+	completeSimple: async (_model: unknown, context: { systemPrompt?: string[]; messages: Array<{ content: unknown }> }, options?: { signal?: AbortSignal }) => {
+		reviewerCalls.push({ system: context.systemPrompt?.[0] ?? "", input: JSON.parse(String(context.messages[0]?.content)) as Record<string, unknown> });
+		const next = reviewerScript.shift() ?? reviewerReply("block");
+		if (next instanceof Error) throw next;
+		const text = typeof next === "function" ? await next(options?.signal) : next;
+		return { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" };
+	},
+}));
+
 /** The firewall's transport: the wire fake the suite has always had, kept so
  *  that nothing in a test run can open a socket. It answers the same scripted
  *  judgement as the judge seam, so a path that resolved its judge some other
@@ -769,7 +812,9 @@ export function makeCtx(options: CtxOptions = {}): ExtensionContext {
 				resolver: () => async (): Promise<string | undefined> => (jevApiKeyPresent ? JEV_TEST_KEY : undefined),
 			},
 			getAvailable: () => [],
-			getApiKey: async (): Promise<string | undefined> => undefined,
+			// The stage 2 reviewer's fake model; nothing else resolves.
+			find: (provider: string, id: string) => (`${provider}/${id}` === REVIEWER_TEST_MODEL ? { provider, id, api: "test" } : undefined),
+			getApiKey: async (model?: { provider?: string }): Promise<string | undefined> => (model?.provider === "test" ? "reviewer-key" : undefined),
 			resolver: () => async (): Promise<string | undefined> => undefined,
 		},
 	} as unknown as ExtensionContext;
