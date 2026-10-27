@@ -2,6 +2,19 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-10-27
+
+### A clicked ask answer is the user's words
+
+No battery change: `jevQuestionsHash` stays `a0393345ac3364d4` and the policy version stays `jev-v2.18`.
+
+- An answer the user picks or types in the host's `ask` tool now counts as a message they typed. The selected labels, typed input and note reach Jev in `evidence.userMessages`, and they can lift a model refusal the same way a typed reply can. The question is the agent's own text, so it stays in non-authorizing tool evidence: a "Cancel" on a question that names the target lifts nothing. Before, an ask answer was a `toolResult`, so it reached Jev only as non-authorizing tool evidence. An agent that followed the refusal's advice and asked through `ask` could never get an approval through. OMP session `01a17ea2` hit this with three approvals in a row, and none of them counted.
+- The host picks an answer itself when a question times out (`timedOut` in the ask details). That pick does not count. In a multi-question ask, each question the user answered counts on its own, and the timed-out ones are dropped. Headless sessions still have no user channel.
+- Tool evidence leaves out the gate's own refusals and the calls they refused. The gate records the call ids it refuses and drops those, so a command that prints refusal-shaped text cannot hide itself. In that session every retry fed the previous refusal back to Jev, and p(safe) for the same `update-fork.sh start` fell from 0.54 to 0.55, then 0.53, then UNSAFE.
+- Tool evidence keeps the newest activity under its size cap. Before, the merged context was cut from the end at 3,000 characters, so the newest entries were the first to go.
+- The newest skill the agent read through `skill://` stays in tool evidence, trimmed to its head, after the six-entry window has moved past it.
+- Re-judged on jev-1.14.0 with the evidence this change builds, the session's first three `start` calls score p(safe) 0.59, 0.64 and 0.66, against 0.54, 0.55 and 0.53 live. All three are still below the 0.80 floor. A typed approval that names the script scores about the same as a clicked one (0.35 to 0.40). The remaining gap is in how the battery credits a script the user named, and the channel the approval came through no longer matters.
+
 ## 2026-10-24
 
 ### The gate never prompts
