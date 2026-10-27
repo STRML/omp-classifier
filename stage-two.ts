@@ -50,6 +50,8 @@ export type CommandScripts = { kind: "scripts"; scripts: ReadScript[] } | { kind
 const WRAPPERS = new Set(["env", "time", "nohup", "exec", "command", "builtin", "nice", "caffeinate", "xargs", "timeout", "gtimeout", "watch", "parallel", "sudo", "doas", "su", "script", "stdbuf", "chroot", "eval", "source", ".", "find", "fd", "entr"]);
 /** Interpreters: their operand is a program file or inline code. */
 const INTERPRETERS = /^(?:bash|sh|zsh|dash|ksh|fish|csh|tcsh|python[\d.]*|pypy[\d.]*|node|deno|ruby|perl|php|tclsh[\d.]*|wish|lua|osascript)$/u;
+/** Builtins that point a command name at another program without changing PATH. */
+const REPOINT_COMMANDS = new Set(["hash", "alias", "unalias", "enable"]);
 /** Text tools whose arguments are patterns (`awk -F/`, `jq '.a/2'`); they run a program file only through `-f`. */
 const PROGRAM_FILE_FLAG_TOOLS = new Set(["awk", "gawk", "mawk", "nawk", "jq", "sed", "gsed"]);
 /** Runners whose operand may be a program file rather than a script name. */
@@ -193,6 +195,10 @@ function bodyHandOff(body: string): string | undefined {
 		.filter(line => !/^\s*#/u.test(line))
 		.join("\n");
 	if (LOCAL_HANDOFF.some(pattern => pattern.test(code))) return "runs another local file";
+	// PATH written any way at all (`read PATH`, `printf -v PATH`, `PATH+=`):
+	// later bare names would resolve where this check did not look. Reading
+	// `$PATH` or `${PATH}` is fine.
+	if (/(?<![$\w{])(?:PATH|BASH_ENV|ENV|CDPATH)\b/u.test(code)) return "changes PATH or what a shell loads";
 	const shebang = body.startsWith("#!") ? body.split("\n", 1)[0] : "";
 	if (shebang !== "" && !/\b(?:ba|z|da|k)?sh\b/u.test(shebang)) return undefined;
 	const parsed = parseShell(body);
@@ -203,22 +209,16 @@ function bodyHandOff(body: string): string | undefined {
 		const name = verbName(command);
 		const names = programNames(command);
 		if (isPathWord(program) && !isSystemProgram(program)) return `runs ${program}`;
-		// Sourcing or interpreting anything runs code: a file named by path or
-		// bare name, or whatever stdin carries (`bash < x.sh`, a here-document).
 		// An interpreter or `source` in a body runs code this read did not cover,
 		// whatever carries it: a file, a bare name, stdin, a pipe, a here-document
 		// or `-c` text. Each of those was a bypass in turn, so none is allowed.
 		if (names.some(n => n === "source" || n === "." || INTERPRETERS.test(n))) return `${name} runs code the gate did not read`;
-		// A wrapper starts another program (`timeout 30 bash x`), and a PATH change
-		// makes every later bare name resolve somewhere this check did not look.
-		if (names.some(n => WRAPPERS.has(n))) return `${name} runs another program`;
+		// A wrapper starts another program (`timeout 30 bash x`), and `hash -p`,
+		// `alias` or `enable` repoint a command name without touching PATH.
+		if (names.some(n => WRAPPERS.has(n) || REPOINT_COMMANDS.has(n))) return `${name} runs or repoints another program`;
 		if (changesPath(command)) return "changes PATH";
 		if (names.some(n => PROGRAM_FILE_FLAG_TOOLS.has(n)) && command.words.some(word => /^(?:-f|--from-file|--file)(?:=|$)/u.test(word.value))) return `${name} runs a program file`;
 		if (names.some(n => FILE_RUNNERS.has(n) && runnerRunsFile(n, command.words))) return `${name} runs a program file`;
-		const handsPaths = names.some(n => WRAPPERS.has(n) || INTERPRETERS.test(n));
-		if (handsPaths && command.words.slice(1).some(word => isPathWord(word.value) && !isSystemProgram(word.value))) {
-			return `hands a local path to ${name}`;
-		}
 	}
 	return undefined;
 }
