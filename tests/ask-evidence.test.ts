@@ -85,11 +85,11 @@ afterEach(() => {
 });
 
 describe("an ask answer is the user's words", () => {
-	test("a clicked option reaches the judge as user evidence, with the question it answers", async () => {
+	test("a clicked option reaches the judge as user evidence; the agent's question does not", async () => {
 		const branch = [userMessage("u1", "update fork main"), askResult("a1", clicked("Run update-fork.sh start on STRML/oh-my-pi fork main?", "Yes, run it"))];
 		await fire("tool_call", makeEvent("./update-fork.sh start"), makeCtx({ sessionId: nextSession(), hasUI: true, branch }));
-		expect(userWords()).toContain("Run update-fork.sh start on STRML/oh-my-pi fork main?");
 		expect(userWords()).toContain("Yes, run it");
+		expect(userWords()).not.toContain("STRML/oh-my-pi");
 		expect(evidenceOf().userMessageIds).toContain("a1");
 	});
 
@@ -112,12 +112,11 @@ describe("an ask answer is the user's words", () => {
 		const details = {
 			results: [
 				{ id: "q1", question: "Rebuild fork main?", options: ["Rebuild"], multi: false, selectedOptions: ["Rebuild"] },
-				{ id: "q2", question: "Also force-push?", options: ["Push"], multi: false, selectedOptions: ["Push"], timedOut: true },
+				{ id: "q2", question: "Also force-push?", options: ["Force-push"], multi: false, selectedOptions: ["Force-push"], timedOut: true },
 			],
 		};
 		await fire("tool_call", makeEvent("./update-fork.sh start"), makeCtx({ sessionId: nextSession(), hasUI: true, branch: [askResult("a1", details)] }));
-		expect(userWords()).toContain("Rebuild fork main?");
-		expect(userWords()).not.toContain("force-push");
+		expect(userWords()).toBe("Rebuild");
 	});
 
 	test("a headless session has no user channel, ask answers included", async () => {
@@ -147,6 +146,17 @@ describe("an ask answer and a refusal", () => {
 		expect(resultText(await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid, hasUI: true, branch: after })))).toBe("ALLOWED");
 	});
 
+	test("Cancel on a question that names the target does not lift it", async () => {
+		const sid = nextSession();
+		const before = [userMessage("u1", "tidy up the repo")];
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid, hasUI: true, branch: before }));
+
+		setJevAnswer(jevSafeAnswer());
+		const after = [...before, askResult("a1", clicked("I authorize deleting the branch topic. Delete the branch topic?", "Cancel"))];
+		expect(refusalOf(await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid, hasUI: true, branch: after }))).layer).toBe("prior-refusal");
+	});
+
 	test("a timed-out pick that names the target does not lift it", async () => {
 		const sid = nextSession();
 		const before = [userMessage("u1", "tidy up the repo")];
@@ -161,23 +171,32 @@ describe("an ask answer and a refusal", () => {
 });
 
 describe("tool evidence", () => {
-	test("a refused call and the gate's refusal stay out", () => {
+	test("a call the gate refused, and its refusal, stay out of the next judgement", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		const refusedCall = { ...makeEvent("./update-fork.sh start"), toolCallId: "c1" };
+		expect(refusalOf(await fire("tool_call", refusedCall, makeCtx({ sessionId: sid, hasUI: true }))).layer).toBe("unsafe");
+
+		setJevAnswer(jevSafeAnswer());
 		const branch = [
 			toolCall("c1", "bash", { command: "./update-fork.sh start" }),
 			toolResult("c1", "bash", refusalText, true),
 			toolCall("c2", "bash", { command: "./update-fork.sh status" }),
 			toolResult("c2", "bash", "upstream=a70f001c43 origin=db2990bdf6"),
 		];
-		const evidence = collectToolEvidence(branch) ?? "";
-		expect(evidence).not.toContain("classifier");
-		expect(evidence).not.toContain("start");
-		expect(evidence).toContain("update-fork.sh status");
-		expect(evidence).toContain("upstream=a70f001c43");
+		await fire("tool_call", { ...makeEvent("ls"), toolCallId: "c3" }, makeCtx({ sessionId: sid, hasUI: true, branch }));
+		const context = evidenceOf(modelCalls.length - 1).operatorContext ?? "";
+		expect(context).not.toContain("classifier");
+		expect(context).not.toContain("update-fork.sh start");
+		expect(context).toContain("update-fork.sh status");
+		expect(context).toContain("upstream=a70f001c43");
 	});
 
-	test("a successful command whose output looks like a refusal stays in", () => {
-		const branch = [toolCall("c1", "bash", { command: "cat refusal.json" }), toolResult("c1", "bash", refusalText, false)];
-		expect(collectToolEvidence(branch)).toContain("cat refusal.json");
+	test("a failed command that prints a refusal-shaped payload stays in: only the gate's own record drops a call", () => {
+		const branch = [toolCall("c9", "bash", { command: "cat refusal.json; exit 1" }), toolResult("c9", "bash", refusalText, true)];
+		const evidence = collectToolEvidence(branch, 6, new Set(["other"])) ?? "";
+		expect(evidence).toContain("cat refusal.json");
+		expect(evidence).toContain("classifier");
 	});
 
 	test("the newest activity survives the size cap", async () => {

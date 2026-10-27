@@ -303,6 +303,20 @@ const REFUSAL_CAP = 20;
 const floorTaint = new Map<string, string[]>();
 const FLOOR_TAINT_CAP = 50;
 
+/** The tool call ids this gate refused. Tool evidence drops a refused call and
+ *  its result by these ids, never by what the result says, since any command
+ *  can print text shaped like a refusal. Host call ids are unique, so one set
+ *  serves every session; the cap drops the oldest. */
+const refusedToolCallIds = new Set<string>();
+const REFUSED_CALL_CAP = 1_000;
+
+function rememberRefusedCall(toolCallId: string): void {
+	refusedToolCallIds.add(toolCallId);
+	if (refusedToolCallIds.size <= REFUSED_CALL_CAP) return;
+	const oldest = refusedToolCallIds.values().next().value;
+	if (oldest !== undefined) refusedToolCallIds.delete(oldest);
+}
+
 /** Per-session classifier pause (issue #48): `/classifier off` adds the
  *  sessionId here. Same semantics as `config.enabled=false` scoped to one
  *  session — model classification skips, critical/env/static-rule checks stay
@@ -1243,16 +1257,15 @@ function userChannelBranch(ctx: ExtensionContext): ReadonlyArray<EvidenceBranchE
 
 const nonEmptyString = (value: unknown): string | undefined => (typeof value === "string" && value.trim() !== "" ? value : undefined);
 
-/** One answered question as the user's words: the question it answers, then
- *  what they picked or typed. A pick the host made because the question timed
- *  out is nobody's words, so it yields nothing. */
+/** One answered question as the user's words: what they picked or typed. The
+ *  question is the agent's text, not part of the click, so it stays in tool
+ *  evidence. A pick the host made because the question timed out is nobody's
+ *  words, so it yields nothing. */
 function askAnswerLine(answer: Record<string, unknown>): string | undefined {
 	if (answer.timedOut === true) return undefined;
 	const picked = Array.isArray(answer.selectedOptions) ? answer.selectedOptions.filter(option => nonEmptyString(option) !== undefined) : [];
 	const reply = [picked.join(", "), nonEmptyString(answer.customInput), nonEmptyString(answer.note)].filter(part => part !== undefined && part !== "");
-	if (reply.length === 0) return undefined;
-	const question = nonEmptyString(answer.question);
-	return question === undefined ? reply.join("\n") : `Answered "${question}": ${reply.join("\n")}`;
+	return reply.length > 0 ? reply.join("\n") : undefined;
 }
 
 /** The user's words in an ask tool result's details, one line per answered
@@ -1778,18 +1791,20 @@ export function operatorContextFromInput(value: unknown): string | undefined {
  * the classifier record fixes the common "the file was just written" blind
  * spot without turning agent-authored text into authorization.
  *
- * The gate's own refusals stay out, with the calls they refused: they are the
- * gate's verdicts, not the agent's activity, and a retry judged against them
- * only scored lower each time. The newest skill the agent read is pinned, since
- * it is what says what the task's commands do.
+ * The calls the gate refused (`refusedCallIds`, recorded by the gate itself)
+ * stay out with their refusals: they are the gate's verdicts, not the agent's
+ * activity, and a retry judged against them only scored lower each time. The
+ * newest skill the agent read is pinned, since it is what says what the task's
+ * commands do.
  */
 export function collectToolEvidence(
 	branch: ReadonlyArray<{ type: string; message?: unknown }>,
 	maxItems = 6,
+	refusedCallIds: ReadonlySet<string> = new Set(),
 ): string | undefined {
 	if (maxItems <= 0) return undefined;
 	const live = branch.slice(branchStartAfterLatestResetBoundary(branch));
-	const { refusedCallIds, skillCallIds } = toolCallRoles(live);
+	const skillCallIds = skillReadCallIds(live);
 	const entries: string[] = [];
 	let skill: { index: number; text: string } | undefined;
 	const encode = (value: unknown): string => {
@@ -1824,7 +1839,7 @@ export function collectToolEvidence(
 			continue;
 		}
 		if (role === "toolResult") {
-			if (isGateRefusal(message)) continue;
+			if (typeof message.toolCallId === "string" && refusedCallIds.has(message.toolCallId)) continue;
 			const name = typeof message.toolName === "string" ? message.toolName : "tool";
 			const content = redactSecrets(textOf(message.content));
 			if (content.trim() === "") continue;
@@ -1855,38 +1870,25 @@ const PINNED_SKILL_MAX_CHARS = 500;
 /** Room for the two tier labels mergeOperatorContext adds. */
 const OPERATOR_CONTEXT_LABEL_CHARS = 100;
 
-/** Whether a tool result is this gate's own refusal: an error whose text is
- *  the refusal payload. A command that merely prints one succeeded, and stays. */
-function isGateRefusal(message: Record<string, unknown>): boolean {
-	if (message.isError !== true) return false;
-	try {
-		const parsed: unknown = JSON.parse(textOf(message.content));
-		return typeof parsed === "object" && parsed !== null && (parsed as { classifier?: unknown }).classifier === "blocked";
-	} catch {
-		return false;
-	}
-}
-
-/** Which tool calls the gate refused, and which read a skill, by call id. */
-function toolCallRoles(branch: ReadonlyArray<{ type: string; message?: unknown }>): { refusedCallIds: Set<string>; skillCallIds: Set<string> } {
-	const refusedCallIds = new Set<string>();
-	const skillCallIds = new Set<string>();
+/** The ids of the tool calls that read a skill through `skill://`. */
+function skillReadCallIds(branch: ReadonlyArray<{ type: string; message?: unknown }>): Set<string> {
+	const ids = new Set<string>();
 	for (const entry of branch) {
 		if (entry.type !== "message" || typeof entry.message !== "object" || entry.message === null) continue;
 		const message = entry.message as Record<string, unknown>;
-		if (message.role === "toolResult" && typeof message.toolCallId === "string" && isGateRefusal(message)) refusedCallIds.add(message.toolCallId);
 		if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
 		for (const block of message.content as Array<Record<string, unknown> | null>) {
 			if (block?.type !== "toolCall" || block.name !== "read" || typeof block.id !== "string") continue;
 			const target = (block.arguments as { path?: unknown } | undefined)?.path;
-			if (typeof target === "string" && target.startsWith("skill://")) skillCallIds.add(block.id);
+			if (typeof target === "string" && target.startsWith("skill://")) ids.add(block.id);
 		}
 	}
-	return { refusedCallIds, skillCallIds };
+	return ids;
 }
 
 /** The newest entries that fit maxItems and the size cap, oldest first, with
- *  the pinned skill ahead of them when the window has moved past it. */
+ *  the pinned skill ahead of them when the window has moved past it. The
+ *  newest entry always stays, cut to the budget when it is too long. */
 function newestToolEvidence(entries: readonly string[], maxItems: number, skill: { index: number; text: string } | undefined): string | undefined {
 	const firstInWindow = Math.max(0, entries.length - maxItems);
 	const pin = skill !== undefined && skill.index < firstInWindow ? skill.text : undefined;
@@ -1894,7 +1896,10 @@ function newestToolEvidence(entries: readonly string[], maxItems: number, skill:
 	const kept: string[] = [];
 	for (let index = entries.length - 1; index >= firstInWindow; index--) {
 		const cost = entries[index].length + 1;
-		if (cost > budget) break;
+		if (cost > budget) {
+			if (kept.length === 0) kept.push(truncated(entries[index], Math.max(0, budget - 2)));
+			break;
+		}
 		budget -= cost;
 		kept.unshift(entries[index]);
 	}
@@ -5707,7 +5712,7 @@ export default function (pi: ExtensionAPI) {
 		let operatorToolEvidence: string | undefined;
 		if (config.evidenceUserMessages > 0) {
 			try {
-				operatorToolEvidence = collectToolEvidence(ctx.sessionManager.getBranch());
+				operatorToolEvidence = collectToolEvidence(ctx.sessionManager.getBranch(), undefined, refusedToolCallIds);
 			} catch {
 				// Evidence is advisory. An isolated SDK context may not expose a branch;
 				// never turn that diagnostic gap into a blocked tool call.
@@ -6584,7 +6589,11 @@ export default function (pi: ExtensionAPI) {
 			};
 		}
 	};
-	pi.on("tool_call", handleToolCall);
+	pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext) => {
+		const result = await handleToolCall(event, ctx);
+		if (result !== undefined && "block" in result && result.block === true) rememberRefusedCall(event.toolCallId);
+		return result;
+	});
 
 	// Session boundaries: delete only this runner's entries. The extension module
 	// is shared across concurrent sessions; clearing the whole cache on one
