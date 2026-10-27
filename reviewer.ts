@@ -26,6 +26,8 @@ import { completeSimple, type Model } from "@oh-my-pi/pi-ai";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { redactSecrets } from "./redact";
 
+/** How many draws a malformed reply may cost before the review fails. */
+const REVIEWER_ATTEMPTS = 2;
 /** Room for the decision JSON after any reasoning the model does. */
 const REVIEWER_MAX_TOKENS = 2_048;
 /** Per-field caps for the rendered input, so one long entry cannot crowd out the command. */
@@ -203,17 +205,27 @@ export async function runReviewer(input: ReviewerInput, call: ReviewerModelCall,
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(new Error(`reviewer timed out after ${timeoutMs}ms`)), timeoutMs);
 	let model: string | undefined;
+	const aborted = new Promise<never>((_, reject) => controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true }));
 	try {
-		const reply = await Promise.race([
-			call(REVIEWER_SYSTEM_PROMPT, renderReviewerInput(input), controller.signal),
-			new Promise<never>((_, reject) => controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true })),
-		]);
-		model = reply.model;
-		const decision = parseReviewerReply(reply.text);
+		// A reply that is not the schema decided nothing, so one more draw is
+		// safe: it is the first answer that counts, never the best of several.
+		// A block or an allow is final; only a malformed reply is retried.
+		let decision: ReviewerDecision | undefined;
+		let malformed: unknown;
+		for (let attempt = 0; attempt < REVIEWER_ATTEMPTS && decision === undefined; attempt++) {
+			const reply = await Promise.race([call(REVIEWER_SYSTEM_PROMPT, renderReviewerInput(input), controller.signal), aborted]);
+			model = reply.model;
+			try {
+				decision = parseReviewerReply(reply.text);
+			} catch (error) {
+				malformed = error;
+			}
+		}
+		if (decision === undefined) throw malformed;
 		if (decision.decision === "allow" && !quotesUserWords(decision.userQuote, input.transcript)) {
 			return { kind: "failed", why: "allow without an exact quote of the user's words", model, ms: Date.now() - started };
 		}
-		return { kind: "decided", decision, model, ms: Date.now() - started };
+		return { kind: "decided", decision, model: model ?? "unknown", ms: Date.now() - started };
 	} catch (error) {
 		const why = error instanceof Error ? error.message : String(error);
 		return { kind: "failed", why: truncatedText(why, 200), ...(model === undefined ? {} : { model }), ms: Date.now() - started };
@@ -234,7 +246,14 @@ export function reviewerModelCall(registry: Pick<ModelRegistry, "find" | "getApi
 	return async (system, user, signal) => {
 		const apiKey = await registry.getApiKey(model, sessionId, { signal });
 		if (apiKey === undefined) throw new Error(`no credential for ${spec}`);
-		const reply = await completeSimple(model, { systemPrompt: [system], messages: [{ role: "user", content: user, timestamp: Date.now() }] }, { apiKey, signal, maxTokens: REVIEWER_MAX_TOKENS });
+		const context = { systemPrompt: [system], messages: [{ role: "user" as const, content: user, timestamp: Date.now() }] };
+		// Temperature 0 keeps one input to one answer, which matters because a
+		// block is remembered. A provider that refuses the parameter (some
+		// reasoning models do) gets the same request without it.
+		let reply = await completeSimple(model, context, { apiKey, signal, maxTokens: REVIEWER_MAX_TOKENS, temperature: 0 });
+		if (reply.stopReason === "error" && /temperature/iu.test(reply.errorMessage ?? "")) {
+			reply = await completeSimple(model, context, { apiKey, signal, maxTokens: REVIEWER_MAX_TOKENS });
+		}
 		if (reply.stopReason === "error" || reply.stopReason === "aborted") throw new Error(reply.errorMessage ?? `reviewer call ${reply.stopReason}`);
 		const text = reply.content
 			.filter((part): part is { type: "text"; text: string } => part.type === "text")
