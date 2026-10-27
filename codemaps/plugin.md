@@ -84,7 +84,7 @@ probabilities, hazards, confidence, blastRadius, usage, latencyMs}, userMessageI
 authorization, v3, tool, decision, layer, why, cmd, cwd, spawnCwd, verdict, cached, ms,
 staleCode, floor{asks, entries}, followsDecisionId` (blocked lines point at the verdict/cwd/critical/environment line before them; unclassified lines carry none). Older logs also carry `approval`.
 
-No-UI sessions: `userChannelBranch(ctx)` returns an empty branch when `!ctx.hasUI`, so `evidenceUserSnapshot` and `shadowJevV3` see no user words; tool evidence still reads the whole branch.
+No-UI sessions: `userChannelBranch(ctx)` returns an empty branch when `!ctx.hasUI`, so `evidenceUserSnapshot` and `shadowJevV3` see no user words; tool evidence still reads the whole branch. In a UI session it runs `askAnswersAsUserWords` first, which recasts each `ask` tool result the user answered by hand (not `timedOut`) as a user message, so every user-word reader sees clicks as typed replies. `collectToolEvidence` drops gate refusals with the calls they refused, keeps the newest entries under `TOOL_EVIDENCE_MAX_CHARS`, and pins the newest `skill://` read.
 
 `layer` values: `cap`, `rule`, `cwd`, `script-body`, `critical`, `environment`,
 `verdict`, `cached`, `blocked`, `unclassified`, `internal-error` (older logs also hold `dialog`, `headless`, `granted` and `late-verdict`).
