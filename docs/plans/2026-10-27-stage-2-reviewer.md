@@ -67,11 +67,12 @@ It never sees tool results, skill text or assistant prose. A skill and its scrip
 Outside the transcript it also gets:
 
 - The command, the working directory, and Jev's verdict and reason (labelled stage 1).
-- The body of every script the command runs, read by the gate. That covers interpreter scripts as today, a directly executed path, and a bare name the PATH resolves under the home directory.
-  - The read goes through `realpath`.
-  - The body is marked unread when either path is on the secret-file list, when the file is not a regular file, when it isn't text with a shebang or known extension, when it is over 64 KB, or when it sources or runs another local file.
-  - Bodies go to the reviewer only, never into Jev's judged text. That keeps the length cap, the critical patterns and the host allow rules acting on the command alone.
-  - Each body is hashed at read time, and re-hashed before an allow counts. A changed file fails the review.
+- The body of the one script the command runs, when there is one. Three rounds of review found a new way past every heuristic for guessing which file the shell runs: wrapper flags, a `cd`, PATH, substitutions. So the gate admits two command shapes and refuses every other one (stage-two.ts).
+  - **Shape A, no local program:** every program is a bare name that is not a script. There is no interpreter running a file, no wrapper running another program, and no PATH change.
+  - **Shape B, one local script:** the whole command is one simple command, after at most one literal `cd <dir> &&`. The program is a literal path to an existing script, resolved from the start directory plus that `cd`. Every word is literal, with no assignment and no pipe.
+  - **The read:** it goes through `realpath`. The body is unread when either path is on the secret-file list, the file is not regular, it is binary or over 64 KB, or it runs another local file. "Runs another local file" means a program named by a non-system path, a wrapper or interpreter handed a local path, a runner running a file, `awk -f`, or a script-dir assignment. An unread body means no review.
+  - **Hashing:** the body is hashed at read time. Before an allow counts, the spelled path is re-resolved and the file re-hashed, and any change fails the review.
+  - **Not covered:** build runners and git hooks run repository code nobody read. That is the ordinary development work Jev's safe criterion already covers.
 - The pinned trust policy (`evidence.trustedPolicy`), when present: the CLAUDE.md analogue.
 
 ### What the reviewer is told

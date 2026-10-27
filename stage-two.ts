@@ -2,17 +2,30 @@
  * stage-two — what the gate measures for the stage 2 reviewer
  * (docs/plans/2026-10-27-stage-2-reviewer.md) and what it remembers about it.
  *
- * The reviewer reads the body of every script a command runs. This module
- * finds those scripts and reads them under the rules a model must not be
- * trusted to enforce: a secret path, a non-regular file, a binary, an oversized
- * file, or a script that hands off to another local file is reported unread,
- * and an unread body keeps the reviewer from running at all. Each body is
- * hashed when read, and `scriptsUnchanged` re-reads them before an allow
- * counts, so the reviewer's seconds-long wait is not a window to swap the file.
+ * The reviewer judges a command partly by the body of the script it runs, so
+ * the body it is shown has to be the program that runs. Guessing that from
+ * shell heuristics failed review after review: every wrapper flag, `cd`, PATH
+ * entry or substitution was another way to run a file other than the one
+ * read. So this module does not guess. It admits two command shapes and
+ * refuses every other one, which keeps the stage-1 block:
  *
- * Interpreter invocations (`python3 x.py`, `bash x.sh`) are not read here:
- * readInterpretedScriptBodies already splices their bodies into the judged
- * command, which is the text the reviewer is given.
+ *   A. no local program: every program is a bare name that is not a script,
+ *      with no interpreter running a file, no wrapper running another
+ *      program, and no PATH change;
+ *   B. one local script: the whole command is one simple command, after at
+ *      most one literal `cd <dir> &&`, its program a literal path to an
+ *      existing script, every word literal, no assignment, no pipe.
+ *
+ * A shape-B body is read under rules a model must not be trusted to enforce:
+ * a secret path, a non-regular file, a binary, an oversized file, or a body
+ * that runs another local file is unread, and an unread body means no review.
+ * The body is hashed when read, and `scriptsUnchanged` re-resolves and
+ * re-hashes it before an allow counts.
+ *
+ * What this does not cover, and says so: a build runner (`bun test`, `make`,
+ * `npm run`) or a git hook runs repository code nobody read. That is the
+ * ordinary development work Jev's own safe criterion already covers; the
+ * reviewer is told it runs the repository's own scripts.
  */
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
@@ -20,62 +33,76 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { isSecretPath } from "./floor";
 import { REVIEWER_SCRIPT_MAX_BYTES, type ReviewerScriptBody } from "./reviewer";
-import { parseShell, type ShellCommand } from "./shell-ast";
-import { segmentCwdAt } from "./shell-cwd";
+import { parseShell, type ShellCommand, type ShellWord } from "./shell-ast";
 
 export interface ReadScript extends ReviewerScriptBody {
-	/** The path the command names, resolved against its working directory but not through links. */
+	/** The path the command names, resolved but not through links. */
 	file?: string;
 	/** Where the body was read from, after links. */
 	realPath?: string;
 	sha256?: string;
 }
 
-/** Commands that run the word after them (and their own flags) as the program. */
-const WRAPPERS = new Set(["env", "time", "nohup", "exec", "command", "nice", "caffeinate", "xargs", "timeout", "watch", "parallel", "sudo", "doas"]);
-/** `find` runs the word after one of these as a program. */
-const FIND_EXEC = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
-/** Interpreters whose script operand readInterpretedScriptBodies already reads. */
-const INTERPRETERS = /^(?:bash|sh|zsh|dash|ksh|fish|python[\d.]*|node|bun|deno|ruby|perl|php|tclsh[\d.]*|lua|osascript)$/u;
+/** What the gate can show the reviewer about the programs a command runs. */
+export type CommandScripts = { kind: "scripts"; scripts: ReadScript[] } | { kind: "refuse"; why: string };
+
+/** Commands that run another program named in their arguments. */
+const WRAPPERS = new Set(["env", "time", "nohup", "exec", "command", "builtin", "nice", "caffeinate", "xargs", "timeout", "gtimeout", "watch", "parallel", "sudo", "doas", "su", "script", "stdbuf", "chroot", "eval", "source", ".", "find", "fd", "entr"]);
+/** Interpreters: their operand is a program file or inline code. */
+const INTERPRETERS = /^(?:bash|sh|zsh|dash|ksh|fish|csh|tcsh|python[\d.]*|pypy[\d.]*|node|deno|ruby|perl|php|tclsh[\d.]*|wish|lua|osascript)$/u;
+/** Text tools whose arguments are patterns (`awk -F/`, `jq '.a/2'`); they run a program file only through `-f`. */
+const PROGRAM_FILE_FLAG_TOOLS = new Set(["awk", "gawk", "mawk", "nawk", "jq", "sed", "gsed"]);
+/** Runners whose operand may be a program file rather than a script name. */
+const FILE_RUNNERS = new Set(["bun", "bunx", "npx", "pnpx", "tsx", "ts-node"]);
+/** Where a body may run an absolute program: system and package-manager directories. */
+const SYSTEM_PROGRAM_DIRS = ["/usr/", "/bin/", "/sbin/", "/opt/homebrew/", "/System/", "/Library/Developer/"];
 const SCRIPT_EXTENSION = /\.(?:sh|bash|zsh|py|js|mjs|cjs|ts|rb|pl|tcl|lua)$/iu;
-/**
- * A body that hands work to another local file is incomplete: the reviewer
- * would judge a wrapper and allow code nobody read. `source`/`.` of anything,
- * an interpreter run on a relative or script-dir path, and a script-dir path
- * to a program file all count. A false match only means no stage 2.
- */
+/** The hand-offs a parse can miss: a script-dir path to a program file, and a variable assigned one. */
 const LOCAL_HANDOFF = [
-	/(?:^|[;&|(`]|\s)(?:source|\.)\s+["']?(?:[./~$]|[\w-]+\/|[\w.-]+\.(?:sh|bash|zsh)\b)/mu,
-	/(?:^|[\s;&|(`])(?:exec\s+)?(?:bash|sh|zsh|python3?|node|bun|ruby|perl)\s+(?:\.{1,2}\/|"?\$\{?(?:BASH_SOURCE|0\b|SCRIPT_DIR|DIR\b|HERE\b))/mu,
-	/(?:^|[\s;&|(`])exec\s+(?:\.{1,2}\/|"?\$)/mu,
 	/\$\(\s*dirname\b[^)]*\)"?\/[^\s"']+\.(?:sh|bash|py|js|mjs|ts|rb|pl)\b/u,
-	// A relative program run as a statement's command: `./lib/real.sh`, `(../x)`.
-	/(?:^|[;&|(`{]\s*|\bthen\s+|\bdo\s+|\belse\s+)["']?\.{1,2}\/[^\s"';&|]+/mu,
-	// A variable that names a local script, ready to run as `"$VAR"`.
-	/^\s*(?:local\s+|export\s+|readonly\s+)?[A-Za-z_]\w*=["']?(?:[^"'\s]*(?:BASH_SOURCE|\$\(\s*dirname|\$0\b)[^"'\s]*|\.{1,2}\/[^"'\s]*)\.(?:sh|bash|zsh|py|js|mjs|ts|rb|pl)\b/mu,
+	/^\s*(?:local\s+|export\s+|readonly\s+|declare\s+)?[A-Za-z_]\w*=["']?(?:[^"'\s]*(?:BASH_SOURCE|\$\(\s*dirname|\$0\b)[^"'\s]*|\.{1,2}\/[^"'\s]*)\.(?:sh|bash|zsh|py|js|mjs|ts|rb|pl)\b/mu,
 ];
-/** Commands that may run before a script in the same command line without being able to change it. */
-const INERT_BEFORE_SCRIPT = new Set(["cd", "pushd", "pwd", "export", "set", "true", ":"]);
 
 const sha256 = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 const unread = (spelled: string, why: string): ReadScript => ({ path: spelled, body: null, unread: why });
+const refuse = (why: string): CommandScripts => ({ kind: "refuse", why });
+const expandHome = (value: string): string => (value === "~" ? os.homedir() : value.startsWith("~/") ? path.join(os.homedir(), value.slice(2)) : value);
+const verbName = (command: ShellCommand): string => path.basename(command.words[0]?.value ?? "");
+const isLiteral = (word: ShellWord): boolean => word.literal;
 
-/** A bare program name as the PATH resolves it, when that is a file under the home directory. */
-function userProgramOnPath(name: string): string | undefined {
-	const home = os.homedir();
+/** Whether a word names a file by path rather than by a bare name. */
+const isPathWord = (value: string): boolean => value.includes("/") || value.startsWith("~");
+
+/** A bare name as the gate's PATH resolves it. */
+function onPath(name: string): string | undefined {
 	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
 		if (dir === "") continue;
 		const candidate = path.join(dir, name);
 		try {
 			const stat = fs.statSync(candidate);
-			if (!stat.isFile() || (stat.mode & 0o111) === 0) continue;
-			const real = fs.realpathSync(candidate);
-			return real.startsWith(`${home}${path.sep}`) ? candidate : undefined;
+			if (stat.isFile() && (stat.mode & 0o111) !== 0) return candidate;
 		} catch {
 			// Not in this directory.
 		}
 	}
 	return undefined;
+}
+
+/** Whether a file is text a shell or interpreter runs, rather than a binary. */
+function isScriptFile(file: string): boolean {
+	try {
+		const fd = fs.openSync(file, "r");
+		try {
+			const head = Buffer.alloc(512);
+			const read = fs.readSync(fd, head, 0, head.length, 0);
+			const bytes = head.subarray(0, read);
+			return !bytes.includes(0) && (bytes.subarray(0, 2).toString() === "#!" || SCRIPT_EXTENSION.test(file));
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return false;
+	}
 }
 
 /** Read one program file under the reviewer's rules. */
@@ -101,123 +128,113 @@ export function readScriptForReview(spelled: string, file: string): ReadScript {
 	if (bytes.includes(0)) return unread(spelled, "a binary");
 	const body = bytes.toString("utf8");
 	if (!body.startsWith("#!") && !SCRIPT_EXTENSION.test(real)) return unread(spelled, "not a script");
-	// Full-line comments are prose; a trailing comment is kept, since cutting at
-	// a `#` inside a string could hide a hand-off after it.
+	const handOff = bodyHandOff(body);
+	if (handOff !== undefined) return unread(spelled, handOff);
+	return { path: spelled, body, file, realPath: real, sha256: sha256(bytes) };
+}
+
+/**
+ * Why a body runs a file this read did not cover, or undefined. A shell body
+ * (any body whose shebang names no other interpreter) is parsed: a program
+ * named by a path outside the system directories, a wrapper or interpreter
+ * handed a path, or a construct the parser cannot decompose all count. A
+ * bare variable as the program (`"$OMP"`) is allowed: the reviewer reads what
+ * the body assigns it, and LOCAL_HANDOFF refuses a script-dir assignment.
+ */
+function bodyHandOff(body: string): string | undefined {
 	const code = body
 		.split("\n")
 		.filter(line => !/^\s*#/u.test(line))
 		.join("\n");
-	if (LOCAL_HANDOFF.some(pattern => pattern.test(code))) return unread(spelled, "sources or runs another local file");
-	// The parsed body, for what a regex cannot see: a relative program run as
-	// any command, however it is indented or joined. A shell body the parser
-	// cannot read is not a body the gate can vouch for.
-	// Every body is shell unless its shebang names another interpreter: a file
-	// with no shebang is run by the shell too.
+	if (LOCAL_HANDOFF.some(pattern => pattern.test(code))) return "runs another local file";
 	const shebang = body.startsWith("#!") ? body.split("\n", 1)[0] : "";
-	const otherInterpreter = shebang !== "" && !/\b(?:ba|z|da|k)?sh\b/u.test(shebang);
-	if (!otherInterpreter) {
-		const parsed = parseShell(body);
-		if (!parsed.ok) return unread(spelled, "its shell body could not be parsed");
-		// Any program word, or path argument, that names a file by a relative or
-		// variable-built path (`./x`, `lib/x`, `$DIR/x`) runs a file this read
-		// did not cover. A bare variable (`"$OMP"`) stays: the reviewer sees what
-		// the body assigns it, and LOCAL_HANDOFF refuses a script-dir assignment.
-		const handsOff = parsed.commands.some(
-			command => command.unreadShape !== undefined || programWords(command).some(word => word.value.includes("/") && !path.isAbsolute(word.value) && !word.value.startsWith("~/")),
-		);
-		if (handsOff) return unread(spelled, "sources or runs another local file");
+	if (shebang !== "" && !/\b(?:ba|z|da|k)?sh\b/u.test(shebang)) return undefined;
+	const parsed = parseShell(body);
+	if (!parsed.ok) return "its shell body could not be parsed";
+	for (const command of parsed.commands) {
+		if (command.unreadShape !== undefined) return `a shell construct the gate cannot read (${command.unreadShape})`;
+		const program = command.words[0]?.value ?? "";
+		const name = verbName(command);
+		if (isPathWord(program) && !SYSTEM_PROGRAM_DIRS.some(dir => expandHome(program).startsWith(dir))) return `runs ${program}`;
+		if (PROGRAM_FILE_FLAG_TOOLS.has(name) && command.words.some(word => /^(?:-f|--from-file|--file)(?:=|$)/u.test(word.value))) return `${name} runs a program file`;
+		if (FILE_RUNNERS.has(name) && runnerRunsFile(name, command.words)) return `${name} runs a program file`;
+		const handsPaths = WRAPPERS.has(name) || INTERPRETERS.test(name);
+		if (handsPaths && command.words.slice(1).some(word => isPathWord(word.value) && !SYSTEM_PROGRAM_DIRS.some(dir => expandHome(word.value).startsWith(dir)))) {
+			return `hands a local path to ${name}`;
+		}
 	}
-	return { path: spelled, body, file, realPath: real, sha256: sha256(bytes) };
+	return undefined;
 }
 
-/** The program words of one parsed command: its verb past any wrappers, and any executable path argument (`xargs ./x`). */
-function programWords(command: ShellCommand): Array<{ value: string; offset: number; verb: boolean }> {
-	const words = command.words;
-	let head = 0;
-	while (head < words.length && WRAPPERS.has(path.basename(words[head].value))) {
-		head++;
-		// A wrapper's flags, assignments and numeric flag values (`xargs -n 1`,
-		// `timeout 30`) come before the program it runs.
-		while (head < words.length && (words[head].value.startsWith("-") || /^[A-Za-z_]\w*=/u.test(words[head].value) || /^\d+[smhd]?$/u.test(words[head].value))) head++;
+/** Whether a file runner runs a program file: `bun x.ts`, `bun run ./x.js`,
+ *  `bunx ./x`, `tsx x.ts`. `bun build x.ts` compiles, and `bun test`,
+ *  `bun install` or `bun run <script>` run the repository's own tooling. */
+function runnerRunsFile(name: string, words: readonly ShellWord[]): boolean {
+	const operands = words.slice(1).map(word => word.value).filter(value => !value.startsWith("-"));
+	const isFile = (value: string | undefined): boolean => value !== undefined && (isPathWord(value) || SCRIPT_EXTENSION.test(value));
+	if (name === "tsx" || name === "ts-node") return operands.some(isFile);
+	if (name !== "bun") return isFile(operands[0]);
+	if (operands[0] === "run" || operands[0] === "x" || operands[0] === "exec") return isFile(operands[1]);
+	return isFile(operands[0]);
+}
+
+/** Shape A: why a command with no local program still cannot be reviewed, or undefined. */
+function shapeARefusal(commands: readonly ShellCommand[]): string | undefined {
+	for (const command of commands) {
+		if (command.unreadShape !== undefined) return `a shell construct the gate cannot read (${command.unreadShape})`;
+		const name = verbName(command);
+		if (command.assigns.some(assign => assign.name === "PATH") || (["export", "declare", "typeset", "set"].includes(name) && command.words.some(word => /^PATH=/u.test(word.value)))) {
+			return "changes PATH";
+		}
+		if (command.words.length === 0) continue;
+		if (WRAPPERS.has(name)) return `${name} runs another program`;
+		if (INTERPRETERS.test(name)) return `${name} runs a program the gate does not read`;
+		if (PROGRAM_FILE_FLAG_TOOLS.has(name) && command.words.some(word => /^(?:-f|--from-file|--file)(?:=|$)/u.test(word.value))) return `${name} runs a program file`;
+		if (FILE_RUNNERS.has(name) && runnerRunsFile(name, command.words)) return `${name} runs a program file`;
+		const program = command.words[0];
+		if (!isLiteral(program)) return "the program is built at run time";
+		const resolved = onPath(program.value);
+		if (resolved !== undefined && isScriptFile(resolved)) return `${program.value} is a local script run by name`;
 	}
-	const found: Array<{ value: string; offset: number; verb: boolean }> = [];
-	if (head < words.length) found.push({ value: words[head].value, offset: words[head].offset ?? 0, verb: true });
-	for (let index = head + 1; index < words.length; index++) {
-		const value = words[index].value;
-		const execTarget = path.basename(words[head]?.value ?? "") === "find" && FIND_EXEC.has(words[index - 1].value);
-		if (execTarget || /^(?:\.{1,2}\/|\/|~\/)/u.test(value)) found.push({ value, offset: words[index].offset ?? 0, verb: execTarget });
-	}
-	return found;
+	return undefined;
 }
 
 /**
- * Every script the command runs directly, read for the reviewer, deduplicated
- * by real path. A command the parser cannot read, or a relative program whose
- * working directory the gate cannot pin, is reported unread.
+ * What the gate can show the reviewer about the programs `command` runs,
+ * starting from `startCwd` (the directory before any `cd` in the command).
+ * `{scripts: []}` is shape A, one script is shape B, and anything else is a
+ * refusal that keeps the stage-1 block.
  */
-export function scriptsForReview(command: string, cwd: string): ReadScript[] {
+export function scriptsForReview(command: string, startCwd: string): CommandScripts {
 	const parsed = parseShell(command);
-	if (!parsed.ok) return [unread(command, "the command could not be parsed")];
-	const home = os.homedir();
-	const seen = new Map<string, ReadScript>();
-	// Whether an earlier step of this command line could have written, checked
-	// out, or replaced a script before it runs: the body read now would then not
-	// be the program that runs.
-	let writableBefore = false;
-	for (const shellCommand of parsed.commands) {
-		if (shellCommand.unreadShape !== undefined) return [unread(command, `the command has a shape the gate cannot read (${shellCommand.unreadShape})`)];
-		const verb = shellCommand.words[0]?.value ?? "";
-		// Anything non-literal (a substitution, a process substitution, a
-		// variable) in a word, an assignment or a redirect can run or write
-		// before the program does.
-		const substitutes =
-			shellCommand.words.some(word => !word.literal) ||
-			shellCommand.assigns.some(assign => assign.value !== undefined && !assign.value.literal) ||
-			shellCommand.redirects.some(redirect => !redirect.target.literal);
-		const inert = !shellCommand.nested && !substitutes && INERT_BEFORE_SCRIPT.has(verb) && !shellCommand.redirects.some(redirect => redirect.direction !== "in");
-		// A substitution in this command's own words runs before its program does.
-		const priorWrites = writableBefore || substitutes;
-		if (!inert) writableBefore = true;
-		for (const word of programWords(shellCommand)) {
-			if (word.verb && INTERPRETERS.test(path.basename(word.value))) break;
-			const expanded = word.value.startsWith("~/") ? path.join(home, word.value.slice(2)) : word.value;
-			let file: string | undefined;
-			if (!expanded.includes("/")) {
-				if (!word.verb) continue;
-				file = userProgramOnPath(expanded);
-				if (file === undefined) continue;
-			} else if (path.isAbsolute(expanded)) {
-				file = expanded;
-			} else {
-				const dir = segmentCwdAt(command, word.offset, cwd);
-				if (dir === null) {
-					seen.set(`unpinned:${word.value}`, unread(word.value, "its working directory could not be pinned"));
-					continue;
-				}
-				file = path.resolve(dir, expanded);
-			}
-			if (!word.verb) {
-				// An argument counts only when it is an executable file: `xargs ./x`,
-				// `find -exec ./x`. A data file the command reads is not a program.
-				try {
-					const stat = fs.statSync(file);
-					if (!stat.isFile() || (stat.mode & 0o111) === 0) continue;
-				} catch {
-					continue;
-				}
-			} else if (!fs.existsSync(file)) {
-				// A program that is not there runs nothing.
-				continue;
-			}
-			if (priorWrites) {
-				seen.set(`after-write:${file}`, unread(word.value, "runs after an earlier step of the same command that could change it"));
-				continue;
-			}
-			const read = readScriptForReview(word.value, file);
-			seen.set(read.realPath ?? `unread:${file}`, read);
-		}
+	if (!parsed.ok) return refuse("the command could not be parsed");
+	const commands = parsed.commands;
+	const runsLocalPath = commands.some(item => isPathWord(item.words[0]?.value ?? "") && !SYSTEM_PROGRAM_DIRS.some(dir => expandHome(item.words[0].value).startsWith(dir)));
+	if (!runsLocalPath) {
+		const why = shapeARefusal(commands);
+		return why === undefined ? { kind: "scripts", scripts: [] } : refuse(why);
 	}
-	return [...seen.values()];
+	// Shape B: [cd <literal> &&] <literal path> <literal args>, and nothing else.
+	let dir = startCwd;
+	let rest = commands;
+	if (commands.length === 2 && verbName(commands[0]) === "cd" && commands[1].join === "and") {
+		const cd = commands[0];
+		if (cd.words.length !== 2 || !cd.words[1].literal || cd.assigns.length > 0 || cd.redirects.length > 0) return refuse("the cd before the script is not one literal directory");
+		dir = path.resolve(startCwd, expandHome(cd.words[1].value));
+		rest = commands.slice(1);
+	}
+	if (rest.length !== 1) return refuse("a local script runs inside a compound command");
+	const run = rest[0];
+	if (run.nested || run.negated || run.unreadShape !== undefined) return refuse("the script runs inside a construct the gate cannot read");
+	if (run.assigns.length > 0) return refuse("the script runs with an assignment");
+	if (!run.words.every(isLiteral)) return refuse("the script's words are built at run time");
+	if (run.redirects.some(redirect => redirect.direction !== "out" && !redirect.duplicate)) return refuse("the script reads a redirect");
+	const spelled = run.words[0].value;
+	const file = path.resolve(dir, expandHome(spelled));
+	if (!fs.existsSync(file)) return refuse(`${spelled} does not exist yet`);
+	const read = readScriptForReview(spelled, file);
+	if (read.body === null) return refuse(`${spelled}: ${read.unread ?? "not read"}`);
+	return { kind: "scripts", scripts: [read] };
 }
 
 /** Whether every body still has the bytes the reviewer was shown, at the
@@ -225,7 +242,7 @@ export function scriptsForReview(command: string, cwd: string): ReadScript[] {
  *  that now points elsewhere counts as a change. */
 export function scriptsUnchanged(scripts: readonly ReadScript[]): boolean {
 	return scripts.every(script => {
-		if (script.file === undefined || script.realPath === undefined || script.sha256 === undefined) return true;
+		if (script.file === undefined || script.realPath === undefined || script.sha256 === undefined) return false;
 		try {
 			if (fs.realpathSync(script.file) !== script.realPath) return false;
 			return sha256(fs.readFileSync(script.realPath)) === script.sha256;
@@ -236,7 +253,7 @@ export function scriptsUnchanged(scripts: readonly ReadScript[]): boolean {
 }
 
 /**
- * The reviewer's blocks, per session: one key per target, working directory,
+ * The reviewer's blocks, per session: one key per action, working directory,
  * model and the user's words. A retry under the same words is blocked without
  * a call, so a reworded command cannot resample the reviewer, and a new user
  * message re-opens the review.

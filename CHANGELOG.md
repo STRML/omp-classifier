@@ -13,8 +13,8 @@ Plan and failure matrix: `docs/plans/2026-10-27-stage-2-reviewer.md`. No battery
 - Code holds the line, not the prompt:
   - only UNSURE escalates, never UNSAFE, and never with a secrets, exfiltration, privilege or injection hazard at the review level;
   - headless sessions, one-hot answers, the eval tool and dry runs never escalate;
-  - every script must be read: a binary, a file over 64 KB, a secret path, a script that hands off to another local file, or one an earlier step of the same command could write means no review;
-  - an allow must quote the user's own words verbatim, checked in code;
+  - only two command shapes are reviewed. One runs no local program: system tools and the repository's own build runners. The other runs one local script on its own, optionally after a literal `cd`, with literal words. Interpreters running a file, wrappers, PATH changes, pipes and scripts inside compound commands are never reviewed. The script body must be readable: not binary, at most 64 KB, not a secret path, not running another local file;
+  - an allow must quote the user's own words: a whole entry or at least three words of one, checked in code. The check proves the words exist; whether they cover the command is the reviewer's judgement;
   - the scripts are re-resolved and re-hashed before an allow counts;
   - an allow still passes the forced-block overlay and any recorded refusal, and is never cached;
   - a block is remembered for the target until the user writes again;

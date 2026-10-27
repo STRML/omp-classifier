@@ -892,6 +892,13 @@ function statusReportPath(): string {
 	return path.join(classifierDataDir(), "status.json");
 }
 
+/** The stage 2 reviewer on an audit line: what it decided, why it failed, or
+ *  which eligibility check kept it from running. */
+export type ReviewerAudit =
+	| { decision: "allow" | "block"; rule: string; reason: string; model: string; ms: number }
+	| { failed: string; model?: string; ms: number }
+	| { skipped: string };
+
 /** One decisions.jsonl line; the field order is the log contract (issue #33).
  *  `verdict` is null whenever no model verdict existed (static rules, caps,
  *  critical patterns); `ms` is wall-clock from tool_call entry for a lead
@@ -906,13 +913,6 @@ function statusReportPath(): string {
  *  under different spelling. Logs written before
  *  https://github.com/STRML/omp-classifier/issues/184 also hold `dialog`,
  *  `headless`, `granted` and `late-verdict` lines and an `approval` field. */
-/** The stage 2 reviewer on an audit line: what it decided, why it failed, or
- *  which eligibility check kept it from running. */
-export type ReviewerAudit =
-	| { decision: "allow" | "block"; rule: string; reason: string; model: string; ms: number }
-	| { failed: string; model?: string; ms: number }
-	| { skipped: string };
-
 export interface DecisionRecord {
 	/** Stage 2 (docs/plans/2026-10-27-stage-2-reviewer.md), when the verdict reached it. */
 	reviewer?: ReviewerAudit;
@@ -4844,22 +4844,6 @@ function priorRefusalFor(ctx: ExtensionContext, command: string, cwd = ""): Refu
 	}
 }
 
-/**
- * Whether this one call may run past a prior refusal
- * (https://github.com/STRML/omp-classifier/issues/184). All of these must hold:
- *
- *  - the refusal is a model refusal: a critical-pattern or cap refusal never
- *    yields to a verdict, and the user runs that command themselves;
- *  - Jev answered SAFE with its authorization grounded in the user's words;
- *  - the user's messages AFTER the refusal name this command's target, by the
- *    deterministic `literalMatch` (a delete, a branch delete, a merge or a
- *    deploy whose target the user wrote out). An unrelated "thanks", or
- *    words from before the refusal, never count.
- *
- * It decides one call. The record stays, so the next call, reworded or not,
- * meets the same check. Eval code has no shell to match, so an eval refusal
- * never yields; nor does any command shape literalMatch cannot read.
- */
 /** The host bounds a tool_call handler at 30 s and fails it closed; stage 2 keeps this much clear of that. */
 const HANDLER_BUDGET_MS = 30_000;
 const HANDLER_MARGIN_MS = 2_000;
@@ -4873,9 +4857,12 @@ const REVIEWER_HARD_HAZARDS = ["exposes_secrets", "sends_local_data_outbound", "
 export interface StageTwoInput {
 	ctx: ExtensionContext;
 	judgement: Judgement;
-	/** The command as Jev judged it, interpreter script bodies spliced in. */
-	judgedCommand: string;
+	/** The command as the agent wrote it, with no script bodies spliced in. */
+	command: string;
+	/** The directory a leading `cd` points at, for the audit and the block key. */
 	cwd: string;
+	/** The directory the command starts in, before any `cd` it runs. */
+	startCwd: string;
 	config: ClassifierConfig;
 	/** When the gate started on this call: the deadline is measured from it. */
 	started: number;
@@ -4890,7 +4877,7 @@ export interface StageTwoInput {
  * wrong-shaped or quoting words the user never wrote leaves the block in place.
  */
 async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; audit?: ReviewerAudit }> {
-	const { ctx, judgement, judgedCommand, cwd, config } = input;
+	const { ctx, judgement, command, cwd, config } = input;
 	const model = config.reviewerModel;
 	if (judgement.verdict !== "UNSURE" || model === null) return { judgement };
 	const skip = (why: string) => ({ judgement, audit: { skipped: why } });
@@ -4903,13 +4890,14 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	const transcript = reviewerTranscript(ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>, refusedToolCallIds);
 	const userWords = transcript.flatMap(entry => (entry.from === "user" ? [entry.text] : entry.from === "ask" ? [entry.userAnswer] : []));
 	if (userWords.length === 0) return skip("no user words");
-	const scripts = scriptsForReview(judgedCommand, cwd);
-	const unreadScript = scripts.find(script => script.body === null);
-	if (unreadScript !== undefined) return skip(`unread script ${unreadScript.path}: ${unreadScript.unread ?? "not read"}`);
+	const programs = scriptsForReview(command, input.startCwd);
+	if (programs.kind === "refuse") return skip(`unread script: ${programs.why}`);
+	const scripts = programs.scripts;
 	const sessionId = ctx.sessionManager.getSessionId();
 	// The coarse action target, not the refusal key: for git the refusal key is
-	// the whole text, and a block must survive a reworded retry.
-	const blockKey = reviewerBlockKey(normalizeActionTarget(judgedCommand), cwd, model, userWords);
+	// the whole text, and a block must survive a reworded retry. Siblings such
+	// as `x.sh start` and `x.sh finish` share it, which errs toward blocking.
+	const blockKey = reviewerBlockKey(normalizeActionTarget(command), cwd, model, userWords);
 	if (reviewerBlocked(sessionId, blockKey)) {
 		return { judgement: { ...judgement, reason: `${judgement.reason}; the stage 2 reviewer already blocked this under the same user words` }, audit: { skipped: "blocked before under the same user words" } };
 	}
@@ -4918,7 +4906,7 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	const timeoutMs = Math.min(config.reviewerTimeoutMs, HANDLER_BUDGET_MS - HANDLER_MARGIN_MS - (Date.now() - input.started));
 	const outcome: ReviewerOutcome = await runReviewer(
 		{
-			command: judgedCommand,
+			command,
 			workingDirectory: cwd,
 			transcript,
 			scriptBodies: scripts.map(({ path: spelled, body }) => ({ path: spelled, body })),
@@ -4942,6 +4930,22 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	};
 }
 
+/**
+ * Whether this one call may run past a prior refusal
+ * (https://github.com/STRML/omp-classifier/issues/184). All of these must hold:
+ *
+ *  - the refusal is a model refusal: a critical-pattern or cap refusal never
+ *    yields to a verdict, and the user runs that command themselves;
+ *  - Jev answered SAFE with its authorization grounded in the user's words;
+ *  - the user's messages AFTER the refusal name this command's target, by the
+ *    deterministic `literalMatch` (a delete, a branch delete, a merge or a
+ *    deploy whose target the user wrote out). An unrelated "thanks", or
+ *    words from before the refusal, never count.
+ *
+ * It decides one call. The record stays, so the next call, reworded or not,
+ * meets the same check. Eval code has no shell to match, so an eval refusal
+ * never yields; nor does any command shape literalMatch cannot read.
+ */
 function priorRefusalLifts(prior: Refusal, judgement: Judgement, command: string, cwd: string, userWordsSinceRefusal: readonly string[]): boolean {
 	if (prior.source !== "model") return false;
 	if (judgement.verdict !== "SAFE" || judgement.authorization !== "grounded") return false;
@@ -6633,7 +6637,7 @@ export default function (pi: ExtensionAPI) {
 			// Stage 2 runs after the cache, on a fresh or a cached UNSURE alike, and
 			// what it allows is never cached: the next call reviews again. Dry run
 			// reports the stage-1 decision and pays for no review.
-			const reviewed = dryRun ? { judgement: stage1 } : await stageTwo({ ctx, judgement: stage1, judgedCommand, cwd, config, started, trustedPolicy: trustedPolicySnapshot.documents });
+			const reviewed = dryRun ? { judgement: stage1 } : await stageTwo({ ctx, judgement: stage1, command, cwd, startCwd, config, started, trustedPolicy: trustedPolicySnapshot.documents });
 			const judgement = reviewed.judgement;
 			const reviewerAudit = reviewed.audit === undefined ? {} : { reviewer: reviewed.audit };
 			// Every resolved decision is logged so prompt/auto-run behavior is

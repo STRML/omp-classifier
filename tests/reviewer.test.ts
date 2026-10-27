@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { DecisionRecord } from "../index";
 import {
 	fire,
-	jevHazardousAnswer,
+
 	jevNoul,
 	jevUnsafeAnswer,
 	jevUnsureAnswer,
@@ -88,6 +88,40 @@ beforeEach(async () => {
 
 afterEach(() => {
 	fs.rmSync(dir, { recursive: true, force: true });
+});
+
+describe("which commands stage 2 can vouch for", () => {
+	test("cd <dir> && ./x.sh reads <dir>/x.sh, from where the command starts", async () => {
+		fs.mkdirSync(path.join(dir, "sub"));
+		script("sub/update.sh", "#!/bin/bash\necho from-sub\n");
+		scriptReviewer(reviewerReply("allow", "update fork main"));
+		const result = await fire("tool_call", makeEvent("cd sub && ./update.sh start"), uiCtx(nextSession(), [user("u1", "update fork main")]));
+		expect(resultText(result)).toBe("ALLOWED");
+		expect(JSON.stringify(reviewerCalls[0].input.scriptBodies)).toContain("from-sub");
+	});
+
+	test.each([
+		["a script an earlier step creates", "make build && ./bin/tool"],
+		["a script run through an interpreter", "bash update.sh start"],
+		["a script after a PATH export", "export PATH=/tmp/evil:$PATH && update.sh start"],
+		["a script with a PATH assignment", "PATH=/tmp/evil update.sh start"],
+		["a script piped into another command", "./update.sh start | tail -5"],
+		["a wrapper running a local program", "xargs -n 1 ./update.sh"],
+		["a local script run by bare name on PATH", "omp-reviewer-test-local.sh"],
+	])("refuses %s", async (_name, command) => {
+		script("update.sh", "#!/bin/bash\necho ok\n");
+		fs.mkdirSync(path.join(dir, "bin"));
+		script("bin/omp-reviewer-test-local.sh", "#!/bin/bash\necho ok\n");
+		const previous = process.env.PATH;
+		process.env.PATH = `${path.join(dir, "bin")}${path.delimiter}${previous ?? ""}`;
+		try {
+			const result = await fire("tool_call", makeEvent(command), uiCtx(nextSession(), [user("u1", "update fork main")]));
+			expect(refusalOf(result).layer).toBe("unsure");
+			expect(reviewerCalls).toHaveLength(0);
+		} finally {
+			process.env.PATH = previous;
+		}
+	});
 });
 
 describe("an UNSURE the user asked for", () => {
@@ -321,4 +355,3 @@ describe("a failed review keeps the stage-1 block", () => {
 	});
 });
 
-void jevHazardousAnswer;

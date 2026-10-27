@@ -60,8 +60,13 @@ command ─▶ Jev ─▶ SAFE ────────────────�
 ```
 
 - **What it reads:** your messages and ask answers, the agent's tool calls, and the body of every script the command runs, read by the gate. It never sees tool results, skill text or the agent's prose.
-- **When it can allow:** only when Jev's verdict is UNSURE (never UNSAFE) and no secrets, exfiltration, privilege or injection hazard is raised. Every script must be readable: a script that is binary, over 64 KB, behind a secret path, or that hands off to another local file means no review.
-- **What an allow needs:** a verbatim quote of your own words asking for the work, which code checks. An allow still passes through the forced-block overlay and any refusal already recorded, and it is never cached.
+- **When it can allow:** only when Jev's verdict is UNSURE (never UNSAFE) and no secrets, exfiltration, privilege or injection hazard is raised.
+- **Which commands it reviews:** two shapes, and no others.
+  - Commands that run no local program: system tools such as `git` and `curl`, or the repository's own build tooling such as `bun test`.
+  - One local script on its own, optionally after `cd <dir> &&`, with literal words. Its body must be readable: not binary, under 64 KB, not behind a secret path, and not running another local file.
+
+  Interpreters running a file, wrappers such as `xargs` or `sudo`, PATH changes, pipes, and scripts inside compound commands are never reviewed. Build runners and git hooks run repository code nobody read. That is the ordinary development work Jev already allows.
+- **What an allow needs:** a verbatim quote of your own words: a whole message or ask answer, or at least three words of one. Code checks that the words exist. Whether they cover the command is the reviewer's judgement. An allow still passes through the forced-block overlay and any refusal already recorded, and it is never cached.
 - **Blocks and failures:** a block is remembered until you write again. A failed review (timeout, malformed reply, a script that changed after it was read) leaves the block in place.
 
 A refusal the session already recorded is stricter. It stays for the rest of the session, and a call gets past it only when all of these hold:

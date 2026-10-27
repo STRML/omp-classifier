@@ -137,15 +137,15 @@ export function renderReviewerInput(input: ReviewerInput): string {
 		return { from: "agent-tool-call", text: truncatedText(redactSecrets(entry.text), TOOL_CALL_MAX_CHARS) };
 	});
 	const document: Record<string, unknown> = {
-		command: input.command,
-		workingDirectory: input.workingDirectory,
+		command: redactSecrets(input.command),
+		workingDirectory: redactSecrets(input.workingDirectory),
 		transcript,
 		scriptBodies: input.scriptBodies.map(script => ({
 			path: script.path,
 			body: script.body === null ? null : redactSecrets(script.body),
 			...(script.unread === undefined ? {} : { unread: script.unread }),
 		})),
-		stage1: input.stage1,
+		stage1: { verdict: input.stage1.verdict, reason: redactSecrets(input.stage1.reason) },
 	};
 	if (input.trustedPolicy !== undefined && input.trustedPolicy.length > 0) {
 		document.trustedPolicy = input.trustedPolicy.map(({ file, content }) => ({ file, content: redactSecrets(content) }));
