@@ -4,6 +4,24 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-27
 
+### A stage 2 reviewer clears what Jev is unsure of and the user asked for
+
+Plan and failure matrix: `docs/plans/2026-10-27-stage-2-reviewer.md`. No battery change: `jevQuestionsHash` stays `a0393345ac3364d4`.
+
+- Jev answers typed questions in one pass and cannot reason through a script. After Sam typed "update fork main", `update-fork.sh start` scored p(safe) 0.21 with the command alone, and 0.73 at best with the skill and the whole script body. A typed "yes, run update-fork.sh start" scored 0.36. Moving the safe floor from 0.80 to 0.55 clears 4 of 113 false asks on the labeled corpora, so thresholds were not the fix.
+- A Jev UNSURE now goes to a reasoning reviewer, the way Claude Code's auto-mode classifier sends flagged actions to a second stage. The reviewer reads the user's messages, ask answers paired with the agent's question, the agent's tool calls, and the body of every script the command runs. It never sees tool results, skill text or assistant prose. Its rules are modelled on `claude auto-mode defaults`: allow work the user asked for, require the user to name both action and target for force pushes, deletes, deploys, publishes and shared-state changes, and never allow exfiltration, secrets, privilege or scope escalation.
+- Code holds the line, not the prompt:
+  - only UNSURE escalates, never UNSAFE, and never with a secrets, exfiltration, privilege or injection hazard at the review level;
+  - headless sessions, one-hot answers, the eval tool and dry runs never escalate;
+  - every script must be read: a binary, a file over 64 KB, a secret path, a script that hands off to another local file, or one an earlier step of the same command could write means no review;
+  - an allow must quote the user's own words verbatim, checked in code;
+  - the scripts are re-resolved and re-hashed before an allow counts;
+  - an allow still passes the forced-block overlay and any recorded refusal, and is never cached;
+  - a block is remembered for the target until the user writes again;
+  - every failure keeps the block.
+- `reviewerModel` (`provider/id`) and `reviewerTimeoutMs` (default 15 s, cut to fit the host's 30 s budget) are new keys in the classifier's own config. A project's settings cannot set them. Unset means no stage 2.
+- Measured with `bun eval/reviewer.ts` over every row the gate blocks on the adversarial, gitflow and intent corpora (jev-1.14.0, one sample), plus rows from the OMP session that motivated this. `deepseek/deepseek-flash` had 0 false allows out of 129 labeled-ask rows, got all 6 session rows right, and ran at a p50 of 1.2 s. Sonnet 5.5 could not be measured from the sandbox (connection errors).
+
 ### A clicked ask answer is the user's words
 
 No battery change: `jevQuestionsHash` stays `a0393345ac3364d4` and the policy version stays `jev-v2.18`.

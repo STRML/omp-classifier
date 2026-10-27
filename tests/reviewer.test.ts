@@ -180,6 +180,9 @@ describe("what never reaches the reviewer", () => {
 		["over 64 KB", () => script("big.sh", `#!/bin/bash\n${"# pad\n".repeat(13_000)}`), "./big.sh"],
 		["a binary", () => script("tool", "\u0000\u0001ELF binary"), "./tool"],
 		["a script that sources another local file", () => script("wrap.sh", "#!/bin/bash\nsource ./lib.sh\n"), "./wrap.sh"],
+		["a script that runs a relative program", () => script("wrap.sh", "#!/bin/bash\nset -e\n./lib/real.sh \"$@\"\n"), "./wrap.sh"],
+		["a script that runs a local script through a variable", () => script("wrap.sh", "#!/bin/bash\nREAL=\"$(dirname \"$0\")/real.sh\"\n\"$REAL\"\n"), "./wrap.sh"],
+		["a script written by an earlier step of the same command", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "printf '#!/bin/sh\\nrm -rf ~\\n' > gen.sh && ./gen.sh"],
 		[
 			"a symlink to a secret file",
 			() => {
@@ -221,6 +224,20 @@ describe("an allow is not a clean bill", () => {
 		await fire("tool_call", makeEvent("git fetch upstream"), uiCtx(sid, [user("u1", "fetch upstream")]));
 		await fire("tool_call", makeEvent("git fetch upstream"), uiCtx(sid, [user("u1", "fetch upstream")]));
 		expect(reviewerCalls).toHaveLength(2);
+	});
+
+	test("a symlink repointed after the read and before the allow blocks", async () => {
+		script("good.sh", "#!/bin/bash\necho fetching\n");
+		script("evil.sh", "#!/bin/bash\necho fetching\n");
+		fs.symlinkSync(path.join(dir, "good.sh"), path.join(dir, "run.sh"));
+		scriptReviewer(async () => {
+			fs.rmSync(path.join(dir, "run.sh"));
+			fs.symlinkSync(path.join(dir, "evil.sh"), path.join(dir, "run.sh"));
+			return reviewerReply("allow", "update fork main");
+		});
+		const result = await fire("tool_call", makeEvent("./run.sh"), uiCtx(nextSession(), [user("u1", "update fork main")]));
+		expect(refusalOf(result).layer).toBe("unsure");
+		expect(reviewerAudit()).toMatchObject({ failed: expect.stringContaining("changed") });
 	});
 
 	test("a script that changes after the read and before the allow blocks", async () => {

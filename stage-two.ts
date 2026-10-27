@@ -24,6 +24,8 @@ import { parseShell, type ShellCommand } from "./shell-ast";
 import { segmentCwdAt } from "./shell-cwd";
 
 export interface ReadScript extends ReviewerScriptBody {
+	/** The path the command names, resolved against its working directory but not through links. */
+	file?: string;
 	/** Where the body was read from, after links. */
 	realPath?: string;
 	sha256?: string;
@@ -45,7 +47,13 @@ const LOCAL_HANDOFF = [
 	/(?:^|[\s;&|(`])(?:exec\s+)?(?:bash|sh|zsh|python3?|node|bun|ruby|perl)\s+(?:\.{1,2}\/|"?\$\{?(?:BASH_SOURCE|0\b|SCRIPT_DIR|DIR\b|HERE\b))/mu,
 	/(?:^|[\s;&|(`])exec\s+(?:\.{1,2}\/|"?\$)/mu,
 	/\$\(\s*dirname\b[^)]*\)"?\/[^\s"']+\.(?:sh|bash|py|js|mjs|ts|rb|pl)\b/u,
+	// A relative program run as a statement's command: `./lib/real.sh`, `(../x)`.
+	/(?:^|[;&|(`{]\s*|\bthen\s+|\bdo\s+|\belse\s+)["']?\.{1,2}\/[^\s"';&|]+/mu,
+	// A variable that names a local script, ready to run as `"$VAR"`.
+	/^\s*(?:local\s+|export\s+|readonly\s+)?[A-Za-z_]\w*=["']?(?:[^"'\s]*(?:BASH_SOURCE|\$\(\s*dirname|\$0\b)[^"'\s]*|\.{1,2}\/[^"'\s]*)\.(?:sh|bash|zsh|py|js|mjs|ts|rb|pl)\b/mu,
 ];
+/** Commands that may run before a script in the same command line without being able to change it. */
+const INERT_BEFORE_SCRIPT = new Set(["cd", "pushd", "pwd", "export", "set", "true", ":"]);
 
 const sha256 = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 const unread = (spelled: string, why: string): ReadScript => ({ path: spelled, body: null, unread: why });
@@ -98,7 +106,7 @@ export function readScriptForReview(spelled: string, file: string): ReadScript {
 		.filter(line => !/^\s*#/u.test(line))
 		.join("\n");
 	if (LOCAL_HANDOFF.some(pattern => pattern.test(code))) return unread(spelled, "sources or runs another local file");
-	return { path: spelled, body, realPath: real, sha256: sha256(bytes) };
+	return { path: spelled, body, file, realPath: real, sha256: sha256(bytes) };
 }
 
 /** The program words of one parsed command: its verb past any wrappers, and any executable path argument (`xargs ./x`). */
@@ -128,8 +136,16 @@ export function scriptsForReview(command: string, cwd: string): ReadScript[] {
 	if (!parsed.ok) return [unread(command, "the command could not be parsed")];
 	const home = os.homedir();
 	const seen = new Map<string, ReadScript>();
+	// Whether an earlier step of this command line could have written, checked
+	// out, or replaced a script before it runs: the body read now would then not
+	// be the program that runs.
+	let writableBefore = false;
 	for (const shellCommand of parsed.commands) {
 		if (shellCommand.unreadShape !== undefined) return [unread(command, `the command has a shape the gate cannot read (${shellCommand.unreadShape})`)];
+		const verb = shellCommand.words[0]?.value ?? "";
+		const inert = INERT_BEFORE_SCRIPT.has(verb) && !shellCommand.redirects.some(redirect => redirect.direction !== "in");
+		const priorWrites = writableBefore;
+		if (!shellCommand.nested && !inert) writableBefore = true;
 		for (const word of programWords(shellCommand)) {
 			if (word.verb && INTERPRETERS.test(path.basename(word.value))) break;
 			const expanded = word.value.startsWith("~/") ? path.join(home, word.value.slice(2)) : word.value;
@@ -161,6 +177,10 @@ export function scriptsForReview(command: string, cwd: string): ReadScript[] {
 				// A program that is not there runs nothing.
 				continue;
 			}
+			if (priorWrites) {
+				seen.set(`after-write:${file}`, unread(word.value, "runs after an earlier step of the same command that could change it"));
+				continue;
+			}
 			const read = readScriptForReview(word.value, file);
 			seen.set(read.realPath ?? `unread:${file}`, read);
 		}
@@ -168,11 +188,14 @@ export function scriptsForReview(command: string, cwd: string): ReadScript[] {
 	return [...seen.values()];
 }
 
-/** Whether every body still has the bytes the reviewer was shown. */
+/** Whether every body still has the bytes the reviewer was shown, at the
+ *  path the command names: the link is resolved again, so a swapped symlink
+ *  that now points elsewhere counts as a change. */
 export function scriptsUnchanged(scripts: readonly ReadScript[]): boolean {
 	return scripts.every(script => {
-		if (script.realPath === undefined || script.sha256 === undefined) return true;
+		if (script.file === undefined || script.realPath === undefined || script.sha256 === undefined) return true;
 		try {
+			if (fs.realpathSync(script.file) !== script.realPath) return false;
 			return sha256(fs.readFileSync(script.realPath)) === script.sha256;
 		} catch {
 			return false;
