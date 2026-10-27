@@ -66,8 +66,11 @@ function gitRepositoryRoot(projectDir: string, env: Record<string, string>): str
 		if (root && path.isAbsolute(root)) return path.resolve(root);
 		throw new Error("Git did not report an absolute repository root");
 	}
+	// Git words "no repository" two ways: a walk to the root ends "(or any of
+	// the parent directories)", and one stopped at a mount point "(or any parent
+	// up to mount point <dir>)". Both mean the directory is in no repository.
 	const stderr = result.stderr.toString();
-	if (result.exitCode === 128 && stderr.includes("not a git repository (or any of the parent directories)")) return null;
+	if (result.exitCode === 128 && /not a git repository \(or any (?:of the parent directories|parent up to mount point )/u.test(stderr)) return null;
 	throw new Error("could not establish the current Git repository root");
 }
 

@@ -345,6 +345,17 @@ describe("/classifier trust-policy", () => {
 		expect(policyContains(policyInJudge(0), repoPolicy)).toBe(false);
 	});
 
+	test("a project directory at a filesystem boundary is outside any repository, so the pin succeeds", async () => {
+		// Git stops at a mount point and says so in a different message:
+		// "not a git repository (or any parent up to mount point /)". `/dev` is
+		// its own mount on macOS and Linux, and a runner whose temp dir is one
+		// failed every trust-policy test on that wording.
+		writeInstruction(standingPolicy);
+		const ctx = makeCtx({ cwd: "/dev" });
+		await fireCommand("classifier", "trust-policy", ctx);
+		expect(report(ctx)).toContain("pinned sha256=");
+	});
+
 	test("a non-regular instruction file is refused by the pin", async () => {
 		writeInstruction(standingPolicy);
 		const firstCtx = makeCtx({ cwd: home });
