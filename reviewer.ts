@@ -246,7 +246,14 @@ export function reviewerModelCall(registry: Pick<ModelRegistry, "find" | "getApi
 	return async (system, user, signal) => {
 		const apiKey = await registry.getApiKey(model, sessionId, { signal });
 		if (apiKey === undefined) throw new Error(`no credential for ${spec}`);
-		const reply = await completeSimple(model, { systemPrompt: [system], messages: [{ role: "user", content: user, timestamp: Date.now() }] }, { apiKey, signal, maxTokens: REVIEWER_MAX_TOKENS, temperature: 0 });
+		const context = { systemPrompt: [system], messages: [{ role: "user" as const, content: user, timestamp: Date.now() }] };
+		// Temperature 0 keeps one input to one answer, which matters because a
+		// block is remembered. A provider that refuses the parameter (some
+		// reasoning models do) gets the same request without it.
+		let reply = await completeSimple(model, context, { apiKey, signal, maxTokens: REVIEWER_MAX_TOKENS, temperature: 0 });
+		if (reply.stopReason === "error" && /temperature/iu.test(reply.errorMessage ?? "")) {
+			reply = await completeSimple(model, context, { apiKey, signal, maxTokens: REVIEWER_MAX_TOKENS });
+		}
 		if (reply.stopReason === "error" || reply.stopReason === "aborted") throw new Error(reply.errorMessage ?? `reviewer call ${reply.stopReason}`);
 		const text = reply.content
 			.filter((part): part is { type: "text"; text: string } => part.type === "text")
