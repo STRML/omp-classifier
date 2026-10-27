@@ -54,8 +54,21 @@ const INTERPRETERS = /^(?:bash|sh|zsh|dash|ksh|fish|csh|tcsh|python[\d.]*|pypy[\
 const PROGRAM_FILE_FLAG_TOOLS = new Set(["awk", "gawk", "mawk", "nawk", "jq", "sed", "gsed"]);
 /** Runners whose operand may be a program file rather than a script name. */
 const FILE_RUNNERS = new Set(["bun", "bunx", "npx", "pnpx", "tsx", "ts-node"]);
-/** Where a body may run an absolute program: system and package-manager directories. */
-const SYSTEM_PROGRAM_DIRS = ["/usr/", "/bin/", "/sbin/", "/opt/homebrew/", "/System/", "/Library/Developer/"];
+/**
+ * Whether a path names a system program: absolute, no `..` segment, and its
+ * real file is owned by root, so neither the agent nor the user's other
+ * tooling could have written it. A directory prefix alone proves nothing
+ * (`/usr/../tmp/x`, a user-writable `/opt/homebrew`).
+ */
+function isSystemProgram(value: string): boolean {
+	const expanded = expandHome(value);
+	if (!path.isAbsolute(expanded) || expanded.split("/").includes("..")) return false;
+	try {
+		return fs.statSync(fs.realpathSync(expanded)).uid === 0;
+	} catch {
+		return false;
+	}
+}
 const SCRIPT_EXTENSION = /\.(?:sh|bash|zsh|py|js|mjs|cjs|ts|rb|pl|tcl|lua)$/iu;
 /** The hand-offs a parse can miss: a script-dir path to a program file, and a variable assigned one. */
 const LOCAL_HANDOFF = [
@@ -68,7 +81,7 @@ const unread = (spelled: string, why: string): ReadScript => ({ path: spelled, b
 const refuse = (why: string): CommandScripts => ({ kind: "refuse", why });
 const expandHome = (value: string): string => (value === "~" ? os.homedir() : value.startsWith("~/") ? path.join(os.homedir(), value.slice(2)) : value);
 const verbName = (command: ShellCommand): string => path.basename(command.words[0]?.value ?? "");
-const isLiteral = (word: ShellWord): boolean => word.literal;
+const isLiteral = (word: ShellWord): boolean => word.fixed;
 
 /** Whether a word names a file by path rather than by a bare name. */
 const isPathWord = (value: string): boolean => value.includes("/") || value.startsWith("~");
@@ -155,11 +168,15 @@ function bodyHandOff(body: string): string | undefined {
 		if (command.unreadShape !== undefined) return `a shell construct the gate cannot read (${command.unreadShape})`;
 		const program = command.words[0]?.value ?? "";
 		const name = verbName(command);
-		if (isPathWord(program) && !SYSTEM_PROGRAM_DIRS.some(dir => expandHome(program).startsWith(dir))) return `runs ${program}`;
+		if (isPathWord(program) && !isSystemProgram(program)) return `runs ${program}`;
+		// Sourcing or interpreting anything runs a file, whether named by path or by bare name.
+		if ((name === "source" || name === "." || INTERPRETERS.test(name)) && command.words.slice(1).some(word => !word.value.startsWith("-") && !isSystemProgram(word.value))) {
+			return `${name} runs ${command.words.slice(1).find(word => !word.value.startsWith("-"))?.value ?? "a file"}`;
+		}
 		if (PROGRAM_FILE_FLAG_TOOLS.has(name) && command.words.some(word => /^(?:-f|--from-file|--file)(?:=|$)/u.test(word.value))) return `${name} runs a program file`;
 		if (FILE_RUNNERS.has(name) && runnerRunsFile(name, command.words)) return `${name} runs a program file`;
 		const handsPaths = WRAPPERS.has(name) || INTERPRETERS.test(name);
-		if (handsPaths && command.words.slice(1).some(word => isPathWord(word.value) && !SYSTEM_PROGRAM_DIRS.some(dir => expandHome(word.value).startsWith(dir)))) {
+		if (handsPaths && command.words.slice(1).some(word => isPathWord(word.value) && !isSystemProgram(word.value))) {
 			return `hands a local path to ${name}`;
 		}
 	}
@@ -209,7 +226,7 @@ export function scriptsForReview(command: string, startCwd: string): CommandScri
 	const parsed = parseShell(command);
 	if (!parsed.ok) return refuse("the command could not be parsed");
 	const commands = parsed.commands;
-	const runsLocalPath = commands.some(item => isPathWord(item.words[0]?.value ?? "") && !SYSTEM_PROGRAM_DIRS.some(dir => expandHome(item.words[0].value).startsWith(dir)));
+	const runsLocalPath = commands.some(item => isPathWord(item.words[0]?.value ?? "") && !isSystemProgram(item.words[0].value));
 	if (!runsLocalPath) {
 		const why = shapeARefusal(commands);
 		return why === undefined ? { kind: "scripts", scripts: [] } : refuse(why);
@@ -219,7 +236,7 @@ export function scriptsForReview(command: string, startCwd: string): CommandScri
 	let rest = commands;
 	if (commands.length === 2 && verbName(commands[0]) === "cd" && commands[1].join === "and") {
 		const cd = commands[0];
-		if (cd.words.length !== 2 || !cd.words[1].literal || cd.assigns.length > 0 || cd.redirects.length > 0) return refuse("the cd before the script is not one literal directory");
+		if (cd.words.length !== 2 || !cd.words[1].fixed || cd.assigns.length > 0 || cd.redirects.length > 0) return refuse("the cd before the script is not one literal directory");
 		dir = path.resolve(startCwd, expandHome(cd.words[1].value));
 		rest = commands.slice(1);
 	}

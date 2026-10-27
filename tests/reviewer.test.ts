@@ -14,7 +14,6 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { DecisionRecord } from "../index";
 import {
 	fire,
-
 	jevNoul,
 	jevUnsafeAnswer,
 	jevUnsureAnswer,
@@ -108,14 +107,16 @@ describe("which commands stage 2 can vouch for", () => {
 		["a script piped into another command", "./update.sh start | tail -5"],
 		["a wrapper running a local program", "xargs -n 1 ./update.sh"],
 		["a local script run by bare name on PATH", "omp-reviewer-test-local.sh"],
+		["a local script disguised behind a system prefix and ..", "/usr/..__DIR__/wrap.sh"],
 	])("refuses %s", async (_name, command) => {
 		script("update.sh", "#!/bin/bash\necho ok\n");
+		script("wrap.sh", "#!/bin/bash\nsource lib.sh\n");
 		fs.mkdirSync(path.join(dir, "bin"));
 		script("bin/omp-reviewer-test-local.sh", "#!/bin/bash\necho ok\n");
 		const previous = process.env.PATH;
 		process.env.PATH = `${path.join(dir, "bin")}${path.delimiter}${previous ?? ""}`;
 		try {
-			const result = await fire("tool_call", makeEvent(command), uiCtx(nextSession(), [user("u1", "update fork main")]));
+			const result = await fire("tool_call", makeEvent(command.replace("__DIR__", dir)), uiCtx(nextSession(), [user("u1", "update fork main")]));
 			expect(refusalOf(result).layer).toBe("unsure");
 			expect(reviewerCalls).toHaveLength(0);
 		} finally {
@@ -231,6 +232,9 @@ describe("what never reaches the reviewer", () => {
 		["a script written by an earlier step of the same command", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "printf '#!/bin/sh\\nrm -rf ~\\n' > gen.sh && ./gen.sh"],
 		["a script written inside a cd's substitution", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "cd \"$(printf 'x' > gen.sh; echo .)\" && ./gen.sh"],
 		["a script written by a substitution in its own arguments", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "./gen.sh \"$(printf 'x' > gen.sh)\""],
+		["a script that sources a file by bare name", () => script("wrap.sh", "#!/bin/bash\nsource lib.sh\n"), "./wrap.sh"],
+		["a script that interprets a file by bare name", () => script("wrap.sh", "#!/bin/bash\npython3 helper.py\n"), "./wrap.sh"],
+		["a script that runs a local program behind a system prefix and ..", () => script("wrap.sh", "#!/bin/bash\n/usr/../tmp/evil.sh\n"), "./wrap.sh"],
 		["a script that runs an indented relative program", () => script("wrap.sh", "#!/bin/bash\nif true; then\n    ./lib/real.sh\nfi\n"), "./wrap.sh"],
 		["a shebang-less .sh that runs a relative program", () => script("wrap.sh", "lib/real.sh\n"), "./wrap.sh"],
 		["a script that runs a variable-built path", () => script("wrap.sh", "#!/bin/bash\nD=lib\n\"$D/real.sh\"\n"), "./wrap.sh"],
@@ -354,4 +358,3 @@ describe("a failed review keeps the stage-1 block", () => {
 		expect(reviewerAudit()).toMatchObject({ failed: expect.stringContaining("timed out") });
 	});
 });
-
