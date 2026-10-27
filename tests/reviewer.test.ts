@@ -195,6 +195,9 @@ describe("what never reaches the reviewer", () => {
 		["a script that runs a relative program", () => script("wrap.sh", "#!/bin/bash\nset -e\n./lib/real.sh \"$@\"\n"), "./wrap.sh"],
 		["a script that runs a local script through a variable", () => script("wrap.sh", "#!/bin/bash\nREAL=\"$(dirname \"$0\")/real.sh\"\n\"$REAL\"\n"), "./wrap.sh"],
 		["a script written by an earlier step of the same command", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "printf '#!/bin/sh\\nrm -rf ~\\n' > gen.sh && ./gen.sh"],
+		["a script written inside a cd's substitution", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "cd \"$(printf 'x' > gen.sh; echo .)\" && ./gen.sh"],
+		["a script written by a substitution in its own arguments", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "./gen.sh \"$(printf 'x' > gen.sh)\""],
+		["a script that runs an indented relative program", () => script("wrap.sh", "#!/bin/bash\nif true; then\n    ./lib/real.sh\nfi\n"), "./wrap.sh"],
 		[
 			"a symlink to a secret file",
 			() => {

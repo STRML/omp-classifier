@@ -106,6 +106,18 @@ export function readScriptForReview(spelled: string, file: string): ReadScript {
 		.filter(line => !/^\s*#/u.test(line))
 		.join("\n");
 	if (LOCAL_HANDOFF.some(pattern => pattern.test(code))) return unread(spelled, "sources or runs another local file");
+	// The parsed body, for what a regex cannot see: a relative program run as
+	// any command, however it is indented or joined. A shell body the parser
+	// cannot read is not a body the gate can vouch for.
+	if (body.startsWith("#!") && /\b(?:ba|z|da|k)?sh\b/u.test(body.split("\n", 1)[0])) {
+		const parsed = parseShell(body);
+		if (!parsed.ok) return unread(spelled, "its shell body could not be parsed");
+		const handsOff = parsed.commands.some(command => {
+			const program = programWords(command).find(word => word.verb)?.value ?? "";
+			return /^\.{1,2}\//u.test(program) || command.unreadShape !== undefined;
+		});
+		if (handsOff) return unread(spelled, "sources or runs another local file");
+	}
 	return { path: spelled, body, file, realPath: real, sha256: sha256(bytes) };
 }
 
@@ -143,9 +155,11 @@ export function scriptsForReview(command: string, cwd: string): ReadScript[] {
 	for (const shellCommand of parsed.commands) {
 		if (shellCommand.unreadShape !== undefined) return [unread(command, `the command has a shape the gate cannot read (${shellCommand.unreadShape})`)];
 		const verb = shellCommand.words[0]?.value ?? "";
-		const inert = INERT_BEFORE_SCRIPT.has(verb) && !shellCommand.redirects.some(redirect => redirect.direction !== "in");
-		const priorWrites = writableBefore;
-		if (!shellCommand.nested && !inert) writableBefore = true;
+		const substitutes = shellCommand.words.some(word => word.substitution) || shellCommand.redirects.some(redirect => !redirect.target.literal);
+		const inert = !shellCommand.nested && !substitutes && INERT_BEFORE_SCRIPT.has(verb) && !shellCommand.redirects.some(redirect => redirect.direction !== "in");
+		// A substitution in this command's own words runs before its program does.
+		const priorWrites = writableBefore || substitutes;
+		if (!inert) writableBefore = true;
 		for (const word of programWords(shellCommand)) {
 			if (word.verb && INTERPRETERS.test(path.basename(word.value))) break;
 			const expanded = word.value.startsWith("~/") ? path.join(home, word.value.slice(2)) : word.value;
