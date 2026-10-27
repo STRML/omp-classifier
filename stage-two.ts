@@ -32,7 +32,9 @@ export interface ReadScript extends ReviewerScriptBody {
 }
 
 /** Commands that run the word after them (and their own flags) as the program. */
-const WRAPPERS = new Set(["env", "time", "nohup", "exec", "command", "nice", "caffeinate"]);
+const WRAPPERS = new Set(["env", "time", "nohup", "exec", "command", "nice", "caffeinate", "xargs", "timeout", "watch", "parallel", "sudo", "doas"]);
+/** `find` runs the word after one of these as a program. */
+const FIND_EXEC = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
 /** Interpreters whose script operand readInterpretedScriptBodies already reads. */
 const INTERPRETERS = /^(?:bash|sh|zsh|dash|ksh|fish|python[\d.]*|node|bun|deno|ruby|perl|php|tclsh[\d.]*|lua|osascript)$/u;
 const SCRIPT_EXTENSION = /\.(?:sh|bash|zsh|py|js|mjs|cjs|ts|rb|pl|tcl|lua)$/iu;
@@ -109,13 +111,20 @@ export function readScriptForReview(spelled: string, file: string): ReadScript {
 	// The parsed body, for what a regex cannot see: a relative program run as
 	// any command, however it is indented or joined. A shell body the parser
 	// cannot read is not a body the gate can vouch for.
-	if (body.startsWith("#!") && /\b(?:ba|z|da|k)?sh\b/u.test(body.split("\n", 1)[0])) {
+	// Every body is shell unless its shebang names another interpreter: a file
+	// with no shebang is run by the shell too.
+	const shebang = body.startsWith("#!") ? body.split("\n", 1)[0] : "";
+	const otherInterpreter = shebang !== "" && !/\b(?:ba|z|da|k)?sh\b/u.test(shebang);
+	if (!otherInterpreter) {
 		const parsed = parseShell(body);
 		if (!parsed.ok) return unread(spelled, "its shell body could not be parsed");
-		const handsOff = parsed.commands.some(command => {
-			const program = programWords(command).find(word => word.verb)?.value ?? "";
-			return /^\.{1,2}\//u.test(program) || command.unreadShape !== undefined;
-		});
+		// Any program word, or path argument, that names a file by a relative or
+		// variable-built path (`./x`, `lib/x`, `$DIR/x`) runs a file this read
+		// did not cover. A bare variable (`"$OMP"`) stays: the reviewer sees what
+		// the body assigns it, and LOCAL_HANDOFF refuses a script-dir assignment.
+		const handsOff = parsed.commands.some(
+			command => command.unreadShape !== undefined || programWords(command).some(word => word.value.includes("/") && !path.isAbsolute(word.value) && !word.value.startsWith("~/")),
+		);
 		if (handsOff) return unread(spelled, "sources or runs another local file");
 	}
 	return { path: spelled, body, file, realPath: real, sha256: sha256(bytes) };
@@ -127,13 +136,16 @@ function programWords(command: ShellCommand): Array<{ value: string; offset: num
 	let head = 0;
 	while (head < words.length && WRAPPERS.has(path.basename(words[head].value))) {
 		head++;
-		while (head < words.length && (words[head].value.startsWith("-") || /^[A-Za-z_]\w*=/u.test(words[head].value))) head++;
+		// A wrapper's flags, assignments and numeric flag values (`xargs -n 1`,
+		// `timeout 30`) come before the program it runs.
+		while (head < words.length && (words[head].value.startsWith("-") || /^[A-Za-z_]\w*=/u.test(words[head].value) || /^\d+[smhd]?$/u.test(words[head].value))) head++;
 	}
 	const found: Array<{ value: string; offset: number; verb: boolean }> = [];
 	if (head < words.length) found.push({ value: words[head].value, offset: words[head].offset ?? 0, verb: true });
 	for (let index = head + 1; index < words.length; index++) {
 		const value = words[index].value;
-		if (/^(?:\.{1,2}\/|\/|~\/)/u.test(value)) found.push({ value, offset: words[index].offset ?? 0, verb: false });
+		const execTarget = path.basename(words[head]?.value ?? "") === "find" && FIND_EXEC.has(words[index - 1].value);
+		if (execTarget || /^(?:\.{1,2}\/|\/|~\/)/u.test(value)) found.push({ value, offset: words[index].offset ?? 0, verb: execTarget });
 	}
 	return found;
 }
@@ -155,7 +167,13 @@ export function scriptsForReview(command: string, cwd: string): ReadScript[] {
 	for (const shellCommand of parsed.commands) {
 		if (shellCommand.unreadShape !== undefined) return [unread(command, `the command has a shape the gate cannot read (${shellCommand.unreadShape})`)];
 		const verb = shellCommand.words[0]?.value ?? "";
-		const substitutes = shellCommand.words.some(word => word.substitution) || shellCommand.redirects.some(redirect => !redirect.target.literal);
+		// Anything non-literal (a substitution, a process substitution, a
+		// variable) in a word, an assignment or a redirect can run or write
+		// before the program does.
+		const substitutes =
+			shellCommand.words.some(word => !word.literal) ||
+			shellCommand.assigns.some(assign => assign.value !== undefined && !assign.value.literal) ||
+			shellCommand.redirects.some(redirect => !redirect.target.literal);
 		const inert = !shellCommand.nested && !substitutes && INERT_BEFORE_SCRIPT.has(verb) && !shellCommand.redirects.some(redirect => redirect.direction !== "in");
 		// A substitution in this command's own words runs before its program does.
 		const priorWrites = writableBefore || substitutes;

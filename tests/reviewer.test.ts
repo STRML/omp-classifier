@@ -198,6 +198,11 @@ describe("what never reaches the reviewer", () => {
 		["a script written inside a cd's substitution", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "cd \"$(printf 'x' > gen.sh; echo .)\" && ./gen.sh"],
 		["a script written by a substitution in its own arguments", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "./gen.sh \"$(printf 'x' > gen.sh)\""],
 		["a script that runs an indented relative program", () => script("wrap.sh", "#!/bin/bash\nif true; then\n    ./lib/real.sh\nfi\n"), "./wrap.sh"],
+		["a shebang-less .sh that runs a relative program", () => script("wrap.sh", "lib/real.sh\n"), "./wrap.sh"],
+		["a script that runs a variable-built path", () => script("wrap.sh", "#!/bin/bash\nD=lib\n\"$D/real.sh\"\n"), "./wrap.sh"],
+		["a script that hands a relative program to xargs", () => script("wrap.sh", "#!/bin/bash\necho a | xargs lib/real.sh\n"), "./wrap.sh"],
+		["a script written by a process substitution before it runs", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "cat <(printf x > gen.sh) && ./gen.sh"],
+		["a script written by an assignment's substitution", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "X=\"$(printf x > gen.sh)\" ./gen.sh"],
 		[
 			"a symlink to a secret file",
 			() => {
