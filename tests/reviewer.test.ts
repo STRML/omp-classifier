@@ -240,6 +240,8 @@ describe("what never reaches the reviewer", () => {
 		["a script that feeds a file to an interpreter's stdin", () => script("wrap.sh", "#!/bin/bash\nbash < payload.txt\n"), "./wrap.sh"],
 		["a script that runs a here-document through an interpreter", () => script("wrap.sh", "#!/bin/bash\nsh <<'EOF'\nrm -rf ~\nEOF\n"), "./wrap.sh"],
 		["a script that pipes into an interpreter", () => script("wrap.sh", "#!/bin/bash\ncat payload.txt | bash\n"), "./wrap.sh"],
+		["a script that runs an interpreter through a wrapper", () => script("wrap.sh", "#!/bin/bash\ntimeout 30 bash payload\n"), "./wrap.sh"],
+		["a script that changes PATH", () => script("wrap.sh", "#!/bin/bash\nexport PATH=/tmp/evil:$PATH\ngit status\n"), "./wrap.sh"],
 		["a script that runs inline interpreter code", () => script("wrap.sh", "#!/bin/bash\npython3 -c 'import os'\n"), "./wrap.sh"],
 		["a script that interprets a file by bare name", () => script("wrap.sh", "#!/bin/bash\npython3 helper.py\n"), "./wrap.sh"],
 		["a script that runs a local program behind a system prefix and ..", () => script("wrap.sh", "#!/bin/bash\n/usr/../tmp/evil.sh\n"), "./wrap.sh"],

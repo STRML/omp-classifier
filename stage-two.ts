@@ -209,6 +209,10 @@ function bodyHandOff(body: string): string | undefined {
 		// whatever carries it: a file, a bare name, stdin, a pipe, a here-document
 		// or `-c` text. Each of those was a bypass in turn, so none is allowed.
 		if (names.some(n => n === "source" || n === "." || INTERPRETERS.test(n))) return `${name} runs code the gate did not read`;
+		// A wrapper starts another program (`timeout 30 bash x`), and a PATH change
+		// makes every later bare name resolve somewhere this check did not look.
+		if (names.some(n => WRAPPERS.has(n))) return `${name} runs another program`;
+		if (changesPath(command)) return "changes PATH";
 		if (names.some(n => PROGRAM_FILE_FLAG_TOOLS.has(n)) && command.words.some(word => /^(?:-f|--from-file|--file)(?:=|$)/u.test(word.value))) return `${name} runs a program file`;
 		if (names.some(n => FILE_RUNNERS.has(n) && runnerRunsFile(n, command.words))) return `${name} runs a program file`;
 		const handsPaths = names.some(n => WRAPPERS.has(n) || INTERPRETERS.test(n));
@@ -231,14 +235,20 @@ function runnerRunsFile(name: string, words: readonly ShellWord[]): boolean {
 	return isFile(operands[0]);
 }
 
+/** Whether a command assigns or exports PATH, for itself or for what follows. */
+function changesPath(command: ShellCommand): boolean {
+	return (
+		command.assigns.some(assign => assign.name === "PATH") ||
+		(["export", "declare", "typeset", "readonly", "local", "set"].includes(verbName(command)) && command.words.some(word => /^PATH(?:\+)?=/u.test(word.value)))
+	);
+}
+
 /** Shape A: why a command with no local program still cannot be reviewed, or undefined. */
 function shapeARefusal(commands: readonly ShellCommand[]): string | undefined {
 	for (const command of commands) {
 		if (command.unreadShape !== undefined) return `a shell construct the gate cannot read (${command.unreadShape})`;
 		const name = verbName(command);
-		if (command.assigns.some(assign => assign.name === "PATH") || (["export", "declare", "typeset", "set"].includes(name) && command.words.some(word => /^PATH=/u.test(word.value)))) {
-			return "changes PATH";
-		}
+		if (changesPath(command)) return "changes PATH";
 		if (command.words.length === 0) continue;
 		const program = command.words[0];
 		if (!isLiteral(program)) return "the program is built at run time";
