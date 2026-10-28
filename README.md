@@ -63,11 +63,11 @@ command ─▶ Jev ─▶ SAFE ────────────────�
 - **When it can allow:** only when Jev's verdict is UNSURE (never UNSAFE) and no secrets, exfiltration, privilege or injection hazard is raised.
 - **Which commands it reviews:** two shapes, and no others.
   - Commands that run no local program: system tools such as `git` and `curl`, or the repository's own build tooling such as `bun test`.
-  - One local script on its own, optionally after `cd <dir> &&`, with literal words. Its body must be readable: not binary, under 64 KB, not behind a secret path, and not running another local file.
+  - One local script on its own, optionally after `cd <dir> &&`, with literal words. Its body must be readable: not binary, under 64 KB, not behind a secret path, and not handing off to another program (an interpreter, a wrapper, a change to PATH or what a shell loads, or a program named by a path outside the root-owned system directories).
 
   Interpreters running a file, wrappers such as `xargs` or `sudo`, PATH changes, pipes, and scripts inside compound commands are never reviewed. Build runners and git hooks run repository code nobody read. That is the ordinary development work Jev already allows.
 - **What an allow needs:** a verbatim quote of your own words: a whole message or ask answer, or at least three words of one. Code checks that the words exist. Whether they cover the command is the reviewer's judgement. An allow still passes through the forced-block overlay and any refusal already recorded, and it is never cached.
-- **Blocks and failures:** a block is remembered until you write again. A failed review (timeout, malformed reply, a script that changed after it was read) leaves the block in place.
+- **Blocks and failures:** a block is remembered until you write again. The reviewer runs at temperature 0, and a malformed reply gets one retry. A failed review (timeout, a second malformed reply, a script that changed after it was read) leaves the block in place.
 
 A refusal the session already recorded is stricter. It stays for the rest of the session, and a call gets past it only when all of these hold:
 
