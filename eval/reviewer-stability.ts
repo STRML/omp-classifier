@@ -40,11 +40,21 @@ if (values.session === undefined || values.cwd === undefined || values.upto === 
 	process.exit(2);
 }
 
+const draws = Number(values.draws);
+const timeoutMs = Number(values.timeout);
+if (!Number.isInteger(draws) || draws < 1 || !Number.isInteger(timeoutMs) || timeoutMs < 1) {
+	console.error("--draws and --timeout must be positive integers");
+	process.exit(2);
+}
+
 const entries = readFileSync(values.session, "utf8")
 	.trim()
 	.split("\n")
 	.map(line => JSON.parse(line));
-const cut = entries.findIndex(e => e.type === "message" && e.message?.role === "user" && JSON.stringify(e.message.content).includes(values.upto!));
+// The user's own text only: a string, or the text blocks of a block array.
+const userText = (content: unknown): string =>
+	typeof content === "string" ? content : Array.isArray(content) ? content.map(block => (typeof block?.text === "string" ? block.text : "")).join("\n") : "";
+const cut = entries.findIndex(e => e.type === "message" && e.message?.role === "user" && userText(e.message.content).includes(values.upto!));
 if (cut < 0) {
 	console.error(`no user message contains ${JSON.stringify(values.upto)}`);
 	process.exit(2);
@@ -73,8 +83,8 @@ const input = {
 	stage1: { verdict: "UNSURE" as const, reason: "below floor" },
 };
 const tally: Record<string, number> = {};
-for (let i = 0; i < Number(values.draws); i++) {
-	const outcome = await runReviewer(input, call, Number(values.timeout));
+for (let i = 0; i < draws; i++) {
+	const outcome = await runReviewer(input, call, timeoutMs);
 	const key = outcome.kind === "decided" ? outcome.decision.decision : `failed: ${outcome.why.slice(0, 60)}`;
 	tally[key] = (tally[key] ?? 0) + 1;
 }
