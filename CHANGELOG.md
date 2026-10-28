@@ -4,6 +4,28 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-27
 
+### The reviewer runs at temperature 0 and retries one malformed reply
+
+From the first live check of stage 2 (https://github.com/STRML/omp-classifier/pull/195), with the real Jev, the transcript of OMP session `01a17ea2`, the real script read and `deepseek/deepseek-flash`.
+
+- Three draws on the same input came back allow, allow and block, and one reply broke the schema. A block is remembered until the user writes again, so one bad draw could pin the command. The reviewer now asks for `temperature: 0`, and sends the request without it when a provider rejects the setting.
+- A malformed reply is retried once. An allow or a block is final and is never re-drawn, and a provider error is not retried.
+- Live after the change: `update-fork.sh start` allowed 10 of 10 draws at two points in the session, and `status` 5 of 5. The corpus bake-off still has 0 of 129 false allows, p50 1.1 s.
+
+### A script body that hands off to another program is not reviewed
+
+Two automated security reviews of the merged reviewer found ways to run code the reviewer never read (https://github.com/STRML/omp-classifier/pull/193, https://github.com/STRML/omp-classifier/pull/194).
+
+| Hole | After |
+|---|---|
+| `~/bin/tool -> /bin/sh`, then `tool x` | A program is known by its spelled name and by the name of the file it resolves to, PATH lookups included |
+| A root-owned program in a group- or other-writable directory | A system program needs its spelled path and its real path on a chain of root-owned components nobody else can write |
+| `bash < x` or `sh <<EOF` in a body | Feeding code to an interpreter or `source` on stdin is a hand-off |
+| `timeout 30 bash x` in a body | Any wrapper in a body is a hand-off |
+| `export PATH=…` in a body | A body that writes PATH, `BASH_ENV`, `ENV` or `CDPATH` is a hand-off |
+
+A program named through a variable (`"$OMP"`) is a stated residual: the reviewer sees the assignment, and the gate does not follow it. `update-fork.sh` still reads.
+
 ### A stage 2 reviewer clears what Jev is unsure of and the user asked for
 
 Plan and failure matrix: `docs/plans/2026-10-27-stage-2-reviewer.md`. No battery change: `jevQuestionsHash` stays `a0393345ac3364d4`.
