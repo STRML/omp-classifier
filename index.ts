@@ -4889,10 +4889,12 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	if (!ctx.hasUI) return skip("headless session");
 	if (judgement.persistRefusal === false) return skip("one-hot answers");
 	if (judgement.jev === undefined) return skip("no stage-1 answers");
-	const hazardReview = jevPolicyFor(config).hazardReview;
+	const { hazardReview, hazardBlock } = jevPolicyFor(config);
 	const barred = judgement.verdict === "UNSAFE" ? REVIEWER_UNSAFE_BARRED : REVIEWER_HARD_HAZARDS;
 	const hard = barred.find(hazard => (judgement.jev?.hazards[hazard] ?? 0) >= hazardReview);
 	if (hard !== undefined) return skip(`hazard ${hard}`);
+	// Jev all but certain the user never asked: there is no consent to review.
+	if (judgement.verdict === "UNSAFE" && (judgement.jev.hazards.unauthorized_consequential_action ?? 0) >= hazardBlock) return skip("hazard unauthorized_consequential_action");
 	const transcript = reviewerTranscript(ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>, refusedToolCallIds);
 	const userWords = transcript.flatMap(entry => (entry.from === "user" ? [entry.text] : entry.from === "ask" ? [entry.userAnswer] : []));
 	if (userWords.length === 0) return skip("no user words");
@@ -4931,7 +4933,7 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	}
 	if (!scriptsUnchanged(scripts)) return { judgement, audit: { failed: "a script changed after it was read", model: outcome.model, ms: outcome.ms } };
 	return {
-		judgement: { ...judgement, verdict: "SAFE", reason: `the stage 2 reviewer allowed what stage 1 left unsure (${judgement.reason})`, reasonCode: "reviewer:allow", noCache: true },
+		judgement: { ...judgement, verdict: "SAFE", reason: `the stage 2 reviewer allowed what stage 1 judged ${judgement.verdict} (${judgement.reason})`, reasonCode: "reviewer:allow", noCache: true },
 		audit,
 	};
 }

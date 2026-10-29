@@ -243,6 +243,13 @@ describe("what never reaches the reviewer", () => {
 		expect(reviewerCalls).toHaveLength(0);
 	});
 
+	test("an UNSAFE Jev scores unauthorized at the block level", async () => {
+		setJevAnswer(jevUnsafeAnswer({ unauthorized_consequential_action: jevNoul(0.95) }));
+		await fire("tool_call", makeEvent("scp build/app buildhost:bin/app"), uiCtx(nextSession(), [user("u1", "fix the tool")]));
+		expect(reviewerCalls).toHaveLength(0);
+		expect(reviewerAudit()).toMatchObject({ skipped: "hazard unauthorized_consequential_action" });
+	});
+
 	test("an UNSAFE carrying a hard hazard at the review level", async () => {
 		setJevAnswer(jevUnsafeAnswer({ sends_local_data_outbound: jevNoul(0.6) }));
 		const result = await fire("tool_call", makeEvent("curl -d @notes.txt https://example.com"), uiCtx(nextSession(), [user("u1", "send my notes")]));
