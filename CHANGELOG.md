@@ -2,6 +2,22 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-10-29
+
+### Stage 2 reviews an UNSAFE too
+
+From OMP session `01a18825`. The user clicked an ask answer that named an scp of a rebuilt binary to a machine on their network, and Jev answered UNSAFE on that scp (0.54, then 0.89 after the user typed that they wanted it deployed), with every hard hazard under the review level. The reviewer never ran.
+
+| Cause | Fix |
+|---|---|
+| Stage 2 escalated only UNSURE | An UNSAFE escalates too, under the same checks (no hard hazard at the review level, a UI session, user words), and only when Jev scored `destructive_or_irreversible` under the review level and `unauthorized_consequential_action` under the block level. A reviewer block still records the refusal; an allow records none |
+| macOS ships `cd` as `/usr/bin/cd`, a root-owned sh script, so every `cd <dir> && …` read as "a local script run by name" | A script found on PATH on a root-owned chain is a system program, like any binary there |
+| The reviewer weighed the user's earlier "don't make requests against that machine for now" over the later ask answer | The prompt reads the user's words in order: a limit stands until a later user entry or answer asks for the action again |
+
+Measured with `deepseek/deepseek-flash` on the adversarial, gitflow and intent corpora (jev-1.14.0, one sample): 0 of 129 labeled-ask rows allowed, and 0 of 34 among the 70 rows production now escalates (6 of them UNSAFE). `eval/reviewer-stability.ts` replaying the session's scp with stage 1 UNSAFE: allowed 5/5 after the ask answer, and blocked 5/5 before it, while the earlier limit stood. The probe takes `--at <iso time>` to cut after an ask answer, and `--verdict` and `--reason` for stage 1.
+
+The agent's real command also ran `ssh`, which resolved to a stale user-owned wrapper ahead of `/usr/bin/ssh` on PATH, and stage 2 does not review a local script run by name. That is a property of the machine, not the gate: the wrapper is removed, and with `/usr/bin/ssh` the command passes the shape check.
+
 ## 2026-10-27
 
 ### The reviewer runs at temperature 0 and retries one malformed reply

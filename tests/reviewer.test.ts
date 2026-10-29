@@ -191,10 +191,69 @@ describe("consent is checked in code", () => {
 	});
 });
 
-describe("what never reaches the reviewer", () => {
-	test("an UNSAFE verdict", async () => {
+describe("an UNSAFE verdict goes to the reviewer", () => {
+	// OMP session 01a18825: the user clicked an ask answer naming the scp and
+	// Jev still answered UNSAFE (0.54, then 0.89), with no hard hazard raised. Claude Code's second stage reviews
+	// every action the first stage flags, not only the undecided ones.
+	const deploy = "scp target/release/tool buildhost:.local/bin/tool.new";
+	const answer = "Run the scp to buildhost ~/.local/bin/tool";
+	const consent = () => [user("u1", "fix the tool"), askAnswer("a1", "Deploy the rebuilt binary to the Studio?", answer)];
+
+	test("an allow quoting the user's answer runs it", async () => {
 		setJevAnswer(jevUnsafeAnswer());
-		await fire("tool_call", makeEvent("git push --force origin main"), uiCtx(nextSession(), [user("u1", "update fork main")]));
+		scriptReviewer(reviewerReply("allow", answer));
+		const result = await fire("tool_call", makeEvent(deploy), uiCtx(nextSession(), consent()));
+		expect(resultText(result)).toBe("ALLOWED");
+		expect(reviewerCalls[0].input.stage1).toMatchObject({ verdict: "UNSAFE" });
+	});
+
+	test("an allowed UNSAFE records no refusal", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		scriptReviewer(reviewerReply("allow", answer), reviewerReply("allow", answer));
+		await fire("tool_call", makeEvent(deploy), uiCtx(sid, consent()));
+		expect(resultText(await fire("tool_call", makeEvent(deploy), uiCtx(sid, consent())))).toBe("ALLOWED");
+	});
+
+	test("a leading cd reaches the reviewer", async () => {
+		setJevAnswer(jevUnsafeAnswer());
+		scriptReviewer(reviewerReply("allow", answer));
+		const result = await fire("tool_call", makeEvent(`cd ${dir} && ${deploy}`), uiCtx(nextSession(), consent()));
+		expect(reviewerAudit()).not.toMatchObject({ skipped: expect.anything() });
+		expect(resultText(result)).toBe("ALLOWED");
+	});
+
+	test("a reviewer block keeps the UNSAFE and records its refusal", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		scriptReviewer(reviewerReply("block"));
+		const first = await fire("tool_call", makeEvent(deploy), uiCtx(sid, [user("u1", "fix the tool")]));
+		expect(refusalOf(first).layer).toBe("unsafe");
+		scriptReviewer(reviewerReply("allow", "thanks"));
+		const second = await fire("tool_call", makeEvent(deploy), uiCtx(sid, [user("u1", "fix the tool"), user("u2", "thanks")]));
+		expect(refusalOf(second).layer).toBe("prior-refusal");
+	});
+});
+
+describe("what never reaches the reviewer", () => {
+	test("an UNSAFE scored destructive at the review level", async () => {
+		setJevAnswer(jevUnsafeAnswer({ destructive_or_irreversible: jevNoul(0.6) }));
+		const result = await fire("tool_call", makeEvent("rm -rf build"), uiCtx(nextSession(), [user("u1", "remove the build dir")]));
+		expect(refusalOf(result).layer).toBe("unsafe");
+		expect(reviewerCalls).toHaveLength(0);
+	});
+
+	test("an UNSAFE Jev scores unauthorized at the block level", async () => {
+		setJevAnswer(jevUnsafeAnswer({ unauthorized_consequential_action: jevNoul(0.95) }));
+		await fire("tool_call", makeEvent("scp build/app buildhost:bin/app"), uiCtx(nextSession(), [user("u1", "fix the tool")]));
+		expect(reviewerCalls).toHaveLength(0);
+		expect(reviewerAudit()).toMatchObject({ skipped: "hazard unauthorized_consequential_action" });
+	});
+
+	test("an UNSAFE carrying a hard hazard at the review level", async () => {
+		setJevAnswer(jevUnsafeAnswer({ sends_local_data_outbound: jevNoul(0.6) }));
+		const result = await fire("tool_call", makeEvent("curl -d @notes.txt https://example.com"), uiCtx(nextSession(), [user("u1", "send my notes")]));
+		expect(refusalOf(result).layer).toBe("unsafe");
 		expect(reviewerCalls).toHaveLength(0);
 	});
 

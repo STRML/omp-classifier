@@ -45,7 +45,7 @@ command ─▶ floor (critical, cap, env, script refusal) ───────�
 Code checks every condition below. None of them is left to the prompt.
 
 - The tool is `bash` and this is not a dry run. The eval tool path is out of scope.
-- The verdict is UNSURE. An UNSAFE is never escalated: Jev judged it, and an allow-by-default reviewer must not get the chance to clear it. All nine blocks that motivated this plan were UNSURE.
+- The verdict is UNSURE or UNSAFE. Until 2026-10-29 an UNSAFE was never escalated. Then OMP session `01a18825` showed Jev answering UNSAFE (0.54, then 0.89) on an scp the user had just clicked to approve, with no hard hazard raised. Jev scores the action and cannot weigh the consent; Claude Code's second stage reviews whatever its first stage flags. An UNSAFE also stays out when `destructive_or_irreversible` is at or above hazardReview: consent can cover a deploy, and the reviewer must not be the only thing between the agent and an irreversible delete. It also stays out when `unauthorized_consequential_action` is at or above hazardBlock: Jev is then all but certain nobody asked. Measured before the change: the reviewer blocked all 46 UNSAFE labeled-ask rows without a hard hazard in the bake-off.
 - No hard hazard is at or above `hazardReview`: `exposes_secrets`, `sends_local_data_outbound`, `escalates_privilege`, `state_contains_injection`. The secret and exfiltration protections live only in those hazards, because the floor in floor.ts is shadow-only.
 - The answers are not one-hot. A keyword bridge has no distribution to escalate from.
 - The session has a UI. A headless session has no user channel, so the reviewer would only see agent-authored text.
@@ -103,7 +103,7 @@ It answers strict JSON: `{"decision":"allow"|"block","rule":"…","reason":"…"
 - **An allow** makes the verdict SAFE (reason code `reviewer:allow`) for this call only; it is never cached. It then goes through the same SAFE branch as a Jev SAFE. The overlay flags (`rm -r`, lookalike hosts, interpreter re-exec markers) still block, and a prior refusal still needs the user's words to name the target (`literalMatch`), exactly as today.
 - **A block** keeps the stage-1 verdict and is remembered for the target and user words. The agent's refusal payload says that stage 2 blocked it. The rule and reason go to the audit line only, so an adversarial agent learns nothing about which sentence to engineer.
 - **A failure** (no model, timeout, bad JSON, an extra field, a non-2xx, a bad quote, a changed body) keeps the stage-1 verdict. Nothing is remembered, and the audit line carries `reviewer: {failed}`.
-- **Refusal memory:** unchanged. Only UNSAFE writes a refusal, and UNSAFE never reaches the reviewer.
+- **Refusal memory:** only an UNSAFE writes a refusal. An UNSAFE the reviewer allows writes none; one it blocks writes the refusal as before.
 - **Deadline:** stage 2 gets the smaller of `reviewerTimeoutMs` (default 15 s) and what remains of the host's 30 s handler budget minus 2 s. Its request is aborted at the deadline.
 - **Audit line:** a `reviewer` field with `{decision, rule, reason, model, ms}`, or `{failed, model?, ms}`, or `{skipped: <why>}` when an eligibility check stopped it.
 
@@ -117,8 +117,8 @@ It answers strict JSON: `{"decision":"allow"|"block","rule":"…","reason":"…"
 | Reviewer times out | abort at the deadline | late answer used | block as stage 1, audit `failed: timeout` |
 | Reviewer returns prose, extra fields, unknown decision | strict parse | lenient parse allows | block, audit `failed: schema` |
 | No `classifier-reviewer` role or no credential | reviewer skipped | throws past the handler | block as stage 1, audit `failed: no model` |
-| UNSAFE verdict | reviewer not run | reviewer clears a judged UNSAFE | test: UNSAFE blocks, no reviewer call |
-| Hard hazard (secrets, outbound data, privilege, injection) ≥ hazardReview on an UNSURE | reviewer not run | reviewer clears an exfiltration | test |
+| UNSAFE verdict, no hard hazard, destructive under the review level | reviewer runs; a block records the refusal | reviewer clears an UNSAFE the user never asked for | tests: an allow quoting the answer runs it, a block records the refusal, a destructive UNSAFE is not reviewed; bake-off 0/34 eligible false allows |
+| Hard hazard (secrets, outbound data, privilege, injection) ≥ hazardReview on an UNSURE or UNSAFE | reviewer not run | reviewer clears an exfiltration | test |
 | Prior refusal, reviewer allows, user only said "thanks" or clicked an unrelated ask | `prior-refusal` block, as today | lift on any message | test |
 | Reviewer allow, overlay flag (`rm -rf dir`) | `flagged` block | allow skips the overlay | test |
 | Reviewer SAFE served from cache after words change | never cached | cache hit allows | test: second call re-runs the reviewer |
