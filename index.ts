@@ -4806,6 +4806,11 @@ export function normalizeActionTarget(command: string): string {
  *  from becoming a session-wide refusal for every invocation of that subverb.
  */
 function refusalKeyForCommand(command: string): string {
+	// A trailing output filter prints part of what ran and changes nothing, so
+	// key the command it reads: `x | tail -5` meets the refusal on
+	// `x | tail -60` and on `x` (https://github.com/STRML/omp-classifier/issues/203).
+	const unfiltered = withoutOutputFilter(command);
+	if (unfiltered !== command) return refusalKeyForCommand(unfiltered);
 	// The old identity first, because it is what the session's refusals are
 	// already keyed under: an ordinary command keeps exactly the key it had,
 	// including the leading-`cd` canonicalization, so nothing that used to be
