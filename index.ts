@@ -96,7 +96,7 @@ import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-codi
 import { getPluginsDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
 import { heredocShadowedAt, maskHeredocBodiesAndAnsiSpans, openQuoteBefore, segmentWorkingDirectories, SHELL_WORD_EXPANSION } from "./shell-cwd";
-import { parseShell, substitutionSpans, type ShellCommand, type ShellRedirect } from "./shell-ast";
+import { parseShell, substitutionSpans, verbName, type ShellCommand, type ShellRedirect } from "./shell-ast";
 import {
 	DEFAULT_JUDGE_BACKEND,
 	judgeBackendFor,
@@ -109,7 +109,7 @@ import { buildAuthorizationState, DEFAULT_AUTHORIZATION_POLICY, deriveAuthorizat
 import { deriveDecisionOrder, type DecisionBranch } from "./decision-order";
 import { literalMatch } from "./literal-match";
 import { redactSecrets, redactValue } from "./redact";
-import { reviewerModelCall, runReviewer, type ReviewerOutcome, type ReviewerTranscriptEntry } from "./reviewer";
+import { quotesUserWords, reviewerModelCall, runReviewer, type ReviewerOutcome, type ReviewerTranscriptEntry } from "./reviewer";
 import { forgetReviewerBlocks, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged } from "./stage-two";
 import { formatTrustPolicyPin, normalizeTrustPolicyPin, pinUserInstructionFiles, resolvePinnedUserPolicy, type TrustPolicyPin, type TrustedPolicyDocument } from "./trust-policy";
 import {
@@ -4823,8 +4823,123 @@ function refusalKeyForCommand(command: string): string {
 	const words = stripped.split(" ").filter(word => word !== "");
 	let index = 0;
 	while (index < words.length && WRAPPER_COMMANDS.has(commandBasename(words[index].toLowerCase()))) index++;
-	if (commandBasename(words[index]?.toLowerCase() ?? "") !== "git") return actionTarget;
+	const verb = commandBasename(words[index]?.toLowerCase() ?? "");
+	if (REMOTE_VALUE_FLAGS.has(verb)) return remoteRefusalKey(command) ?? actionTarget;
+	if (verb !== "git") return actionTarget;
 	return `git-exact:${stripped}`;
+}
+
+/** Short flags that take a value, per remote verb, from each tool's man page.
+ *  Their value is not an operand, so `-o BatchMode=yes` never names the host. */
+/** A Map, not an object literal: a verb such as `constructor` must not find
+ *  Object.prototype, throw in the key, and leave its refusal unrecorded. */
+const REMOTE_VALUE_FLAGS = new Map([["ssh", "BbcDEeFIiJLlmOopQRSWw"], ["scp", "cDFiJloPSX"], ["rsync", "eBfMT"]]);
+/** rsync's long options that can take their value as the next word: every
+ *  `--name=VALUE` option in rsync(1). One left out reads its value as a file
+ *  operand, and a retry that writes `--name=VALUE` or drops it escapes. */
+const RSYNC_VALUE_OPTIONS = new Set([
+	"--rsh", "--rsync-path", "--remote-option", "--exclude", "--include", "--filter", "--exclude-from", "--include-from", "--files-from",
+	"--chmod", "--chown", "--usermap", "--groupmap", "--port", "--timeout", "--contimeout", "--password-file", "--log-file",
+	"--log-file-format", "--out-format", "--info", "--debug", "--bwlimit", "--partial-dir", "--temp-dir", "--backup-dir", "--suffix",
+	"--compare-dest", "--copy-dest", "--link-dest", "--max-size", "--min-size", "--max-delete", "--max-alloc", "--block-size",
+	"--modify-window", "--checksum-choice", "--checksum-seed", "--compress-choice", "--compress-level", "--skip-compress", "--iconv",
+	"--sockopts", "--address", "--write-batch", "--only-write-batch", "--read-batch", "--protocol", "--outbuf", "--stop-after", "--stop-at",
+]);
+
+/**
+ * The refusal key for ssh, scp and rsync: where the command acts, with every
+ * option dropped. OMP session 01a188b8 ran a refused
+ * `scp -o BatchMode=yes -q target/release/mlxtop studio-local:.local/bin/mlxtop.new`
+ * by dropping `-q` and spelling the destination from `/Users/<user>`: the
+ * flag-and-first-argument key changed and the copy did not. So options leave
+ * the key, a remote path is spelled from `~`, a local path is its file name,
+ * and scp and rsync are one verb. ssh keeps its host and the remote command.
+ * Undefined when the command is none of these, or a copy with no remote end,
+ * which keeps the ordinary key.
+ */
+function remoteRefusalKey(command: string): string | undefined {
+	const read = commandOperands(command);
+	if (read === undefined || !REMOTE_VALUE_FLAGS.has(read.verb)) return undefined;
+	const { verb, operands } = read;
+	if (verb === "ssh") {
+		const host = sshHost(operands[0]);
+		if (!host) return undefined;
+		// `ssh host -- cmd` runs the same remote command as `ssh host cmd`.
+		const remoteCommand = operands[1] === "--" ? operands.slice(2) : operands.slice(1);
+		return ["ssh", host, ...remoteCommand].join(" ").replace(/\s+/gu, " ").trim().toLowerCase();
+	}
+	const spelled = operands.map(remoteCopyOperand);
+	if (!spelled.some(operand => operand.remote)) return undefined;
+	return ["remote-copy", ...spelled.map(operand => operand.key).sort()].join(" ").toLowerCase();
+}
+
+/**
+ * The verb and operands of a command's first program, past a leading `cd`
+ * and any wrapper: the words that are not options. For ssh, scp and rsync an
+ * option's value is skipped with it, and everything after ssh's host is the
+ * remote command, flags and all. Undefined when the shell parser cannot read it.
+ */
+function commandOperands(command: string): { verb: string; operands: string[] } | undefined {
+	const parsed = parseShell(command);
+	if (!parsed.ok) return undefined;
+	const top = parsed.commands.filter(entry => !entry.nested);
+	const first = top[0] !== undefined && verbName(top[0]) === "cd" ? top[1] : top[0];
+	const words = (first?.words ?? []).map(word => word.value);
+	let index = 0;
+	while (index < words.length && WRAPPER_COMMANDS.has(commandBasename(words[index].toLowerCase()))) index++;
+	const verb = commandBasename(words[index]?.toLowerCase() ?? "");
+	if (verb === "") return undefined;
+	const valueFlags = REMOTE_VALUE_FLAGS.get(verb) ?? "";
+	const operands: string[] = [];
+	let optionsEnded = false;
+	for (let at = index + 1; at < words.length; at++) {
+		const word = words[at];
+		if (verb === "ssh" && operands.length > 0) {
+			operands.push(word);
+			continue;
+		}
+		if (optionsEnded || !word.startsWith("-") || word === "-") {
+			operands.push(word);
+			continue;
+		}
+		if (word === "--") optionsEnded = true;
+		else if (word.startsWith("--")) at += verb === "rsync" && RSYNC_VALUE_OPTIONS.has(word) ? 1 : 0;
+		else at += shortFlagTakesNextWord(word, valueFlags) ? 1 : 0;
+	}
+	return { verb, operands };
+}
+
+/** ssh's destination as a bare host: no `ssh://`, user, or port. */
+function sshHost(destination: string | undefined): string | undefined {
+	return destination?.replace(/^ssh:\/\//u, "").replace(/^[^@]*@/u, "").replace(/:\d+$/u, "") || undefined;
+}
+
+/** Whether a short-flag cluster such as `-qo` ends in a flag whose value is
+ *  the next word. A value flag earlier in the cluster takes the rest of it. */
+function shortFlagTakesNextWord(word: string, valueFlags: string): boolean {
+	for (let at = 1; at < word.length; at++) {
+		if (valueFlags.includes(word[at])) return at === word.length - 1;
+	}
+	return false;
+}
+
+/** One scp or rsync operand as the key spells it: `host:~/path` for a remote
+ *  end, whatever user or home spelling it had, and the file name for a local
+ *  one, so a relative and an absolute spelling of the same file agree. */
+function remoteCopyOperand(operand: string): { key: string; remote: boolean } {
+	const remote = /^(?:[^@/:]+@)?([^/:]+):(.*)$/u.exec(operand);
+	const trimmed = (text: string) => (text.length > 1 ? text.replace(/\/+$/u, "") : text);
+	if (remote === null) return { key: path.posix.basename(trimmed(operand)) || operand, remote: false };
+	// The remote user's home is unknown here, so any home spelling counts as
+	// `~`: the local one, and `/home/<user>`, `/Users/<user>` or `/root`.
+	// Merging two users' homes on one host errs toward keeping a refusal.
+	const home = os.homedir();
+	let remotePath = trimmed(remote[2]).replace(/^~[^/]*/u, "~");
+	if (remotePath === home || remotePath.startsWith(`${home}/`)) remotePath = `~${remotePath.slice(home.length)}`;
+	else remotePath = remotePath.replace(/^(?:\/home\/[^/]+|\/Users\/[^/]+|\/root)(?=\/|$)/u, "~");
+	if (remotePath === "") remotePath = "~";
+	else if (!remotePath.startsWith("/") && !remotePath.startsWith("~") && !remotePath.startsWith(":")) remotePath = `~/${remotePath}`;
+	return { key: `${remote[1]}:${remotePath}`, remote: true };
 }
 
 
@@ -4870,6 +4985,9 @@ export interface StageTwoInput {
 	/** When the gate started on this call: the deadline is measured from it. */
 	started: number;
 	trustedPolicy: readonly TrustedPolicyDocument[];
+	/** This session's standing refusal of the command's target. A model refusal
+	 *  sends a stage-1 SAFE to the reviewer too, since only its allow can lift it. */
+	priorRefusal?: Refusal;
 }
 
 /**
@@ -4881,10 +4999,11 @@ export interface StageTwoInput {
  * outcome keeps the stage-1 judgement, so a reviewer that is missing, slow,
  * wrong-shaped or quoting words the user never wrote leaves the block in place.
  */
-async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; audit?: ReviewerAudit }> {
+async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; audit?: ReviewerAudit; userQuote?: string }> {
 	const { ctx, judgement, command, cwd, config } = input;
 	const model = config.reviewerModel;
-	if ((judgement.verdict !== "UNSURE" && judgement.verdict !== "UNSAFE") || model === null) return { judgement };
+	const refusedSafe = judgement.verdict === "SAFE" && input.priorRefusal?.source === "model";
+	if ((judgement.verdict !== "UNSURE" && judgement.verdict !== "UNSAFE" && !refusedSafe) || model === null) return { judgement };
 	const skip = (why: string) => ({ judgement, audit: { skipped: why } });
 	if (!ctx.hasUI) return skip("headless session");
 	if (judgement.persistRefusal === false) return skip("one-hot answers");
@@ -4918,15 +5037,15 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 			workingDirectory: cwd,
 			transcript,
 			scriptBodies: scripts.map(({ path: spelled, body }) => ({ path: spelled, body })),
-			stage1: { verdict: judgement.verdict, reason: judgement.reason },
+			stage1: { verdict: judgement.verdict, reason: refusedSafe ? `${judgement.reason}; this session refused the same target earlier: ${input.priorRefusal?.why ?? ""}` : judgement.reason },
 			...(input.trustedPolicy.length > 0 ? { trustedPolicy: input.trustedPolicy } : {}),
 		},
 		call,
 		timeoutMs,
 	);
 	if (outcome.kind === "failed") return { judgement, audit: { failed: outcome.why, ...(outcome.model === undefined ? {} : { model: outcome.model }), ms: outcome.ms } };
-	const audit: ReviewerAudit = { ...outcome.decision, model: outcome.model, ms: outcome.ms };
-	delete (audit as { userQuote?: string }).userQuote;
+	const { userQuote, ...decision } = outcome.decision;
+	const audit: ReviewerAudit = { ...decision, model: outcome.model, ms: outcome.ms };
 	if (outcome.decision.decision === "block") {
 		rememberReviewerBlock(sessionId, blockKey);
 		return { judgement: { ...judgement, reason: `${judgement.reason}; the stage 2 reviewer blocked it` }, audit };
@@ -4935,6 +5054,7 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	return {
 		judgement: { ...judgement, verdict: "SAFE", reason: `the stage 2 reviewer allowed what stage 1 judged ${judgement.verdict} (${judgement.reason})`, reasonCode: "reviewer:allow", noCache: true },
 		audit,
+		userQuote,
 	};
 }
 
@@ -4959,6 +5079,73 @@ function priorRefusalLifts(prior: Refusal, judgement: Judgement, command: string
 	if (judgement.verdict !== "SAFE" || judgement.authorization !== "grounded") return false;
 	if (userWordsSinceRefusal.length === 0) return false;
 	return literalMatch({ command, cwd, homeDir: os.homedir(), userMessages: userWordsSinceRefusal, resolveRealPath: realPathOf }).matched;
+}
+
+/**
+ * Whether a stage 2 allow lifts a model refusal for this one call. Literal
+ * match never reads a network command, so without this an scp the user
+ * clicked to approve stays refused (OMP session 01a188b8). Two checks in code
+ * keep the reviewer from lifting on any words at all: the quote must come from
+ * words the user gave after the refusal, and those words, or the ask question
+ * they answer, must name the target (its host, or an operand's file name).
+ */
+function reviewerLifts(prior: Refusal, judgement: Judgement, userQuote: string | undefined, command: string, consent: readonly ReviewerTranscriptEntry[]): boolean {
+	if (prior.source !== "model" || judgement.reasonCode !== "reviewer:allow" || userQuote === undefined) return false;
+	const anchors = consentAnchors(command);
+	if (anchors.size === 0) return false;
+	return consent.some(said => {
+		if (said.from === "agent-tool-call" || !quotesUserWords(userQuote, [said])) return false;
+		const named = said.from === "ask" ? `${said.agentQuestion}\n${said.userAnswer}` : said.text;
+		return named
+			.toLowerCase()
+			.split(/[^a-z0-9._-]+/u)
+			.some(word => anchors.has(word));
+	});
+}
+
+/** What a user's words have to name for consent to reach this command: the
+ *  host of an ssh, scp or rsync command, otherwise each operand's file name. */
+function consentAnchors(command: string): Set<string> {
+	const read = commandOperands(command);
+	if (read === undefined) return new Set();
+	const { verb, operands } = read;
+	if (verb === "ssh") return new Set([sshHost(operands[0])?.toLowerCase() ?? ""].filter(host => host !== ""));
+	if (verb === "scp" || verb === "rsync") {
+		const hosts = operands.map(operand => /^(?:[^@/:]+@)?([^/:]+):/u.exec(operand)?.[1]?.toLowerCase());
+		if (hosts.some(host => host !== undefined)) return new Set(hosts.filter((host): host is string => host !== undefined));
+	}
+	// git's subcommand is the action, not its target.
+	const targets = verb === "git" ? operands.slice(1) : operands;
+	return new Set(targets.map(operand => path.posix.basename(operand.replace(/\/+$/u, "")).toLowerCase()).filter(name => name.length >= 3));
+}
+
+/** The user's messages and hand-given ask answers after the message `afterId`,
+ *  read off the branch the way userMessagesSince reads them, so the ids agree,
+ *  but keeping each answer's question. A no-UI session has none. */
+function consentSince(ctx: ExtensionContext, afterId: string | undefined): ReviewerTranscriptEntry[] {
+	const entries: ReviewerTranscriptEntry[] = [];
+	if (!ctx.hasUI) return entries;
+	try {
+		const branch = ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>;
+		for (let index = branchStartAfterLatestResetBoundary(branch); index < branch.length; index++) {
+			const entry = branch[index];
+			if (entry.type !== "message") continue;
+			const message = entry.message as (EvidenceBranchEntry["message"] & { toolName?: string; details?: unknown }) | undefined;
+			const id = message?.id ?? entry.id ?? `user-${index}`;
+			let said: ReviewerTranscriptEntry[] = [];
+			if (message?.role === "user" && message.attribution === "user" && textOf(message.content).trim() !== "") said = [{ from: "user", text: textOf(message.content) }];
+			else if (message?.role === "toolResult" && message.toolName === "ask") said = askAnswerPairs(message.details).map(pair => ({ from: "ask" as const, agentQuestion: pair.question, userAnswer: pair.answer }));
+			if (said.length === 0) continue;
+			if (id === afterId) {
+				entries.length = 0;
+				continue;
+			}
+			entries.push(...said);
+		}
+	} catch {
+		// No branch in an isolated context: no consent to read.
+	}
+	return entries;
 }
 
 /** The id of the newest user-typed message since the latest `/clear`, read the
@@ -5798,7 +5985,7 @@ export default function (pi: ExtensionAPI) {
 		},
 		"prior-refusal": {
 			headline: "prior refusal",
-			next: "This target was refused earlier in the session (why names the source). A critical or cap refusal never runs through the agent: ask the user to run the command themselves. After a model refusal, ask the user in chat; the command runs on a retry only when their reply names its target (the file, branch or deploy) and the classifier judges it safe.",
+			next: "This target was refused earlier in the session (why names the source). A critical or cap refusal never runs through the agent: ask the user to run the command themselves. After a model refusal, ask the user, naming the target (the file, branch, deploy or host) in your question; the command runs on a retry only when their reply, or the question they answered, names it and the classifier or its reviewer judges it safe.",
 			notThis: NO_DISGUISE,
 		},
 	};
@@ -6645,7 +6832,7 @@ export default function (pi: ExtensionAPI) {
 			// Stage 2 runs after the cache, on a fresh or a cached UNSURE or UNSAFE, and
 			// what it allows is never cached: the next call reviews again. Dry run
 			// reports the stage-1 decision and pays for no review.
-			const reviewed = dryRun ? { judgement: stage1 } : await stageTwo({ ctx, judgement: stage1, command, cwd, startCwd, config, started, trustedPolicy: trustedPolicySnapshot.documents });
+			const reviewed = dryRun ? { judgement: stage1 } : await stageTwo({ ctx, judgement: stage1, command, cwd, startCwd, config, started, trustedPolicy: trustedPolicySnapshot.documents, ...(prior === undefined ? {} : { priorRefusal: prior }) });
 			const judgement = reviewed.judgement;
 			const reviewerAudit = reviewed.audit === undefined ? {} : { reviewer: reviewed.audit };
 			// Every resolved decision is logged so prompt/auto-run behavior is
@@ -6686,7 +6873,8 @@ export default function (pi: ExtensionAPI) {
 				}
 				const lifts =
 					prior !== undefined &&
-					priorRefusalLifts(prior, judgement, judgedCommand, cwd, userMessagesSince(ctx, prior.userMessageId).map(message => message.text));
+					(priorRefusalLifts(prior, judgement, judgedCommand, cwd, userMessagesSince(ctx, prior.userMessageId).map(message => message.text)) ||
+						reviewerLifts(prior, judgement, "userQuote" in reviewed ? reviewed.userQuote : undefined, command, consentSince(ctx, prior.userMessageId)));
 				const replay = replayDecision({
 					tool: "bash",
 					command: judgedCommand,

@@ -72,12 +72,13 @@ command ─▶ Jev ─▶ SAFE ────────────────�
 A refusal the session already recorded is stricter. It stays for the rest of the session, and a call gets past it only when all of these hold:
 
 - the refusal came from Jev's verdict, not from a critical pattern or the length cap (those never run through the agent: run the command yourself);
-- a message you sent after the refusal names the command's target, as `literalMatch` reads it: a delete, a branch delete, a merge or a deploy with its target written out ("delete the branch topic");
-- Jev answers SAFE with its authorization grounded in your messages.
+- and one of these holds:
+  - A message you sent after the refusal names the command's target, as `literalMatch` reads it: a delete, a branch delete, a merge or a deploy with its target written out ("delete the branch topic"). Jev also has to answer SAFE with its authorization grounded in your messages.
+  - The stage 2 reviewer allows the call and quotes words you gave after the refusal. Those words, or the ask question they answer, have to name the target: the host of an ssh, scp or rsync command, otherwise an operand's file name. `literalMatch` never reads a network command, so this is the only way one gets past a refusal. While a model refusal stands, a stage-1 SAFE goes to the reviewer as well.
 
-That decides one call. The record stays, so the next call is checked again. A command shape `literalMatch` cannot read, eval code, and a headless session (no user channel) never get past a refusal. A `flagged` command never runs through the agent either.
+That decides one call. The record stays, so the next call is checked again. Eval code and a headless session (no user channel) never get past a refusal. A `flagged` command never runs through the agent either.
 
-Refusal memory keys on a strict action identity that keeps flags (split, sorted short bundles) and the first argument, plus the directory: a refused operation does not pin its whole verb class, its host, or its container.
+Refusal memory keys on a strict action identity that keeps flags (split, sorted short bundles) and the first argument, plus the directory: a refused operation does not pin its whole verb class, its host, or its container. ssh, scp and rsync key on where they act instead, and drop every option with its value. ssh keys on its host and remote command. scp and rsync count as one verb and key on each remote end, spelled from `~`, plus each local file's name. So a retry that drops `-q`, or spells `.local/bin` as `/Users/<you>/.local/bin`, is the same copy and still meets the refusal.
 
 There are no grants. No answer outlives the call it answered. A leftover `omp-classifier-grants.json` from an older version is never read.
 

@@ -318,9 +318,12 @@ behind it. The sweep in L5 exists to make that cheap enough to be routine.
   plus the cwd, and fed back into the state as `priorRefusal` so rewording cannot launder a
   refusal into a fresh judgment. A refusal stands for the session: new evidence or operator
   context reaches the judge but does not erase it. A SAFE under a prior refusal blocks, except
-  for one call past a model refusal when the user's messages since the refusal name the
-  command's target by `literalMatch` and the SAFE's authorization is grounded
-  (`priorRefusalLifts`). Critical and cap refusals never yield.
+  for one call past a model refusal in two cases. The user's messages since the refusal name
+  the command's target by `literalMatch` and the SAFE's authorization is grounded
+  (`priorRefusalLifts`). Or the stage 2 reviewer allows it, quoting words the user gave since
+  the refusal, and those words or the ask question they answer name the target
+  (`reviewerLifts`). Critical and cap refusals never yield. ssh, scp and rsync key on where
+  they act, with options dropped (`remoteRefusalKey`).
 - **Decision audit**: one JSONL line per decision at
   `<agentDir>/omp-classifier/decisions.jsonl`, every path, with session/decision ids,
   `policyVersion`/`policyHash` (the battery hash), `modelId`, `verdict`, `reasonCode`, the
