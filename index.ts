@@ -5054,7 +5054,10 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	// The coarse action target, not the refusal key: for git the refusal key is
 	// the whole text, and a block must survive a reworded retry. Siblings such
 	// as `x.sh start` and `x.sh finish` share it, which errs toward blocking.
-	const blockKey = reviewerBlockKey(normalizeActionTarget(command), cwd, model, userWords);
+	// Read past a leading cd and an assignment prefix the way the refusal key
+	// does, so `FOO=1 cmd` meets the block on `cmd`.
+	const bare = extractLeadingCdTarget(command.replace(/\s+/gu, " ").trim())?.rest || command;
+	const blockKey = reviewerBlockKey(normalizeActionTarget(unwrappedCommand(bare) ?? bare), cwd, model, userWords);
 	if (reviewerBlocked(sessionId, blockKey)) {
 		return { judgement: { ...judgement, reason: `${judgement.reason}; the stage 2 reviewer already blocked this under the same user words` }, audit: { skipped: "blocked before under the same user words" } };
 	}

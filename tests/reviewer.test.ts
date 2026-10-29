@@ -479,6 +479,18 @@ describe("a reviewer block", () => {
 		expect(reviewerCalls).toHaveLength(1);
 	});
 
+	test("is remembered through an assignment prefix: the retry never reaches the reviewer", async () => {
+		// https://github.com/STRML/omp-classifier/issues/200: the block key read
+		// `FOO=1` as the action and asked the reviewer again. A wrapper such as
+		// `timeout 30` never reaches the reviewer at all (stage-two.ts shape A).
+		const sid = nextSession();
+		scriptReviewer(reviewerReply("block"));
+		const branch = [user("u1", "tidy up")];
+		await fire("tool_call", makeEvent("git fetch upstream"), uiCtx(sid, branch));
+		await fire("tool_call", makeEvent("FOO=1 git fetch upstream"), uiCtx(sid, branch));
+		expect(reviewerCalls).toHaveLength(1);
+	});
+
 	test("re-opens when the user writes again", async () => {
 		const sid = nextSession();
 		scriptReviewer(reviewerReply("block"), reviewerReply("allow", "yes, fetch upstream"));
