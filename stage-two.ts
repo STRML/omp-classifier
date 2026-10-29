@@ -280,18 +280,22 @@ function countsOnly(args: readonly string[]): boolean {
 	return true;
 }
 
-/** grep short options that read a file or a directory, and those that take a value. */
-const GREP_FILE_LETTERS = new Set(["f", "r", "R", "d", "D"]);
+/** grep short options known to read stdin only, and those that take a value.
+ *  Any other letter (`-f`, `-r`, `-R`, `-d`, `-D`, or one the gate does not
+ *  know) refuses. */
+const GREP_FLAG_LETTERS = new Set(["i", "y", "v", "n", "c", "o", "q", "s", "E", "F", "G", "w", "x", "h", "H", "l", "L", "b"]);
 const GREP_VALUE_LETTERS = new Set(["e", "m", "A", "B", "C"]);
-const GREP_LONG_BARRED = /^--(?:file|recursive|dereference-recursive|directories|devices|include|exclude)/u;
+/** grep long options read stdin only when spelled out in full from this list:
+ *  getopt_long takes a unique prefix, so `--rec` is `--recursive`. */
+const GREP_LONG_ALLOWED = /^--(?:ignore-case|invert-match|count|line-number|only-matching|quiet|silent|no-messages|extended-regexp|fixed-strings|basic-regexp|word-regexp|line-regexp|colou?r(?:=(?:never|always|auto))?|(?:max-count|after-context|before-context|context)=\d+)$/u;
 
 /** One short-option cluster: undefined when it reads a file, else whether
  *  the next word is its value and whether that value is a pattern. */
 function grepCluster(cluster: string): { next: boolean; pattern: boolean } | undefined {
 	for (let at = 0; at < cluster.length; at += 1) {
 		const letter = cluster[at];
-		if (GREP_FILE_LETTERS.has(letter)) return undefined;
 		if (GREP_VALUE_LETTERS.has(letter)) return { next: at === cluster.length - 1, pattern: letter === "e" };
+		if (!GREP_FLAG_LETTERS.has(letter)) return undefined;
 	}
 	return { next: false, pattern: false };
 }
@@ -303,8 +307,8 @@ function grepsStdinOnly(args: readonly string[]): boolean {
 	for (let at = 0; at < args.length; at += 1) {
 		const arg = args[at];
 		if (arg.startsWith("--")) {
-			if (arg === "--" || GREP_LONG_BARRED.test(arg)) return false;
 			if (arg.startsWith("--regexp=")) patterns += 1;
+			else if (!GREP_LONG_ALLOWED.test(arg)) return false;
 			continue;
 		}
 		if (!arg.startsWith("-") || arg === "-") {

@@ -13,7 +13,7 @@ Shape B now accepts one trailing pipe into `tail`, `head`, `grep` or `cat`. The 
 | Filter | Arguments it may take |
 |---|---|
 | tail, head | counts only (`-60`, `-n 20`, `--lines=5`, `-q`) |
-| grep | one pattern or `-e` patterns, no operand, none of `-f -r -R -d -D` |
+| grep | one pattern or `-e` patterns, no operand, and only options from a stdin-only allowlist, long ones spelled in full (getopt_long reads `--rec` as `--recursive`) |
 | cat | flags only |
 
 Any other right side, a second pipe, or a filter joined by `&&` still refuses. A reviewer block keys on the command without its filter, so a retry that changes the filter or drops it meets the same block.
