@@ -264,6 +264,92 @@ function shapeARefusal(commands: readonly ShellCommand[]): string | undefined {
 	return undefined;
 }
 
+const COUNT = /^[+-]?\d+$/u;
+const HEAD_TAIL_ARG = /^(?:-\d+|-[nc][+-]?\d+|-[qv]|--(?:lines|bytes)=[+-]?\d+)$/u;
+
+/** tail/head arguments that only set a count: no word can name a file. */
+function countsOnly(args: readonly string[]): boolean {
+	for (let at = 0; at < args.length; at += 1) {
+		if (HEAD_TAIL_ARG.test(args[at])) continue;
+		if ((args[at] === "-n" || args[at] === "-c") && COUNT.test(args[at + 1] ?? "")) {
+			at += 1;
+			continue;
+		}
+		return false;
+	}
+	return true;
+}
+
+/** grep short options that read a file or a directory, and those that take a value. */
+const GREP_FILE_LETTERS = new Set(["f", "r", "R", "d", "D"]);
+const GREP_VALUE_LETTERS = new Set(["e", "m", "A", "B", "C"]);
+const GREP_LONG_BARRED = /^--(?:file|recursive|dereference-recursive|directories|devices|include|exclude)/u;
+
+/** One short-option cluster: undefined when it reads a file, else whether
+ *  the next word is its value and whether that value is a pattern. */
+function grepCluster(cluster: string): { next: boolean; pattern: boolean } | undefined {
+	for (let at = 0; at < cluster.length; at += 1) {
+		const letter = cluster[at];
+		if (GREP_FILE_LETTERS.has(letter)) return undefined;
+		if (GREP_VALUE_LETTERS.has(letter)) return { next: at === cluster.length - 1, pattern: letter === "e" };
+	}
+	return { next: false, pattern: false };
+}
+
+/** grep arguments that search stdin only: one pattern, and no file operand. */
+function grepsStdinOnly(args: readonly string[]): boolean {
+	let operands = 0;
+	let patterns = 0;
+	for (let at = 0; at < args.length; at += 1) {
+		const arg = args[at];
+		if (arg.startsWith("--")) {
+			if (arg === "--" || GREP_LONG_BARRED.test(arg)) return false;
+			if (arg.startsWith("--regexp=")) patterns += 1;
+			continue;
+		}
+		if (!arg.startsWith("-") || arg === "-") {
+			operands += 1;
+			continue;
+		}
+		const cluster = grepCluster(arg.slice(1));
+		if (cluster === undefined) return false;
+		if (cluster.next) at += 1;
+		if (cluster.pattern) patterns += 1;
+	}
+	return patterns > 0 ? operands === 0 : operands === 1;
+}
+
+/** The filters a script's output may be piped into, each with the arguments
+ *  that keep it reading the pipe and nothing else. */
+const OUTPUT_FILTERS: Record<string, (args: readonly string[]) => boolean> = {
+	tail: countsOnly,
+	head: countsOnly,
+	grep: grepsStdinOnly,
+	cat: args => args.every(arg => /^-[benstuv]+$/u.test(arg)),
+};
+
+/** Whether `command` is a system output filter reading the pipe it is on:
+ *  `./x.sh | tail -60` runs what x.sh runs and prints part of it. */
+function isOutputFilter(command: ShellCommand): boolean {
+	if (command.join !== "pipe" || command.nested || command.negated || command.unreadShape !== undefined) return false;
+	if (command.assigns.length > 0 || command.redirects.length > 0 || !command.words.every(isLiteral)) return false;
+	const name = command.words[0]?.value ?? "";
+	const filter = Object.hasOwn(OUTPUT_FILTERS, name) ? OUTPUT_FILTERS[name] : undefined;
+	if (filter === undefined) return false;
+	const resolved = onPath(name);
+	return resolved !== undefined && isSystemProgram(resolved) && filter(command.words.slice(1).map(word => word.value));
+}
+
+/** `command` with a trailing output filter cut off, so `./x.sh | tail -60`
+ *  and `./x.sh` name one action. Any other command comes back unchanged. */
+export function withoutOutputFilter(command: string): string {
+	const parsed = parseShell(command);
+	if (!parsed.ok || parsed.commands.length < 2) return command;
+	const last = parsed.commands[parsed.commands.length - 1];
+	if (last.sourceOffset === undefined || !isOutputFilter(last)) return command;
+	return command.slice(0, last.sourceOffset).replace(/\|&?\s*$/u, "").trimEnd();
+}
+
 /**
  * What the gate can show the reviewer about the programs `command` runs,
  * starting from `startCwd` (the directory before any `cd` in the command).
@@ -279,14 +365,14 @@ export function scriptsForReview(command: string, startCwd: string): CommandScri
 		const why = shapeARefusal(commands);
 		return why === undefined ? { kind: "scripts", scripts: [] } : refuse(why);
 	}
-	// Shape B: [cd <literal> &&] <literal path> <literal args>, and nothing else.
+	// Shape B: [cd <literal> &&] <literal path> <literal args> [| <output filter>], and nothing else.
 	let dir = startCwd;
-	let rest = commands;
-	if (commands.length === 2 && verbName(commands[0]) === "cd" && commands[1].join === "and") {
-		const cd = commands[0];
+	let rest = commands.length > 1 && isOutputFilter(commands[commands.length - 1]) ? commands.slice(0, -1) : commands;
+	if (rest.length === 2 && verbName(rest[0]) === "cd" && rest[1].join === "and") {
+		const cd = rest[0];
 		if (cd.words.length !== 2 || !cd.words[1].fixed || cd.assigns.length > 0 || cd.redirects.length > 0) return refuse("the cd before the script is not one literal directory");
 		dir = path.resolve(startCwd, expandHome(cd.words[1].value));
-		rest = commands.slice(1);
+		rest = rest.slice(1);
 	}
 	if (rest.length !== 1) return refuse("a local script runs inside a compound command");
 	const run = rest[0];

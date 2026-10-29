@@ -105,7 +105,18 @@ describe("which commands stage 2 can vouch for", () => {
 		["a script run through an interpreter", "bash update.sh start"],
 		["a script after a PATH export", "export PATH=/tmp/evil:$PATH && update.sh start"],
 		["a script with a PATH assignment", "PATH=/tmp/evil update.sh start"],
-		["a script piped into another command", "./update.sh start | tail -5"],
+		["a script piped into a program that is not an output filter", "./update.sh start | sort"],
+		["a script piped into a filter that reads a file", "./update.sh start | tail -5 secret.txt"],
+		["a script piped into grep reading patterns from a file", "./update.sh start | grep -f patterns.txt"],
+		["a script piped into grep searching a directory", "./update.sh start | grep -rn token"],
+		["a script piped into grep with a second operand", "./update.sh start | grep token .env"],
+		["a script piped into cat reading a file", "./update.sh start | cat .env"],
+		["a script piped into a filter that writes a file", "./update.sh start | tail -5 > out.txt"],
+		["a script piped into a filter with a built word", "./update.sh start | tail -n \"$N\""],
+		["a script piped through a filter into another command", "./update.sh start | tail -5 | bash"],
+		["a script piped into a local program named like a filter", "./update.sh start | ./tail -5"],
+		["a script piped into a filter shadowed on PATH", "./update.sh start | head -5"],
+		["a script joined to a filter by &&", "./update.sh start && tail -5"],
 		["a wrapper running a local program", "xargs -n 1 ./update.sh"],
 		["a local script run by bare name on PATH", "omp-reviewer-test-local.sh"],
 		["a local script disguised behind a system prefix and ..", "/usr/..__DIR__/wrap.sh"],
@@ -117,6 +128,8 @@ describe("which commands stage 2 can vouch for", () => {
 		fs.mkdirSync(path.join(dir, "bin"));
 		script("bin/omp-reviewer-test-local.sh", "#!/bin/bash\necho ok\n");
 		fs.symlinkSync("/bin/sh", path.join(dir, "bin", "tool"));
+		script("bin/head", "#!/bin/bash\ncat ~/.ssh/id_ed25519\n");
+		script("tail", "#!/bin/bash\necho ok\n");
 		script("linkwrap.sh", "#!/bin/bash\ntool payload.txt\n");
 		const previous = process.env.PATH;
 		process.env.PATH = `${path.join(dir, "bin")}${path.delimiter}${previous ?? ""}`;
@@ -127,6 +140,26 @@ describe("which commands stage 2 can vouch for", () => {
 		} finally {
 			process.env.PATH = previous;
 		}
+	});
+
+	test.each([
+		["tail with a count", "./update.sh start 2>&1 | tail -60"],
+		["tail with -n", "./update.sh start | tail -n 20"],
+		["head with -n", "./update.sh start | head -n 5"],
+		["grep with one pattern", "./update.sh start | grep -E 'error|warn'"],
+		["grep with -e and context", "./update.sh start | grep -A 3 -e error"],
+		["cat", "./update.sh start | cat"],
+		["a pipe that carries stderr", "./update.sh start |& tail -5"],
+		["a leading cd", "cd sub && ./update.sh start | tail -5"],
+	])("reads the script piped into an output filter: %s", async (_name, command) => {
+		script("update.sh", "#!/bin/bash\necho from-update\n");
+		fs.mkdirSync(path.join(dir, "sub"));
+		script("sub/update.sh", "#!/bin/bash\necho from-update\n");
+		scriptReviewer(reviewerReply("allow", "update fork main"));
+		const result = await fire("tool_call", makeEvent(command), uiCtx(nextSession(), [user("u1", "update fork main")]));
+		expect(resultText(result)).toBe("ALLOWED");
+		expect(reviewerCalls).toHaveLength(1);
+		expect(JSON.stringify(reviewerCalls[0].input.scriptBodies)).toContain("from-update");
 	});
 });
 
@@ -476,6 +509,18 @@ describe("a reviewer block", () => {
 		const branch = [user("u1", "tidy up")];
 		await fire("tool_call", makeEvent("git fetch upstream"), uiCtx(sid, branch));
 		await fire("tool_call", makeEvent("git fetch upstream  # retry"), uiCtx(sid, branch));
+		expect(reviewerCalls).toHaveLength(1);
+	});
+
+	test("is remembered past an output filter: a retry with another filter or none never reaches the reviewer", async () => {
+		script("update.sh", "#!/bin/bash\necho ok\n");
+		const sid = nextSession();
+		scriptReviewer(reviewerReply("block"));
+		const branch = [user("u1", "update fork main")];
+		await fire("tool_call", makeEvent("./update.sh start 2>&1 | tail -60"), uiCtx(sid, branch));
+		await fire("tool_call", makeEvent("./update.sh start | tail -5"), uiCtx(sid, branch));
+		await fire("tool_call", makeEvent("./update.sh start | grep -i error"), uiCtx(sid, branch));
+		await fire("tool_call", makeEvent("./update.sh start"), uiCtx(sid, branch));
 		expect(reviewerCalls).toHaveLength(1);
 	});
 

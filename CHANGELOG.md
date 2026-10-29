@@ -4,6 +4,20 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-29
 
+### Stage 2 reads a script whose output is piped into a filter
+
+From OMP session `01a18951`. The gate blocked `update-fork.sh start 2>&1 | tail -60` twice, both UNSURE: first below the floor (safe 0.67), then on `destructive_or_irreversible` (0.66) on the retry, whose state carried the first refusal. Every hard hazard was at 0.20 or under, so both were eligible for review. The reviewer never ran, because shape B refused any pipe and logged `unread script: a local script runs inside a compound command`.
+
+Shape B now accepts one trailing pipe into `tail`, `head`, `grep` or `cat`. The filter must resolve to a system program on a root-owned chain, with literal words, no redirect, no assignment, and no argument that can name a file:
+
+| Filter | Arguments it may take |
+|---|---|
+| tail, head | counts only (`-60`, `-n 20`, `--lines=5`, `-q`) |
+| grep | one pattern or `-e` patterns, no operand, none of `-f -r -R -d -D` |
+| cat | flags only |
+
+Any other right side, a second pipe, or a filter joined by `&&` still refuses. A reviewer block keys on the command without its filter, so a retry that changes the filter or drops it meets the same block.
+
 ### A wrapped retry meets the refusal of the command it wraps
 
 https://github.com/STRML/omp-classifier/issues/200, found by the commit security scan on https://github.com/STRML/omp-classifier/pull/199. The refusal key skipped wrapper words but not their arguments, so `timeout 30 scp …` keyed on `timeout 30` and ran past the scp's refusal. Every wrapped command with a duration or option shared that one key, so two unrelated commands under `timeout 30` also refused each other.
