@@ -4,6 +4,12 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-29
 
+### A wrapped retry meets the refusal of the command it wraps
+
+https://github.com/STRML/omp-classifier/issues/200, found by the commit security scan on https://github.com/STRML/omp-classifier/pull/199. The refusal key skipped wrapper words but not their arguments, so `timeout 30 scp …` keyed on `timeout 30` and ran past the scp's refusal. Every wrapped command with a duration or option shared that one key, so two unrelated commands under `timeout 30` also refused each other.
+
+The key now reads each wrapper with its own option grammar (`scanWrapperOptions`, the same table the interpreter scan uses) and keys the command it runs. That covers `timeout [opts] DURATION`, `nice -n N`, `env [opts] NAME=VALUE`, `stdbuf -oL`, stacked wrappers, and a bare `NAME=VALUE` prefix, for git, ssh/scp/rsync and every other command. A wrapper whose options the grammar cannot read (`env -S`) keeps the key on the text as written.
+
 ### A refused copy stays refused when it is reworded, and consent after the refusal can lift it
 
 From OMP session `01a188b8`. The gate refused an scp of a rebuilt binary to the Studio, the agent asked, and the user picked "Deploy now". The retry still met the refusal. The agent then dropped `-q` and spelled the destination from `/Users/<user>`, and the copy ran.
