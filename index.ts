@@ -4820,18 +4820,49 @@ function refusalKeyForCommand(command: string): string {
 	// than falling back to the broad `command git` identity.
 	const collapsed = command.replace(/\s+/gu, " ").trim();
 	const stripped = extractLeadingCdTarget(collapsed)?.rest || collapsed;
-	const words = stripped.split(" ").filter(word => word !== "");
-	let index = 0;
-	while (index < words.length && WRAPPER_COMMANDS.has(commandBasename(words[index].toLowerCase()))) index++;
-	const verb = commandBasename(words[index]?.toLowerCase() ?? "");
+	// A wrapper runs the command after it, so key that command: a refusal then
+	// covers it wrapped or bare (https://github.com/STRML/omp-classifier/issues/200).
+	const inner = unwrappedCommand(stripped);
+	if (inner !== undefined) return refusalKeyForCommand(inner);
+	const verb = commandBasename(stripped.split(" ")[0]?.toLowerCase() ?? "");
 	if (REMOTE_VALUE_FLAGS.has(verb)) return remoteRefusalKey(command) ?? actionTarget;
 	if (verb !== "git") return actionTarget;
 	return `git-exact:${stripped}`;
 }
 
+/**
+ * The command a leading wrapper or assignment runs, as text: `timeout 30 scp a
+ * b:c` gives `scp a b:c`. Each wrapper is read with its own option grammar
+ * (`scanWrapperOptions`), so `timeout`'s duration and `nice -n 5`'s value are
+ * skipped with it. Undefined when nothing wraps the command, or a wrapper's
+ * options cannot be read, which keeps the key on the text as written.
+ */
+function unwrappedCommand(command: string): string | undefined {
+	const parsed = parseShell(command);
+	if (!parsed.ok) return undefined;
+	const first = parsed.commands.find(entry => !entry.nested);
+	if (first === undefined) return undefined;
+	const index = programIndex(first.words.map(word => word.value));
+	const offset = index === undefined ? undefined : first.words[index]?.offset;
+	if (offset === undefined || (index === 0 && first.assigns.length === 0)) return undefined;
+	return command.slice(offset);
+}
+
+/** Where a command's own program starts among its words, past every wrapper
+ *  and its options. Undefined when a wrapper's options cannot be read. */
+function programIndex(words: string[]): number | undefined {
+	let index = 0;
+	while (index < words.length && WRAPPER_COMMANDS.has(commandBasename(words[index].toLowerCase()))) {
+		const scan = scanWrapperOptions(commandBasename(words[index].toLowerCase()), words, index + 1);
+		if ("opaque" in scan) return undefined;
+		index = scan.next;
+	}
+	return index;
+}
+
 /** Short flags that take a value, per remote verb, from each tool's man page.
- *  Their value is not an operand, so `-o BatchMode=yes` never names the host. */
-/** A Map, not an object literal: a verb such as `constructor` must not find
+ *  Their value is not an operand, so `-o BatchMode=yes` never names the host.
+ *  A Map, not an object literal: a verb such as `constructor` must not find
  *  Object.prototype, throw in the key, and leave its refusal unrecorded. */
 const REMOTE_VALUE_FLAGS = new Map([["ssh", "BbcDEeFIiJLlmOopQRSWw"], ["scp", "cDFiJloPSX"], ["rsync", "eBfMT"]]);
 /** rsync's long options that can take their value as the next word: every
@@ -4885,8 +4916,7 @@ function commandOperands(command: string): { verb: string; operands: string[] } 
 	const top = parsed.commands.filter(entry => !entry.nested);
 	const first = top[0] !== undefined && verbName(top[0]) === "cd" ? top[1] : top[0];
 	const words = (first?.words ?? []).map(word => word.value);
-	let index = 0;
-	while (index < words.length && WRAPPER_COMMANDS.has(commandBasename(words[index].toLowerCase()))) index++;
+	const index = programIndex(words) ?? 0;
 	const verb = commandBasename(words[index]?.toLowerCase() ?? "");
 	if (verb === "") return undefined;
 	const valueFlags = REMOTE_VALUE_FLAGS.get(verb) ?? "";

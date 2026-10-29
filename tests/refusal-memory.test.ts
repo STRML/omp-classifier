@@ -392,6 +392,49 @@ describe("a remote copy's refusal survives a rewrite of the same copy", () => {
 	});
 });
 
+describe("a wrapper does not change what a refusal covers (https://github.com/STRML/omp-classifier/issues/200)", () => {
+	// The key skipped wrapper words but not their arguments, so
+	// `timeout 30 scp …` keyed on `timeout 30` and ran past the scp's refusal.
+	const cases: Array<[string, string, string]> = [
+		["timeout with a duration", "scp target/release/tool buildhost:.local/bin/tool.new", "timeout 30 scp target/release/tool buildhost:.local/bin/tool.new"],
+		["timeout with options", "scp target/release/tool buildhost:.local/bin/tool.new", "timeout -k 5 --preserve-status 30s scp target/release/tool buildhost:.local/bin/tool.new"],
+		["nice -n", "scp target/release/tool buildhost:.local/bin/tool.new", "nice -n 5 scp target/release/tool buildhost:.local/bin/tool.new"],
+		["env with an assignment", "scp target/release/tool buildhost:.local/bin/tool.new", "env FOO=1 scp target/release/tool buildhost:.local/bin/tool.new"],
+		["a bare assignment", "scp target/release/tool buildhost:.local/bin/tool.new", "FOO=1 scp target/release/tool buildhost:.local/bin/tool.new"],
+		["stdbuf and nohup stacked", "rm -rf build", "nohup stdbuf -oL rm -rf build"],
+		["a wrapped git command", "git branch -D topic", "timeout 10 git branch -D topic"],
+	];
+
+	for (const [name, refused, wrapped] of cases) {
+		test(`${name} still meets the refusal`, async () => {
+			const sid = nextSession();
+			setJevAnswer(jevUnsafeAnswer());
+			await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid }));
+			setJevAnswer(jevSafeAnswer());
+			await fire("tool_call", makeEvent(wrapped), makeCtx({ sessionId: sid }));
+			expect(priorRefusalOf(1)).toBeDefined();
+		});
+	}
+
+	test("a refused wrapped command is keyed on what it wraps, so the bare retry meets it", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("timeout 30 ssh buildhost 'rm -f ~/tool'"), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		await fire("tool_call", makeEvent("ssh buildhost 'rm -f ~/tool'"), makeCtx({ sessionId: sid }));
+		expect(priorRefusalOf(1)).toBeDefined();
+	});
+
+	test("two wrapped commands on different hosts are still two targets", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("timeout 30 ssh hosta 'ls /tmp'"), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		await fire("tool_call", makeEvent("timeout 30 ssh hostb 'ls /tmp'"), makeCtx({ sessionId: sid }));
+		expect(priorRefusalOf(1)).toBeUndefined();
+	});
+});
+
 describe("refusal memory under changing words", () => {
 	test("a model refusal stands when the user's words move in a UI session", async () => {
 		const sid = nextSession();
