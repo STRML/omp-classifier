@@ -15,6 +15,7 @@ import type { DecisionRecord } from "../index";
 import {
 	fire,
 	jevNoul,
+	jevSafeAnswer,
 	jevUnsafeAnswer,
 	jevUnsureAnswer,
 	loadPlugin,
@@ -232,6 +233,92 @@ describe("an UNSAFE verdict goes to the reviewer", () => {
 		scriptReviewer(reviewerReply("allow", "thanks"));
 		const second = await fire("tool_call", makeEvent(deploy), uiCtx(sid, [user("u1", "fix the tool"), user("u2", "thanks")]));
 		expect(refusalOf(second).layer).toBe("prior-refusal");
+	});
+});
+
+describe("consent given after a refusal", () => {
+	// OMP session 01a188b8: the gate refused an scp, the agent asked, the user
+	// picked "Deploy now", and the retry still met the refusal, because only
+	// literal-match could lift one and it never reads a network command. The
+	// agent then reworded the copy past the key. A reviewer allow now lifts a
+	// model refusal for one call when it quotes words given after the refusal,
+	// and those words (or the question they answer) name the target.
+	const deploy = "scp target/release/tool buildhost:.local/bin/tool.new";
+	const before = () => [user("u1", "fix the tool")];
+	const after = () => [...before(), askAnswer("a1", "Deploy the rebuilt tool to buildhost:~/.local/bin/tool?", "Deploy now")];
+
+	/** Refuse the deploy once in this session: UNSAFE, and the reviewer blocks. */
+	async function refuseDeploy(sid: string): Promise<void> {
+		setJevAnswer(jevUnsafeAnswer());
+		scriptReviewer(reviewerReply("block"));
+		expect(refusalOf(await fire("tool_call", makeEvent(deploy), uiCtx(sid, before()))).layer).toBe("unsafe");
+	}
+
+	test("an ask answer to a question naming the target lifts it for that call", async () => {
+		const sid = nextSession();
+		await refuseDeploy(sid);
+		scriptReviewer(reviewerReply("allow", "Deploy now"));
+		const result = await fire("tool_call", makeEvent(deploy), uiCtx(sid, after()));
+		expect(resultText(result)).toBe("ALLOWED");
+		expect(readDecisions().at(-1)?.why).toContain("runs past the refusal");
+	});
+
+	test("a stage-1 SAFE on a refused target goes to the reviewer, which can lift it", async () => {
+		const sid = nextSession();
+		await refuseDeploy(sid);
+		setJevAnswer(jevSafeAnswer());
+		scriptReviewer(reviewerReply("allow", "Deploy now"));
+		const result = await fire("tool_call", makeEvent(deploy), uiCtx(sid, after()));
+		expect(reviewerCalls).toHaveLength(2);
+		expect(reviewerCalls[1].input.stage1).toMatchObject({ verdict: "SAFE" });
+		expect(resultText(result)).toBe("ALLOWED");
+	});
+
+	test("a stage-1 SAFE on a refused target that the reviewer blocks stays refused", async () => {
+		const sid = nextSession();
+		await refuseDeploy(sid);
+		setJevAnswer(jevSafeAnswer());
+		scriptReviewer(reviewerReply("block"));
+		expect(refusalOf(await fire("tool_call", makeEvent(deploy), uiCtx(sid, after()))).layer).toBe("prior-refusal");
+	});
+
+	test("a quote from words given before the refusal does not lift it", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		scriptReviewer(reviewerReply("block"));
+		const named = [user("u1", "deploy the tool to buildhost")];
+		await fire("tool_call", makeEvent(deploy), uiCtx(sid, named));
+		scriptReviewer(reviewerReply("allow", "deploy the tool to buildhost"));
+		const result = await fire("tool_call", makeEvent(deploy), uiCtx(sid, [...named, user("u2", "ok go")]));
+		expect(refusalOf(result).layer).toBe("prior-refusal");
+	});
+
+	test("an answer whose question never names the target does not lift it", async () => {
+		const sid = nextSession();
+		await refuseDeploy(sid);
+		scriptReviewer(reviewerReply("allow", "Deploy now"));
+		const vague = [...before(), askAnswer("a1", "Should I continue?", "Deploy now")];
+		expect(refusalOf(await fire("tool_call", makeEvent(deploy), uiCtx(sid, vague))).layer).toBe("prior-refusal");
+	});
+
+	test("a headless session never lifts it", async () => {
+		const sid = nextSession();
+		await refuseDeploy(sid);
+		setJevAnswer(jevSafeAnswer());
+		const result = await fire("tool_call", makeEvent(deploy), makeCtx({ sessionId: sid, hasUI: false, branch: after(), cwd: dir }));
+		expect(refusalOf(result).layer).toBe("prior-refusal");
+		expect(reviewerCalls).toHaveLength(1);
+	});
+
+	test("a review-limit refusal never lifts", async () => {
+		writeConfig({ maxCommandLength: 64 });
+		await loadPlugin(makeSettings([]));
+		const sid = nextSession();
+		const long = `scp ${"-o ConnectTimeout=5 ".repeat(4)}target/release/tool buildhost:.local/bin/tool.new`;
+		expect(refusalOf(await fire("tool_call", makeEvent(long), uiCtx(sid, before()))).layer).toBe("cap");
+		setJevAnswer(jevUnsafeAnswer());
+		scriptReviewer(reviewerReply("allow", "Deploy now"));
+		expect(refusalOf(await fire("tool_call", makeEvent(deploy), uiCtx(sid, after()))).layer).toBe("prior-refusal");
 	});
 });
 

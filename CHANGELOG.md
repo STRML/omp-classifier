@@ -4,6 +4,15 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-29
 
+### A refused copy stays refused when it is reworded, and consent after the refusal can lift it
+
+From OMP session `01a188b8`. The gate refused an scp of a rebuilt binary to the Studio, the agent asked, and the user picked "Deploy now". The retry still met the refusal. The agent then dropped `-q` and spelled the destination from `/Users/<user>`, and the copy ran.
+
+| Cause | Fix |
+|---|---|
+| The refusal key was the verb, the sorted flags and the first argument. Dropping `-q` changed the key, and `-o BatchMode=yes` put `batchmode=yes` in the argument slot, so the host never entered the key | ssh, scp and rsync key on where they act, with every option and its value dropped. ssh keys on its host and remote command. scp and rsync count as one verb and key on each remote end, spelled from `~`, plus each local file's name |
+| Only `literalMatch` could lift a model refusal, and it never reads a network command, so no consent could lift one | A stage 2 allow lifts a model refusal for one call when its quote comes from user words or an ask answer given after the refusal, and those words or the ask question name the target (its host, or an operand's file name). A stage-1 SAFE under a model refusal now goes to the reviewer. Critical, cap, eval and headless refusals still never lift |
+
 ### Stage 2 reviews an UNSAFE too
 
 From OMP session `01a18825`. The user clicked an ask answer that named an scp of a rebuilt binary to a machine on their network, and Jev answered UNSAFE on that scp (0.54, then 0.89 after the user typed that they wanted it deployed), with every hard hazard under the review level. The reviewer never ran.

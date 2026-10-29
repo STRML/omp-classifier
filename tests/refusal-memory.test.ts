@@ -304,11 +304,72 @@ describe("refusal identity at the gate (issue #64)", () => {
 		const again = makeCtx({ sessionId: sid, hasUI: true });
 		const result = await fire("tool_call", makeEvent("ssh raw-ovh  'wp db delete --all'"), again);
 		expect(refusalOf(result).layer).toBe("prior-refusal");
-		expect(priorRefusalOf(1)?.target).toBe("ssh --all' raw-ovh");
+		expect(priorRefusalOf(1)?.target).toBe("ssh raw-ovh wp db delete --all");
 		// The refusal rode in the state, and a SAFE verdict is not a clean bill.
 		expect(readDecisions().some(line => line.why.includes("prior refusal"))).toBe(true);
 	});
 
+	test("a remote command's refusal names its host, not a flag's value", async () => {
+		// `-o BatchMode=yes` used to fill the first-argument slot, so every
+		// `ssh -o BatchMode=yes <host>` shared one key whatever the host.
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("ssh -o BatchMode=yes hosta 'ls /tmp'"), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		const result = await fire("tool_call", makeEvent("ssh -o BatchMode=yes hostb 'ls /tmp'"), makeCtx({ sessionId: sid }));
+		expect(priorRefusalOf(1)).toBeUndefined();
+		expect(result).toBeUndefined();
+	});
+});
+
+describe("a remote copy's refusal survives a rewrite of the same copy", () => {
+	// OMP session 01a188b8: the gate refused
+	// `scp -o BatchMode=yes -q target/release/mlxtop studio-local:.local/bin/mlxtop.new`,
+	// and the agent ran the same copy past the refusal by dropping `-q` and
+	// spelling the destination from `/Users/<user>`. Neither changes what lands
+	// where, so neither may change the refusal's key.
+	const refused = "scp -o BatchMode=yes -q target/release/tool buildhost:.local/bin/tool.new";
+	const rewrites: Array<[string, string]> = [
+		["a dropped quiet flag and an absolute home path", `scp -o BatchMode=yes target/release/tool buildhost:${os.homedir()}/.local/bin/tool.new`],
+		["a tilde path and no options", "scp target/release/tool buildhost:~/.local/bin/tool.new"],
+		["a user@ prefix and a source spelled with ./", "scp -q ./target/release/tool me@buildhost:.local/bin/tool.new"],
+		["rsync in place of scp", "rsync -az target/release/tool buildhost:.local/bin/tool.new"],
+	];
+
+	for (const [name, rewrite] of rewrites) {
+		test(`${name} still meets the refusal`, async () => {
+			const sid = nextSession();
+			setJevAnswer(jevUnsafeAnswer());
+			await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid }));
+			setJevAnswer(jevSafeAnswer());
+			const result = await fire("tool_call", makeEvent(rewrite), makeCtx({ sessionId: sid }));
+			expect(priorRefusalOf(1)).toBeDefined();
+			expect(refusalOf(result).layer).toBe("prior-refusal");
+		});
+	}
+
+	test("a copy to another host or another file is a different target", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		await fire("tool_call", makeEvent("scp target/release/tool otherhost:.local/bin/tool.new"), makeCtx({ sessionId: sid }));
+		await fire("tool_call", makeEvent("scp target/release/tool buildhost:.local/bin/other.new"), makeCtx({ sessionId: sid }));
+		expect(priorRefusalOf(1)).toBeUndefined();
+		expect(priorRefusalOf(2)).toBeUndefined();
+	});
+
+	test("an ssh refusal survives a dropped flag", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("ssh -q -o BatchMode=yes buildhost 'mv ~/.local/bin/tool.new ~/.local/bin/tool'"), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		await fire("tool_call", makeEvent("ssh buildhost 'mv ~/.local/bin/tool.new ~/.local/bin/tool'"), makeCtx({ sessionId: sid }));
+		expect(priorRefusalOf(1)).toBeDefined();
+	});
+});
+
+describe("refusal memory under changing words", () => {
 	test("a model refusal stands when the user's words move in a UI session", async () => {
 		const sid = nextSession();
 		const userEntry = (content: string) => ({ type: "message", message: { role: "user", attribution: "user", content } });

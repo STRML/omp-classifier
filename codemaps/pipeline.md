@@ -106,4 +106,9 @@ the newest user message id (`newestUserMessageId`). Fed back to the judge as
 `recordExtras.priorRefusal`. A record is never erased mid-session; `priorRefusalFor` ignores evidence
 changes. One bash call runs past a model refusal when `priorRefusalLifts` holds: SAFE,
 authorization `grounded`, and `literalMatch` over the user messages after the recorded one
-(`userMessagesSince`). Critical, cap and eval refusals never yield.
+(`userMessagesSince`). Or when `reviewerLifts` holds: a stage 2 allow whose quote is in the
+user words and ask answers after the recorded one (`consentSince`), where that entry or its ask
+question names a `consentAnchors` target (host for ssh/scp/rsync, else operand file names).
+A stage-1 SAFE under a model refusal goes to stage 2 for this. Critical, cap and eval refusals
+never yield. ssh, scp and rsync key on `remoteRefusalKey` (host and remote command; remote ends
+spelled from `~` plus local file names), not `normalizeActionTarget`.
