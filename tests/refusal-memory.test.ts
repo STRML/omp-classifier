@@ -334,6 +334,8 @@ describe("a remote copy's refusal survives a rewrite of the same copy", () => {
 		["a tilde path and no options", "scp target/release/tool buildhost:~/.local/bin/tool.new"],
 		["a user@ prefix and a source spelled with ./", "scp -q ./target/release/tool me@buildhost:.local/bin/tool.new"],
 		["rsync in place of scp", "rsync -az target/release/tool buildhost:.local/bin/tool.new"],
+		["an rsync long option with its value as the next word", "rsync --bwlimit 100 --partial-dir .rsync-partial target/release/tool buildhost:.local/bin/tool.new"],
+		["a remote home spelled for another user", "scp target/release/tool buildhost:/home/deploy/.local/bin/tool.new"],
 	];
 
 	for (const [name, rewrite] of rewrites) {
@@ -357,6 +359,27 @@ describe("a remote copy's refusal survives a rewrite of the same copy", () => {
 		await fire("tool_call", makeEvent("scp target/release/tool buildhost:.local/bin/other.new"), makeCtx({ sessionId: sid }));
 		expect(priorRefusalOf(1)).toBeUndefined();
 		expect(priorRefusalOf(2)).toBeUndefined();
+	});
+
+	test("an ssh refusal survives a `--` before the remote command", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("ssh buildhost 'rm -f ~/.local/bin/tool'"), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		await fire("tool_call", makeEvent("ssh buildhost -- 'rm -f ~/.local/bin/tool'"), makeCtx({ sessionId: sid }));
+		expect(priorRefusalOf(1)).toBeDefined();
+	});
+
+	test("a program named like an Object.prototype member is still remembered", async () => {
+		// A plain-object lookup found `constructor` on the prototype, the key
+		// threw, and addRefusal swallowed it: nothing was recorded.
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("constructor -d prod"), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		// Respelled so the verdict cache misses and the judge sees the state.
+		await fire("tool_call", makeEvent("constructor -d ./prod"), makeCtx({ sessionId: sid }));
+		expect(priorRefusalOf(1)).toBeDefined();
 	});
 
 	test("an ssh refusal survives a dropped flag", async () => {

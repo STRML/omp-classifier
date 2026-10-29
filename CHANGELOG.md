@@ -11,6 +11,7 @@ From OMP session `01a188b8`. The gate refused an scp of a rebuilt binary to the 
 | Cause | Fix |
 |---|---|
 | The refusal key was the verb, the sorted flags and the first argument. Dropping `-q` changed the key, and `-o BatchMode=yes` put `batchmode=yes` in the argument slot, so the host never entered the key | ssh, scp and rsync key on where they act, with every option and its value dropped. ssh keys on its host and remote command. scp and rsync count as one verb and key on each remote end, spelled from `~`, plus each local file's name |
+| Review follow-ups on the new key | rsync's value-taking long options (`--bwlimit 100`) skip their value; a remote home spelled `/home/<user>`, `/Users/<user>`, `/root` or `~user` counts as `~`; `ssh host -- cmd` keys as `ssh host cmd`; the verb table is a `Map`, so a program named `constructor` with a short flag no longer throws in the key and loses its refusal |
 | Only `literalMatch` could lift a model refusal, and it never reads a network command, so no consent could lift one | A stage 2 allow lifts a model refusal for one call when its quote comes from user words or an ask answer given after the refusal, and those words or the ask question name the target (its host, or an operand's file name). A stage-1 SAFE under a model refusal now goes to the reviewer. Critical, cap, eval and headless refusals still never lift |
 
 ### Stage 2 reviews an UNSAFE too

@@ -4824,16 +4824,27 @@ function refusalKeyForCommand(command: string): string {
 	let index = 0;
 	while (index < words.length && WRAPPER_COMMANDS.has(commandBasename(words[index].toLowerCase()))) index++;
 	const verb = commandBasename(words[index]?.toLowerCase() ?? "");
-	if (REMOTE_VALUE_FLAGS[verb] !== undefined) return remoteRefusalKey(command) ?? actionTarget;
+	if (REMOTE_VALUE_FLAGS.has(verb)) return remoteRefusalKey(command) ?? actionTarget;
 	if (verb !== "git") return actionTarget;
 	return `git-exact:${stripped}`;
 }
 
 /** Short flags that take a value, per remote verb, from each tool's man page.
  *  Their value is not an operand, so `-o BatchMode=yes` never names the host. */
-const REMOTE_VALUE_FLAGS: Record<string, string> = { ssh: "BbcDEeFIiJLlmOopQRSWw", scp: "cDFiJloPSX", rsync: "eBfMT" };
-/** rsync's long options that take their value as the next word. */
-const RSYNC_VALUE_OPTIONS = new Set(["--rsh", "--rsync-path", "--exclude", "--include", "--filter", "--exclude-from", "--include-from", "--files-from", "--chmod", "--chown", "--port", "--timeout", "--password-file", "--log-file"]);
+/** A Map, not an object literal: a verb such as `constructor` must not find
+ *  Object.prototype, throw in the key, and leave its refusal unrecorded. */
+const REMOTE_VALUE_FLAGS = new Map([["ssh", "BbcDEeFIiJLlmOopQRSWw"], ["scp", "cDFiJloPSX"], ["rsync", "eBfMT"]]);
+/** rsync's long options that can take their value as the next word: every
+ *  `--name=VALUE` option in rsync(1). One left out reads its value as a file
+ *  operand, and a retry that writes `--name=VALUE` or drops it escapes. */
+const RSYNC_VALUE_OPTIONS = new Set([
+	"--rsh", "--rsync-path", "--remote-option", "--exclude", "--include", "--filter", "--exclude-from", "--include-from", "--files-from",
+	"--chmod", "--chown", "--usermap", "--groupmap", "--port", "--timeout", "--contimeout", "--password-file", "--log-file",
+	"--log-file-format", "--out-format", "--info", "--debug", "--bwlimit", "--partial-dir", "--temp-dir", "--backup-dir", "--suffix",
+	"--compare-dest", "--copy-dest", "--link-dest", "--max-size", "--min-size", "--max-delete", "--max-alloc", "--block-size",
+	"--modify-window", "--checksum-choice", "--checksum-seed", "--compress-choice", "--compress-level", "--skip-compress", "--iconv",
+	"--sockopts", "--address", "--write-batch", "--only-write-batch", "--read-batch", "--protocol", "--outbuf", "--stop-after", "--stop-at",
+]);
 
 /**
  * The refusal key for ssh, scp and rsync: where the command acts, with every
@@ -4848,12 +4859,14 @@ const RSYNC_VALUE_OPTIONS = new Set(["--rsh", "--rsync-path", "--exclude", "--in
  */
 function remoteRefusalKey(command: string): string | undefined {
 	const read = commandOperands(command);
-	if (read === undefined || REMOTE_VALUE_FLAGS[read.verb] === undefined) return undefined;
+	if (read === undefined || !REMOTE_VALUE_FLAGS.has(read.verb)) return undefined;
 	const { verb, operands } = read;
 	if (verb === "ssh") {
 		const host = sshHost(operands[0]);
 		if (!host) return undefined;
-		return ["ssh", host, ...operands.slice(1)].join(" ").replace(/\s+/gu, " ").trim().toLowerCase();
+		// `ssh host -- cmd` runs the same remote command as `ssh host cmd`.
+		const remoteCommand = operands[1] === "--" ? operands.slice(2) : operands.slice(1);
+		return ["ssh", host, ...remoteCommand].join(" ").replace(/\s+/gu, " ").trim().toLowerCase();
 	}
 	const spelled = operands.map(remoteCopyOperand);
 	if (!spelled.some(operand => operand.remote)) return undefined;
@@ -4876,7 +4889,7 @@ function commandOperands(command: string): { verb: string; operands: string[] } 
 	while (index < words.length && WRAPPER_COMMANDS.has(commandBasename(words[index].toLowerCase()))) index++;
 	const verb = commandBasename(words[index]?.toLowerCase() ?? "");
 	if (verb === "") return undefined;
-	const valueFlags = REMOTE_VALUE_FLAGS[verb] ?? "";
+	const valueFlags = REMOTE_VALUE_FLAGS.get(verb) ?? "";
 	const operands: string[] = [];
 	let optionsEnded = false;
 	for (let at = index + 1; at < words.length; at++) {
@@ -4917,10 +4930,14 @@ function remoteCopyOperand(operand: string): { key: string; remote: boolean } {
 	const remote = /^(?:[^@/:]+@)?([^/:]+):(.*)$/u.exec(operand);
 	const trimmed = (text: string) => (text.length > 1 ? text.replace(/\/+$/u, "") : text);
 	if (remote === null) return { key: path.posix.basename(trimmed(operand)) || operand, remote: false };
+	// The remote user's home is unknown here, so any home spelling counts as
+	// `~`: the local one, and `/home/<user>`, `/Users/<user>` or `/root`.
+	// Merging two users' homes on one host errs toward keeping a refusal.
 	const home = os.homedir();
-	let remotePath = trimmed(remote[2]);
-	if (remotePath === "" || remotePath === "~" || remotePath === home) remotePath = "~";
-	else if (remotePath.startsWith(`${home}/`)) remotePath = `~/${remotePath.slice(home.length + 1)}`;
+	let remotePath = trimmed(remote[2]).replace(/^~[^/]*/u, "~");
+	if (remotePath === home || remotePath.startsWith(`${home}/`)) remotePath = `~${remotePath.slice(home.length)}`;
+	else remotePath = remotePath.replace(/^(?:\/home\/[^/]+|\/Users\/[^/]+|\/root)(?=\/|$)/u, "~");
+	if (remotePath === "") remotePath = "~";
 	else if (!remotePath.startsWith("/") && !remotePath.startsWith("~") && !remotePath.startsWith(":")) remotePath = `~/${remotePath}`;
 	return { key: `${remote[1]}:${remotePath}`, remote: true };
 }
