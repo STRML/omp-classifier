@@ -110,7 +110,7 @@ import { deriveDecisionOrder, type DecisionBranch } from "./decision-order";
 import { literalMatch } from "./literal-match";
 import { redactSecrets, redactValue } from "./redact";
 import { quotesUserWords, reviewerModelCall, runReviewer, type ReviewerOutcome, type ReviewerTranscriptEntry } from "./reviewer";
-import { forgetReviewerBlocks, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged } from "./stage-two";
+import { forgetReviewerBlocks, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged, withoutOutputFilter } from "./stage-two";
 import { formatTrustPolicyPin, normalizeTrustPolicyPin, pinUserInstructionFiles, resolvePinnedUserPolicy, type TrustPolicyPin, type TrustedPolicyDocument } from "./trust-policy";
 import {
 	buildJevState,
@@ -5055,8 +5055,10 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	// the whole text, and a block must survive a reworded retry. Siblings such
 	// as `x.sh start` and `x.sh finish` share it, which errs toward blocking.
 	// Read past a leading cd and an assignment prefix the way the refusal key
-	// does, so `FOO=1 cmd` meets the block on `cmd`.
-	const bare = extractLeadingCdTarget(command.replace(/\s+/gu, " ").trim())?.rest || command;
+	// does, so `FOO=1 cmd` meets the block on `cmd`. A trailing output filter
+	// is dropped too, so `x.sh | tail -5` meets the block on `x.sh | tail -60`.
+	const unfiltered = withoutOutputFilter(command);
+	const bare = extractLeadingCdTarget(unfiltered.replace(/\s+/gu, " ").trim())?.rest || unfiltered;
 	const blockKey = reviewerBlockKey(normalizeActionTarget(unwrappedCommand(bare) ?? bare), cwd, model, userWords);
 	if (reviewerBlocked(sessionId, blockKey)) {
 		return { judgement: { ...judgement, reason: `${judgement.reason}; the stage 2 reviewer already blocked this under the same user words` }, audit: { skipped: "blocked before under the same user words" } };
