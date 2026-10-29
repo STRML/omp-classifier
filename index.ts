@@ -4853,6 +4853,9 @@ const HANDLER_MARGIN_MS = 2_000;
  * one of them stays a block whatever the reviewer would say.
  */
 const REVIEWER_HARD_HAZARDS = ["exposes_secrets", "sends_local_data_outbound", "escalates_privilege", "state_contains_injection"] as const;
+/** An UNSAFE escalates only for what consent can cover: one Jev scored as
+ *  destructive or irreversible stays blocked, whatever the user said. */
+const REVIEWER_UNSAFE_BARRED = [...REVIEWER_HARD_HAZARDS, "destructive_or_irreversible"] as const;
 
 export interface StageTwoInput {
 	ctx: ExtensionContext;
@@ -4870,22 +4873,25 @@ export interface StageTwoInput {
 }
 
 /**
- * Stage 2 (docs/plans/2026-10-27-stage-2-reviewer.md): send a Jev UNSURE to
- * the reviewer when every check below holds, and return the verdict to act
- * on. Only an allow changes it, and an allow is never cached. Every other
+ * Stage 2 (docs/plans/2026-10-27-stage-2-reviewer.md): send a Jev UNSURE or
+ * UNSAFE to the reviewer when every check below holds, and return the verdict
+ * to act on. Claude Code's second stage reviews whatever its first stage
+ * flags: Jev answers UNSAFE on a deploy the user clicked to approve, since it
+ * scores the action and cannot weigh the consent. Only an allow changes it, and an allow is never cached. Every other
  * outcome keeps the stage-1 judgement, so a reviewer that is missing, slow,
  * wrong-shaped or quoting words the user never wrote leaves the block in place.
  */
 async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; audit?: ReviewerAudit }> {
 	const { ctx, judgement, command, cwd, config } = input;
 	const model = config.reviewerModel;
-	if (judgement.verdict !== "UNSURE" || model === null) return { judgement };
+	if ((judgement.verdict !== "UNSURE" && judgement.verdict !== "UNSAFE") || model === null) return { judgement };
 	const skip = (why: string) => ({ judgement, audit: { skipped: why } });
 	if (!ctx.hasUI) return skip("headless session");
 	if (judgement.persistRefusal === false) return skip("one-hot answers");
 	if (judgement.jev === undefined) return skip("no stage-1 answers");
 	const hazardReview = jevPolicyFor(config).hazardReview;
-	const hard = REVIEWER_HARD_HAZARDS.find(hazard => (judgement.jev?.hazards[hazard] ?? 0) >= hazardReview);
+	const barred = judgement.verdict === "UNSAFE" ? REVIEWER_UNSAFE_BARRED : REVIEWER_HARD_HAZARDS;
+	const hard = barred.find(hazard => (judgement.jev?.hazards[hazard] ?? 0) >= hazardReview);
 	if (hard !== undefined) return skip(`hazard ${hard}`);
 	const transcript = reviewerTranscript(ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>, refusedToolCallIds);
 	const userWords = transcript.flatMap(entry => (entry.from === "user" ? [entry.text] : entry.from === "ask" ? [entry.userAnswer] : []));
@@ -6634,7 +6640,7 @@ export default function (pi: ExtensionAPI) {
 			// nondeterministic judge from flapping verdicts); UNAVAILABLE sets
 			// noCache for the same reason.
 			if (cacheable && !cached && stage1.verdict !== "UNAVAILABLE" && !stage1.noCache) remember(scoped, cacheKey, stage1);
-			// Stage 2 runs after the cache, on a fresh or a cached UNSURE alike, and
+			// Stage 2 runs after the cache, on a fresh or a cached UNSURE or UNSAFE, and
 			// what it allows is never cached: the next call reviews again. Dry run
 			// reports the stage-1 decision and pays for no review.
 			const reviewed = dryRun ? { judgement: stage1 } : await stageTwo({ ctx, judgement: stage1, command, cwd, startCwd, config, started, trustedPolicy: trustedPolicySnapshot.documents });

@@ -50,17 +50,17 @@ The gate never opens a dialog (https://github.com/STRML/omp-classifier/issues/18
 
 Say so in chat, or click an answer when the agent asks. On the retry, Jev reads your words as user evidence (`evidenceUserMessages`), and a SAFE verdict runs.
 
-When Jev is unsure and `reviewerModel` is set, a second stage reviews the command before it blocks. That second stage is a reasoning model reading your messages, the agent's tool calls and the scripts the command runs. It is modelled on Claude Code's auto-mode classifier:
+When Jev is unsure or calls a command unsafe and `reviewerModel` is set, a second stage reviews the command before it blocks. That second stage is a reasoning model reading your messages, the agent's tool calls and the scripts the command runs. It is modelled on Claude Code's auto-mode classifier:
 
 ```
-command ─▶ Jev ─▶ SAFE ─────────────────────────────────▶ runs
-             └──▶ UNSURE ─▶ eligible? ─▶ reviewer ─▶ allow ─▶ runs (not cached)
-                               │                 └─▶ block ─▶ blocked, remembered
-                               └─ no ──────────────────────▶ blocked
+command ─▶ Jev ─▶ SAFE ───────────────────────────────────────────▶ runs
+             └──▶ UNSURE or UNSAFE ─▶ eligible? ─▶ reviewer ─▶ allow ─▶ runs (not cached)
+                                         │                 └─▶ block ─▶ blocked, remembered
+                                         └─ no ──────────────────────▶ blocked
 ```
 
 - **What it reads:** your messages and ask answers, the agent's tool calls, and the body of every script the command runs, read by the gate. It never sees tool results, skill text or the agent's prose.
-- **When it can allow:** only when Jev's verdict is UNSURE (never UNSAFE) and no secrets, exfiltration, privilege or injection hazard is raised.
+- **When it can allow:** when Jev's verdict is UNSURE or UNSAFE and no secrets, exfiltration, privilege or injection hazard is raised. An UNSAFE also needs Jev's destructive-or-irreversible score under the review level, and one the reviewer blocks still records its refusal.
 - **Which commands it reviews:** two shapes, and no others.
   - Commands that run no local program: system tools such as `git` and `curl`, or the repository's own build tooling such as `bun test`.
   - One local script on its own, optionally after `cd <dir> &&`, with literal words. Its body must be readable: not binary, under 64 KB, not behind a secret path, and not handing off to another program (an interpreter, a wrapper, a change to PATH or what a shell loads, or a program named by a path outside the root-owned system directories).
@@ -237,7 +237,7 @@ The state can carry an `evidence` object whose fields have different authors, an
 
 The command text (up to 8,000 characters), its resolved working directory, recent user messages when `evidenceUserMessages` is non-zero, requesting-agent operator context, and any current explicitly pinned user-level policy snapshot go to TypeSafe's System One API (`api.typesafe.ai`) by default. The fixed policy paths are re-read on each classification only to verify the pin; changed bytes are never interpreted as policy. `/classifier trust-policy` reports paths, hashes, and byte lengths; `/classifier status` shows only the pin hash. An `endpoint` `judgeBackend` sends the same judge state to that endpoint instead: it is the operator's own server, with its own logging and retention. TypeSafe's logging and retention policies apply to the default path. Command text is sent as written and may contain private paths, proprietary snippets, inline env assignments, or secrets; secret-shaped values in evidence and policy contents are redacted before they leave the machine. Caller-supplied `env` values are never sent; that path blocks instead.
 
-With `reviewerModel` set, a command Jev is unsure of also goes to that model's provider. It sends the command, the bodies of the scripts it runs (up to 64 KB each), your recent messages and ask answers, the agent's recent tool calls, and the pinned policy snapshot. Secret-shaped values are redacted, and a file on the secret-path list is never read.
+With `reviewerModel` set, a command Jev is unsure of or calls unsafe also goes to that model's provider. It sends the command, the bodies of the scripts it runs (up to 64 KB each), your recent messages and ask answers, the agent's recent tool calls, and the pinned policy snapshot. Secret-shaped values are redacted, and a file on the secret-path list is never read.
 
 ## Development
 

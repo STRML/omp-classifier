@@ -257,7 +257,9 @@ function shapeARefusal(commands: readonly ShellCommand[]): string | undefined {
 		if (names.some(n => INTERPRETERS.test(n))) return `${name} runs a program the gate does not read`;
 		if (names.some(n => PROGRAM_FILE_FLAG_TOOLS.has(n)) && command.words.some(word => /^(?:-f|--from-file|--file)(?:=|$)/u.test(word.value))) return `${name} runs a program file`;
 		if (names.some(n => FILE_RUNNERS.has(n) && runnerRunsFile(n, command.words))) return `${name} runs a program file`;
-		if (resolved !== undefined && isScriptFile(resolved)) return `${program.value} is a local script run by name`;
+		// A script on a root-owned chain is a system program like any binary
+		// there: macOS ships `cd` as /usr/bin/cd, a root-owned sh script.
+		if (resolved !== undefined && isScriptFile(resolved) && !isSystemProgram(resolved)) return `${program.value} is a local script run by name`;
 	}
 	return undefined;
 }

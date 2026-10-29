@@ -27,7 +27,7 @@ Runtime dep: `mvdan-sh` (shell parser, loaded lazily by `shell-ast.ts`). Dev dep
 | L4 interaction | refusal payloads, dry-run (the gate never prompts) | index.ts (`refuse`, `REFUSAL_GUIDANCE`, `refusalPayload`) |
 | L3 memory | verdict cache, refusal memory, audit log | index.ts (module state, `logDecision`) |
 | L2 judgment | state + battery, transport, derivation | jev.ts, jev-judge.ts, decision-order.ts, authorization.ts |
-| L2b stage 2 | reviewer on a live jev-v2 UNSURE: prompt, strict reply, quote check (reviewer.ts); script discovery and reads, re-hash, block memory (stage-two.ts); eligibility and wiring (`stageTwo`, `reviewerTranscript` in index.ts); bake-off `eval/reviewer.ts` | reviewer.ts, stage-two.ts |
+| L2b stage 2 | reviewer on a live jev-v2 UNSURE or UNSAFE: prompt, strict reply, quote check (reviewer.ts); script discovery and reads, re-hash, block memory (stage-two.ts); eligibility and wiring (`stageTwo`, `reviewerTranscript` in index.ts); bake-off `eval/reviewer.ts` | reviewer.ts, stage-two.ts |
 | L1 recognition | critical/structural/overlay scans, floor, literal match | index.ts (overlay scanners), floor.ts, literal-match.ts, recognizer.ts |
 | L0 evidence | command, cwd, user msgs, pinned policy, measured provenance | index.ts (evidence), jev.ts (`measure*`), trust-policy.ts, shell-cwd.ts |
 | shared infra | parser, cwd walk, redaction, CLI grammars | shell-ast.ts, shell-cwd.ts, redact.ts, arity.ts (+arity.generated.ts) |

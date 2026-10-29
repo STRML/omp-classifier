@@ -2,7 +2,9 @@
  * Stage 2 reviewer stability probe (docs/plans/2026-10-27-stage-2-reviewer.md).
  *
  * Replays one command against the live reviewer, with the transcript of a
- * saved OMP session cut at the first user message containing `--upto`, and
+ * saved OMP session cut at the first user message containing `--upto` (or
+ * after the last entry at or before the ISO time `--at`, which also cuts after
+ * an ask answer), and
  * tallies the decisions over `--draws` runs. A block is remembered until the
  * user writes again, so a reviewer that answers the same input two ways can
  * pin a command the user asked for. This is the check that found it.
@@ -29,14 +31,17 @@ const { values, positionals } = parseArgs({
 		session: { type: "string" },
 		cwd: { type: "string" },
 		upto: { type: "string" },
+		at: { type: "string" },
+		verdict: { type: "string", default: "UNSURE" },
+		reason: { type: "string", default: "below floor" },
 		model: { type: "string", default: "deepseek/deepseek-flash" },
 		draws: { type: "string", default: "5" },
 		timeout: { type: "string", default: "15000" },
 	},
 });
 const command = positionals.join(" ").replace(/^~(?=\/)/u, homedir());
-if (values.session === undefined || values.cwd === undefined || values.upto === undefined || command === "") {
-	console.error("usage: bun eval/reviewer-stability.ts --session <jsonl> --cwd <dir> --upto <text> [--model p/id] [--draws n] -- <command>");
+if (values.session === undefined || values.cwd === undefined || (values.upto === undefined) === (values.at === undefined) || command === "") {
+	console.error("usage: bun eval/reviewer-stability.ts --session <jsonl> --cwd <dir> (--upto <text> | --at <iso>) [--verdict UNSURE|UNSAFE] [--reason text] [--model p/id] [--draws n] -- <command>");
 	process.exit(2);
 }
 
@@ -54,9 +59,12 @@ const entries = readFileSync(values.session, "utf8")
 // The user's own text only: a string, or the text blocks of a block array.
 const userText = (content: unknown): string =>
 	typeof content === "string" ? content : Array.isArray(content) ? content.map(block => (typeof block?.text === "string" ? block.text : "")).join("\n") : "";
-const cut = entries.findIndex(e => e.type === "message" && e.message?.role === "user" && userText(e.message.content).includes(values.upto!));
+const cut =
+	values.at !== undefined
+		? entries.findLastIndex(e => typeof e.timestamp === "string" && e.timestamp <= values.at!)
+		: entries.findIndex(e => e.type === "message" && e.message?.role === "user" && userText(e.message.content).includes(values.upto!));
 if (cut < 0) {
-	console.error(`no user message contains ${JSON.stringify(values.upto)}`);
+	console.error(`no cut point for ${JSON.stringify(values.upto ?? values.at)}`);
 	process.exit(2);
 }
 
@@ -80,7 +88,7 @@ const input = {
 	workingDirectory: values.cwd,
 	transcript: reviewerTranscript(entries.slice(0, cut + 1)),
 	scriptBodies: programs.scripts.map(({ path, body }) => ({ path, body })),
-	stage1: { verdict: "UNSURE" as const, reason: "below floor" },
+	stage1: { verdict: values.verdict!, reason: values.reason! },
 };
 const tally: Record<string, number> = {};
 for (let i = 0; i < draws; i++) {
@@ -88,5 +96,5 @@ for (let i = 0; i < draws; i++) {
 	const key = outcome.kind === "decided" ? outcome.decision.decision : `failed: ${outcome.why.slice(0, 60)}`;
 	tally[key] = (tally[key] ?? 0) + 1;
 }
-console.log(JSON.stringify({ command, upto: values.upto, model: values.model, tally }));
+console.log(JSON.stringify({ command, cut: values.upto ?? values.at, verdict: values.verdict, model: values.model, tally }));
 store.close();
