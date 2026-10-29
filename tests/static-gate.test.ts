@@ -5,6 +5,9 @@
  * check), deny stays with the host, narrow allow is honored without a model
  * call, blanket allow gets classified, and env overrides prompt.
  */
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	fire,
@@ -103,6 +106,21 @@ describe("allow rules", () => {
 		await loadPlugin(makeSettings([{ match: "git status *", approval: "allow" }]));
 		expect(await gate("git status --short")).toBe("ALLOWED");
 		expect(modelCalls.length).toBe(0);
+	});
+
+	test("a script run by path and piped into an allowed filter runs on the rules, with no model call", async () => {
+		// OMP session 01a18951: `update-fork.sh start 2>&1 | tail -60`, with an
+		// allow rule on the script's directory and one on `tail -60`.
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-sg-")));
+		try {
+			fs.writeFileSync(path.join(dir, "update.sh"), "#!/bin/bash\ngit fetch upstream\n");
+			fs.chmodSync(path.join(dir, "update.sh"), 0o755);
+			await loadPlugin(makeSettings([{ match: `${dir}/*`, approval: "allow" }, { match: "tail -60", approval: "allow" }]));
+			expect(await gate(`${dir}/update.sh start 2>&1 | tail -60`)).toBe("ALLOWED");
+			expect(modelCalls.length).toBe(0);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	test("narrow allow is honored even for a destructive-looking command", async () => {

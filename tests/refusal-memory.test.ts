@@ -435,6 +435,38 @@ describe("a wrapper does not change what a refusal covers (https://github.com/ST
 	});
 });
 
+describe("an output filter does not change what a refusal covers (https://github.com/STRML/omp-classifier/issues/203)", () => {
+	// The key read `| tail -60` as the flags -6 -0, so `| tail -5` and the
+	// bare command were three targets.
+	const cases: Array<[string, string, string]> = [
+		["another count", "./update.sh start 2>&1 | tail -60", "./update.sh start | tail -5"],
+		["no filter", "./update.sh start | tail -60", "./update.sh start"],
+		["another filter", "./update.sh start | tail -60", "./update.sh start | grep -i error"],
+		["a filter added to the refused command", "rm -rf build", "rm -rf build | tail -5"],
+		["a git command", "git push --force origin main | tail -5", "git push --force origin main"],
+	];
+
+	for (const [name, refused, retried] of cases) {
+		test(`${name} still meets the refusal`, async () => {
+			const sid = nextSession();
+			setJevAnswer(jevUnsafeAnswer());
+			await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid }));
+			setJevAnswer(jevSafeAnswer());
+			await fire("tool_call", makeEvent(retried), makeCtx({ sessionId: sid }));
+			expect(priorRefusalOf(1)).toBeDefined();
+		});
+	}
+
+	test("a pipe into a program that is not an output filter stays its own target", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent("./update.sh start | tail -60"), makeCtx({ sessionId: sid }));
+		setJevAnswer(jevSafeAnswer());
+		await fire("tool_call", makeEvent("./other.sh start | tail -60"), makeCtx({ sessionId: sid }));
+		expect(priorRefusalOf(1)).toBeUndefined();
+	});
+});
+
 describe("refusal memory under changing words", () => {
 	test("a model refusal stands when the user's words move in a UI session", async () => {
 		const sid = nextSession();

@@ -4,6 +4,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-29
 
+### A refusal holds when a retry changes its output filter
+
+https://github.com/STRML/omp-classifier/issues/203, found while fixing https://github.com/STRML/omp-classifier/pull/202. The refusal key read `| tail -60` as the flags `-6 -0`. A retry with `| tail -5`, with `| grep error`, or with no pipe got a new key and was judged as if nothing had been refused. The key now drops a trailing output filter first, using the same check as the stage 2 reviewer-block key. A pipe into anything that is not an output filter keeps its own key.
+
 ### Stage 2 reads a script whose output is piped into a filter
 
 From OMP session `01a18951`. The gate blocked `update-fork.sh start 2>&1 | tail -60` twice, both UNSURE: first below the floor (safe 0.67), then on `destructive_or_irreversible` (0.66) on the retry, whose state carried the first refusal. Every hard hazard was at 0.20 or under, so both were eligible for review. The reviewer never ran, because shape B refused any pipe and logged `unread script: a local script runs inside a compound command`.
