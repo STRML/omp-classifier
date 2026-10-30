@@ -467,6 +467,52 @@ describe("an output filter does not change what a refusal covers (https://github
 	});
 });
 
+describe("inline code is keyed on the code it runs", () => {
+	// The key kept the interpreter and the first space-separated word, which
+	// for `python -c "\nimport …` is a lone quote: one refused snippet
+	// refused every later snippet, including the fix that dropped the rmtree.
+	const refusedCopy = `python3 -c "\nimport shutil, pathlib\ndst = pathlib.Path('configs/x')\nif dst.exists(): shutil.rmtree(dst)\nshutil.copytree('src', dst)\n"`;
+	const fixedCopy = `python3 -c "\nimport shutil, pathlib\ndst = pathlib.Path('configs/x')\nassert not dst.exists()\nshutil.copytree('src', dst)\n"`;
+
+	const differ: Array<[string, string, string]> = [
+		["python -c with the destructive line removed", refusedCopy, fixedCopy],
+		["a venv python -c", `~/.venv/bin/python -c "\nimport os\nos.remove('a')\n"`, `~/.venv/bin/python -c "\nimport os\nprint(os.listdir('.'))\n"`],
+		["a python heredoc", "python3 - <<'EOF'\nimport os\nos.remove('a')\nEOF", "python3 - <<'EOF'\nprint('ok')\nEOF"],
+		["node -e", `node -e "require('fs').rmSync('out', {recursive: true})"`, `node -e "console.log(require('fs').readdirSync('.'))"`],
+		["bash -c", `bash -c "rm -rf build"`, `bash -c "ls build"`],
+	];
+	for (const [name, refused, retried] of differ) {
+		test(`${name}: other code is another target`, async () => {
+			const sid = nextSession();
+			setJevAnswer(jevUnsafeAnswer());
+			await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid }));
+			setJevAnswer(jevSafeAnswer());
+			await fire("tool_call", makeEvent(retried), makeCtx({ sessionId: sid }));
+			expect(priorRefusalOf(1)).toBeUndefined();
+		});
+	}
+
+	const same: Array<[string, string, string]> = [
+		["the same code re-run", refusedCopy, refusedCopy],
+		["the same code with other spacing", `bash -c "rm -rf build"`, `bash  -c  "rm -rf build"`],
+		["the same code wrapped", `bash -c "rm -rf build"`, `timeout 30 bash -c "rm -rf build"`],
+		["the same code piped into a filter", `bash -c "rm -rf build"`, `bash -c "rm -rf build" | tail -5`],
+		["the same heredoc", "python3 - <<'EOF'\nimport os\nos.remove('a')\nEOF", "python3 - <<'EOF'\nimport os\nos.remove('a')\nEOF"],
+	];
+	// An exact repeat may answer from the verdict cache and never reach the
+	// judge, so these check the outcome rather than the judged state.
+	for (const [name, refused, retried] of same) {
+		test(`${name} still meets the refusal`, async () => {
+			const sid = nextSession();
+			setJevAnswer(jevUnsafeAnswer());
+			await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid }));
+			setJevAnswer(jevSafeAnswer());
+			const result = await fire("tool_call", makeEvent(retried), makeCtx({ sessionId: sid }));
+			expect(refusalOf(result).layer).not.toBeUndefined();
+		});
+	}
+});
+
 describe("refusal memory under changing words", () => {
 	test("a model refusal stands when the user's words move in a UI session", async () => {
 		const sid = nextSession();

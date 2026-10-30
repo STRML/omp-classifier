@@ -4831,8 +4831,23 @@ function refusalKeyForCommand(command: string): string {
 	if (inner !== undefined) return refusalKeyForCommand(inner);
 	const verb = commandBasename(stripped.split(" ")[0]?.toLowerCase() ?? "");
 	if (REMOTE_VALUE_FLAGS.has(verb)) return remoteRefusalKey(command) ?? actionTarget;
+	// Inline code is its own target. The action identity keeps the first
+	// space-separated word, which for `python -c "\nimport …` is a lone quote,
+	// so one refused snippet refused every later one, the fix included.
+	if (runsInlineCode(verb, stripped)) return `code-exact:${stripped}`;
 	if (verb !== "git") return actionTarget;
 	return `git-exact:${stripped}`;
+}
+
+const INLINE_CODE_VERB = /^(?:python[\d.]*|node|bun|deno|ruby|perl|php|bash|sh|zsh)$/u;
+/** `-c`, `-e`, a combined short cluster ending in either (`-lc`, `-Bc`), or `--eval`. */
+const INLINE_CODE_FLAG = /^(?:-[a-z]*[ce]|--eval)$/iu;
+
+/** Whether an interpreter runs code written into the command: a `-c`/`-e`
+ *  string, or a here-document. */
+function runsInlineCode(verb: string, command: string): boolean {
+	if (!INLINE_CODE_VERB.test(verb)) return false;
+	return command.includes("<<") || command.split(" ").some(word => INLINE_CODE_FLAG.test(word));
 }
 
 /**
