@@ -6389,7 +6389,7 @@ export default function (pi: ExtensionAPI) {
 			const cacheableEval = networkProvenanceForCache?.directoryUnresolved !== true && networkProvenanceForCache?.ambientConfigUnreadable !== true;
 			const cached = cacheableEval ? scoped.get(cacheKey) : undefined;
 			if (dryRun && !cached) {
-				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, judgement: undefined });
+				const replay = replayDecision({ tool: "eval", command: evalCode, cwd, judgement: undefined, maxCommandLength: config.maxCommandLength });
 				return dryRunStop({
 					would: "classify",
 					layer: "classifier",
@@ -6436,6 +6436,7 @@ export default function (pi: ExtensionAPI) {
 					const replay = replayDecision({
 						tool: "eval",
 						command: evalCode,
+						maxCommandLength: config.maxCommandLength,
 						cwd,
 						judgement,
 						// Eval code has no shell for literalMatch to read, so an
@@ -6458,7 +6459,9 @@ export default function (pi: ExtensionAPI) {
 					const why =
 						flagList.length > 0
 							? `classifier-safe but flags: ${flagList.join(", ")}`
-							: `classifier-safe despite prior ${prior?.source ?? ""} refusal of "${prior?.loggableTarget ?? ""}"`;
+							: prior === undefined
+								? `classifier-safe but ${replay.why}`
+								: `classifier-safe despite prior ${prior.source} refusal of "${prior.loggableTarget}"`;
 					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", ...lead, why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
 					return refuse(ctx, target, flagList.length > 0 ? "flagged" : "prior-refusal", withFlagFootnotes(why, flagList), "eval", "follows verdict", { ...auditFields(), ...judgementAudit(judgement), ...spawnField, verdict: "SAFE", ...follows });
 				}
@@ -6594,7 +6597,7 @@ export default function (pi: ExtensionAPI) {
 			// A deny rule is the one decision that outranks everything natively
 			// (tools/bash.ts:557) — the host blocks the call, nothing to add.
 			if (rule?.approval === "deny" || policy.bashPolicy === "deny") {
-				const replay = replayDecision({ tool: "bash", command, cwd: ctx.cwd, staticRule: "deny" });
+				const replay = replayDecision({ tool: "bash", command, cwd: ctx.cwd, staticRule: "deny", maxCommandLength: config.maxCommandLength });
 				if (dryRun) {
 					return dryRunStop({
 						would: "allow",
@@ -6739,7 +6742,7 @@ export default function (pi: ExtensionAPI) {
 			// a per-session `autoApprove` (wrapper.ts:189-192) forces `yolo`
 			// without appearing in settings at all.
 			if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(judgedCommand))) {
-				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, riskFlags: ["critical"] });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, riskFlags: ["critical"], maxCommandLength: config.maxCommandLength });
 				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, ...lead, why: "critical pattern: matches a built-in dangerous-command pattern", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				// A critical hit is a refusal (issue #30): the pattern itself is the
 				// memory, so a rewording that dodges the pattern meets it at the
@@ -6753,7 +6756,7 @@ export default function (pi: ExtensionAPI) {
 			// prompt/narrow-allow rule that only judged the command string. Env
 			// values are not shown to the classifier — they can hold secrets.
 			if (env.key !== "") {
-				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, envKeys: env.keys });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, envKeys: env.keys, maxCommandLength: config.maxCommandLength });
 				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, ...lead, why: "environment override: command runs with caller-supplied env; not classified", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				return refuse(ctx, target, "environment", "command runs with caller-supplied env; not classified", "bash", "", { ...auditFields(), ...follows });
 			}
@@ -6763,7 +6766,7 @@ export default function (pi: ExtensionAPI) {
 			// `tools.approval.bash` policy in native resolveApproval, so apply the
 			// user prompt only when no pattern rule decided the call.
 			if (rule?.approval === "prompt") {
-				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd: ctx.cwd, staticRule: "prompt" });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd: ctx.cwd, staticRule: "prompt", maxCommandLength: config.maxCommandLength });
 				if (dryRun) {
 					return dryRunStop({
 						would: "allow",
@@ -6780,12 +6783,12 @@ export default function (pi: ExtensionAPI) {
 			// call. The rule can say nothing about the file, so the call classifies
 			// as if no rule had matched.
 			if (rule?.approval === "allow" && !isBlanketPattern(rule.match) && script.bodies.length === 0) {
-				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, staticRule: "allow" });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, staticRule: "allow", maxCommandLength: config.maxCommandLength });
 				logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: replay.layer, why: `rule: ${rule.match}`, cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				return;
 			}
 			if (!rule && policy.bashPolicy === "prompt") {
-				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd: ctx.cwd, staticRule: "prompt" });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd: ctx.cwd, staticRule: "prompt", maxCommandLength: config.maxCommandLength });
 				if (dryRun) {
 					return dryRunStop({
 						would: "allow",
@@ -6842,7 +6845,7 @@ export default function (pi: ExtensionAPI) {
 			// Dry-run probe (issue #32): with nothing cached, the classifier model
 			// would run — report that instead of paying the call.
 			if (dryRun && !cached) {
-				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, judgement: undefined, priorRefusal: Boolean(prior) });
+				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, judgement: undefined, priorRefusal: Boolean(prior), maxCommandLength: config.maxCommandLength });
 				return dryRunStop({
 					would: "classify",
 					layer: "classifier",
@@ -6918,6 +6921,7 @@ export default function (pi: ExtensionAPI) {
 				const replay = replayDecision({
 					tool: "bash",
 					command: judgedCommand,
+					maxCommandLength: config.maxCommandLength,
 					cwd,
 					judgement,
 					priorRefusal: prior !== undefined && !lifts,
@@ -6935,10 +6939,14 @@ export default function (pi: ExtensionAPI) {
 				// The refusal stands until the user's own words lift it, and the
 				// moderate-risk overlay keeps its own reason when both hit.
 				const priorTarget = prior?.loggableTarget ?? "";
+				// With neither a flag nor a refusal, the replay blocked for its own
+				// reason (a length cap), and the reason names it.
 				const why =
 					flags.length > 0
 						? `classifier-safe but flags: ${flags.join(", ")}`
-						: `classifier-safe despite prior ${prior?.source ?? ""} refusal of "${priorTarget}"`;
+						: prior === undefined
+							? `classifier-safe but ${replay.why}`
+							: `classifier-safe despite prior ${prior.source} refusal of "${priorTarget}"`;
 				const agentWhy = withFlagFootnotes(why, flags);
 				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "verdict", ...lead, why, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...reviewerAudit });
 				return refuse(ctx, target, flags.length > 0 ? "flagged" : "prior-refusal", agentWhy, "bash", "follows verdict", {
