@@ -480,6 +480,7 @@ describe("inline code is keyed on the code it runs", () => {
 		["a python heredoc", "python3 - <<'EOF'\nimport os\nos.remove('a')\nEOF", "python3 - <<'EOF'\nprint('ok')\nEOF"],
 		["node -e", `node -e "require('fs').rmSync('out', {recursive: true})"`, `node -e "console.log(require('fs').readdirSync('.'))"`],
 		["bash -c", `bash -c "rm -rf build"`, `bash -c "ls build"`],
+		["inline code after a script run by the same interpreter", `python3 setup.py && python3 -c "import os; os.remove('a')"`, `python3 setup.py && python3 -c "print(1)"`],
 	];
 	for (const [name, refused, retried] of differ) {
 		test(`${name}: other code is another target`, async () => {
@@ -498,6 +499,12 @@ describe("inline code is keyed on the code it runs", () => {
 		["the same code wrapped", `bash -c "rm -rf build"`, `timeout 30 bash -c "rm -rf build"`],
 		["the same code piped into a filter", `bash -c "rm -rf build"`, `bash -c "rm -rf build" | tail -5`],
 		["the same heredoc", "python3 - <<'EOF'\nimport os\nos.remove('a')\nEOF", "python3 - <<'EOF'\nimport os\nos.remove('a')\nEOF"],
+		// A script's own -e or -c is its argument, and a heredoc after a script
+		// is its input: the script is the target, as it always was.
+		["a script with its own -e argument", "python3 deploy.py -e prod", "python3 deploy.py -e staging"],
+		["a script with its own -c argument", "python3 deploy.py -c prod.yml", "python3 deploy.py -c staging.yml"],
+		["a script fed a heredoc", "python3 deploy.py <<'EOF'\nprod\nEOF", "python3 deploy.py <<'EOF'\nstaging\nEOF"],
+		["a script run with python's -E", "python3 -E deploy.py prod", "python3 -E deploy.py staging"],
 	];
 	// An exact repeat may answer from the verdict cache and never reach the
 	// judge, so these check the outcome rather than the judged state.
