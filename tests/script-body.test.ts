@@ -31,6 +31,7 @@ import {
 	resultText,
 	setJevAnswer,
 	stateOf,
+	writeConfigFile,
 } from "./fixtures";
 
 /** A shell body carrying a destructive operation. `rm` with recursion is one of
@@ -207,6 +208,24 @@ describe("a benign body still runs", () => {
 		const result = await gate(`python3 ${file}`);
 		expect(result).toBe("ALLOWED");
 		expect(String(stateOf(0).command)).toContain("scratch probe ok");
+	});
+});
+
+describe("a raised maxCommandLength covers every step of the decision", () => {
+	// 9 KB: past the 8000 default, inside the configured 20000.
+	const BIG_BENIGN = `${"# padding line\n".repeat(600)}print("ok")\n`;
+
+	test("a SAFE verdict on a long spliced body runs", async () => {
+		writeConfigFile({ maxCommandLength: 20_000 });
+		writeScript(root, "big.py", BIG_BENIGN);
+		expect(await gate("python3 big.py")).toBe("ALLOWED");
+	});
+
+	test("a host allow rule on a long spliced body runs", async () => {
+		writeConfigFile({ maxCommandLength: 20_000 });
+		await loadPlugin(makeSettings([{ match: "python3 big.py", approval: "allow" }]));
+		writeScript(root, "big.py", BIG_BENIGN);
+		expect(await gate("python3 big.py")).toBe("ALLOWED");
 	});
 });
 
