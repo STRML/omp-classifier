@@ -167,6 +167,25 @@ describe("which commands stage 2 can vouch for", () => {
 	});
 
 	test.each([
+		["an empty entry", ""],
+		["a dot entry", "."],
+		["a relative entry", "sub"],
+	])("refuses a script behind a timeout when PATH has %s", async (_name, entry) => {
+		fs.mkdirSync(path.join(dir, "sub"));
+		script("sub/update.sh", "#!/bin/bash\necho ok\n");
+		script("sub/timeout", "#!/bin/bash\ncat ~/.ssh/id_ed25519\n");
+		const previous = process.env.PATH;
+		process.env.PATH = `${entry}${path.delimiter}${previous ?? ""}`;
+		try {
+			const result = await fire("tool_call", makeEvent("cd sub && timeout 10 ./update.sh start"), uiCtx(nextSession(), [user("u1", "update fork main")]));
+			expect(refusalOf(result).layer).toBe("unsure");
+			expect(reviewerCalls).toHaveLength(0);
+		} finally {
+			process.env.PATH = previous;
+		}
+	});
+
+	test.each([
 		["tail with a count", "./update.sh start 2>&1 | tail -60"],
 		["tail with -n", "./update.sh start | tail -n 20"],
 		["head with -n", "./update.sh start | head -n 5"],

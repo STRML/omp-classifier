@@ -270,10 +270,13 @@ const DURATION = /^\d+(?:\.\d+)?[smhd]?$/u;
 /** How many words a leading `timeout <duration>` takes before the program it
  *  runs: 2, or 0 when there is none. Only that bare form counts, and only for
  *  a timeout binary on PATH: an option, a built duration, or a `timeout`
- *  script shadowing it is left for shapeARefusal to refuse. */
+ *  script shadowing it is left for shapeARefusal to refuse. An empty or
+ *  relative PATH entry also refuses: the shell resolves it from the command's
+ *  own directory, after any `cd`, and onPath cannot see that file. */
 function timeoutWords(command: ShellCommand): number {
 	const [wrapper, duration] = command.words;
 	if (command.words.length < 3 || !wrapper.fixed || !duration.fixed || !DURATION.test(duration.value)) return 0;
+	if ((process.env.PATH ?? "").split(path.delimiter).some(dir => !path.isAbsolute(dir))) return 0;
 	const resolved = TIMEOUTS.has(wrapper.value) ? onPath(wrapper.value) : undefined;
 	if (resolved === undefined || isScriptFile(resolved)) return 0;
 	return programNames(command).every(name => TIMEOUTS.has(name)) ? 2 : 0;
