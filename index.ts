@@ -4841,7 +4841,7 @@ function refusalKeyForCommand(command: string): string {
 
 const INLINE_CODE_VERB = /^(?:python[\d.]*|node|bun|deno|ruby|perl|php|bash|sh|zsh)$/u;
 /** `-c`, `-e`, a combined short cluster ending in either (`-lc`, `-Bc`), or `--eval`. */
-const INLINE_CODE_FLAG = /^(?:-[a-z]*[ce]|--eval)$/iu;
+const INLINE_CODE_FLAG = /^(?:-[a-zA-Z]*[ce]|--eval)$/u;
 
 /** Whether an interpreter runs code written into the command: a `-c`/`-e`
  *  among its own options, or a here-document when its program is `-` or
@@ -4859,14 +4859,20 @@ function runsInlineCode(verb: string, command: string): boolean {
 		const words = entry.words.map(word => word.value);
 		const at = programIndex(words);
 		if (entry.nested || at === undefined || commandBasename(words[at]?.toLowerCase() ?? "") !== verb) continue;
-		for (const value of words.slice(at + 1)) {
-			if (INLINE_CODE_FLAG.test(value)) return true;
-			if (value === "-") break;
-			if (!value.startsWith("-")) return false;
-		}
-		return entry.redirects.some(redirect => redirect.here);
+		if (interpreterRunsInlineCode(words.slice(at + 1), entry)) return true;
 	}
 	return false;
+}
+
+/** One interpreter invocation: its options up to the first operand, then a
+ *  heredoc when the program is `-` or absent. */
+function interpreterRunsInlineCode(args: readonly string[], entry: ShellCommand): boolean {
+	for (const value of args) {
+		if (INLINE_CODE_FLAG.test(value)) return true;
+		if (value === "-") break;
+		if (!value.startsWith("-")) return false;
+	}
+	return entry.redirects.some(redirect => redirect.here);
 }
 
 /**
