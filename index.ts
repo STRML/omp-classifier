@@ -4834,7 +4834,7 @@ function refusalKeyForCommand(command: string): string {
 	// Inline code is its own target. The action identity keeps the first
 	// space-separated word, which for `python -c "\nimport …` is a lone quote,
 	// so one refused snippet refused every later one, the fix included.
-	if (runsInlineCode(verb, stripped)) return `code-exact:${stripped}`;
+	if (runsInlineCode(verb, command)) return `code-exact:${stripped}`;
 	if (verb !== "git") return actionTarget;
 	return `git-exact:${stripped}`;
 }
@@ -4844,10 +4844,29 @@ const INLINE_CODE_VERB = /^(?:python[\d.]*|node|bun|deno|ruby|perl|php|bash|sh|z
 const INLINE_CODE_FLAG = /^(?:-[a-z]*[ce]|--eval)$/iu;
 
 /** Whether an interpreter runs code written into the command: a `-c`/`-e`
- *  string, or a here-document. */
+ *  among its own options, or a here-document when its program is `-` or
+ *  absent. Past the first operand the words belong to a script, so
+ *  `python3 deploy.py -e prod` and a heredoc fed to `deploy.py` keep the
+ *  script as their target. An option with a value (`-W ignore -c …`) ends
+ *  the scan early, which falls back to the broader key. */
 function runsInlineCode(verb: string, command: string): boolean {
 	if (!INLINE_CODE_VERB.test(verb)) return false;
-	return command.includes("<<") || command.split(" ").some(word => INLINE_CODE_FLAG.test(word));
+	// Parse the command as written: collapsing whitespace would flatten a
+	// heredoc's body onto its operator's line.
+	const parsed = parseShell(command);
+	if (!parsed.ok) return false;
+	for (const entry of parsed.commands) {
+		const words = entry.words.map(word => word.value);
+		const at = programIndex(words);
+		if (entry.nested || at === undefined || commandBasename(words[at]?.toLowerCase() ?? "") !== verb) continue;
+		for (const value of words.slice(at + 1)) {
+			if (INLINE_CODE_FLAG.test(value)) return true;
+			if (value === "-") break;
+			if (!value.startsWith("-")) return false;
+		}
+		return entry.redirects.some(redirect => redirect.here);
+	}
+	return false;
 }
 
 /**
