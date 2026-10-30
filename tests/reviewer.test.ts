@@ -126,6 +126,11 @@ describe("which commands stage 2 can vouch for", () => {
 		["a local script disguised behind a system prefix and ..", "/usr/..__DIR__/wrap.sh"],
 		["an interpreter behind a link with an innocent name", "__DIR__/bin/tool payload.txt"],
 		["a script whose body runs an interpreter through a PATH link", "./linkwrap.sh"],
+		["a timeout with options", "timeout -k 5 10 ./update.sh start"],
+		["a timeout with a built duration", "timeout \"$N\" ./update.sh start"],
+		["a timeout running an interpreter", "timeout 10 bash update.sh start"],
+		["a timeout running another wrapper", "timeout 10 env ./update.sh start"],
+		["a timeout running a bare name", "timeout 10 omp-reviewer-test-local.sh"],
 	])("refuses %s", async (_name, command) => {
 		script("update.sh", "#!/bin/bash\necho ok\n");
 		script("wrap.sh", "#!/bin/bash\nsource lib.sh\n");
@@ -146,6 +151,40 @@ describe("which commands stage 2 can vouch for", () => {
 		}
 	});
 
+	test("refuses a script behind a timeout shadowed on PATH", async () => {
+		script("update.sh", "#!/bin/bash\necho ok\n");
+		fs.mkdirSync(path.join(dir, "bin"));
+		script("bin/timeout", "#!/bin/bash\ncat ~/.ssh/id_ed25519\n");
+		const previous = process.env.PATH;
+		process.env.PATH = `${path.join(dir, "bin")}${path.delimiter}${previous ?? ""}`;
+		try {
+			const result = await fire("tool_call", makeEvent("timeout 10 ./update.sh start"), uiCtx(nextSession(), [user("u1", "update fork main")]));
+			expect(refusalOf(result).layer).toBe("unsure");
+			expect(reviewerCalls).toHaveLength(0);
+		} finally {
+			process.env.PATH = previous;
+		}
+	});
+
+	test.each([
+		["an empty entry", ""],
+		["a dot entry", "."],
+		["a relative entry", "sub"],
+	])("refuses a script behind a timeout when PATH has %s", async (_name, entry) => {
+		fs.mkdirSync(path.join(dir, "sub"));
+		script("sub/update.sh", "#!/bin/bash\necho ok\n");
+		script("sub/timeout", "#!/bin/bash\ncat ~/.ssh/id_ed25519\n");
+		const previous = process.env.PATH;
+		process.env.PATH = `${entry}${path.delimiter}${previous ?? ""}`;
+		try {
+			const result = await fire("tool_call", makeEvent("cd sub && timeout 10 ./update.sh start"), uiCtx(nextSession(), [user("u1", "update fork main")]));
+			expect(refusalOf(result).layer).toBe("unsure");
+			expect(reviewerCalls).toHaveLength(0);
+		} finally {
+			process.env.PATH = previous;
+		}
+	});
+
 	test.each([
 		["tail with a count", "./update.sh start 2>&1 | tail -60"],
 		["tail with -n", "./update.sh start | tail -n 20"],
@@ -156,6 +195,8 @@ describe("which commands stage 2 can vouch for", () => {
 		["cat", "./update.sh start | cat"],
 		["a pipe that carries stderr", "./update.sh start |& tail -5"],
 		["a leading cd", "cd sub && ./update.sh start | tail -5"],
+		["a timeout in seconds", "timeout 1500 ./update.sh start"],
+		["a timeout with a unit, after a cd, into a filter", "cd sub && timeout 5m ./update.sh start 2>&1 | tail -5"],
 	])("reads the script piped into an output filter: %s", async (_name, command) => {
 		script("update.sh", "#!/bin/bash\necho from-update\n");
 		fs.mkdirSync(path.join(dir, "sub"));

@@ -264,6 +264,24 @@ function shapeARefusal(commands: readonly ShellCommand[]): string | undefined {
 	return undefined;
 }
 
+const TIMEOUTS = new Set(["timeout", "gtimeout"]);
+const DURATION = /^\d+(?:\.\d+)?[smhd]?$/u;
+
+/** How many words a leading `timeout <duration>` takes before the program it
+ *  runs: 2, or 0 when there is none. Only that bare form counts, and only for
+ *  a timeout binary on PATH: an option, a built duration, or a `timeout`
+ *  script shadowing it is left for shapeARefusal to refuse. An empty or
+ *  relative PATH entry also refuses: the shell resolves it from the command's
+ *  own directory, after any `cd`, and onPath cannot see that file. */
+function timeoutWords(command: ShellCommand): number {
+	const [wrapper, duration] = command.words;
+	if (command.words.length < 3 || !wrapper.fixed || !duration.fixed || !DURATION.test(duration.value)) return 0;
+	if ((process.env.PATH ?? "").split(path.delimiter).some(dir => !path.isAbsolute(dir))) return 0;
+	const resolved = TIMEOUTS.has(wrapper.value) ? onPath(wrapper.value) : undefined;
+	if (resolved === undefined || isScriptFile(resolved)) return 0;
+	return programNames(command).every(name => TIMEOUTS.has(name)) ? 2 : 0;
+}
+
 const COUNT = /^[+-]?\d+$/u;
 const HEAD_TAIL_ARG = /^(?:-\d+|-[nc][+-]?\d+|-[qv]|--(?:lines|bytes)=[+-]?\d+)$/u;
 
@@ -364,12 +382,13 @@ export function scriptsForReview(command: string, startCwd: string): CommandScri
 	const parsed = parseShell(command);
 	if (!parsed.ok) return refuse("the command could not be parsed");
 	const commands = parsed.commands;
-	const runsLocalPath = commands.some(item => isPathWord(item.words[0]?.value ?? "") && !isSystemProgram(item.words[0].value));
+	const programWord = (item: ShellCommand): string => item.words[timeoutWords(item)]?.value ?? "";
+	const runsLocalPath = commands.some(item => isPathWord(programWord(item)) && !isSystemProgram(programWord(item)));
 	if (!runsLocalPath) {
 		const why = shapeARefusal(commands);
 		return why === undefined ? { kind: "scripts", scripts: [] } : refuse(why);
 	}
-	// Shape B: [cd <literal> &&] <literal path> <literal args> [| <output filter>], and nothing else.
+	// Shape B: [cd <literal> &&] [timeout <duration>] <literal path> <literal args> [| <output filter>], and nothing else.
 	let dir = startCwd;
 	let rest = commands.length > 1 && isOutputFilter(commands[commands.length - 1]) ? commands.slice(0, -1) : commands;
 	if (rest.length === 2 && verbName(rest[0]) === "cd" && rest[1].join === "and") {
@@ -384,7 +403,7 @@ export function scriptsForReview(command: string, startCwd: string): CommandScri
 	if (run.assigns.length > 0) return refuse("the script runs with an assignment");
 	if (!run.words.every(isLiteral)) return refuse("the script's words are built at run time");
 	if (run.redirects.some(redirect => redirect.direction !== "out" && !redirect.duplicate)) return refuse("the script reads a redirect");
-	const spelled = run.words[0].value;
+	const spelled = programWord(run);
 	const file = path.resolve(dir, expandHome(spelled));
 	if (!fs.existsSync(file)) return refuse(`${spelled} does not exist yet`);
 	const read = readScriptForReview(spelled, file);
