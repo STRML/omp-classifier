@@ -781,9 +781,11 @@ describe("escalates_privilege on a remote host the user named", () => {
 	test("an ssh run through a variable has no host to name, so it stays barred", async () => {
 		setJevAnswer(privileged());
 		const indirect = `SSH="ssh root@192.168.86.53"; $SSH 'systemctl stop contents-recognition-service'`;
-		await fire("tool_call", makeEvent(indirect), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
+		const result = await fire("tool_call", makeEvent(indirect), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
 		expect(reviewerCalls).toHaveLength(0);
-		expect(reviewerAudit()).toMatchObject({ skipped: "hazard escalates_privilege" });
+		// The script-body reader now refuses `$SSH <operand>` (an expanded verb
+		// that could run anything it is handed) before the judge or reviewer.
+		expect(resultText(result)).not.toBe("ALLOWED");
 	});
 });
 
