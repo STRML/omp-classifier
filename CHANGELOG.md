@@ -4,6 +4,22 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### Arithmetic over names the body sets to integers reads again, and `[[ ]]` is not a glob
+
+Two over-refusals from today's hardening, plus one more gap.
+
+- **Every `[[ ]]` body was refused.** https://github.com/STRML/omp-classifier/pull/228 refused a verb that brace expansion or a glob rewrites, and `[[` reads as a glob character. It now gets the same exemption `[` had.
+- **Any name in arithmetic was refused**, so `start=$SECONDS; echo $((SECONDS - start))`, `n=0; (( n++ ))` and `for ((i=0; i<3; i++))` stopped stage 2 from reading the script. The danger is a name whose value the reviewer cannot see, because bash evaluates it as an expression. A name now taints only when the body fills it with something other than an integer: an assignment from text, a substitution or another variable, an array, a `read`, `mapfile`, `getopts` or `printf -v` target, a `for`/`select` word, or a positional parameter. Arithmetic reading a tainted name still refuses. A name the body sets only from digits, `$(( ))` or an integer special (`SECONDS`, `RANDOM`, `$#`, `$?`, …) reads, and so does one the body never assigns: that one comes from the environment, which the session shell latch from https://github.com/STRML/omp-classifier/issues/176 guards.
+- **`declare 'a=([w]=1)'`** hands `declare` a compound assignment as text, which it parses again and whose subscripts it evaluates. `declare`, `typeset`, `local`, `readonly` and `export` now refuse a word shaped `name=(`.
+
+| Body | Before | After |
+|---|---|---|
+| `[[ -n $x ]] && git fetch` | refused | reviewed |
+| `start=$SECONDS; echo $((SECONDS - start))` | refused | reviewed |
+| `n=0; for ((i=0; i<2; i++)); do (( n++ )); done; [[ $n -eq 2 ]]` | refused | reviewed |
+| `read -r w; echo $((w + 1))`, `w=$(cat f); (( w++ ))`, `(( $1 ))` | refused | refused |
+| `declare 'a=([w]=1)'` | reviewed | refused |
+
 ### A program named by an expansion is never read in a script body
 
 Stage 2 let a body name its program with a variable (`"$OMP" status`), on the theory that the reviewer reads what the body assigns. https://github.com/STRML/omp-classifier/pull/230 limited that to a bare verb with no arguments or input. The security review found three ways past even that. `X='bash payload.txt'; $X` splits into a program and its argument. `cat payload.txt | "$X"` feeds it a script through a pipe. An earlier `exec <` can do the same through stdin. A verb built from an expansion now refuses outright. `test` also stops treating `"$@"`, `"${a[@]}"` or `"${!p@}"` as one operand, since each expands to one word per element.
