@@ -58,7 +58,7 @@ import { createHash } from "node:crypto";
 import { accessSync, constants as fsConstants, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
-import { getDomain } from "tldts";
+import { createRequire } from "node:module";
 import { redactSecrets } from "./redact";
 import { parseShell, shellRunsInSourceOrder, type ShellCommand, type ShellJoin, type ShellWord } from "./shell-ast";
 import { maskHeredocBodiesAndAnsiSpans, segmentCwdAt, SHELL_WORD_EXPANSION } from "./shell-cwd";
@@ -1906,8 +1906,33 @@ function sharedTrailingLabels(a: string, b: string): number {
  *  bare suffix (`github.io`) or an address has no registrable domain, so it
  *  shares one with nothing. */
 function sameRegistrableDomain(a: string, b: string): boolean {
+	const getDomain = registrableDomainReader();
+	if (getDomain === undefined) return false;
 	const domain = getDomain(a, { allowPrivateDomains: true });
 	return domain !== null && domain === getDomain(b, { allowPrivateDomains: true });
+}
+
+type GetDomain = (host: string, options: { allowPrivateDomains: boolean }) => string | null;
+let registrableDomain: { read: GetDomain | undefined } | undefined;
+
+/** `tldts`'s `getDomain`, loaded on first use. A checkout updated without a
+ *  reinstall lacks the package, and a static import would then fail the whole
+ *  plugin's load, which leaves commands ungated. Missing, every sibling stays
+ *  a lookalike: the measurement errs toward asking. */
+function registrableDomainReader(): GetDomain | undefined {
+	if (registrableDomain === undefined) {
+		try {
+			registrableDomain = { read: (createRequire(import.meta.url)("tldts") as { getDomain: GetDomain }).getDomain };
+		} catch {
+			registrableDomain = { read: undefined };
+		}
+	}
+	return registrableDomain.read;
+}
+
+/** Test seam: forget the loaded reader, or stand in for a missing package. */
+export function resetRegistrableDomainReader(missing = false): void {
+	registrableDomain = missing ? { read: undefined } : undefined;
 }
 
 /** A plain DNS name: anything else (a `$`, a quote, a substitution) was not

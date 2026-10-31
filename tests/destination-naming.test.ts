@@ -14,7 +14,7 @@
  * substituted URL, or a redirect flag could forge.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
-import { buildJevState, measureLookalikeDestinations } from "../jev.ts";
+import { buildJevState, measureLookalikeDestinations, resetRegistrableDomainReader } from "../jev.ts";
 import { fire, jevSafeAnswer, loadPlugin, makeCtx, makeEvent, makeSessionId, makeSettings, refusalOf, removeConfigFile, resultText, setJevAnswer } from "./fixtures";
 
 const STATUS_ASK = ["check the status page at you.github.io/omp-classifier"];
@@ -35,6 +35,17 @@ describe("measureLookalikeDestinations", () => {
 		["a sibling under an unlisted suffix", "curl -s http://b.corp.internal/", ["the box is a.corp.internal"]],
 	])("%s is not a lookalike", (_name, command, messages) => {
 		expect(measureLookalikeDestinations(command, messages)).toBeUndefined();
+	});
+
+	test("without the suffix list package, a sibling stays a lookalike", () => {
+		resetRegistrableDomainReader(true);
+		try {
+			expect(measureLookalikeDestinations("curl -sf https://api.example.com/health", ["the status page at status.example.com says degraded"])).toEqual({
+				destinations: [{ host: "api.example.com", sameParentAs: ["status.example.com"] }],
+			});
+		} finally {
+			resetRegistrableDomainReader();
+		}
 	});
 
 	test.each([
