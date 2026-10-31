@@ -191,12 +191,16 @@ export function commandMatchesCriticalPattern(command: string, shellTrusted = tr
  * refusal that never yields. A target with an expansion is left to the raw
  * scan and the judge, as before.
  */
+/** `>&2` and `>&-` duplicate or close a descriptor. bash reads any other
+ *  `>&word` as `&>word`, a write to that file, whatever the parser calls it. */
+const namesDescriptor = (redirect: ShellRedirect): boolean => redirect.duplicate && redirect.target.fixed && /^(?:\d+|-)$/u.test(redirect.target.value);
+
 function redirectTargetMatches(command: string): boolean {
 	if (!command.includes(">")) return false;
 	const parsed = parseShell(command);
 	if (!parsed.ok) return false;
 	return parsed.commands.some(entry =>
-		entry.redirects.some(redirect => redirect.direction !== "in" && !redirect.duplicate && !redirect.here && matchesCriticalPattern(`> ${redirect.target.value}`)),
+		entry.redirects.some(redirect => redirect.direction !== "in" && !redirect.here && !namesDescriptor(redirect) && matchesCriticalPattern(`> ${redirect.target.value}`)),
 	);
 }
 

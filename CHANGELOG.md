@@ -13,6 +13,7 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 | `echo x > "/etc/passwd"` | runs on a SAFE | `critical` |
 | `echo x > /etc/"shadow"` | runs on a SAFE | `critical` |
 | `cat img > "/dev/sda"` | runs on a SAFE | `critical` |
+| `echo x >& "/etc/passwd"` (bash reads `>&file` as `&>file`) | runs on a SAFE | `critical` |
 | `echo "rm -rf /"` | `critical` | `critical` (raw text, unchanged) |
 
 ### The critical patterns read what a command runs, not the data it carries

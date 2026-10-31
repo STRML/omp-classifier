@@ -143,6 +143,7 @@ describe("anything that executes the same text stays critical", () => {
 		["a single-quoted append onto /etc/sudoers", `echo x >> '/etc/sudoers'`],
 		["a partly quoted redirect onto /etc/shadow", `echo x > /etc/"shadow"`],
 		["a quoted redirect onto a disk device", `cat img > "/dev/sda"`],
+		["a >& onto a quoted file, which bash reads as &>", `echo x >& "/etc/passwd"`],
 	])("%s", async (_name, command) => {
 		expect(await layerOf(command)).toBe("critical");
 		expect(modelCalls.length).toBe(0);
