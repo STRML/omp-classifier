@@ -4,6 +4,18 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### `test` with a built word reads only in fixed shapes, and an expanded verb only bare
+
+https://github.com/STRML/omp-classifier/pull/229 refused a `test` operator built at run time by its position (first, or after `!`, `-a`, `-o`, `(`). The security review showed position can't be trusted. An unquoted word splits (`s='-v a[w]'; [ $s ]` is `[ -v a[w] ]`), and the connective can be built too (`[ "$g" "$f" "$n" ]` with `g='!'`). `test` and `[` now read a word built at run time only in three shapes, with every built word one double-quoted span and every operator fixed: `[ "$x" ]`, `[ -n "$x" ]` (any string or file operator except `-v` and `-R`), and `[ "$a" = "$b" ]` (string, file or numeric comparison, which `[` does not evaluate). Any other shape refuses. A verb spelled by an expansion now reads only bare, with no argument and no input redirect, since it can be an interpreter reading a script on stdin (`$X < payload.txt`). `wait` refuses `-p` bundled with other flags (`-fp`).
+
+| Body | Before | After |
+|---|---|---|
+| `s='-v a[w]'; [ $s ]` | reviewed | refused |
+| `[ "$g" "$f" "$n" ]` with `g='!' f=-v` | reviewed | refused |
+| `X=bash; $X < payload.txt` | reviewed | refused |
+| `wait -fp 'a[w]'` | reviewed | refused |
+| `[ "$1" = start ]`, `[ -n "$x" ]`, `[ "$#" -eq 1 ]`, `[ "$x" ]`, `"$OMP"` alone | reviewed | reviewed |
+
 ### Names that builtins evaluate, quoted arithmetic and loop headers count too
 
 The security review of https://github.com/STRML/omp-classifier/pull/228 found four more places bash evaluates a value the gate did not read:
