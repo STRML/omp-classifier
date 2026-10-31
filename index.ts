@@ -2176,89 +2176,6 @@ const SCRIPT_FILE_EXTENSION = /\.(?:py|pyw|rb|js|mjs|cjs|ts|mts|cts|tsx|jsx|sh|b
 // continuation or a parenthesized import list.
 const INTERPRETER_CODE_RISK =
 	/exec\(|eval\((?!\s*\))|os\.system|\bsubprocess\s*\.|\bimport\b[^\n]*\bsubprocess\b|\bimport\s*\([^)]*\bsubprocess\b|\bfrom\s+subprocess\b|["']subprocess["']|create_subprocess_|base64|b64decode|__import__|marshal|\\x[0-9a-f]{2}/;
-/** Text where some language sees a line break that a `\n` split does not
- *  (`\r`, form feed, vertical tab, NEL, U+2028/9), or a source encoding other
- *  than UTF-8 or ASCII (utf-7 decodes `+AAo-` to a newline). In either a
- *  comment can carry code, so nothing is cut. */
-const NO_COMMENT_CUT = /[\r\f\v\u0085\u2028\u2029]|coding[:=][ \t]*(?!(?:utf-?8|ascii)\b)[-\w.]+/i;
-
-/** Which comment rule the interpreter allows. In Python a `#` outside a string
- *  always starts a comment, and so does one at a word start in a shell script
- *  that feeds no heredoc to another program. For any other language, or a
- *  shell script with a heredoc, only a prose comment (letters, digits, spaces
- *  and `.,:!?-`) is cut: a `#` that language does not read as a comment (a JS
- *  regex `/ # /`, PHP's `?>`) needs punctuation to close what it opened and to
- *  run anything after it. */
-type CommentRule = "any" | "prose";
-const PROSE_COMMENT = /^#[\w\s.,:!?-]*$/u;
-const PYTHON_VERB = /^python[\d.]*$/u;
-const SHELL_VERB = /^(?:ba|z|da|k)?sh$/u;
-
-/** An interpreter named inside a shell script: a quoted string handed to it is
- *  that language's code, so the script's comments fall back to the prose rule. */
-const NAMES_OTHER_INTERPRETER = /\b(?:node|nodejs|deno|bun|perl|php|ruby|python[\d.]*|lua|awk|gawk|osascript|tclsh|Rscript|julia)\b/u;
-
-function commentRule(verb: string, text: string): CommentRule {
-	const name = commandBasename(verb);
-	if (PYTHON_VERB.test(name)) return "any";
-	if (!SHELL_VERB.test(name) || text.includes("<<")) return "prose";
-	return NAMES_OTHER_INTERPRETER.test(text) ? "prose" : "any";
-}
-
-/** Whether the backslashes right before `at` escape it: an odd run does. */
-function escapedAt(line: string, at: number): boolean {
-	let run = 0;
-	while (at - 1 - run >= 0 && line[at - 1 - run] === "\\") run += 1;
-	return run % 2 === 1;
-}
-
-/** Whether a `#` at `at` can open a comment: at the line start or after
- *  unescaped whitespace, and followed by whitespace or the line end (a JS
- *  private field `#run` is code). */
-function opensComment(line: string, at: number): boolean {
-	if (at > 0 && !(/\s/u.test(line[at - 1]) && !escapedAt(line, at - 1))) return false;
-	return /^#(?:\s|$)/u.test(line.slice(at));
-}
-
-/** `lines` with each trailing `#` comment cut where cutting cannot hide code.
- *  Quote state carries across lines from the top of the text, so a `#` inside
- *  a string that spans lines (an f-string's `{exec(x)}`, a shell `$(...)`) is
- *  never a comment, and under the `any` rule a quote inside a comment that sits
- *  outside every string is just text. A backslash escapes the next character
- *  in or out of quotes. A line ending in `\` is never cut (it joins the next
- *  line first), and under the prose rule only a prose comment is cut. Any
- *  doubt keeps the line whole: it can only flag. */
-function cutTrailingComments(lines: readonly string[], rule: CommentRule): string[] {
-	let quote = "";
-	return lines.map(line => {
-		for (let at = 0; at < line.length; at += 1) {
-			const ch = line[at];
-			if (ch === "\\") {
-				at += 1;
-				continue;
-			}
-			if (quote !== "") {
-				if (ch === quote) quote = "";
-				continue;
-			}
-			if (ch === "'" || ch === '"' || ch === "`") {
-				quote = ch;
-				continue;
-			}
-			if (ch !== "#" || !opensComment(line, at)) continue;
-			const cuttable = !line.endsWith("\\") && (rule === "any" || PROSE_COMMENT.test(line.slice(at)));
-			return cuttable ? line.slice(0, at) : line;
-		}
-		return line;
-	});
-}
-
-/** The text every marker reads: trailing comments cut where that is safe for
- *  `verb`, then `\` continuations joined. */
-function markerText(text: string, verb: string): string {
-	const code = NO_COMMENT_CUT.test(text) ? text : cutTrailingComments(text.split("\n"), commentRule(verb, text)).join("\n");
-	return code.replace(/\\\r?\n/gu, " ");
-}
 /** `compile(` as a builtin. `re.compile(` and `regex.compile(` are exempt only
  *  while the text never rebinds those names, so `import builtins as re` cannot
  *  borrow the exemption. */
@@ -2270,9 +2187,12 @@ const REGEX_COMPILE_ONLY = /(?<!\b(?:re|regex)\.)compile\(/;
 const REBINDS_REGEX_NAME =
 	/(?<!^[ \t]*import[ \t]+(?:\w+(?:[ \t]+as[ \t]+\w+)?[ \t]*,[ \t]*)*(?:re|regex)[ \t]+)\bas\s+(?:re|regex)\b|(?<![\w.])(?:re|regex)\s*=(?!=)|\b(?:def|class|for)\s+(?:re|regex)\b/m;
 
-/** Whether inline code or a script body carries a second-execution marker. */
-function hasInterpreterCodeRisk(text: string, verb: string): boolean {
-	const joined = markerText(text, verb);
+/** Whether inline code or a script body carries a second-execution marker.
+ *  Comments read as code: where a `#` comment ends depends on the language (a
+ *  JS regex `/ # /`, PHP's `?>`, a Python f-string spanning lines), so a
+ *  comment that names a marker flags. */
+function hasInterpreterCodeRisk(text: string): boolean {
+	const joined = text.replace(/\\\r?\n/gu, " ");
 	if (INTERPRETER_CODE_RISK.test(joined)) return true;
 	if (!COMPILE_CALL.test(joined)) return false;
 	return REBINDS_REGEX_NAME.test(joined) || REGEX_COMPILE_ONLY.test(joined);
@@ -4578,7 +4498,7 @@ export function matchModerateRiskTokens(
 	const pipeStages = splitPipeStages(unmaskedNormalized);
 	for (let i = 1; i < pipeStages.length; i++) {
 		for (const { verb, codeText } of stdinExecutingInterpreters(pipeStages[i])) {
-			if (codeText !== null && !hasInterpreterCodeRisk(codeText, verb) && !INTERPRETER_RISK_TOKEN_RE.test(codeText)) continue;
+			if (codeText !== null && !hasInterpreterCodeRisk(codeText) && !INTERPRETER_RISK_TOKEN_RE.test(codeText)) continue;
 			flags.add(`| ${verb}`);
 		}
 	}
@@ -4645,7 +4565,7 @@ export function matchModerateRiskTokens(
 				// bare command would have flagged (`bash -c 'rm -rf x'`
 				// keeps the backstop `rm -rf x` has).
 				const codeText = words.slice(2).join(" ");
-				if (hasInterpreterCodeRisk(codeText, verb) || INTERPRETER_RISK_TOKEN_RE.test(codeText)) {
+				if (hasInterpreterCodeRisk(codeText) || INTERPRETER_RISK_TOKEN_RE.test(codeText)) {
 					flags.add(`${verb} ${next}`);
 				}
 			}
@@ -7171,7 +7091,7 @@ export default function (pi: ExtensionAPI) {
 				// script that re-execs or decodes its real work, and that must not
 				// depend on the judge noticing which file it is reading.
 				for (const body of script.bodies) {
-					if (hasInterpreterCodeRisk(body.body, body.verb)) flags.push(`${body.verb} runs ${body.operand}`);
+					if (hasInterpreterCodeRisk(body.body)) flags.push(`${body.verb} runs ${body.operand}`);
 				}
 				const lifts =
 					prior !== undefined &&

@@ -203,12 +203,6 @@ describe("second-execution markers read code, not prose", () => {
 		["a docstring that names subprocess", '"""One heading came from the subprocess\nrewrite."""\nprint("ok")\n'],
 		["a comment that names subprocess", "# no subprocess here\nprint('ok')\n"],
 		["eval() with no argument", "model.eval()\nprint('ok')\n"],
-		["a trailing comment that names an import", "print(1) # do not import subprocess\n"],
-		["a comment that names a marker", "# decode base64 input\nprint(1)\n"],
-		["a Python comment with punctuation that names a marker", "# base64 encoding (RFC 4648)\nprint(1)\n"],
-		["a Python comment with an apostrophe that names a marker", "# don't use base64\nprint(1)\n"],
-		["a Python comment that holds quotes and names an import", "x = 1 # it's fine'; import subprocess\n"],
-		["a comment line that names an import", "# do not import subprocess\nprint(1)\n"],
 		["re aliased as regex inside an import list", "import os, re as regex\nPAT = regex.compile(r'a+')\n"],
 		["re aliased as regex", "import re as regex\nPAT = regex.compile(r'a+')\n"],
 		["regex aliased as re", "import regex as re\nPAT = re.compile(r'a+')\n"],
@@ -236,7 +230,6 @@ describe("second-execution markers read code, not prose", () => {
 		["compile through another module imported as regex", "from builtins import compile as c\nfrom evil import re as regex\nregex.compile(src)\n"],
 		["a JS private field that runs exec", "class A {\n#run = require('child_process').exec('ls');\n}\n"],
 		["code after a comment line", "# setup\nimport subprocess\n"],
-		// Comments scan as code: PHP ends a `#` comment at `?>`.
 		["an import after a comment that closes a multi-line string", 's = """\nend # """; import subprocess\n'],
 		["an import behind a comment under a utf-7 coding", "# -*- coding: utf-7 -*-\nx = 1 # +AAo-import subprocess\n"],
 		["an import under a #-prefixed name", "x = 1;#import subprocess\n"],
@@ -245,7 +238,6 @@ describe("second-execution markers read code, not prose", () => {
 		["a JS private field named import", "class A {\n  #import = subprocess;\n}\n"],
 		["a from-import alias after an earlier import", "import os; from evil import re as regex\nregex.compile(src)\n"],
 		["an import after a carriage return in a comment", "x = 1 # note\rimport subprocess\n"],
-		["base64 after a comment cut is refused", "x = 1 # note ?>\nimport base64\n"],
 	])("%s is still flagged", async (_name, body) => {
 		writeScript(root, "probe.py", body);
 		expect(refusalOf(await gate("python3 probe.py")).layer).toBe("flagged");
@@ -259,8 +251,9 @@ describe("second-execution markers read code, not prose", () => {
 		expect(refusalOf(await gate(command)).layer).toBe("flagged");
 	});
 
-	// The comment rule follows the interpreter: only Python, and a shell script
-	// with no heredoc, cut any `#` comment; every other language cuts prose only.
+	// Comments read as code: each language ends a `#` comment somewhere else,
+	// and every attempt to cut them hid code in some language (rounds 2-8 of
+	// https://github.com/STRML/omp-classifier/pull/211).
 	test.each([
 		["a JS regex literal holding # before exec", "probe.js", "node", "const exec = require('child_process').exec;\nconst r = / # /; exec(payload);\n"],
 		["a PHP comment that closes the tag", "probe.php", "php", "<?php\n# note ?> <?php exec($cmd);\n"],
@@ -278,12 +271,18 @@ describe("second-execution markers read code, not prose", () => {
 		expect(["flagged", "script-body"]).toContain(refusalOf(await gate(`${verb} ${file}`)).layer);
 	});
 
+	// The cost of reading comments as code: a comment that names a marker
+	// flags, as it did before the markers were narrowed. It fails closed.
 	test.each([
-		["a shell comment after an escaped backslash", "echo foo\\\\ # base64 encoding\n"],
-		["a shell comment with punctuation", "ls # base64 (RFC 4648)\n"],
-	])("%s runs on a SAFE", async (_name, body) => {
-		writeScript(root, "probe.sh", body);
-		expect(await gate("bash probe.sh")).toBe("ALLOWED");
+		["a trailing comment that names an import", "print(1) # do not import subprocess\n"],
+		["a comment that names a marker", "# decode base64 input\nprint(1)\n"],
+		["a Python comment with punctuation that names a marker", "# base64 encoding (RFC 4648)\nprint(1)\n"],
+		["a Python comment with an apostrophe that names a marker", "# don't use base64\nprint(1)\n"],
+		["a Python comment that holds quotes and names an import", "x = 1 # it's fine'; import subprocess\n"],
+		["a comment line that names an import", "# do not import subprocess\nprint(1)\n"],
+	])("%s flags: comments read as code", async (_name, body) => {
+		writeScript(root, "probe.py", body);
+		expect(refusalOf(await gate("python3 probe.py")).layer).toBe("flagged");
 	});
 
 	test("inline code that only builds a regex runs on a SAFE", async () => {
