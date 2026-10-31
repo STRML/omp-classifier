@@ -4,6 +4,21 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### A Python run refuses when a local file shadows any stdlib module, and a shebang's env must be a system program
+
+Two gaps the security review found after https://github.com/STRML/omp-classifier/pull/218 merged.
+
+- **Transitive shadowing.** The script's directory (the working directory for `-c`, `-m` and stdin) comes first on `sys.path`, so a local `re.py` replaces `re` for every import of it, including the imports stdlib modules make among themselves: `import json` loads `re`. The gate only checked the names the body imports. It now refuses when any root holds a module file, package, compiled file or extension named like any module in the interpreter's standard library, imported or not.
+- **Shebang env.** `#!/some/dir/env python3` passed as long as the name after it was a python name, though a user-owned file named `env` runs whatever it likes. The `env` in a shebang must now be a system program.
+
+| Case | Before | After |
+|---|---|---|
+| `./probe.py` doing `import json` beside a local `re.py` | reviewed | refused: a local re shadows the standard library |
+| `python -m json.tool` in a directory holding `re.py` | reviewed | refused |
+| `#!./bin/env python3` | refused only when no python3 was on PATH | refused: env is not a system program |
+
+The write check stays a deny-list by design. A body that writes a module file through an API the gate does not recognise and then imports it lazily is visible in the body the reviewer reads, and the reviewer treats code it cannot inspect as unknown.
+
 ### Stage 2 stops trusting names an earlier call or a hidden assignment can move
 
 Found while building https://github.com/STRML/omp-classifier/pull/218. Stage 2 checks that a script body never changes PATH, then resolves the body's bare names against the gate's own environment. Both halves had a gap.

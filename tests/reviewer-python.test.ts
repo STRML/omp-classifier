@@ -244,7 +244,7 @@ describe("a spawn the body spells out is the reviewer's to judge", () => {
 describe("Python the gate cannot read all of stays refused", () => {
 	test.each([
 		["a local module next to the code", "import helpers", "imports the local module helpers"],
-		["a local module shadowing the standard library", "import json", "imports the local module json"],
+		["a local module shadowing the standard library", "import json", "shadows the standard library"],
 		["a relative import", "from . import helpers", "relative import"],
 		["a module the interpreter does not have", "import notinstalled", "imports notinstalled"],
 		["exec", "exec(open('payload.txt').read())", "uses exec"],
@@ -258,7 +258,7 @@ describe("Python the gate cannot read all of stays refused", () => {
 	])("python -c with %s", async (_name, code, why) => {
 		const python = fakeVenv(fakeInstall());
 		write("helpers.py", "import os\nos.system('id')\n");
-		write("json.py", "import os\nos.system('id')\n");
+		if (code === "import json") write("json.py", "import os\nos.system('id')\n");
 		await expectRefused(`${python} -c "${code.replaceAll('"', '\\"')}"`, why);
 	});
 
@@ -382,6 +382,34 @@ describe("a Python script run by its shebang reads under the same rules", () => 
 		write("probe.py", `#!${python}\nimport helpers\n`, 0o755);
 		write("helpers.py", "import os\nos.system('id')\n");
 		await expectRefused("./probe.py", "imports the local module helpers");
+	});
+
+	// The script's directory comes first on sys.path, so a local file named
+	// like any stdlib module wins for every import of it, including the ones
+	// stdlib modules make among themselves (`json` imports `re`).
+	test.each([
+		["a module file", "re.py"],
+		["a package directory", "collections/__init__.py"],
+		["a compiled file", "os.pyc"],
+	])("one whose directory holds a stdlib-named %s is refused, even unimported", async (_name, shadow) => {
+		const python = fakeVenv(fakeInstall());
+		write("probe.py", `#!${python}\nimport json\n`, 0o755);
+		write(shadow, "import os\nos.system('id')\n");
+		await expectRefused("./probe.py", "shadows the standard library");
+	});
+
+	test("python -m with a stdlib-named file in the working directory is refused", async () => {
+		const python = fakeVenv(fakeInstall());
+		write("re.py", "import os\nos.system('id')\n");
+		await expectRefused(`${python} -m json.tool data.json`, "shadows the standard library");
+	});
+
+	test("an env shebang names env by a path that is not a system program", async () => {
+		const python = fakeVenv(fakeInstall());
+		const env = write("bin/env", "#!/bin/sh\nexec /bin/sh -c 'id'\n", 0o755);
+		write("probe.py", `#!${env} python3\nimport json\n`, 0o755);
+		expect(python).toContain("venv");
+		await expectRefused("./probe.py", "names an env that is not a system program");
 	});
 
 	test("one that imports a module its interpreter does not have is refused", async () => {
