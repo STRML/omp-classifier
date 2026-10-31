@@ -27,7 +27,7 @@ import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { isSecretName } from "./redact";
 import { parseShell, type ShellCommand, type ShellRedirect, type ShellWord, verbName, verbOf } from "./shell-ast";
-import { segmentCwdLookup } from "./shell-cwd";
+import { maskHeredocBodiesAndAnsiSpans, segmentCwdLookup } from "./shell-cwd";
 
 /** Which floor entry a finding came from. The numbers are the plan's, plus
  *  `unread-command` for a command the shell parser rejected or could not
@@ -204,7 +204,9 @@ function scanText(text: string, source: FloorFinding["source"], tainted: readonl
 		findings.push({ entry: "unread-command", detail: `a ${unread.unreadShape} the shell adapter could not read`, source });
 	}
 	if (parsed.ok) {
-		const cwdAt = cwd === undefined ? undefined : segmentCwdLookup(text, cwd);
+		// The walk reads the masked text, as the script-body reader's does: a
+		// `cd` inside a comment or a heredoc body moves nothing.
+		const cwdAt = cwd === undefined ? undefined : segmentCwdLookup(maskHeredocBodiesAndAnsiSpans(text).masked, cwd);
 		scanSecrets(parsed.commands, { cwdAt, shellTracing: SHELL_TRACING.test(text), tainted, captured: capturedOut, findings, source, visited: new Set() });
 		if (shellEvalOfNonLiteral(parsed.commands)) {
 			findings.push({ entry: "obfuscated-code", detail: "shell eval runs a value rather than a literal", source });

@@ -4,6 +4,33 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### The script-body reader follows the shell parse, and refuses where it cannot
+
+The script-body reader (issue 67) found interpreter calls by reading the command as text: a masker blanked heredoc bodies and quote spans, the host tokenizer split segments, and a text walk followed `cd`. None of the three knew about comments, and the masker treated every `<<` as a heredoc. When one of them lost its place it blanked the rest of the command or moved the shell somewhere bash does not, and the reader read nothing, or the wrong file, and refused nothing. The parse already knew better, so the reader now uses it.
+
+- **Comments and heredocs come from the parse.** A second parser instance keeps comments (`shellLayout` in `shell-ast.ts`), and the masker blanks each comment and each heredoc body where the parse puts them. A quote in a comment opens nothing, and a here-string, an arithmetic shift, or a `<<` inside quotes or a comment is not a heredoc. The jev provenance tiers and the shadow floor read the same masked text, so their `cd` walk skips comments too.
+- **Fail closed when there is no parse.** The reader refuses every command the parser rejects. bash runs a multi-line command line by line, so the lines above a stray `fi` still run while none of the parse's checks see them, and no test on raw words can say what `py\thon3`, `p"y"thon3` or `$X` becomes. The text masker still falls back to text for its other callers, and now reports when it blanked to the end of the command (`lost`).
+- **The parse is a second reader.** Every parsed command whose verb is an interpreter has its program read: the ones the text pass already read are skipped (same resolved file, `env -C` included), and the rest are read from the directory the walk gives that command's offset. That covers `then python3 x.py`, `time python3 x.py`, `! python3 x.py`, `"$(python3 x.py)"`, backticks and loop bodies, which the text pass never saw as interpreter calls.
+- **A verb the shell expands refuses** when it could matter. A brace or glob verb (`pyth{on3,} p.py`, `{cd,dir}`, `c{d,} dir`) always refuses. A variable or substituted verb (`$PY p.py`, `cd${x} dir`, `$c dir`) refuses when the command runs any program at all (source position is not execution order) or one of its operands could be a script: script-shaped, anything that exists (a directory too, since python runs its `__main__.py`), anything the gate cannot stat, or itself expanded. `"$@"` and `$EDITOR` with nothing to open are unaffected. An `alias` definition counts the same way.
+- **The walk is used only when it agrees with the parse** on every command that can move the shell (verb and first operand, counted on both sides), none of them sits in a function body or a loop, and the command defines no function (`function cd { :; }` makes every later `cd` a no-op). A command that defines a function and runs a program refuses: the function can shadow any verb, and its body runs wherever it is called.
+- **A `cd` the walk cannot pin is unknown.** A target that does not exist yet (`mkdir -p nd && cd nd`), a target that is not a directory, and a bare name while CDPATH is set (in the command text or the gate's environment) no longer count as a no-op.
+
+| Command (cwd holds a harmful `p.py`) | Before | After |
+|---|---|---|
+| `echo hi # it's` then `python3 p.py` | allowed, body never read | body read, `flagged` |
+| `echo $((1<<3))`, `cat <<< hi` or `echo '<<' x`, then `python3 p.py` | allowed, body never read | body read, `flagged` |
+| `echo hi # ; cd ../safe` then `python3 p.py` | read `../safe/p.py` (benign) | reads `./p.py`, `flagged` |
+| `if true; then python3 p.py; fi`, `time python3 p.py`, `echo "$(python3 p.py)"` | allowed, body never read | body read, `flagged` |
+| `pyth{on3,} p.py`, `$PY p.py` | allowed, body never read | `script-body` refusal |
+| `{cd,../safe}; python3 p.py`, `c=cd; $c ../safe; python3 p.py` | read `./p.py` while bash runs `../safe/p.py` | `script-body` refusal |
+| `function f { cd ../safe; }; f; python3 p.py`, `f() { python3 p.py; }; cd ../safe; f` | read the wrong file | `script-body` refusal |
+| `mkdir -p nd && cd nd && python3 p.py`, `CDPATH=… ; cd safe; python3 p.py` | read `./p.py` | `script-body` refusal |
+| `cd dir && python3 x.py`, `python3 x.py # comment`, `# Let's run it` then `python3 x.py`, `cat > f <<'EOF'` with an unbalanced quote then `python3 x.py`, `echo "it's"` | judged | judged |
+
+Side effects: the risk-token overlay no longer flags a token that appears only inside a comment, and the jev push, network and delete tiers measure nothing (instead of the old directory) after a `cd` whose target is missing or a bare name under CDPATH. Over 9,210 untruncated commands from the mined history corpus, the branch refuses 4 that `main` reads (2 commands with an unbalanced quote, 2 loop bodies running a file past the review limit), plus 231 whose `cd` target no longer exists on this machine.
+
+Residuals: a CDPATH or a `cd` function defined by an earlier call in the host's persistent shell is not visible to the reader, so a bare `cd name` after one is still followed as written.
+
 ### Stage 2 reads hidden arithmetic from the parse, not the text
 
 https://github.com/STRML/omp-classifier/pull/225 refused script bodies whose arithmetic reads a name, because bash evaluates the variable's value as an expression and a value of `PATH=/x` assigns PATH. It found those spots with regexes over the body text, and every review round found another spelling: a substring offset on `${1:w}`, `${@:w}` or `${a[0]:w}`, a compound array `( [w]=1 )`, a `[[ ]]` comparison split over lines, `declare -i` (later plain assignments become arithmetic), `declare -n` (a name becomes an alias of another), and a verb rewritten by brace expansion (`{ex,}port`). `hiddenArithmetic` in `shell-ast.ts` now reads the parse. It checks `ArithmCmd`, `let`, `$(( ))`, `$[ ]`, every subscript and substring offset (read off the node, since the walker does not descend into them), and `[[ ]]` comparisons whose operator the runtime derives from a parse of `-eq` through `-ge`. Any one of them that reads a name, an expansion or a substitution refuses. `declare`, `typeset` and `local` with `-i` or `-n`, or with a flag word built at run time, refuse outright, as does a verb that brace expansion or a glob rewrites. The text scans are removed.
