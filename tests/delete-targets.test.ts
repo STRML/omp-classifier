@@ -16,6 +16,7 @@ import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, w
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildJevState, gateTempRoots, jevQuestions, JEV_POLICY_VERSION, JEV_V3_POLICY_VERSION, measureDeleteTargets } from "../jev";
+import { shellTmpdirFor } from "../index";
 import { fire, jevSafeAnswer, loadPlugin, makeCtx, makeEvent, makeSettings, modelCalls, removeConfigFile, setJevAnswer, stateOf } from "./fixtures";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "delete-targets-")));
@@ -348,6 +349,47 @@ describe("delete targets through the gate", () => {
 		}
 	});
 
+	/** Runs `command` with the process TMPDIR pointed at `shellTmp`, from `cwd`. */
+	const stateWithTmpdir = async (shellTmp: string, command: string, cwd: string): Promise<Array<Record<string, unknown>>> => {
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = shellTmp;
+		try {
+			const before = modelCalls.length;
+			await fire("tool_call", makeEvent(command), makeCtx({ sessionId: session(), cwd }));
+			return stateOf(before).deleteTargets as Array<Record<string, unknown>>;
+		} finally {
+			if (saved === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = saved;
+		}
+	};
+
+	test("a $TMPDIR operand is read with the gate's TMPDIR when nothing can rewrite it", async () => {
+		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-")));
+		try {
+			mkdirSync(join(real, "x"));
+			writeFileSync(join(real, "x", "probe.md"), "x");
+			const entries = await stateWithTmpdir(real, 'trash "$TMPDIR/x/probe.md"', home);
+			expect(entries).toHaveLength(1);
+			expect(entries[0]).toMatchObject({ target: '$TMPDIR/x/probe.md', underTempRoot: true });
+		} finally {
+			rmSync(real, { recursive: true, force: true });
+		}
+	});
+
+	test("a $TMPDIR operand stays unmeasured when an .envrc sits in the working directory", async () => {
+		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-envrc-")));
+		try {
+			mkdirSync(join(real, "x"));
+			writeFileSync(join(real, "x", "probe.md"), "x");
+			writeFileSync(join(real, ".envrc"), "export TMPDIR=$HOME\n");
+			const entries = await stateWithTmpdir(real, 'trash "$TMPDIR/x/probe.md"', real);
+			expect(entries).toHaveLength(1);
+			expect(entries[0].underTempRoot).toBeNull();
+		} finally {
+			rmSync(real, { recursive: true, force: true });
+		}
+	});
+
 	test("a command with no delete carries no field", async () => {
 		const before = modelCalls.length;
 		await fire("tool_call", makeEvent("ls -la"), makeCtx({ sessionId: session(), cwd: home }));
@@ -378,6 +420,44 @@ describe("delete targets through the gate", () => {
 		} finally {
 			rmSync(real, { recursive: true, force: true });
 			rmSync(outside, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("shellTmpdirFor", () => {
+	const cwd = mkdtempSync(join(base, "shell-tmpdir-"));
+	const nested = join(cwd, "a", "b");
+	mkdirSync(nested, { recursive: true });
+
+	test("returns the process TMPDIR when no .envrc is above the working directories", () => {
+		expect(shellTmpdirFor([cwd], { TMPDIR: "/var/folders/zz/T" })).toBe("/var/folders/zz/T");
+	});
+
+	test("is null when TMPDIR is unset or empty", () => {
+		expect(shellTmpdirFor([cwd], {})).toBeNull();
+		expect(shellTmpdirFor([cwd], { TMPDIR: "" })).toBeNull();
+	});
+
+	test("is null when an .envrc sits at or above any of the working directories", () => {
+		writeFileSync(join(cwd, ".envrc"), "export TMPDIR=/x\n");
+		try {
+			expect(shellTmpdirFor([cwd], { TMPDIR: "/var/folders/zz/T" })).toBeNull();
+			expect(shellTmpdirFor([nested], { TMPDIR: "/var/folders/zz/T" })).toBeNull();
+			expect(shellTmpdirFor([home, nested], { TMPDIR: "/var/folders/zz/T" })).toBeNull();
+		} finally {
+			rmSync(join(cwd, ".envrc"), { force: true });
+		}
+		expect(shellTmpdirFor([nested], { TMPDIR: "/var/folders/zz/T" })).toBe("/var/folders/zz/T");
+	});
+
+	test("reads process.env by default", () => {
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = "/var/folders/yy/T";
+		try {
+			expect(shellTmpdirFor([cwd])).toBe("/var/folders/yy/T");
+		} finally {
+			if (saved === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = saved;
 		}
 	});
 });

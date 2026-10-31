@@ -30,7 +30,7 @@ shadow: judgeJevV3 = jev-v3.8 battery ∥ judgeAuthorization ─► deriveAuthor
 | `lookalikeDestinationFlags(cmd, userMessages)` | 1949 | fn, pure | index bash/eval SAFE overlay, eval/run `riskFlagsFor` |
 | `measureGitWorktreeProvenance(cwd)` | 1758 | fn | same |
 | `measureGitRefProvenance(cmd, cwd)` | 2260 | fn | same |
-| `measureDeleteTargets(cmd, startCwd, roots?)` | 2426 | fn | index `classify` (shell only) + bash cache key (#166) |
+| `measureDeleteTargets(cmd, startCwd, roots?, shellTmpdir?)` | 2881 | fn | index `classify` (shell only) + bash cache key (#166); `shellTmpdir` from index `shellTmpdirFor` lets a leading `$TMPDIR` operand measure (#176) |
 | `gateTempRoots()` | 2340 | fn | `measureDeleteTargets` default: real `/tmp`, `/private/tmp`, `os.tmpdir()`; never `/` or a root holding home |
 | `parseDockerPortState`, `parseComposeServices`, `isLoopbackHost` | 943/981/1262 | fn | network tier, tests |
 | `buildJevState(input)` | 2470 | fn | index `classify`, `shadowJevV3`, eval/run |
