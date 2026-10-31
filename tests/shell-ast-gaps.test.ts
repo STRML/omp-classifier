@@ -13,7 +13,7 @@
  */
 import { beforeEach, describe, expect, test } from "bun:test";
 import { summarizeActions } from "../authorization";
-import { parseShell, shellDefinesFunction, shellRunsInSourceOrder, substitutionSpans, type ShellCommand } from "../shell-ast";
+import { hiddenArithmetic, parseShell, shellDefinesFunction, shellRunsInSourceOrder, substitutionSpans, type ShellCommand } from "../shell-ast";
 import { fire, jevSafeAnswer, loadPlugin, makeCtx, makeEvent, makeSettings, modelCalls, refusalOf, removeConfigFile, resultText, setJevAnswer } from "./fixtures";
 
 const nested = (text: string): string[] => {
@@ -93,6 +93,7 @@ describe("a tree too deep to walk fails closed", () => {
 		expect(shellRunsInSourceOrder(deep)).toBe(false);
 		expect(shellDefinesFunction(deep)).toBe(true);
 		expect(substitutionSpans(deep)).toEqual(["x"]);
+		expect(hiddenArithmetic(deep)).toBe("its shell body is too deep to read");
 	});
 
 	describe("through the gate", () => {

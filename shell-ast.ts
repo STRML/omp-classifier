@@ -1166,8 +1166,8 @@ function arithmeticReadsAnything(node: any, trusted: ReadonlySet<string>): boole
  * `x[w]=1`, `( [w]=1 )`), a substring offset or length (`${s:w:1}`), and a
  * `[[ ]]` numeric comparison. `declare -i` makes every later assignment to
  * the name arithmetic, and `declare -n` makes the name an alias of another,
- * so both refuse outright. Read from the parse: the walker does not descend
- * into slices and subscripts, so those are read off the node itself.
+ * so both refuse outright. Read from the parse; slices and subscripts are
+ * read off the node itself.
  */
 export function hiddenArithmetic(text: string): string | undefined {
 	let tree: unknown;
@@ -1176,6 +1176,19 @@ export function hiddenArithmetic(text: string): string | undefined {
 	} catch {
 		return "its shell body could not be parsed";
 	}
+	let why: string | undefined;
+	try {
+		walkArithmetic(tree, found => {
+			why = found;
+		});
+	} catch {
+		// A tree deeper than the walk's stack is a tree this did not read.
+		return "its shell body is too deep to read";
+	}
+	return why;
+}
+
+function walkArithmetic(tree: unknown, report: (why: string) => void): void {
 	const { arithmeticTests, nameTests } = getShell();
 	const trusted = trustedNames(tree);
 	const reads = (node: unknown): boolean => arithmeticReadsAnything(node, trusted);
@@ -1199,9 +1212,9 @@ export function hiddenArithmetic(text: string): string | undefined {
 			const flags = (n.Args ?? []).filter((arg: any) => arg.Naked && arg.Value).map((arg: any) => literalWordText(arg.Value));
 			if (flags.some((flag: string) => /^[-+][A-Za-z]*[in]/u.test(flag) || !/^[-+A-Za-z0-9_]*$/u.test(flag))) why = "declare -i or -n changes what a later assignment does";
 		}
+		if (why !== undefined) report(why);
 		return why === undefined;
 	});
-	return why;
 }
 
 /** A code point bash would emit, or the escape as written when it is out of
