@@ -956,10 +956,11 @@ export interface DecisionRecord {
 	/** The jev-v3 shadow (plan Phase 2 step 8), carried like `authorization`
 	 *  onto every line that followed a judgement. Decides nothing. */
 	v3?: ShadowV3;
-	/** Whether this session's refusal of the command's target decided this
+	/** Whether an unlifted refusal of the command's target applied to this
 	 *  line. Refusal memory is the gate's own bookkeeping and is kept out of
 	 *  the judge's state, so this field is the only place a decision records
-	 *  that the memory — not the verdict — produced the block. */
+	 *  that the memory stood: a moderate-risk flag or a short length cap can
+	 *  block the same call, and this says the refusal was also in force. */
 	priorRefusal?: boolean;
 	approval?: "allow-once" | "allow-session" | "always-allow" | "deny" | "headless" | "unavailable";
 	tool: "bash" | "eval";
@@ -5273,21 +5274,31 @@ export function namesRemoteHost(command: string, transcript: readonly ReviewerTr
 	return hosts.length > 0 && hosts.every(host => transcript.some(said => namesAnchor(said, new Set([host]))));
 }
 
-/** Whether this remote command's only local secret is the identity file it
- *  presents to a host the user named. `ssh -i ~/.ssh/key root@host` hands the
- *  host a signature, never the key, so the file is a credential used for its
- *  purpose rather than a value exposed. Every structural check namesRemoteHost
- *  makes applies, an identity flag has to be there, and any other secret-shaped
- *  word — a path, a store read, a secret-looking argument — keeps the hazard
- *  hard. The words are all fixed, so none of them can expand into one later. */
+/** Whether this command's only local secret is the identity file it presents
+ *  to a host the user named. `ssh -i ~/.ssh/key root@host` hands the host a
+ *  signature, never the key, so the file is a credential used for its purpose
+ *  rather than a value exposed. Narrow on purpose:
+ *
+ *  - ssh only. `scp` and `rsync` move file contents, so a copied `.env` or key
+ *    is exposure (or a secret reaching a foreign host) no matter which
+ *    identity file authenticates the transfer.
+ *  - Every structural check namesRemoteHost makes applies, an identity flag has
+ *    to be there, and any other secret-shaped word keeps the hazard hard.
+ *  - The remote command, when there is one, has to be inert text: no redirect,
+ *    pipe, substitution, separator or escape, and no token that reads as a
+ *    secret path or a store read (`ssh … 'cat .env'`). What the remote side
+ *    does with its own files is then nothing this command moves.
+ *
+ *  The words are all fixed, so none of them can expand into one later. */
 function remoteIdentityOnly(command: string, transcript: readonly ReviewerTranscriptEntry[]): boolean {
 	if (!namesRemoteHost(command, transcript)) return false;
 	const parsed = parseShell(withoutOutputFilter(command));
 	if (!parsed.ok) return false;
 	const commands = parsed.commands[0] !== undefined && verbName(parsed.commands[0]) === "cd" ? parsed.commands.slice(1) : parsed.commands;
 	const remote = commands[0];
-	// A redirect can feed a local secret to the remote side (`< ~/.aws/credentials`), so any redirect keeps the hazard hard.
-	if (remote === undefined || remote.redirects.length > 0) return false;
+	// A redirect on this side can feed a local secret to the remote host
+	// (`< ~/.aws/credentials`), so any redirect keeps the hazard hard.
+	if (remote === undefined || verbName(remote) !== "ssh" || remote.redirects.length > 0) return false;
 	const words = remote.words.map(word => word.value);
 	const reading = readRemoteOptions(words[0] ?? "", words.slice(1));
 	if (reading === undefined || reading.identities.length === 0) return false;
@@ -5295,8 +5306,21 @@ function remoteIdentityOnly(command: string, transcript: readonly ReviewerTransc
 	// word index one higher. Both an attached `-ikey` and a separate `-i key`
 	// name the word carrying the path.
 	const identityWords = new Set(reading.identities.map(index => index + 1));
-	return words.every((word, index) => identityWords.has(index) || (!isSecretPath(word) && secretStoreRead(word) === undefined));
+	if (!words.every((word, index) => identityWords.has(index) || (!isSecretPath(word) && secretStoreRead(word) === undefined))) return false;
+	// `firstOperand` is the host's argument index; everything after it is the
+	// remote command, whether it arrives quoted as one word or bare.
+	const remoteWords = words.slice(reading.firstOperand === undefined ? words.length - 1 : reading.firstOperand + 2);
+	const remoteCommand = remoteWords.join(" ");
+	if (remoteCommand === "") return true;
+	if (SHELL_CONTROL_CHARACTER.test(remoteCommand)) return false;
+	if (secretStoreRead(remoteCommand) !== undefined) return false;
+	return !remoteWords.some(word => word.split(/\s+/u).some(token => isSecretPath(token)));
 }
+
+/** Anything that lets the remote command reach a local file or another
+ *  program: redirection, piping, substitution, sequencing, an escape, or a
+ *  newline. `ssh host 'systemctl status x'` carries none of these. */
+const SHELL_CONTROL_CHARACTER = /[;&|<>`$\\\n\r]/u;
 
 /** The options each remote verb may carry under the named-host exception, by
  *  allowlist: anything else may run a local program (ProxyCommand, -S, -e),
@@ -5316,10 +5340,12 @@ const INERT_SSH_SETTINGS = new Set([
 ]);
 
 /** How a remote command's options read: whether every one of them is inert,
- *  and which argument indexes are an identity file's value (`-i`, ssh/scp). */
+ *  which argument indexes are an identity file's value (`-i`, ssh/scp), and
+ *  where the first operand (the host, for ssh) sits. */
 interface RemoteOptionsReading {
 	inert: boolean;
 	identities: number[];
+	firstOperand?: number;
 }
 
 /** Every option an ssh, scp or rsync carries, against the inert list.
@@ -5334,7 +5360,9 @@ function readRemoteOptions(verb: string, args: readonly string[]): RemoteOptions
 		const word = args[at];
 		if (word === "--") return reading;
 		if (!word.startsWith("-") || word === "-") {
-			if (++operands > spec.operands) return reading;
+			operands += 1;
+			if (operands > spec.operands) return reading;
+			reading.firstOperand ??= at;
 			continue;
 		}
 		if (word.startsWith("--")) return { ...reading, inert: false };
@@ -6685,18 +6713,16 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					// A SAFE on a target this session already refused is not a
-					// clean bill: the refusal rode in the state the judge saw, so a
-					// SAFE means the command looks safe, not that the refusal was
-					// wrong. The refusal stands until the user's own words lift it,
-					// and the moderate-risk overlay keeps its own reason when both
-					// hit.
+					// clean bill: the refusal stands until the user's own words
+					// lift it (never, for eval code), and the moderate-risk overlay
+					// keeps its own reason when both hit.
 					const why =
 						flagList.length > 0
-							? `classifier-safe but flags: ${flagList.join(", ")}`
+							? `classifier-safe but flags: ${flagList.join(", ")}` + (prior === undefined ? "" : `; the target was refused earlier this session ("${prior.loggableTarget}")`)
 							: prior === undefined
 								? `classifier-safe but ${replay.why}`
 								: `classifier-safe despite prior ${prior.source} refusal of "${prior.loggableTarget}"`;
-					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", ...lead, why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
+					logDecisionFor(ctx, { tool: "eval", decision: "block", layer: "verdict", ...lead, why, cmd: evalCode, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, priorRefusal: prior !== undefined, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...spawnField });
 					return refuse(ctx, target, flagList.length > 0 ? "flagged" : "prior-refusal", withFlagFootnotes(why, flagList), "eval", "follows verdict", { ...auditFields(), ...judgementAudit(judgement), ...spawnField, verdict: "SAFE", ...follows });
 				}
 				const cause = VERDICT_CAUSE[judgement.verdict];

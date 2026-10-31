@@ -65,15 +65,15 @@ afterEach(() => {
 /** Fresh session id per test; the plugin's stores are module-level. */
 const nextSession = (): string => `refusal-memory-${(seq += 1)}`;
 
-/** Whether the last decision was decided by this session's refusal of the
- *  target. Refusal memory is the gate's own bookkeeping and no longer rides in
- *  the judge's state, so the audit line is the observable: the gate records
- *  `priorRefusal` when the memory, not the verdict, produced the block. */
-const metRefusal = (): boolean => {
-	// A call writes a verdict line and, when blocked, a follow line; only the
-	// verdict line carries the judgement fields, so read that one.
-	const verdictLine = readDecisions().findLast(line => line.layer === "verdict");
-	return verdictLine?.priorRefusal === true;
+/** Whether the decision for this exact command was taken with an unlifted
+ *  refusal of its target in force. Refusal memory is the gate's own
+ *  bookkeeping and no longer rides in the judge's state, so the audit line is
+ *  the observable: it records `priorRefusal` when the memory stood. Joining on
+ *  the logged command keeps an earlier call's verdict from answering for a
+ *  retry that never reached one. */
+const metRefusal = (command: string): boolean => {
+	const wanted = command.replace(/\s+/gu, " ").trim();
+	return readDecisions().findLast(entry => entry.layer === "verdict" && entry.cmd === wanted)?.priorRefusal === true;
 };
 
 describe("refusal identity (issue #64)", () => {
@@ -126,7 +126,7 @@ describe("refusal memory", () => {
 		setJevAnswer(jevSafeAnswer());
 		await fire("tool_call", makeEvent("git push origin feature"), makeCtx({ sessionId: sid }));
 		expect(modelCalls.length).toBe(2);
-		expect(metRefusal()).toBe(false);
+		expect(metRefusal("git push origin feature")).toBe(false);
 	});
 
 	test("a Git refusal does not carry over to a differently-cased ref", async () => {
@@ -139,7 +139,7 @@ describe("refusal memory", () => {
 		setJevAnswer(jevSafeAnswer());
 		await fire("tool_call", makeEvent("git diff Release..main"), makeCtx({ sessionId: sid }));
 		expect(modelCalls.length).toBe(2);
-		expect(metRefusal()).toBe(false);
+		expect(metRefusal("git diff Release..main")).toBe(false);
 	});
 
 	test("a wrapped Git command is keyed on the git command it wraps", async () => {
@@ -152,7 +152,7 @@ describe("refusal memory", () => {
 		setJevAnswer(jevSafeAnswer());
 		await fire("tool_call", makeEvent("command git diff feature..main"), makeCtx({ sessionId: sid }));
 		expect(modelCalls.length).toBe(2);
-		expect(metRefusal()).toBe(false);
+		expect(metRefusal("command git diff feature..main")).toBe(false);
 	});
 
 	test("a reworded command meets the refusal without telling the judge about it", async () => {
@@ -168,21 +168,22 @@ describe("refusal memory", () => {
 		// every pass until the hazard could not be reviewed at all).
 		expect(JSON.stringify(stateOf(1))).not.toContain("priorRefusal");
 		// The refusal still decides: a SAFE answer on that target is a block.
-		expect(metRefusal()).toBe(true);
+		expect(metRefusal("rm -rf ./x")).toBe(true);
 	});
 
 	test("a one-hot UNSAFE asks but is not remembered as a refusal (jev-v2.1)", async () => {
 		// The keyword bridge answers 0/1 with no distribution behind it. Its
-		// UNSAFE still asks; it must not pin the target for the session.
+		// UNSAFE still asks; it must not pin the target for the session, so the
+		// SAFE retry must not carry a refusal.
 		const sid = nextSession();
 		setJevAnsweringApi("chat");
 		setJevAnswer(jevUnsafeAnswer());
 		await fire("tool_call", makeEvent("rm -rf x"), makeCtx({ sessionId: sid }));
 		setJevAnsweringApi();
-		setJevAnswer(jevUnsafeAnswer());
+		setJevAnswer(jevSafeAnswer());
 		await fire("tool_call", makeEvent("rm -rf ./x"), makeCtx({ sessionId: sid }));
 		expect(modelCalls.length).toBe(2);
-		expect(metRefusal()).toBe(false);
+		expect(metRefusal("rm -rf ./x")).toBe(false);
 	});
 
 	test("an UNSURE verdict is undecided, so it is not remembered as a refusal", async () => {
@@ -194,9 +195,10 @@ describe("refusal memory", () => {
 		await fire("tool_call", makeEvent("git diff --stat"), makeCtx({ sessionId: sid }));
 		setJevAnswer(jevSafeAnswer());
 		// The same target, respelled: had the UNSURE written a refusal, this
-		// would meet it.
-		await fire("tool_call", makeEvent("cd /workspace && git diff --stat"), makeCtx({ sessionId: sid }));
-		expect(metRefusal()).toBe(false);
+		// would meet it. Nothing else flags the command, so it runs.
+		const respelled = await fire("tool_call", makeEvent("cd /workspace && git diff --stat"), makeCtx({ sessionId: sid }));
+		expect(respelled).toBeUndefined();
+		expect(metRefusal("cd /workspace && git diff --stat")).toBe(false);
 	});
 
 	test("an UNAVAILABLE verdict judged nothing, so it is not remembered either", async () => {
@@ -206,6 +208,7 @@ describe("refusal memory", () => {
 		setJevAnswer(jevSafeAnswer());
 		const ctx = makeCtx({ sessionId: sid });
 		expect(await fire("tool_call", makeEvent("cd /workspace && git diff --stat"), ctx)).toBeUndefined();
+		expect(metRefusal("cd /workspace && git diff --stat")).toBe(false);
 	});
 
 	test("a SAFE that lands despite a prior refusal still blocks", async () => {
@@ -249,10 +252,10 @@ describe("refusal memory", () => {
 		// bare, so whatever the moderate-risk overlay does, the refusal did not
 		// decide it.
 		await fire("tool_call", makeEvent("rm -r -f f01"), makeCtx({ sessionId: sid }));
-		expect(metRefusal()).toBe(false);
+		expect(metRefusal("rm -r -f f01")).toBe(false);
 		// Newest target (rm -f -r f21) is still remembered.
 		await fire("tool_call", makeEvent("rm -r -f f21"), makeCtx({ sessionId: sid }));
-		expect(metRefusal()).toBe(true);
+		expect(metRefusal("rm -r -f f21")).toBe(true);
 	});
 });
 
@@ -346,7 +349,7 @@ describe("a remote copy's refusal survives a rewrite of the same copy", () => {
 			await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid }));
 			setJevAnswer(jevSafeAnswer());
 			await fire("tool_call", makeEvent(rewrite), makeCtx({ sessionId: sid }));
-			expect(metRefusal()).toBe(true);
+			expect(metRefusal(rewrite)).toBe(true);
 		});
 	}
 
@@ -356,9 +359,9 @@ describe("a remote copy's refusal survives a rewrite of the same copy", () => {
 		await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid }));
 		setJevAnswer(jevSafeAnswer());
 		await fire("tool_call", makeEvent("scp target/release/tool otherhost:.local/bin/tool.new"), makeCtx({ sessionId: sid }));
-		expect(metRefusal()).toBe(false);
+		expect(metRefusal("scp target/release/tool otherhost:.local/bin/tool.new")).toBe(false);
 		await fire("tool_call", makeEvent("scp target/release/tool buildhost:.local/bin/other.new"), makeCtx({ sessionId: sid }));
-		expect(metRefusal()).toBe(false);
+		expect(metRefusal("scp target/release/tool buildhost:.local/bin/other.new")).toBe(false);
 	});
 
 	test("an ssh refusal survives a `--` before the remote command", async () => {
@@ -367,7 +370,7 @@ describe("a remote copy's refusal survives a rewrite of the same copy", () => {
 		await fire("tool_call", makeEvent("ssh buildhost 'rm -f ~/.local/bin/tool'"), makeCtx({ sessionId: sid }));
 		setJevAnswer(jevSafeAnswer());
 		await fire("tool_call", makeEvent("ssh buildhost -- 'rm -f ~/.local/bin/tool'"), makeCtx({ sessionId: sid }));
-		expect(metRefusal()).toBe(true);
+		expect(metRefusal("ssh buildhost -- 'rm -f ~/.local/bin/tool'")).toBe(true);
 	});
 
 	test("a program named like an Object.prototype member is still remembered", async () => {
@@ -379,7 +382,7 @@ describe("a remote copy's refusal survives a rewrite of the same copy", () => {
 		setJevAnswer(jevSafeAnswer());
 		// Respelled so the verdict cache misses and the judge sees the state.
 		await fire("tool_call", makeEvent("constructor -d ./prod"), makeCtx({ sessionId: sid }));
-		expect(metRefusal()).toBe(true);
+		expect(metRefusal("constructor -d ./prod")).toBe(true);
 	});
 
 	test("an ssh refusal survives a dropped flag", async () => {
@@ -388,7 +391,7 @@ describe("a remote copy's refusal survives a rewrite of the same copy", () => {
 		await fire("tool_call", makeEvent("ssh -q -o BatchMode=yes buildhost 'mv ~/.local/bin/tool.new ~/.local/bin/tool'"), makeCtx({ sessionId: sid }));
 		setJevAnswer(jevSafeAnswer());
 		await fire("tool_call", makeEvent("ssh buildhost 'mv ~/.local/bin/tool.new ~/.local/bin/tool'"), makeCtx({ sessionId: sid }));
-		expect(metRefusal()).toBe(true);
+		expect(metRefusal("ssh buildhost 'mv ~/.local/bin/tool.new ~/.local/bin/tool'")).toBe(true);
 	});
 });
 
@@ -412,7 +415,7 @@ describe("a wrapper does not change what a refusal covers (https://github.com/ST
 			await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid }));
 			setJevAnswer(jevSafeAnswer());
 			await fire("tool_call", makeEvent(wrapped), makeCtx({ sessionId: sid }));
-			expect(metRefusal()).toBe(true);
+			expect(metRefusal(wrapped)).toBe(true);
 		});
 	}
 
@@ -422,7 +425,7 @@ describe("a wrapper does not change what a refusal covers (https://github.com/ST
 		await fire("tool_call", makeEvent("timeout 30 ssh buildhost 'rm -f ~/tool'"), makeCtx({ sessionId: sid }));
 		setJevAnswer(jevSafeAnswer());
 		await fire("tool_call", makeEvent("ssh buildhost 'rm -f ~/tool'"), makeCtx({ sessionId: sid }));
-		expect(metRefusal()).toBe(true);
+		expect(metRefusal("ssh buildhost 'rm -f ~/tool'")).toBe(true);
 	});
 
 	test("two wrapped commands on different hosts are still two targets", async () => {
@@ -431,7 +434,7 @@ describe("a wrapper does not change what a refusal covers (https://github.com/ST
 		await fire("tool_call", makeEvent("timeout 30 ssh hosta 'ls /tmp'"), makeCtx({ sessionId: sid }));
 		setJevAnswer(jevSafeAnswer());
 		await fire("tool_call", makeEvent("timeout 30 ssh hostb 'ls /tmp'"), makeCtx({ sessionId: sid }));
-		expect(metRefusal()).toBe(false);
+		expect(metRefusal("timeout 30 ssh hostb 'ls /tmp'")).toBe(false);
 	});
 });
 
@@ -453,7 +456,7 @@ describe("an output filter does not change what a refusal covers (https://github
 			await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid }));
 			setJevAnswer(jevSafeAnswer());
 			await fire("tool_call", makeEvent(retried), makeCtx({ sessionId: sid }));
-			expect(metRefusal()).toBe(true);
+			expect(metRefusal(retried)).toBe(true);
 		});
 	}
 
@@ -467,7 +470,7 @@ describe("an output filter does not change what a refusal covers (https://github
 				await fire("tool_call", makeEvent("./update.sh start | tail -60"), makeCtx({ sessionId: sid }));
 				setJevAnswer(jevSafeAnswer());
 				await fire("tool_call", makeEvent(retried), makeCtx({ sessionId: sid }));
-				expect(metRefusal()).toBe(true);
+				expect(metRefusal(retried)).toBe(true);
 			}
 		} finally {
 			process.env.PATH = previous;
@@ -480,7 +483,7 @@ describe("an output filter does not change what a refusal covers (https://github
 		await fire("tool_call", makeEvent("./update.sh start | tail -60"), makeCtx({ sessionId: sid }));
 		setJevAnswer(jevSafeAnswer());
 		await fire("tool_call", makeEvent("./other.sh start | tail -60"), makeCtx({ sessionId: sid }));
-		expect(metRefusal()).toBe(false);
+		expect(metRefusal("./other.sh start | tail -60")).toBe(false);
 	});
 });
 
@@ -506,7 +509,7 @@ describe("inline code is keyed on the code it runs", () => {
 			await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid }));
 			setJevAnswer(jevSafeAnswer());
 			await fire("tool_call", makeEvent(retried), makeCtx({ sessionId: sid }));
-			expect(metRefusal()).toBe(false);
+			expect(metRefusal(retried)).toBe(false);
 		});
 	}
 
@@ -549,7 +552,7 @@ describe("refusal memory under changing words", () => {
 		// that name the target can let one call past it (never-prompts.test.ts).
 		const moved = makeCtx({ sessionId: sid, hasUI: true, branch: [userEntry("actually stop, keep the build")] });
 		await fire("tool_call", makeEvent("rm -rf x"), moved);
-		expect(metRefusal()).toBe(true);
+		expect(metRefusal("rm -rf x")).toBe(true);
 	});
 
 	test("agent-authored context cannot drop a model refusal", async () => {
@@ -562,6 +565,6 @@ describe("refusal memory under changing words", () => {
 		// operatorContext changed the evidence fingerprint and the refusal
 		// stopped applying (https://github.com/STRML/omp-classifier/issues/189).
 		await fire("tool_call", makeEvent("rm -rf x", { operatorContext: "keeping the build, cleaning logs" }), makeCtx({ sessionId: sid }));
-		expect(metRefusal()).toBe(true);
+		expect(metRefusal("rm -rf x")).toBe(true);
 	});
 });
