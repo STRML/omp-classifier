@@ -178,7 +178,26 @@ export function criticalScanText(command: string, shellTrusted = true): string {
 }
 
 export function commandMatchesCriticalPattern(command: string, shellTrusted = true): boolean {
-	return matchesCriticalPattern(criticalScanText(command, shellTrusted));
+	return matchesCriticalPattern(criticalScanText(command, shellTrusted)) || redirectTargetMatches(command);
+}
+
+/**
+ * The shell removes quotes before it opens a redirect target, so
+ * `echo x > "/etc/passwd"` writes the file the unquoted pattern names, but the
+ * raw text puts a quote between `>` and the path. Each file redirect is
+ * rendered as `> <target as the shell reads it>` and scanned on its own. Only
+ * redirect targets are dequoted: an argument such as `echo "rm -rf /"` is data
+ * the shell prints, and dequoting it would turn every quoted mention into a
+ * refusal that never yields. A target with an expansion is left to the raw
+ * scan and the judge, as before.
+ */
+function redirectTargetMatches(command: string): boolean {
+	if (!command.includes(">")) return false;
+	const parsed = parseShell(command);
+	if (!parsed.ok) return false;
+	return parsed.commands.some(entry =>
+		entry.redirects.some(redirect => redirect.direction !== "in" && !redirect.duplicate && !redirect.here && matchesCriticalPattern(`> ${redirect.target.value}`)),
+	);
 }
 
 export interface CriticalScanBody {
