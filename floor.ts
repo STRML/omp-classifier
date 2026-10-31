@@ -270,6 +270,13 @@ function scanSecrets(commands: readonly ShellCommand[], scan: SecretScan): void 
 function commandSecrets(command: ShellCommand, scan: SecretScan): string[] {
 	const currentCwd = command.sourceOffset === undefined ? undefined : scan.cwdAt?.(command.sourceOffset);
 	scan.visited.add(command);
+	// The walk could not say where this command runs (a `cd` to a target that
+	// does not exist yet, a bare name under CDPATH, an expanded target). A glob
+	// or relative path here resolves somewhere the floor cannot check, so the
+	// command asks rather than reading as one with no secret path in it.
+	if (scan.cwdAt !== undefined && currentCwd === null && unresolvedPathWord(command)) {
+		scan.findings.push({ entry: "unread-command", detail: "a glob or relative path runs in a directory the command text cannot pin", source: scan.source });
+	}
 	const tracing = scan.shellTracing || clientTracing(command);
 	const envIndexes = envAssignments(command);
 	for (const assign of command.assigns) capture(assign.name, [...(assign.value ? [assign.value] : []), ...assign.array], tracing, scan);
@@ -546,6 +553,17 @@ function trustedVerb(command: ShellCommand): string {
 
 function clientTracing(command: ShellCommand): boolean {
 	return TRACING_CLIENT_VERB.test(verbName(command)) && command.words.some(word => CLIENT_TRACING.test(word.value));
+}
+
+/** Whether a command names a path whose meaning depends on its working
+ *  directory: a word or redirect target that globs, or a relative path. */
+function unresolvedPathWord(command: ShellCommand): boolean {
+	const relativeOrGlob = (word: ShellWord): boolean => {
+		const value = word.value;
+		if (value === "" || value.startsWith("-") || value.startsWith("/") || value.startsWith("~")) return false;
+		return !word.fixed || value.includes("/") || value.startsWith(".");
+	};
+	return command.words.slice(1).some(relativeOrGlob) || command.redirects.some(redirect => !redirect.here && !redirect.duplicate && relativeOrGlob(redirect.target));
 }
 
 function report(scan: SecretScan, detail: string): void {
