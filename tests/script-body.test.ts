@@ -445,6 +445,38 @@ describe("wrapper option arity", () => {
 		expect(read.refusal?.why).toContain("unknown timeout option");
 		expect(read.bodies).toEqual([]);
 	});
+
+	// `command -v` and `-V` describe how each name resolves and run none of
+	// them, so there is no program to read. The gate refused the lookup as
+	// "command option -v cannot be resolved" (OMP session 01a18e06).
+	test.each([
+		"command -v git",
+		"command -V git",
+		"command -v berth berthd wt 2>/dev/null; echo '---'; ls ~/.claude/commands 2>/dev/null | head -40",
+		"command -p -v python3",
+		"command -pv python3",
+		"command -vp python3 payload.py",
+	])("a lookup runs nothing and reads nothing: %s", command => {
+		writeScript(root, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies(command, root, 8000);
+		expect(read.refusal).toBeNull();
+		expect(read.bodies).toEqual([]);
+	});
+
+	test("a command -v lookup reaches the judge and runs on a SAFE", async () => {
+		expect(await gate("command -v git")).toBe("ALLOWED");
+	});
+
+	test("command without a lookup option still reads the program it runs", async () => {
+		writeScript(root, "payload.py", HARMFUL_CODE);
+		const result = await gate("command -p python3 payload.py");
+		expect(refusalOf(result).why).toContain("flags: python3 runs payload.py");
+	});
+
+	test("an option command does not know keeps the command opaque", () => {
+		const read = readInterpretedScriptBodies("command -x python3 payload.py", root, 8000);
+		expect(read.refusal?.why).toContain("unknown command option");
+	});
 });
 
 describe("heredocs inside shell script bodies", () => {

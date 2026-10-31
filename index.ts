@@ -2403,7 +2403,19 @@ export function evalRiskFlags(code: string): string[] {
 	const flags = new Set<string>();
 	for (const match of code.matchAll(new RegExp(EVAL_CODE_FLAG_RE.source, `${EVAL_CODE_FLAG_RE.flags}g`))) {
 		const end = (match.index ?? 0) + match[0].length;
-		if (/^\s*(=>|=[^=])/u.test(code.slice(end)) || /^\.\w/u.test(code.slice(end))) continue;
+		const after = code.slice(end);
+		// A token being assigned (`rm = ...`, `rm => ...`) or dereferenced
+		// (`rm.stdout`) is a program variable. So is a bare element of an
+		// argument list, tuple or list (`("mxm", rm)`, `f(x, rm)`, `[rm]`):
+		// both neighbours must be value punctuation, `(` `[` or `,` before and
+		// `,` `)` `]` `}` after. In shell text a command word follows a space,
+		// `;`, `|`, `$(` or `{`, so `"(ls | xargs rm)"`, `"echo $(rm)"`,
+		// `{rm,-rf,x}` (brace expansion runs rm) and `${rm}` all stay flagged.
+		// At worst the exemption covers `(rm)` or `(x,rm)` in a shell string,
+		// which run rm with no operand or no command named rm at all.
+		const before = code.slice(0, match.index ?? 0);
+		const listElement = /[([,]\s*$/u.test(before) && /^\s*[,)\]}]/u.test(after);
+		if (/^\s*(=>|=[^=])/u.test(after) || /^\.\w/u.test(after) || listElement) continue;
 		flags.add(match[0]);
 	}
 	return [...flags].sort();
@@ -3558,6 +3570,19 @@ function scanWrapperOptions(wrapper: string, words: string[], start: number): Wr
 	return { next: index, cwdChange };
 }
 
+/** Whether `command`'s leading options include `-v` or `-V`: bash then only
+ *  describes how each name resolves and runs none of them, so the words after
+ *  are names, not a program. Only `-p`, `-v` and `-V` (alone or bundled) count;
+ *  anything else falls through to the wrapper grammar, which fails closed. */
+function isCommandLookup(words: readonly string[], start: number): boolean {
+	for (let index = start; index < words.length; index++) {
+		const word = words[index];
+		if (!/^-[pvV]+$/u.test(word)) return false;
+		if (/[vV]/u.test(word)) return true;
+	}
+	return false;
+}
+
 /**
  * The interpreter a segment's own verb names, with the words after it.
  * Wrappers are parsed from their own option grammars: guessing that any number
@@ -3579,6 +3604,7 @@ function interpreterInvocation(segment: string[]): InterpreterInvocation {
 			continue;
 		}
 		const wrapper = commandBasename(word);
+		if (wrapper === "command" && isCommandLookup(segment, i + 1)) return null;
 		if (WRAPPER_COMMANDS.has(wrapper)) {
 			const options = scanWrapperOptions(wrapper, segment, i + 1);
 			if ("opaque" in options) return options;

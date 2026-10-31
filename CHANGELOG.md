@@ -4,6 +4,17 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### `command -v` and a Python variable named `rm` no longer block
+
+Two false blocks from the decision log, both on words that run nothing.
+
+| Command | Before | After |
+|---|---|---|
+| `command -v git` | `script-body`: "command option -v cannot be resolved" | reaches the judge |
+| eval payload with `("mxm", rm)` and one `subprocess.run(["grep", ...])` | `flagged: rm` on a SAFE | runs on a SAFE |
+
+`command -v` and `-V` describe how each name resolves and run none of them, but the wrapper grammar marked both options `opaque`, so the script-body reader refused the whole line. A lookup (`-v` or `-V` among the leading options, alone or bundled with `-p`) now ends the scan with no program to read. Any other option still goes through the grammar and fails closed. In eval payloads, the moderate-risk token scan already skipped a token being assigned or dereferenced. It now also skips a bare element of an argument list, tuple or list: `(`, `[` or `,` before the token and `,` `)` `]` or `}` after it. In shell text a command word follows a space, `;`, `|`, `$(` or `{`, so `["rm", "-rf", x]`, `"rm -rf x"`, `"(cd x; rm)"`, `"echo $(ls | xargs rm)"`, `{rm,-rf,x}` (brace expansion runs rm) and `${rm}` all still flag.
+
 ### A `$TMPDIR` delete operand is measured with the shell's own TMPDIR
 
 https://github.com/STRML/omp-classifier/issues/176. Once the gate measured delete targets (https://github.com/STRML/omp-classifier/issues/166), every operand with an expansion measured `null`, because the gate could not promise which directory the shell would expand `$TMPDIR` to. `trash "$TMPDIR/omp-run-2/report.json"` therefore reached the judge with no proof it was temp cleanup and asked. The gate now expands a leading `$TMPDIR` or `${TMPDIR}` (bare or double-quoted as a whole word, followed by a plain `/path`) with the value the bash tool's shell will hold, then measures it like any other path: the real path must sit strictly inside a temp root.
