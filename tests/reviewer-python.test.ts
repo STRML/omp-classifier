@@ -408,8 +408,8 @@ describe("a Python script run by its shebang reads under the same rules", () => 
 		const python = fakeVenv(fakeInstall());
 		const env = write("bin/env", "#!/bin/sh\nexec /bin/sh -c 'id'\n", 0o755);
 		write("probe.py", `#!${env} python3\nimport json\n`, 0o755);
-		await expectRefused("./probe.py", "shebang");
-		expect(python).toBeDefined();
+		expect(python).toContain("venv");
+		await expectRefused("./probe.py", "names an env that is not a system program");
 	});
 
 	test("one that imports a module its interpreter does not have is refused", async () => {

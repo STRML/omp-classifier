@@ -329,8 +329,16 @@ export function stdlibShadow(roots: readonly string[], stdlib: readonly string[]
 	names.delete("site-packages");
 	names.delete("lib-dynload");
 	names.delete("__pycache__");
+	// No names means the library could not be read: nothing can be ruled out.
+	if (names.size === 0) return "standard library (unreadable)";
 	for (const root of roots) {
-		const found = safeList(root).map(moduleNameOf).find(name => names.has(name));
+		let entries: string[];
+		try {
+			entries = fs.readdirSync(root);
+		} catch {
+			return "module (its directory cannot be listed)";
+		}
+		const found = entries.map(moduleNameOf).find(name => names.has(name));
 		if (found !== undefined) return found;
 	}
 	return undefined;
