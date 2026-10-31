@@ -137,6 +137,13 @@ describe("anything that executes the same text stays critical", () => {
 		["a verb spelled as a variable", `$G commit -m 'rm -rf /'`],
 		["echo stays scanned", `echo "rm -rf /"`],
 		["a commit inside a substitution", `bash -c "$(git commit -m 'rm -rf /')"`],
+		// The shell removes quotes before it opens a redirect target, so a
+		// quoted target is the same write the unquoted pattern names.
+		["a double-quoted redirect onto /etc/passwd", `echo x > "/etc/passwd"`],
+		["a single-quoted append onto /etc/sudoers", `echo x >> '/etc/sudoers'`],
+		["a partly quoted redirect onto /etc/shadow", `echo x > /etc/"shadow"`],
+		["a quoted redirect onto a disk device", `cat img > "/dev/sda"`],
+		["a >& onto a quoted file, which bash reads as &>", `echo x >& "/etc/passwd"`],
 	])("%s", async (_name, command) => {
 		expect(await layerOf(command)).toBe("critical");
 		expect(modelCalls.length).toBe(0);
