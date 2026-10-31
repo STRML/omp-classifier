@@ -4,6 +4,43 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### Stage 2 reads a Python run whose interpreter it can identify
+
+A venv's `bin/python` is a symlink into a user-owned install (pyenv, Homebrew, uv). Stage 2 only vouched for a program on a root-owned chain, so it took the venv interpreter for a local script, read the binary as its body, and refused with "a binary". The reviewer never saw a `python -c`, a `python - <<'PY'` or a `python x.py`. In the decision log since 2026-10-30, these made up 11 of the reviewer's 21 unread-script skips: 8 "a binary" and 3 here-documents refused as "reads a redirect". A bare `python3` was refused as well ("runs a program the gate does not read").
+
+Stage 2 now admits a third shape: one Python run, after at most one literal `cd X &&` and a bare `timeout <duration>`, optionally piped into an output filter. The program counts as Python when the file it resolves to is named `python`, `python3` or `python3.N`, starts with a Mach-O or ELF header, and is either a system program or the interpreter its venv's `pyvenv.cfg` names as `home`. A script named `python3.12` is read as the script it is. What the reviewer reads depends on the mode:
+
+| Mode | What the reviewer reads |
+|---|---|
+| `-c CODE` | the code, in the command |
+| `-` with a quoted here-document | the here-document body, in the command |
+| `FILE` | the file, read and hashed like a shape-B body |
+| `-m MODULE`, installed | nothing more, like `bun test` |
+
+The gate still refuses code it can see running something it did not read:
+
+- an import of a module in `sys.path[0]` (the script's own directory, or the working directory for `-c` and stdin)
+- a relative import
+- an import of a name missing from the interpreter's standard library and site-packages
+- a spawn: `subprocess`, `os.system`, an `exec*` or `spawn*`
+- `exec`, `eval` or `compile`
+- the import machinery, an edit to `sys.path`, or reflection by name (`getattr`, `__import__`)
+- a module whose job is running a string or file (`runpy`, `timeit`, `pdb`, `code`)
+- unpickling
+
+It also refuses an unquoted here-document, a here-string, stdin from a file, an option outside `-uBEsSIOqbP`, words built at run time, an assignment, and a set `PYTHONPATH` or `PYTHONHOME`. A script run by a Python shebang now gets the same import and hand-off checks. Before this, any such body was shown with no checks at all. No reviewer run in the log had a `.py` program, so this changes no past decision.
+
+| Command (from the log, anonymized) | Before | After |
+|---|---|---|
+| `cd /Users/you/repo && ~/.venv/bin/python -c "import shutil, pathlib; ..."` | refused, "a binary" | reviewed |
+| `cd /Users/you/repo && ~/.venv/bin/python - <<'PY'` (re, pathlib, xml.etree) | refused, "reads a redirect" | reviewed |
+| same, with `sys.path.insert(0, "scripts")` | refused | refused, "sys.path" |
+| `~/.venv/bin/python -m pytest tests/x.py -q \| tail -25` | refused, "a binary" | reviewed |
+| `timeout 2400 ~/.venv/bin/python -m scripts.flow "name" \| tail -40` | refused, "a binary" | refused, "imports the local module scripts" |
+| `python3 -c ...`, `python3` from Homebrew, no venv | refused | refused |
+
+Not covered: a module that the code's imports pull in transitively, shadowed by a file someone planted in `sys.path[0]` (the same class as a planted binary, judged when it is written), a `.pth` file in site-packages, the local code an installed `-m` runner loads (pytest's `conftest.py`), and a copy of another binary saved as `python3.12` in a venv.
+
 ### `command -v` and a Python variable named `rm` no longer block
 
 Two false blocks from the decision log, both on words that run nothing.
