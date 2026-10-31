@@ -558,10 +558,15 @@ function clientTracing(command: ShellCommand): boolean {
 /** Whether a command names a path whose meaning depends on its working
  *  directory: a word or redirect target that globs, or a relative path. */
 function unresolvedPathWord(command: ShellCommand): boolean {
+	// Every operand counts except an absolute path, a home path written out in
+	// full, and a plain option flag: a bare `id_rsa` or `credentials` is a
+	// relative path too.
 	const relativeOrGlob = (word: ShellWord): boolean => {
 		const value = word.value;
-		if (value === "" || value.startsWith("-") || value.startsWith("/") || value.startsWith("~")) return false;
-		return !word.fixed || value.includes("/") || value.startsWith(".");
+		if (value === "" || /^-{1,2}[A-Za-z0-9][A-Za-z0-9-]*$/u.test(value)) return false;
+		if (value.startsWith("/")) return !word.fixed;
+		if (value.startsWith("~")) return !word.fixed;
+		return true;
 	};
 	return command.words.slice(1).some(relativeOrGlob) || command.redirects.some(redirect => !redirect.here && !redirect.duplicate && relativeOrGlob(redirect.target));
 }

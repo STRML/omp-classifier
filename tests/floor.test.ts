@@ -516,7 +516,10 @@ describe("the floor reads the parser's view (plan 2026-09-22-real-shell-parser.m
 			// so it asks; a command with no such path does not.
 			expect(evaluateFloor({ command: "cd not-there-yet && cat .e*", cwd }).asks).toBe(true);
 			expect(evaluateFloor({ command: "cd not-there-yet && cat ./notes", cwd }).asks).toBe(true);
-			expect(evaluateFloor({ command: "cd not-there-yet && echo hi", cwd }).asks).toBe(false);
+			expect(evaluateFloor({ command: "cd not-there-yet && cat credentials", cwd }).asks).toBe(true);
+			expect(evaluateFloor({ command: "cd not-there-yet && cat ~/{a,b}", cwd }).asks).toBe(true);
+			expect(evaluateFloor({ command: "cd not-there-yet && ls -la /etc", cwd }).asks).toBe(false);
+			expect(evaluateFloor({ command: "cd not-there-yet && true", cwd }).asks).toBe(false);
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
