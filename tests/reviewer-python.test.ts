@@ -635,6 +635,13 @@ describe("startup code the interpreter runs before the body stays refused", () =
 		write(rel, content);
 		await expectReviewed(`${python} -c "import json"`);
 	});
+
+	test("a sitecustomize elsewhere under the venv root but outside its site-packages is still read", async () => {
+		const python = fakeVenv(fakeInstall(), "venv", undefined, true);
+		write("base/lib/python3.12/site-packages/sitecustomize.py", "import os\n");
+		write("venv/lib/python3.12/site-packages/ok.pth", "import os\n");
+		await expectRefused(`${python} -c "import json"`, "sitecustomize.py runs at interpreter startup");
+	});
 });
 
 

@@ -470,7 +470,12 @@ export function startupRefusal(libs: readonly string[], venv: { root: string; sy
 	// 2026-10-31: "Trust user site-packages"): its .pth files and
 	// sitecustomize are the user's installed tooling. The base install's and
 	// the user site's directories outside the venv are still read.
-	const inVenv = (dir: string): boolean => venv !== undefined && (dir === venv.root || dir.startsWith(`${venv.root}${path.sep}`));
+	// Only the venv's exact site-packages, and only for a venv whose root is
+	// neither the home directory nor an ancestor of the base install: a
+	// pyvenv.cfg in either would otherwise exempt the user site or the stdlib.
+	const base = path.dirname(path.dirname(real));
+	const venvSite = venv !== undefined && version !== undefined && venv.root !== os.homedir() && base !== venv.root && !base.startsWith(`${venv.root}${path.sep}`) ? path.join(venv.root, "lib", `python${version}`, "site-packages") : undefined;
+	const inVenv = (dir: string): boolean => venvSite !== undefined && dir === venvSite;
 	for (const dir of [...libs, ...sites].filter(dir => !inVenv(dir))) {
 		const custom = safeList(dir).find(entry => CUSTOMIZE.test(entry));
 		if (custom !== undefined) return `${path.join(dir, custom)} runs at interpreter startup, unread`;
