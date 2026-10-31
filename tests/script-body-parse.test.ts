@@ -177,6 +177,11 @@ describe("a verb the shell expands is not an interpreter the reader can name", (
 		["a variable interpreter with an extensionless file operand", "$PY payload"],
 		["a variable interpreter with an expanded operand", "$PY $SCRIPT"],
 		["a variable interpreter with a directory operand", "$PY pkgdir"],
+		["a variable verb reading a redirected file", "$X < p.py"],
+		["a variable verb reading a here-string", "$X <<< \"$code\""],
+		["a variable verb reading a heredoc", "$X <<'EOF'\nimport os\nEOF"],
+		["a variable verb fed by a pipe", "cat p.py | $X"],
+		["a variable verb reading stdin by -", "$X -"],
 	])("%s refuses", async (_name, command) => {
 		write(path.join(start, "payload"), HARMFUL);
 		write(path.join(start, "pkgdir", "__main__.py"), HARMFUL);
@@ -188,7 +193,7 @@ describe("a verb the shell expands is not an interpreter the reader can name", (
 	});
 
 	test.each([
-		["an editor variable", "$EDITOR notes.txt"],
+		["an editor variable with nothing to open", "$EDITOR"],
 		["all arguments as the command", '"$@"'],
 	])("%s with no script to run stays open", async (_name, command) => {
 		expect(await gate(command)).toBe("ALLOWED");

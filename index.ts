@@ -4218,35 +4218,17 @@ const ALIAS_DEFINITION = (command: ShellCommand): boolean =>
  * the verb before it runs it, so it may be an interpreter running a script, or
  * a `cd` moving the shell under every program after it.
  *
- * A brace or glob verb (`pyth{on3,}`, `{cd,dir}`) is never an ordinary command
- * and always refuses: the expansion can even turn the verb's own pieces into
- * the program operand (`pyth{on3,} p` runs `python3 python p`). A variable or
- * substituted verb refuses when it matters: a program runs after it, or one of
- * its operands could be a script (script-shaped, an existing file in the
- * directory it runs in, or itself expanded). `"$@"` and `$EDITOR` with nothing
- * to open stay open. An alias definition makes every later word a verb the
- * reader cannot name, in the same way.
+ * A brace or glob verb (`pyth{on3,}`, `{cd,dir}`) always refuses. A variable
+ * or substituted verb refuses whenever it could be handed code: any operand
+ * (a script, `-`, a directory), any input redirect (`< p.py`, a here-string, a
+ * heredoc), or a pipe into its stdin (`cat p.py | $X`). It also refuses when
+ * the command runs any program at all, because source position is not
+ * execution order: `$X` can call a function or a `cd`. Only a bare `"$@"` or
+ * `$EDITOR` with nothing to read stays open. An alias definition makes every
+ * later word a verb the reader cannot name, in the same way.
  */
-function expandedVerbRefusal(commands: readonly ShellCommand[], programAt: readonly number[], cwdAt: (offset: number) => string | null): string | null {
-	// Source position is not execution order: a function body, or a word the
-	// shell expands into a function call, runs a program wherever it is
-	// called. So any program anywhere in the command counts.
+function expandedVerbRefusal(commands: readonly ShellCommand[], programAt: readonly number[]): string | null {
 	const programAnywhere = programAt.length > 0;
-	const mayBeScript = (word: ShellWord, offset: number): boolean => {
-		if (word.value.startsWith("-")) return false;
-		if (!word.literal || scriptShapedWord(word.value)) return true;
-		const dir = cwdAt(offset);
-		if (dir === null) return true;
-		// Anything that exists may be a program: a directory too (python runs
-		// its `__main__.py`). Only a word that names nothing is passed over;
-		// a word the gate cannot even stat is not one it may clear.
-		try {
-			fs.statSync(resolveToCwd(word.value, dir));
-			return true;
-		} catch (err) {
-			return (err as NodeJS.ErrnoException).code !== "ENOENT";
-		}
-	};
 	for (const command of commands) {
 		const offset = command.sourceOffset ?? 0;
 		if (ALIAS_DEFINITION(command)) {
@@ -4258,7 +4240,11 @@ function expandedVerbRefusal(commands: readonly ShellCommand[], programAt: reado
 		const verb = expandedVerb(command);
 		if (verb === null) continue;
 		const index = command.words.indexOf(verb);
-		if (verb.literal || programAnywhere || command.words.slice(index + 1).some(word => mayBeScript(word, offset))) {
+		const fedInput =
+			command.words.length > index + 1 ||
+			command.join === "pipe" ||
+			command.redirects.some(redirect => redirect.direction !== "out");
+		if (verb.literal || programAnywhere || fedInput) {
 			return `script body blocked: the shell expands the command name ${verb.source}, so the classifier cannot tell which program it runs or where it leaves the shell`;
 		}
 	}
@@ -4420,7 +4406,7 @@ export function readInterpretedScriptBodies(command: string, cwd: string, limit:
 		if (found.refs.length > 0) parsedRefs.push({ command: parsedCommand, ...found });
 	}
 	const cwdAt = walkTrusted ? segmentCwdLookup(masked, cwd, resolveToCwd) : () => null;
-	const expanded = expandedVerbRefusal(parsed.commands, parsedRefs.map(entry => entry.command.sourceOffset ?? 0), cwdAt);
+	const expanded = expandedVerbRefusal(parsed.commands, parsedRefs.map(entry => entry.command.sourceOffset ?? 0));
 	if (expanded !== null) return { text, bodies, refusal: { why: expanded } };
 	// A function definition can shadow any verb, `cd` and the interpreter
 	// included, and its body runs wherever it is called, so neither the walk

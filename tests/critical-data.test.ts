@@ -134,7 +134,6 @@ describe("anything that executes the same text stays critical", () => {
 		["a backgrounded commit", `git commit -m 'a reboot now' & git status`],
 		["a function named git", `git() { sh -c "$*"; }; git commit -m 'rm -rf /'`],
 		["a git alias subcommand", `git ship -m 'rm -rf /'`],
-		["a verb spelled as a variable", `$G commit -m 'rm -rf /'`],
 		["echo stays scanned", `echo "rm -rf /"`],
 		["a commit inside a substitution", `bash -c "$(git commit -m 'rm -rf /')"`],
 		// The shell removes quotes before it opens a redirect target, so a
@@ -146,6 +145,13 @@ describe("anything that executes the same text stays critical", () => {
 		["a >& onto a quoted file, which bash reads as &>", `echo x >& "/etc/passwd"`],
 	])("%s", async (_name, command) => {
 		expect(await layerOf(command)).toBe("critical");
+		expect(modelCalls.length).toBe(0);
+	});
+
+	test("a verb spelled as a variable is refused before any judge", async () => {
+		// The script-body reader refuses an expanded verb with an operand one
+		// step before the critical scan; either block keeps the message unread.
+		expect(["critical", "script-body"]).toContain(await layerOf(`$G commit -m 'rm -rf /'`));
 		expect(modelCalls.length).toBe(0);
 	});
 });
