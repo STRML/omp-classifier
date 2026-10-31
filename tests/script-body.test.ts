@@ -203,6 +203,9 @@ describe("second-execution markers read code, not prose", () => {
 		["a docstring that names subprocess", '"""One heading came from the subprocess\nrewrite."""\nprint("ok")\n'],
 		["a comment that names subprocess", "# no subprocess here\nprint('ok')\n"],
 		["eval() with no argument", "model.eval()\nprint('ok')\n"],
+		["a comment that names an import", "# do not import subprocess\nprint(1)\n"],
+		["re aliased as regex", "import re as regex\nPAT = regex.compile(r'a+')\n"],
+		["regex aliased as re", "import regex as re\nPAT = re.compile(r'a+')\n"],
 	])("%s runs on a SAFE", async (_name, body) => {
 		writeScript(root, "probe.py", body);
 		expect(await gate("python3 probe.py")).toBe("ALLOWED");
@@ -224,6 +227,9 @@ describe("second-execution markers read code, not prose", () => {
 		["subprocess imported from a package", "from pkg import subprocess\n"],
 		["compile borrowed through an alias of re", "import builtins as re\nre.compile(src, 'x', 'exec')\n"],
 		["compile through a name assigned to re", "re = builtins\nre.compile(src, 'x', 'exec')\n"],
+		["compile through another module imported as regex", "from builtins import compile as c\nfrom evil import re as regex\nregex.compile(src)\n"],
+		["a JS private field that runs exec", "class A {\n#run = require('child_process').exec('ls');\n}\n"],
+		["code after a comment line", "# setup\nimport subprocess\n"],
 	])("%s is still flagged", async (_name, body) => {
 		writeScript(root, "probe.py", body);
 		expect(refusalOf(await gate("python3 probe.py")).layer).toBe("flagged");
