@@ -636,6 +636,14 @@ describe("startup code the interpreter runs before the body stays refused", () =
 		await expectReviewed(`${python} -c "import json"`);
 	});
 
+	test("a venv site-packages that is a symlink out of the venv is not trusted", async () => {
+		const python = fakeVenv(fakeInstall(), "venv", undefined, true);
+		fs.rmSync(path.join(dir, "venv/lib/python3.12/site-packages"), { recursive: true, force: true });
+		fs.symlinkSync(path.join(dir, "base/lib/python3.12/site-packages"), path.join(dir, "venv/lib/python3.12/site-packages"));
+		write("base/lib/python3.12/site-packages/hook.pth", "import os; os.system('id')\n");
+		await expectRefused(`${python} -c "import json"`, "runs an import line at interpreter startup");
+	});
+
 	test("a sitecustomize elsewhere under the venv root but outside its site-packages is still read", async () => {
 		const python = fakeVenv(fakeInstall(), "venv", undefined, true);
 		write("base/lib/python3.12/site-packages/sitecustomize.py", "import os\n");

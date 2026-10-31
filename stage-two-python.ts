@@ -475,7 +475,20 @@ export function startupRefusal(libs: readonly string[], venv: { root: string; sy
 	// pyvenv.cfg in either would otherwise exempt the user site or the stdlib.
 	const base = path.dirname(path.dirname(real));
 	const venvSite = venv !== undefined && version !== undefined && venv.root !== os.homedir() && base !== venv.root && !base.startsWith(`${venv.root}${path.sep}`) ? path.join(venv.root, "lib", `python${version}`, "site-packages") : undefined;
-	const inVenv = (dir: string): boolean => venvSite !== undefined && dir === venvSite;
+	// Compared by real path, and only while the site-packages really sits
+	// inside the venv root: a symlink to the base install's or the user
+	// site's directory is not the venv's own.
+	const resolved = (dir: string): string | undefined => {
+		try {
+			return fs.realpathSync(dir);
+		} catch {
+			return undefined;
+		}
+	};
+	const realRoot = venv === undefined ? undefined : resolved(venv.root);
+	const realSite = venvSite === undefined ? undefined : resolved(venvSite);
+	const ownSite = realRoot !== undefined && realSite !== undefined && realSite.startsWith(`${realRoot}${path.sep}`) ? realSite : undefined;
+	const inVenv = (dir: string): boolean => ownSite !== undefined && resolved(dir) === ownSite;
 	for (const dir of [...libs, ...sites].filter(dir => !inVenv(dir))) {
 		const custom = safeList(dir).find(entry => CUSTOMIZE.test(entry));
 		if (custom !== undefined) return `${path.join(dir, custom)} runs at interpreter startup, unread`;
