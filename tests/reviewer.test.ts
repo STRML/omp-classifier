@@ -239,6 +239,35 @@ describe("which commands stage 2 can vouch for", () => {
 	});
 });
 
+describe("a session whose shell an earlier call may have changed", () => {
+	// The host keeps one shell per session, so `export PATH=...` in one call
+	// changes what a bare name resolves to in the next. Stage 2 resolves names
+	// against the gate's own environment, which that export never touched.
+	test.each(["export PATH=/tmp/evil:$PATH", "a=PA; b=TH; export \"$a$b=/tmp/evil\"", "alias git=/tmp/evil"])("after %s, a later script is not reviewed", async earlier => {
+		const session = nextSession();
+		const branch = [user("u1", "update fork main")];
+		scriptReviewer(reviewerReply("block"));
+		await fire("tool_call", makeEvent(earlier), uiCtx(session, branch));
+		script("update.sh", "#!/bin/bash\ngit fetch origin\n");
+		scriptReviewer(reviewerReply("allow", "update fork main"));
+		const before = reviewerCalls.length;
+		const result = await fire("tool_call", makeEvent("./update.sh start"), uiCtx(session, branch));
+		expect(refusalOf(result).layer).toBe("unsure");
+		expect(reviewerCalls).toHaveLength(before);
+		expect(reviewerAudit()).toMatchObject({ skipped: expect.stringContaining("shell") });
+	});
+
+	test("a session that never touched its shell still reaches the reviewer", async () => {
+		const session = nextSession();
+		const branch = [user("u1", "update fork main")];
+		scriptReviewer(reviewerReply("block"));
+		await fire("tool_call", makeEvent("git status"), uiCtx(session, branch));
+		script("update.sh", "#!/bin/bash\ngit fetch origin\n");
+		scriptReviewer(reviewerReply("allow", "update fork main"));
+		expect(resultText(await fire("tool_call", makeEvent("./update.sh start"), uiCtx(session, branch)))).toBe("ALLOWED");
+	});
+});
+
 describe("an UNSURE the user asked for", () => {
 	test("the reviewer allows it, quoting the user's words, and it runs", async () => {
 		script("update.sh", "#!/bin/bash\ncase \"$1\" in start) git fetch origin ;; esac\n");
@@ -525,6 +554,16 @@ describe("what never reaches the reviewer", () => {
 		["a script that hands a relative program to xargs", () => script("wrap.sh", "#!/bin/bash\necho a | xargs lib/real.sh\n"), "./wrap.sh"],
 		["a script written by a process substitution before it runs", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "cat <(printf x > gen.sh) && ./gen.sh"],
 		["a script written by an assignment's substitution", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "X=\"$(printf x > gen.sh)\" ./gen.sh"],
+		// A variable's name built at run time can be PATH: no text names it.
+		["a script that exports a name it builds at run time", () => script("wrap.sh", "#!/bin/bash\na=PA; b=TH\nexport \"$a$b=/tmp/evil:/usr/bin\"\ngit status\n"), "./wrap.sh"],
+		["a script that declares a name it builds at run time", () => script("wrap.sh", "#!/bin/bash\nn=PATH\ndeclare -x \"$n=/tmp/evil\"\ngit status\n"), "./wrap.sh"],
+		["a script that reads into a name it builds at run time", () => script("wrap.sh", "#!/bin/bash\nn=PATH\nread -r \"$n\" < /tmp/p\ngit status\n"), "./wrap.sh"],
+		["a script that printf -v's a name it builds at run time", () => script("wrap.sh", "#!/bin/bash\nn=PATH\nprintf -v \"$n\" %s /tmp/evil\ngit status\n"), "./wrap.sh"],
+		// Arithmetic evaluates a variable's value as an expression, so
+		// `w='PATH=1'; (( w ))` assigns PATH without the text naming it.
+		["a script whose arithmetic evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\n(( w ))\ngit status\n"), "./wrap.sh"],
+		["a script whose let evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\nlet w\ngit status\n"), "./wrap.sh"],
+		["a script whose [[ ]] compares a variable as a number", () => script("wrap.sh", "#!/bin/bash\nw=x\n[[ $w -eq 1 ]]\ngit status\n"), "./wrap.sh"],
 		[
 			"a symlink to a secret file",
 			() => {

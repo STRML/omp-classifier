@@ -5292,6 +5292,13 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	const transcript = readTranscript();
 	const userWords = transcript.flatMap(entry => (entry.from === "user" ? [entry.text] : entry.from === "ask" ? [entry.userAnswer] : []));
 	if (userWords.length === 0) return skip("no user words");
+	// Stage 2 resolves bare names and reads PYTHON* against the gate's own
+	// environment. The host runs every call of a session in one shell, so once
+	// a call may have changed that shell (an export, an alias, a function, an
+	// .envrc the host loads), the names the reviewer is shown can resolve
+	// elsewhere. The same latch that stops the TMPDIR read (#176) applies.
+	const shellSession = sessionIdOf(ctx);
+	if (shellSession === undefined || shellEnvTouched.has(shellSession) || shellPrefixSet(process.env)) return skip("the session's shell may resolve names differently than the gate");
 	const programs = scriptsForReview(command, input.startCwd);
 	if (programs.kind === "refuse") return skip(`unread script: ${programs.why}`);
 	const scripts = programs.scripts;

@@ -224,6 +224,7 @@ function bodyHandOff(body: string, real: string): string | undefined {
 	// `$PATH` or `${PATH}` is fine.
 	if (/(?<![$\w{])(?:PATH|BASH_ENV|ENV|CDPATH)\b|\$\{(?:PATH|BASH_ENV|ENV|CDPATH):?=/u.test(code)) return "changes PATH or what a shell loads";
 	if (shebang !== "" && !/\b(?:ba|z|da|k)?sh\b/u.test(shebang)) return undefined;
+	if (comparesNamesAsNumbers(code)) return "a numeric comparison evaluates a variable, which can assign any name";
 	const parsed = parseShell(body);
 	if (!parsed.ok) return "its shell body could not be parsed";
 	for (const command of parsed.commands) {
@@ -231,6 +232,8 @@ function bodyHandOff(body: string, real: string): string | undefined {
 		const program = command.words[0]?.value ?? "";
 		const name = verbName(command);
 		const names = programNames(command);
+		const hidden = writesHiddenName(command);
+		if (hidden !== undefined) return hidden;
 		if (isPathWord(program) && !isSystemProgram(program)) return `runs ${program}`;
 		if (program !== "" && !isPathWord(program) && pathHasRelativeEntry()) return "PATH has an empty or relative entry";
 		// An interpreter or `source` in a body runs code this read did not cover,
@@ -243,6 +246,37 @@ function bodyHandOff(body: string, real: string): string | undefined {
 		if (names.some(n => PROGRAM_FILE_FLAG_TOOLS.has(n)) && command.words.some(word => /^(?:-f|--from-file|--file)(?:=|$)/u.test(word.value))) return `${name} runs a program file`;
 		if (names.some(n => FILE_RUNNERS.has(n) && runnerRunsFile(n, command.words))) return `${name} runs a program file`;
 	}
+	return undefined;
+}
+
+/** Builtins that write a variable named by one of their words. */
+const VARIABLE_WRITERS = new Set(["export", "declare", "typeset", "local", "readonly", "read", "mapfile", "readarray", "unset", "getopts", "printf"]);
+/** A `[[ ]]` numeric comparison evaluates both operands as arithmetic, so a
+ *  name or expansion there can assign any variable. The parser does not keep
+ *  the operator, so this reads the body text: any `[[ ]]` with a numeric
+ *  operator whose operands are not both plain integers. `[` does not evaluate
+ *  its operands, so it is not this. */
+const NUMERIC_TEST = /\[\[[^\n]*?\s-(?:eq|ne|lt|le|gt|ge)\s[^\n]*?\]\]/gu;
+const PLAIN_NUMERIC_TEST = /^\[\[\s*-?\d+\s+-(?:eq|ne|lt|le|gt|ge)\s+-?\d+\s*\]\]$/u;
+const comparesNamesAsNumbers = (code: string): boolean => [...code.matchAll(NUMERIC_TEST)].some(match => !PLAIN_NUMERIC_TEST.test(match[0]));
+
+/**
+ * Why a body command may assign a variable whose name its text never spells,
+ * or undefined. The PATH check reads names as text, so a name the shell builds
+ * at run time slips past it: `export "$a$b=/x"` with `a=PA b=TH`. Arithmetic
+ * goes further: `(( w ))`, `let w` and `[[ $w -eq 1 ]]` evaluate the value of
+ * `w` as an expression, and a value of `PATH=1` assigns PATH. Both fail
+ * closed here: a variable writer with any word built at run time, and any
+ * arithmetic that reads a name or an expansion.
+ */
+function writesHiddenName(command: ShellCommand): string | undefined {
+	const verb = command.words[0];
+	if (verb !== undefined && VARIABLE_WRITERS.has(verb.value) && command.words.slice(1).some(word => !word.literal)) {
+		return `${verb.value} writes a variable whose name is built at run time`;
+	}
+	const operands = command.words.slice(1);
+	const readsName = (word: ShellWord): boolean => !word.literal || /[A-Za-z_]/u.test(word.value);
+	if (command.expression === "arithmetic" && operands.some(readsName)) return "arithmetic evaluates a variable, which can assign any name";
 	return undefined;
 }
 
