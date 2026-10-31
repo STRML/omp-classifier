@@ -2194,10 +2194,15 @@ const PROSE_COMMENT = /^#[\w\s.,:!?-]*$/u;
 const PYTHON_VERB = /^python[\d.]*$/u;
 const SHELL_VERB = /^(?:ba|z|da|k)?sh$/u;
 
+/** An interpreter named inside a shell script: a quoted string handed to it is
+ *  that language's code, so the script's comments fall back to the prose rule. */
+const NAMES_OTHER_INTERPRETER = /\b(?:node|nodejs|deno|bun|perl|php|ruby|python[\d.]*|lua|awk|gawk|osascript|tclsh|Rscript|julia)\b/u;
+
 function commentRule(verb: string, text: string): CommentRule {
 	const name = commandBasename(verb);
 	if (PYTHON_VERB.test(name)) return "any";
-	return SHELL_VERB.test(name) && !text.includes("<<") ? "any" : "prose";
+	if (!SHELL_VERB.test(name) || text.includes("<<")) return "prose";
+	return NAMES_OTHER_INTERPRETER.test(text) ? "prose" : "any";
 }
 
 /** Whether the backslashes right before `at` escape it: an odd run does. */
@@ -2207,38 +2212,51 @@ function escapedAt(line: string, at: number): boolean {
 	return run % 2 === 1;
 }
 
-/** `line` without a trailing `#` comment, when cutting it cannot hide code: the
- *  `#` sits outside quotes at the start or after unescaped whitespace and is
- *  followed by whitespace or the line end (a JS private field `#run` is code),
- *  the line does not end in `\` (that would join the next line before the
- *  cut), the comment holds no quote (it could close a multi-line string), and
- *  under the prose rule it is prose. Any doubt keeps the line whole: it can
- *  only flag. */
-function trailingCommentCut(line: string, rule: CommentRule): string {
-	if (line.endsWith("\\")) return line;
+/** Whether a `#` at `at` can open a comment: at the line start or after
+ *  unescaped whitespace, and followed by whitespace or the line end (a JS
+ *  private field `#run` is code). */
+function opensComment(line: string, at: number): boolean {
+	if (at > 0 && !(/\s/u.test(line[at - 1]) && !escapedAt(line, at - 1))) return false;
+	return /^#(?:\s|$)/u.test(line.slice(at));
+}
+
+/** `lines` with each trailing `#` comment cut where cutting cannot hide code.
+ *  Quote state carries across lines from the top of the text, so a `#` inside
+ *  a string that spans lines (an f-string's `{exec(x)}`, a shell `$(...)`) is
+ *  never a comment, and under the `any` rule a quote inside a comment that sits
+ *  outside every string is just text. A backslash escapes the next character
+ *  in or out of quotes. A line ending in `\` is never cut (it joins the next
+ *  line first), and under the prose rule only a prose comment is cut. Any
+ *  doubt keeps the line whole: it can only flag. */
+function cutTrailingComments(lines: readonly string[], rule: CommentRule): string[] {
 	let quote = "";
-	for (let at = 0; at < line.length; at += 1) {
-		const ch = line[at];
-		if (quote !== "") {
-			if (ch === "\\") at += 1;
-			else if (ch === quote) quote = "";
-			continue;
-		}
-		if (ch === "'" || ch === '"' || ch === "`") quote = ch;
-		else if (ch === "#" && (at === 0 || (/\s/u.test(line[at - 1]) && !escapedAt(line, at - 1))) && /^#(?:\s|$)/u.test(line.slice(at))) {
-			const comment = line.slice(at);
-			const cuttable = rule === "any" ? !/['"`]/u.test(comment) : PROSE_COMMENT.test(comment);
+	return lines.map(line => {
+		for (let at = 0; at < line.length; at += 1) {
+			const ch = line[at];
+			if (ch === "\\") {
+				at += 1;
+				continue;
+			}
+			if (quote !== "") {
+				if (ch === quote) quote = "";
+				continue;
+			}
+			if (ch === "'" || ch === '"' || ch === "`") {
+				quote = ch;
+				continue;
+			}
+			if (ch !== "#" || !opensComment(line, at)) continue;
+			const cuttable = !line.endsWith("\\") && (rule === "any" || PROSE_COMMENT.test(line.slice(at)));
 			return cuttable ? line.slice(0, at) : line;
 		}
-	}
-	return line;
+		return line;
+	});
 }
 
 /** The text every marker reads: trailing comments cut where that is safe for
  *  `verb`, then `\` continuations joined. */
 function markerText(text: string, verb: string): string {
-	const rule = commentRule(verb, text);
-	const code = NO_COMMENT_CUT.test(text) ? text : text.split("\n").map(line => trailingCommentCut(line, rule)).join("\n");
+	const code = NO_COMMENT_CUT.test(text) ? text : cutTrailingComments(text.split("\n"), commentRule(verb, text)).join("\n");
 	return code.replace(/\\\r?\n/gu, " ");
 }
 /** `compile(` as a builtin. `re.compile(` and `regex.compile(` are exempt only

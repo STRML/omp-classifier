@@ -206,6 +206,8 @@ describe("second-execution markers read code, not prose", () => {
 		["a trailing comment that names an import", "print(1) # do not import subprocess\n"],
 		["a comment that names a marker", "# decode base64 input\nprint(1)\n"],
 		["a Python comment with punctuation that names a marker", "# base64 encoding (RFC 4648)\nprint(1)\n"],
+		["a Python comment with an apostrophe that names a marker", "# don't use base64\nprint(1)\n"],
+		["a Python comment that holds quotes and names an import", "x = 1 # it's fine'; import subprocess\n"],
 		["a comment line that names an import", "# do not import subprocess\nprint(1)\n"],
 		["re aliased as regex inside an import list", "import os, re as regex\nPAT = regex.compile(r'a+')\n"],
 		["re aliased as regex", "import re as regex\nPAT = regex.compile(r'a+')\n"],
@@ -236,7 +238,6 @@ describe("second-execution markers read code, not prose", () => {
 		["code after a comment line", "# setup\nimport subprocess\n"],
 		// Comments scan as code: PHP ends a `#` comment at `?>`.
 		["an import after a comment that closes a multi-line string", 's = """\nend # """; import subprocess\n'],
-		["an import after a quote inside a comment", "x = 1 # it's fine'; import subprocess\n"],
 		["an import behind a comment under a utf-7 coding", "# -*- coding: utf-7 -*-\nx = 1 # +AAo-import subprocess\n"],
 		["an import under a #-prefixed name", "x = 1;#import subprocess\n"],
 		["a dotted module aliased as regex", "import evil.re as regex\nregex.compile(src)\n"],
@@ -265,6 +266,11 @@ describe("second-execution markers read code, not prose", () => {
 		["a PHP comment that closes the tag", "probe.php", "php", "<?php\n# note ?> <?php exec($cmd);\n"],
 		["a shell heredoc handing a PHP comment to php", "probe.sh", "bash", "php <<'EOF'\n<?php\n# note ?> <?php exec($cmd);\nEOF\n"],
 		["a shell comment after an escaped space", "probe.sh", "bash", "echo a\\ # b; python3 -c 'exec(x)'\n"],
+		["JS code in a shell string that spans lines", "probe.sh", "bash", "node -e \"\nconst r = / # /; require(String.fromCharCode(99)).exec(x)\n\"\n"],
+		["a # inside a multi-line shell string", "probe.sh", "bash", "x=\"\n # ; eval(y)\n\"\n"],
+		["a # inside a multi-line Python f-string", "probe.py", "python3", "payload = input()\nprint(f\"\"\"\n# {exec(payload)}\n\"\"\")\n"],
+		["a # inside a multi-line shell string holding a substitution", "probe.sh", "bash", "x=\"\n# $(base64 -d /dev/null)\n\"\n"],
+		["a # after an escaped quote in a Python string", "probe.py", "python3", "s = \"a \\\" # \"; exec(p)\n"],
 	])("%s is still refused", async (_name, file, verb, body) => {
 		writeScript(root, file, body);
 		// A heredoc handed to an interpreter is refused before the marker scan
