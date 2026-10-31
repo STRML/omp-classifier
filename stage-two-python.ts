@@ -473,11 +473,6 @@ export function startupRefusal(libs: readonly string[], venv: { root: string; sy
 	// Only the venv's exact site-packages, and only for a venv whose root is
 	// neither the home directory nor an ancestor of the base install: a
 	// pyvenv.cfg in either would otherwise exempt the user site or the stdlib.
-	const base = path.dirname(path.dirname(real));
-	const venvSite = venv !== undefined && version !== undefined && venv.root !== os.homedir() && base !== venv.root && !base.startsWith(`${venv.root}${path.sep}`) ? path.join(venv.root, "lib", `python${version}`, "site-packages") : undefined;
-	// Compared by real path, and only while the site-packages really sits
-	// inside the venv root: a symlink to the base install's or the user
-	// site's directory is not the venv's own.
 	const resolved = (dir: string): string | undefined => {
 		try {
 			return fs.realpathSync(dir);
@@ -485,8 +480,13 @@ export function startupRefusal(libs: readonly string[], venv: { root: string; sy
 			return undefined;
 		}
 	};
+	// Every comparison is by real path: a guard that compared the path as
+	// spelled would miss a venv root that is a symlink to the base install.
 	const realRoot = venv === undefined ? undefined : resolved(venv.root);
-	const realSite = venvSite === undefined ? undefined : resolved(venvSite);
+	const realBase = resolved(path.dirname(path.dirname(real)));
+	const realHome = resolved(os.homedir());
+	const rootAllowed = realRoot !== undefined && realBase !== undefined && realRoot !== realHome && realBase !== realRoot && !realBase.startsWith(`${realRoot}${path.sep}`);
+	const realSite = rootAllowed && venv !== undefined && version !== undefined ? resolved(path.join(venv.root, "lib", `python${version}`, "site-packages")) : undefined;
 	const ownSite = realRoot !== undefined && realSite !== undefined && realSite.startsWith(`${realRoot}${path.sep}`) ? realSite : undefined;
 	const inVenv = (dir: string): boolean => ownSite !== undefined && resolved(dir) === ownSite;
 	for (const dir of [...libs, ...sites].filter(dir => !inVenv(dir))) {

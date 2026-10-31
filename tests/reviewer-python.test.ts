@@ -644,6 +644,15 @@ describe("startup code the interpreter runs before the body stays refused", () =
 		await expectRefused(`${python} -c "import json"`, "runs an import line at interpreter startup");
 	});
 
+	test("a venv root that is a symlink to the base install is not trusted", async () => {
+		const base = fakeInstall();
+		const install = path.dirname(path.dirname(base));
+		write("base/pyvenv.cfg", `home = ${path.dirname(base)}\ninclude-system-site-packages = false\nversion = 3.12.2\n`);
+		fs.symlinkSync(install, path.join(dir, "link"));
+		write("base/lib/python3.12/site-packages/hook.pth", "import os; os.system('id')\n");
+		await expectRefused(`${path.join(dir, "link", "bin", "python3.12")} -c "import json"`, "runs an import line at interpreter startup");
+	});
+
 	test("a sitecustomize elsewhere under the venv root but outside its site-packages is still read", async () => {
 		const python = fakeVenv(fakeInstall(), "venv", undefined, true);
 		write("base/lib/python3.12/site-packages/sitecustomize.py", "import os\n");
