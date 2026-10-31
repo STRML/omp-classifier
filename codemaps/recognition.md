@@ -14,12 +14,31 @@ every caller reads as "not read" (fail closed).
 | `verbOf(cmd)` / `verbName(cmd)` | 767/775 | floor, recognizer / floor |
 | `substitutionSpans(text)` | 798 | index (overlay, outbound), authorization |
 | `shellSubstitutionRanges(text)` | 832 | shell-cwd |
+| `shellDefinesFunction(text)` | 368 | index (`touchesShellEnv`) |
 | `setShellParserLoader(loader)` | 163 | tests (shell-ast-load) |
 | `SHELL_OPERATORS` | 186 | — |
 
 The parser loads lazily through `createRequire`. If the load fails, every parse returns `ok:false`
 and the plugin still loads. `ShellCommand.unreadShape` marks a construct the adapter cannot
 flatten.
+
+## critical-scan.ts (426 lines): what the critical patterns read
+
+| Export | Line | Called by |
+|---|---|---|
+| `scanCriticalPatterns(command, bodies, shellTrusted)` → `{critical, unrecorded, judgedBodies}` | 408 | index (bash step 5) |
+| `criticalScanText(command, shellTrusted?)`: the raw text with `git commit`/`gh pr\|issue` message spans blanked in place | 335 | tests |
+| `commandMatchesCriticalPattern(command, shellTrusted?)` | 359 | eval/run (`riskFlagsFor`) |
+| `matchesCriticalPattern(text)`, `CRITICAL_BODY_NOTE` | 29/422 | index |
+
+Blanking runs only when the session's shell is trusted (index passes `!shellEnvTouched.has(session)`,
+false with no session id), the parse succeeds, runs in source order, and every command (nested too)
+is an inert verb or a `git`/`gh` invocation whose words are all `fixed` and whose flags are all on a
+per-subcommand allowlist (`GIT_FLAGS`, `GH_FLAGS`), with no env prefix, no `git -c`, no redirect that
+writes a file, and duplicates only between stdout and stderr. Otherwise the whole text is scanned. A
+shell body's hit is `critical`. A `node`/`bun`/`deno`/`python*` body's hit (no shell extension or
+shebang) is `unrecorded` when the body names a process API (`PROCESS_API`), else it goes to
+`judgedBodies`, which index turns into a step-16 risk flag.
 
 ## shell-cwd.ts (1083 lines): one cwd walk for all readers
 

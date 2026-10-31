@@ -28,7 +28,8 @@ and the reason is JSON from `refusalPayload`. Every decision writes one audit li
 | 3 | cwd input is an internal URL (`://`, `local:/`) | block | `cwd` |
 | 4 | `readInterpretedScriptBodies` refusal (an unreadable or oversized script operand) | block, `addRefusal(cap)` | `script-body` |
 |   | `judgedCommand = script.text` (bodies spliced in); measure the 4 provenance tiers; build `cacheKey`; `priorRefusalFor` | | |
-| 5 | `CRITICAL_BASH_PATTERNS` match | `addRefusal(critical)` → `refuse(critical)` | `critical` |
+| 5 | `scanCriticalPatterns(command, script.bodies, shellTrusted)` (critical-scan.ts): raw text with message operands blanked (never once `shellEnvTouched` holds the session), plus each shell body | `addRefusal(critical)` → `refuse(critical)` | `critical` |
+| 5a | a JS/Python body matched | names a process API, or no judge will run (`enabled false`, session off, static `prompt` rule, `tools.approval.bash: prompt`): `refuse(critical)`, no `addRefusal`. Otherwise `recordExtras.criticalPatternInScriptBody`, audit `criticalBodies`; judged, and a SAFE still blocks `flagged` (step 17) | (`critical`) |
 | 6 | caller-supplied `env` (`canonicalEnv`) | `refuse(environment)` | `environment` |
 | 7 | static `prompt` rule | return undefined (host prompts) | — |
 | 8 | static `allow` rule, not blanket, no script bodies | allow | `rule` |
@@ -38,7 +39,7 @@ and the reason is JSON from `refusalPayload`. Every decision writes one audit li
 | 14 | dry-run with no cached verdict | `dryRunStop(would: classify)` | `classifier` |
 | 15 | **`classify(...)`** or a cache hit (`withoutShadow(cached)`) | Judgement (see below) | |
 | 15a | classify threw | `refuse(unclassified)` | `unclassified` |
-| 16 | verdict SAFE, no `matchModerateRiskTokens` flags, no script `INTERPRETER_CODE_RISK`, and no prior refusal or `priorRefusalLifts` holds for this call (the record stays) | allow | `verdict` / `cached` |
+| 16 | verdict SAFE, no `matchModerateRiskTokens` flags, no script `INTERPRETER_CODE_RISK`, no `criticalBodies` (5a), and no prior refusal or `priorRefusalLifts` holds for this call (the record stays) | allow | `verdict` / `cached` |
 | 17 | verdict SAFE but flags, or a prior refusal that did not lift | `refuse(flagged)` / `refuse(prior-refusal)` | `verdict` |
 | 18 | UNSAFE / UNSURE / UNAVAILABLE | UNSAFE with `persistRefusal` → `addRefusal(model)`; then `refuse(unsafe/unsure/unavailable)` | `verdict` |
 | — | any throw in the try block | block, fail closed | `internal-error` |
