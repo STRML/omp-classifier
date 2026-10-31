@@ -257,6 +257,12 @@ describe("a session whose shell an earlier call may have changed", () => {
 		expect(reviewerAudit()).toMatchObject({ skipped: expect.stringContaining("shell") });
 	});
 
+	test("a body that prints variables and does integer arithmetic still reaches the reviewer", async () => {
+		script("update.sh", "#!/bin/bash\nx=hi\nprintf '%s\\n' \"$x\"\necho $((1 + 2))\n[ \"$1\" = start ] && git fetch origin\nexport FOO=bar\n");
+		scriptReviewer(reviewerReply("allow", "update fork main"));
+		expect(resultText(await fire("tool_call", makeEvent("./update.sh start"), uiCtx(nextSession(), [user("u1", "update fork main")])))).toBe("ALLOWED");
+	});
+
 	test("a session that never touched its shell still reaches the reviewer", async () => {
 		const session = nextSession();
 		const branch = [user("u1", "update fork main")];
@@ -564,6 +570,11 @@ describe("what never reaches the reviewer", () => {
 		["a script whose arithmetic evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\n(( w ))\ngit status\n"), "./wrap.sh"],
 		["a script whose let evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\nlet w\ngit status\n"), "./wrap.sh"],
 		["a script whose [[ ]] compares a variable as a number", () => script("wrap.sh", "#!/bin/bash\nw=x\n[[ $w -eq 1 ]]\ngit status\n"), "./wrap.sh"],
+		["a script whose [[ ]] numeric comparison spans a line continuation", () => script("wrap.sh", "#!/bin/bash\nw=x\n[[ $w \\\n-eq 1 ]]\ngit status\n"), "./wrap.sh"],
+		["a script whose $(( )) evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\necho $((w))\ngit status\n"), "./wrap.sh"],
+		["a script whose array subscript evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\necho ${a[w]}\ngit status\n"), "./wrap.sh"],
+		["a script whose subscripted assignment evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\nx[w]=1\ngit status\n"), "./wrap.sh"],
+		["a script whose printf -v format is built at run time", () => script("wrap.sh", "#!/bin/bash\nprintf \"${O:--v}\" X y\ngit status\n"), "./wrap.sh"],
 		[
 			"a symlink to a secret file",
 			() => {

@@ -224,7 +224,10 @@ function bodyHandOff(body: string, real: string): string | undefined {
 	// `$PATH` or `${PATH}` is fine.
 	if (/(?<![$\w{])(?:PATH|BASH_ENV|ENV|CDPATH)\b|\$\{(?:PATH|BASH_ENV|ENV|CDPATH):?=/u.test(code)) return "changes PATH or what a shell loads";
 	if (shebang !== "" && !/\b(?:ba|z|da|k)?sh\b/u.test(shebang)) return undefined;
-	if (comparesNamesAsNumbers(code)) return "a numeric comparison evaluates a variable, which can assign any name";
+	// The text scans read a line continuation as the shell does: one line.
+	const joined = code.replace(/\\\r?\n/gu, " ");
+	if (comparesNamesAsNumbers(joined)) return "a numeric comparison evaluates a variable, which can assign any name";
+	if (evaluatesNamesInText(joined)) return "arithmetic evaluates a variable, which can assign any name";
 	const parsed = parseShell(body);
 	if (!parsed.ok) return "its shell body could not be parsed";
 	for (const command of parsed.commands) {
@@ -250,7 +253,7 @@ function bodyHandOff(body: string, real: string): string | undefined {
 }
 
 /** Builtins that write a variable named by one of their words. */
-const VARIABLE_WRITERS = new Set(["export", "declare", "typeset", "local", "readonly", "read", "mapfile", "readarray", "unset", "getopts", "printf"]);
+const VARIABLE_WRITERS = new Set(["export", "declare", "typeset", "local", "readonly", "read", "mapfile", "readarray", "unset", "getopts"]);
 /** A `[[ ]]` numeric comparison evaluates both operands as arithmetic, so a
  *  name or expansion there can assign any variable. The parser does not keep
  *  the operator, so this reads the body text: any `[[ ]]` with a numeric
@@ -259,6 +262,17 @@ const VARIABLE_WRITERS = new Set(["export", "declare", "typeset", "local", "read
 const NUMERIC_TEST = /\[\[[^\n]*?\s-(?:eq|ne|lt|le|gt|ge)\s[^\n]*?\]\]/gu;
 const PLAIN_NUMERIC_TEST = /^\[\[\s*-?\d+\s+-(?:eq|ne|lt|le|gt|ge)\s+-?\d+\s*\]\]$/u;
 const comparesNamesAsNumbers = (code: string): boolean => [...code.matchAll(NUMERIC_TEST)].some(match => !PLAIN_NUMERIC_TEST.test(match[0]));
+
+/** Arithmetic outside a command: `$(( w ))` evaluates `w`, and so does an
+ *  array subscript, in an expansion (`${a[w]}`) or an assignment
+ *  (`x[w]=1`). Any of them that reads a name or an expansion fails closed;
+ *  a plain-integer subscript or `$(( 1 + 2 ))` does not. */
+const ARITHMETIC_EXPANSION = /\$\(\(([^)]*)\)\)/gu;
+const SUBSCRIPT = /(?:\$\{[A-Za-z_][A-Za-z0-9_]*|\b[A-Za-z_][A-Za-z0-9_]*)\[([^\]]*)\]/gu;
+const readsAName = (text: string): boolean => /[A-Za-z_$`]/u.test(text);
+const evaluatesNamesInText = (code: string): boolean =>
+	[...code.matchAll(ARITHMETIC_EXPANSION)].some(match => readsAName(match[1] ?? "")) ||
+	[...code.matchAll(SUBSCRIPT)].some(match => readsAName(match[1] ?? ""));
 
 /**
  * Why a body command may assign a variable whose name its text never spells,
@@ -273,6 +287,12 @@ function writesHiddenName(command: ShellCommand): string | undefined {
 	const verb = command.words[0];
 	if (verb !== undefined && VARIABLE_WRITERS.has(verb.value) && command.words.slice(1).some(word => !word.literal)) {
 		return `${verb.value} writes a variable whose name is built at run time`;
+	}
+	// `printf -v NAME` writes a variable; an expanded format word can spell
+	// `-v` (`"${O:--v}"`). `printf '%s' "$x"` only prints.
+	const printfArgs = command.words.slice(1);
+	if (verb?.value === "printf" && printfArgs.length > 0 && (!printfArgs[0].literal || printfArgs.some(word => /^-[A-Za-z]*v/u.test(word.value)))) {
+		return "printf -v writes a variable whose name may be built at run time";
 	}
 	const operands = command.words.slice(1);
 	const readsName = (word: ShellWord): boolean => !word.literal || /[A-Za-z_]/u.test(word.value);
