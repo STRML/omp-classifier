@@ -121,7 +121,15 @@ const isLiteral = (word: ShellWord): boolean => word.fixed;
 /** Whether a word names a file by path rather than by a bare name. */
 const isPathWord = (value: string): boolean => value.includes("/") || value.startsWith("~");
 
-/** A bare name as the gate's PATH resolves it. */
+/** Whether PATH holds an empty or relative entry. The shell resolves one from
+ *  the command's own directory, after any `cd`, so the gate cannot tell which
+ *  file a bare name runs (https://github.com/STRML/omp-classifier/issues/206). */
+function pathHasRelativeEntry(): boolean {
+	return (process.env.PATH ?? "").split(path.delimiter).some(dir => !path.isAbsolute(dir));
+}
+
+/** A bare name as the gate's PATH resolves it. Callers that vouch for a bare
+ *  name check `pathHasRelativeEntry` first: this lookup skips those entries. */
 function onPath(name: string): string | undefined {
 	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
 		if (dir === "") continue;
@@ -251,6 +259,7 @@ function shapeARefusal(commands: readonly ShellCommand[]): string | undefined {
 		if (command.words.length === 0) continue;
 		const program = command.words[0];
 		if (!isLiteral(program)) return "the program is built at run time";
+		if (!isPathWord(program.value) && pathHasRelativeEntry()) return "PATH has an empty or relative entry";
 		const resolved = isPathWord(program.value) ? undefined : onPath(program.value);
 		const names = programNames(command);
 		if (names.some(n => WRAPPERS.has(n))) return `${name} runs another program`;
@@ -276,7 +285,7 @@ const DURATION = /^\d+(?:\.\d+)?[smhd]?$/u;
 function timeoutWords(command: ShellCommand): number {
 	const [wrapper, duration] = command.words;
 	if (command.words.length < 3 || !wrapper.fixed || !duration.fixed || !DURATION.test(duration.value)) return 0;
-	if ((process.env.PATH ?? "").split(path.delimiter).some(dir => !path.isAbsolute(dir))) return 0;
+	if (pathHasRelativeEntry()) return 0;
 	const resolved = TIMEOUTS.has(wrapper.value) ? onPath(wrapper.value) : undefined;
 	if (resolved === undefined || isScriptFile(resolved)) return 0;
 	return programNames(command).every(name => TIMEOUTS.has(name)) ? 2 : 0;
@@ -357,7 +366,7 @@ function isOutputFilter(command: ShellCommand): boolean {
 	if (command.assigns.length > 0 || command.redirects.length > 0 || !command.words.every(isLiteral)) return false;
 	const name = command.words[0]?.value ?? "";
 	const filter = Object.hasOwn(OUTPUT_FILTERS, name) ? OUTPUT_FILTERS[name] : undefined;
-	if (filter === undefined) return false;
+	if (filter === undefined || pathHasRelativeEntry()) return false;
 	const resolved = onPath(name);
 	return resolved !== undefined && isSystemProgram(resolved) && filter(command.words.slice(1).map(word => word.value));
 }

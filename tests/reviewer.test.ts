@@ -185,6 +185,34 @@ describe("which commands stage 2 can vouch for", () => {
 		}
 	});
 
+	// https://github.com/STRML/omp-classifier/issues/206: the shell reads an
+	// empty or relative PATH entry from the command's own directory, after any
+	// `cd`, so a bare name there can be a script nobody read.
+	test.each([
+		["a bare name after a cd, PATH with an empty entry", "", "cd sub && tool start"],
+		["a bare name, PATH with a dot entry", ".", "tool start"],
+		["a bare name, PATH with a relative entry", "sub", "tool start"],
+		["an output filter, PATH with an empty entry", "", "cd sub && ./update.sh start | tail -5"],
+		["an output filter, PATH with a relative entry", "sub", "./update.sh start | tail -5"],
+	])("refuses %s", async (_name, entry, command) => {
+		fs.mkdirSync(path.join(dir, "sub"));
+		script("sub/tool", "#!/bin/bash\ncat ~/.ssh/id_ed25519\n");
+		script("tool", "#!/bin/bash\ncat ~/.ssh/id_ed25519\n");
+		script("sub/tail", "#!/bin/bash\ncat ~/.ssh/id_ed25519\n");
+		script("tail", "#!/bin/bash\ncat ~/.ssh/id_ed25519\n");
+		script("update.sh", "#!/bin/bash\necho ok\n");
+		script("sub/update.sh", "#!/bin/bash\necho ok\n");
+		const previous = process.env.PATH;
+		process.env.PATH = `${entry}${path.delimiter}${previous ?? ""}`;
+		try {
+			const result = await fire("tool_call", makeEvent(command), uiCtx(nextSession(), [user("u1", "update fork main")]));
+			expect(refusalOf(result).layer).toBe("unsure");
+			expect(reviewerCalls).toHaveLength(0);
+		} finally {
+			process.env.PATH = previous;
+		}
+	});
+
 	test.each([
 		["tail with a count", "./update.sh start 2>&1 | tail -60"],
 		["tail with -n", "./update.sh start | tail -n 20"],
