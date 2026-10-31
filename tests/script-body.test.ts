@@ -195,6 +195,46 @@ describe("the body decides, wherever the file lives", () => {
 	});
 });
 
+describe("second-execution markers read code, not prose", () => {
+	// OMP session 01a18e06: generate_landmine_index.py was flagged on a SAFE
+	// verdict for `re.compile(` and a docstring that says "the subprocess".
+	test.each([
+		["a regex compile", 'import re\nHEADING = re.compile(r"^### (\\d+)")\n'],
+		["a docstring that names subprocess", '"""One heading came from the subprocess\nrewrite."""\nprint("ok")\n'],
+		["a comment that names subprocess", "# no subprocess here\nprint('ok')\n"],
+		["eval() with no argument", "model.eval()\nprint('ok')\n"],
+	])("%s runs on a SAFE", async (_name, body) => {
+		writeScript(root, "probe.py", body);
+		expect(await gate("python3 probe.py")).toBe("ALLOWED");
+	});
+
+	test.each([
+		["import subprocess", "import subprocess\n"],
+		["subprocess in an import list", "import os, subprocess\n"],
+		["from subprocess", "from subprocess import run\n"],
+		["a subprocess call", "subprocess.run(['ls'])\n"],
+		["an asyncio subprocess", "asyncio.create_subprocess_shell('ls')\n"],
+		["the module named as a string", "importlib.import_module('subprocess')\n"],
+		["builtin compile", "code = compile(src, 'x', 'exec')\n"],
+		["eval with an argument", "eval(payload)\n"],
+		["exec", "exec(payload)\n"],
+	])("%s is still flagged", async (_name, body) => {
+		writeScript(root, "probe.py", body);
+		expect(refusalOf(await gate("python3 probe.py")).layer).toBe("flagged");
+	});
+
+	test.each([
+		["an import after a semicolon", `python3 -c "x = 1; import subprocess"`],
+		["a from-import after a semicolon", `python3 -c "x = 1; from subprocess import run"`],
+	])("inline code with %s is still flagged", async (_name, command) => {
+		expect(refusalOf(await gate(command)).layer).toBe("flagged");
+	});
+
+	test("inline code that only builds a regex runs on a SAFE", async () => {
+		expect(await gate(`python3 -c "import re; print(re.compile('a+').pattern)"`)).toBe("ALLOWED");
+	});
+});
+
 describe("a benign body still runs", () => {
 	test("from the session's directory", async () => {
 		writeScript(root, "probe.py", BENIGN);

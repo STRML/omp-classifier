@@ -2169,8 +2169,11 @@ const SCRIPT_FILE_EXTENSION = /\.(?:py|pyw|rb|js|mjs|cjs|ts|mts|cts|tsx|jsx|sh|b
 // shows every character it will run — so a SAFE verdict on plain code may
 // release it. A payload that decodes or re-execs is NOT the code the model
 // read, so the wrapper's SAFE says nothing about what actually runs.
+// Each marker matches code, not prose: `re.compile(` builds a regex and
+// `model.eval()` takes no code, and a docstring that says "subprocess" runs
+// nothing. Every literal way to reach the module still matches.
 const INTERPRETER_CODE_RISK =
-	/exec\(|eval\(|os\.system|subprocess|base64|b64decode|compile\(|__import__|marshal|\\x[0-9a-f]{2}/;
+	/exec\(|eval\((?!\s*\))|os\.system|\bsubprocess\s*\.|(?:^|;)\s*import\s[^\n;]*\bsubprocess\b|(?:^|;)\s*from\s+subprocess\b|["']subprocess["']|create_subprocess_|base64|b64decode|(?<!\b(?:re|regex)\.)compile\(|__import__|marshal|\\x[0-9a-f]{2}/m;
 
 // Same token set as a word-boundary regex, for matching inside joined
 // interpreter-code text where a quoted payload arrives as one token

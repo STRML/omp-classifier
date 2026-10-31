@@ -2,6 +2,20 @@
 
 All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 port reference STRML/omp-classifier, the parent project this one is forked from; later ones reference this repository.
 
+## 2026-10-31
+
+### Second-execution markers read code, not prose
+
+From OMP session `01a18e06`. Jev answered SAFE on `python scripts/generate_landmine_index.py` four times, and the gate blocked every run on `python runs scripts/generate_landmine_index.py`. The body matched two markers: `re.compile(`, which builds a regex, and a docstring that says "the subprocess".
+
+| Marker | Before | After |
+|---|---|---|
+| `compile(` | any call | not after `re.` or `regex.` |
+| `eval(` | any call | needs an argument (`model.eval()` runs no code) |
+| `subprocess` | the word anywhere | `import`/`from` statements (also after `;`), `subprocess.`, the module named in quotes, `create_subprocess_` |
+
+A body that uses subprocess still flags. A body that only mentions it in prose no longer does.
+
 ## 2026-10-29
 
 ### A refusal holds when a retry changes its output filter
