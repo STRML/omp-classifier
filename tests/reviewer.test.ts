@@ -597,6 +597,8 @@ describe("what never reaches the reviewer", () => {
 		["a script whose arithmetic reads a name filled by read", () => script("wrap.sh", "#!/bin/bash\nread -r w < /dev/null\necho $((w + 1))\ngit status\n"), "./wrap.sh"],
 		["a script whose arithmetic reads a for-loop word", () => script("wrap.sh", "#!/bin/bash\nfor w in a b; do echo $((w)); done\ngit status\n"), "./wrap.sh"],
 		["a script whose arithmetic reads a substitution's result", () => script("wrap.sh", "#!/bin/bash\nw=$(cat count.txt)\n(( w++ ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name a default assigned", () => script("wrap.sh", "#!/bin/bash\n: \"${w:=$(cat count.txt)}\"\n(( w ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name a plain default assigned", () => script("wrap.sh", "#!/bin/bash\n: ${w=x}\necho $((w))\ngit status\n"), "./wrap.sh"],
 		["a script whose arithmetic reads a positional parameter", () => script("wrap.sh", "#!/bin/bash\n(( $1 ))\ngit status\n"), "./wrap.sh"],
 		["a script whose indirect expansion names a variable at run time", () => script("wrap.sh", "#!/bin/bash\nw=x\necho ${!w}\ngit status\n"), "./wrap.sh"],
 		["a script whose [[ -v ]] tests a subscripted name", () => script("wrap.sh", "#!/bin/bash\nw=x\n[[ -v 'a[w]' ]]\ngit status\n"), "./wrap.sh"],

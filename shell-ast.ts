@@ -1012,7 +1012,8 @@ function integerValue(word: any): boolean {
  * The names a body fills with something the reviewer cannot vouch for as an
  * integer: an assignment from text, a substitution or another variable, an
  * array, `read`/`mapfile`/`getopts`/`printf -v` targets, a `for`/`select`
- * word list, and the positional parameters. Arithmetic reading one of these
+ * word list, a `${w:=…}`/`${w=…}` default (any default operator taints), and
+ * the positional parameters. Arithmetic reading one of these
  * can evaluate an injected expression. A name the body never assigns comes
  * from the environment, which the session latch guards (#176).
  */
@@ -1026,6 +1027,9 @@ function taintedNames(tree: any): Set<string> {
 		const n = node as any;
 		if (type === "Assign" && n.Name?.Value && (n.Array || n.Index || !integerValue(n.Value))) tainted.add(n.Name.Value);
 		if ((type === "WordIter" || type === "SelectClause") && n.Name?.Value) tainted.add(n.Name.Value);
+		// `${w:=text}` and `${w=text}` assign w. Any default operator taints,
+		// which costs only a later arithmetic read of the same name.
+		if (type === "ParamExp" && n.Exp && n.Param?.Value) tainted.add(n.Param.Value);
 		if (type === "CallExpr") {
 			// biome-ignore lint/suspicious/noExplicitAny: untyped AST
 			const words: any[] = n.Args ?? [];
