@@ -4,6 +4,23 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### The shell parser reads slices, `>&file` and very deep pipelines the way bash does
+
+Three places where `shell-ast.ts` told its callers less than bash runs. mvdan-sh's `Walk` does not enter a parameter expansion's slice, and it keeps an extended glob's pattern as raw text. So `${x:$(cmd):1}` and `@($(cmd)|c)` listed no nested command, though bash runs `cmd`. Every `>&word` was read as a descriptor copy, but bash copies only for a number or `-`: `>&out.txt`, `1>&out.txt` and `>&$f` write a file the way `&>` does, and the action summary dropped those writes. A pipeline of about 2,800 stages parses and then overflows `Walk`'s stack. `shellRunsInSourceOrder`, `substitutionSpans` and `shellDefinesFunction` let that RangeError escape, and the gate blocked the call as `internal-error` without judging it.
+
+- The shared `walk` helper visits a slice's offset and length, so every reader built on it (substitutions, variables, spans, ranges) sees them.
+- An extended glob whose pattern holds `$(`, a backtick, `<(` or `>(` makes the parse fail (`ok:false`, read as "not read"), and `substitutionSpans` falls back to its text pairing.
+- `>&word` with no descriptor or descriptor 1 is a write to `word` unless `word` is digits or `-`. Either way it writes stdout and stderr, so `fd` is `&`. `2>&file` and `<&file` are bash errors and stay copies.
+- The three readers catch the overflow and answer the fail-closed way: not in source order, defines a function, the text pairing.
+
+| Input | Before | After |
+|---|---|---|
+| `echo ${x:$(rm -rf ~/proj):1}` | no nested command, no delete in the summary | nested `rm`, delete listed |
+| `echo @($(rm -rf ~/proj)\|c)` | parsed, no nested command | parse refused |
+| `cat ~/.aws/credentials >&out.txt` | no write in the summary | write `out.txt` |
+| `2>&1`, `>&2`, `>&-` | copy | copy |
+| `a\|a\|…` (2,800 stages) then `echo $(x)` | RangeError, `internal-error` block | judged |
+
 ### Stage 2 reads hidden arithmetic from the parse, not the text
 
 https://github.com/STRML/omp-classifier/pull/225 refused script bodies whose arithmetic reads a name, because bash evaluates the variable's value as an expression and a value of `PATH=/x` assigns PATH. It found those spots with regexes over the body text, and every review round found another spelling: a substring offset on `${1:w}`, `${@:w}` or `${a[0]:w}`, a compound array `( [w]=1 )`, a `[[ ]]` comparison split over lines, `declare -i` (later plain assignments become arithmetic), `declare -n` (a name becomes an alias of another), and a verb rewritten by brace expansion (`{ex,}port`). `hiddenArithmetic` in `shell-ast.ts` now reads the parse. It checks `ArithmCmd`, `let`, `$(( ))`, `$[ ]`, every subscript and substring offset (read off the node, since the walker does not descend into them), and `[[ ]]` comparisons whose operator the runtime derives from a parse of `-eq` through `-ge`. Any one of them that reads a name, an expansion or a substitution refuses. `declare`, `typeset` and `local` with `-i` or `-n`, or with a flag word built at run time, refuse outright, as does a verb that brace expansion or a glob rewrites. The text scans are removed.
