@@ -66,6 +66,10 @@ let loadSh: ShLoader = () => requireSh("mvdan-sh");
 interface ShellRuntime {
 	syntax: Syntax;
 	parser: Parser;
+	/** A second parser that keeps comments, for {@link shellLayout} only: the
+	 *  readers above never see a comment node, and sharing one parser would
+	 *  hand every walk a node type it does not expect. */
+	commentParser: Parser;
 	redirect: Record<RedirectOpName, number>;
 	binary: Record<BinaryOpName, number>;
 	redirectDirection: Record<number, ShellRedirect["direction"] | undefined>;
@@ -150,7 +154,8 @@ const deriveRuntime = (mod: unknown): ShellRuntime => {
 
 	const arithmeticTests = new Set(["-eq", "-ne", "-lt", "-le", "-gt", "-ge"].map(op => operatorOf(`[[ 1 ${op} 1 ]]`, "BinaryTest")));
 
-	return { syntax, parser, redirect, binary, redirectDirection, arithmeticTests };
+	const commentParser = syntax.NewParser(syntax.Variant(syntax.LangBash), syntax.KeepComments(true));
+	return { syntax, parser, commentParser, redirect, binary, redirectDirection, arithmeticTests };
 };
 
 /** The live runtime, loading and deriving the parser on first use. */
@@ -919,6 +924,147 @@ export function shellSubstitutionRanges(text: string): ShellSubstitutionRange[] 
 	}
 	ranges.sort((a, b) => a.start - b.start || b.end - a.end);
 	return ranges;
+}
+
+/** A half-open range of string indexes into the text that was parsed. */
+export interface ShellSpan {
+	start: number;
+	end: number;
+}
+
+/**
+ * Where the parser found text the shell never reads as a command, and where it
+ * found commands that do not run where they are written.
+ *
+ * The text readers in `shell-cwd.ts` and the script-body reader split a command
+ * with a quote-aware tokenizer that knows nothing else. Every shape below used
+ * to be guessed from the text, and each guess failed open: a quote inside a
+ * comment opened a quote that never closed, and every `<<` (a here-string, an
+ * arithmetic shift, a quoted or commented `<<`) opened a heredoc. Both blanked
+ * the rest of the command, so a later `python3 p.py` was never read.
+ */
+export interface ShellLayout {
+	/** Every `# …` comment, from the `#` to the end of its line. */
+	comments: ShellSpan[];
+	/** Every heredoc body together with its closing delimiter line. */
+	heredocBodies: ShellSpan[];
+	/** Function bodies, loops and coprocesses: commands inside run later, more
+	 *  than once, or not at all, so a `cd` there is not a `cd` at that point. */
+	deferred: ShellSpan[];
+	/** The function definitions among `deferred`: a body runs wherever the
+	 *  function is called, so its commands have no directory of their own. */
+	functions: ShellSpan[];
+}
+
+const DEFERRED_SHAPES = new Set(["FuncDecl", "ForClause", "WhileClause", "CoprocClause"]);
+
+let lastLayout: { text: string; layout: ShellLayout | null } | undefined;
+
+/**
+ * The parser's {@link ShellLayout} of `text`, or null when it cannot be read:
+ * a syntax error, a parser that did not load, a tree too deep to walk, or a
+ * heredoc whose closer is not where the parse says it is. A null layout is the
+ * caller's cue to fall back to its text reading and to distrust it.
+ *
+ * Several readers ask about the same command in one gate call, so the last
+ * answer is kept.
+ */
+export function shellLayout(text: string): ShellLayout | null {
+	if (lastLayout?.text === text) return lastLayout.layout;
+	const layout = readLayout(text);
+	lastLayout = { text, layout };
+	return layout;
+}
+
+interface HeredocOpener {
+	/** Where the operator's delimiter word ends. */
+	wordEnd: number;
+	dash: boolean;
+	delimiter: string;
+	body?: ShellSpan;
+}
+
+function readLayout(text: string): ShellLayout | null {
+	let tree: unknown;
+	try {
+		tree = getShell().commentParser.Parse(text, "command.sh");
+	} catch {
+		return null;
+	}
+	const comments: ShellSpan[] = [];
+	const deferred: ShellSpan[] = [];
+	const functions: ShellSpan[] = [];
+	const openers: HeredocOpener[] = [];
+	const { redirect: op } = getShell();
+	const spanOf = (node: unknown): ShellSpan | null => {
+		const start = sourceOffsetOf(node, text);
+		const end = sourceEndOffsetOf(node, text);
+		return start === undefined || end === undefined || end < start ? null : { start, end };
+	};
+	let unreadable = false;
+	try {
+		walk(tree, (node: unknown) => {
+			const type = nodeType(node as NonNullable<unknown>);
+			if (type === "Comment" || DEFERRED_SHAPES.has(type)) {
+				const span = spanOf(node);
+				if (span === null) unreadable = true;
+				else (type === "Comment" ? comments : deferred).push(span);
+				if (span !== null && type === "FuncDecl") functions.push(span);
+				return true;
+			}
+			if (type !== "Redirect") return true;
+			// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+			const redir = node as any;
+			if (redir.Op !== op.heredoc && redir.Op !== op.heredocDash) return true;
+			const word = spanOf(redir.Word);
+			const body = redir.Hdoc ? spanOf(redir.Hdoc) : undefined;
+			if (word === null || body === null) {
+				unreadable = true;
+				return true;
+			}
+			openers.push({ wordEnd: word.end, dash: redir.Op === op.heredocDash, delimiter: readWord(redir.Word, text, []).value, body });
+			return true;
+		});
+	} catch {
+		// A tree deeper than the walk's stack is a tree this did not read.
+		return null;
+	}
+	if (unreadable) return null;
+	const heredocBodies = heredocSpans(text, openers);
+	if (heredocBodies === null) return null;
+	return { comments, heredocBodies, deferred, functions };
+}
+
+/**
+ * Each heredoc's body and closer line. The parser hands back a body word that
+ * already ends at the closer, but an EMPTY body has no word at all, and its
+ * closer line would otherwise survive as a segment of its own: `cat <<python3`
+ * closed by a `python3` line reads as an interpreter call. That line is found
+ * the way the shell finds it (the line after the opener's line, or the line
+ * after the previous body when two openers share a line) and checked against
+ * the delimiter; a line that does not match means this reading is wrong.
+ */
+function heredocSpans(text: string, openers: HeredocOpener[]): ShellSpan[] | null {
+	const spans: ShellSpan[] = [];
+	let cursor = 0;
+	for (const opener of [...openers].sort((a, b) => a.wordEnd - b.wordEnd)) {
+		if (opener.body !== undefined) {
+			spans.push(opener.body);
+			const newline = text.indexOf("\n", opener.body.end);
+			cursor = newline === -1 ? text.length : newline + 1;
+			continue;
+		}
+		const openerLineEnd = text.indexOf("\n", opener.wordEnd);
+		if (openerLineEnd === -1) continue;
+		const lineStart = Math.max(openerLineEnd + 1, cursor);
+		const newline = text.indexOf("\n", lineStart);
+		const lineEnd = newline === -1 ? text.length : newline;
+		const line = text.slice(lineStart, lineEnd);
+		if ((opener.dash ? line.replace(/^\t+/u, "") : line) !== opener.delimiter) return null;
+		spans.push({ start: lineStart, end: lineEnd });
+		cursor = newline === -1 ? text.length : newline + 1;
+	}
+	return spans;
 }
 
 /**

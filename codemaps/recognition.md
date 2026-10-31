@@ -5,7 +5,7 @@
 Deterministic code that never calls a model. A shell parse that fails returns `{ok:false}`, which
 every caller reads as "not read" (fail closed).
 
-## shell-ast.ts (923 lines): the only owner of `mvdan-sh`
+## shell-ast.ts (1126 lines): the only owner of `mvdan-sh`
 
 | Export | Line | Called by |
 |---|---|---|
@@ -15,12 +15,14 @@ every caller reads as "not read" (fail closed).
 | `substitutionSpans(text)` | 798 | index (overlay, outbound), authorization |
 | `shellSubstitutionRanges(text)` | 832 | shell-cwd |
 | `shellDefinesFunction(text)` | 368 | index (`touchesShellEnv`) |
+| `shellLayout(text)` → `{comments, heredocBodies, deferred, functions}` or null | 968 | shell-cwd (masker), index `readInterpretedScriptBodies` |
 | `setShellParserLoader(loader)` | 163 | tests (shell-ast-load) |
 | `SHELL_OPERATORS` | 186 | — |
 
 The parser loads lazily through `createRequire`. If the load fails, every parse returns `ok:false`
 and the plugin still loads. `ShellCommand.unreadShape` marks a construct the adapter cannot
-flatten.
+flatten. `shellLayout` uses a second parser that keeps comments; null means the text could not be
+laid out (syntax error, a tree too deep to walk, an empty heredoc whose closer is not where expected).
 
 ## critical-scan.ts (247 lines): what the critical patterns read
 
@@ -39,19 +41,23 @@ redirect but `2>&1`/`>&2`/`>/dev/null`. Otherwise the whole text is scanned. A s
 when the body names a process API (`PROCESS_API`), else it goes to `judgedBodies`, which index turns
 into a step-16 risk flag.
 
-## shell-cwd.ts (1083 lines): one cwd walk for all readers
+## shell-cwd.ts (1182 lines): one cwd walk for all readers
 
 | Export | Line | Called by |
 |---|---|---|
-| `maskHeredocBodiesAndAnsiSpans(cmd)` → `{masked,…}` | 165 | index (script reader, overlay), jev (push/network tiers) |
+| `maskHeredocBodiesAndAnsiSpans(cmd)` → `{masked, bodies, quoted, lost}` | 200 | index (script reader, overlay), jev (push/network tiers), floor |
+| `directoryChangesAgree(masked, commands, deferred)`, `commandMayChangeDirectory(words)` | 1101/1097 | index `readInterpretedScriptBodies` |
 | `segmentWorkingDirectories(...)` | 1000 | index `readInterpretedScriptBodies` |
 | `segmentCwdAt(...)` | 1044 | jev (provenance tiers) |
 | `segmentCwdLookup(...)` | 1054 | floor |
 | `heredocShadowedAt`, `openQuoteBefore` | 106/325 | index `withoutWrittenHeredocBodies` |
 | `SHELL_WORD_EXPANSION`, `CwdResolver`, `defaultCwdResolver` | 38/531/534 | index, jev |
 
-A directory the text cannot pin is `null`, never a guess. Callers inject the resolver: index uses
-the host's `resolveToCwd`, the network tier uses `node:path`.
+A directory the text cannot pin is `null`, never a guess: an expansion, a target that is not an
+existing directory, or a bare name while CDPATH is set. Callers inject the resolver: index uses
+the host's `resolveToCwd`, the network tier uses `node:path`. The masker blanks comments and heredoc
+bodies from `shellLayout` when the parse succeeds, and falls back to text (`lost` when it blanked to
+EOF) when it does not.
 
 ## floor.ts (719 lines): the code floor (shadow)
 
@@ -143,7 +149,7 @@ signature changes. Repository-local files are never read.
 | `evalRiskFlags(code)` | 2095 | eval-code overlay | eval SAFE branch, `shadowJevV3`, eval/run |
 | `evalSubprocessMarkers(code, lang)` | 2110 | whether an eval payload spawns at all (JS/PY/RB/JL tables) | eval path entry |
 | `evalSpawnCwd(code, cwd)` | 2755 | literal / opaque spawn cwd | eval path |
-| `readInterpretedScriptBodies(cmd, cwd, limit)` | 3775 | splices interpreter script bodies into the judged text, or refuses | bash path step 4 |
+| `readInterpretedScriptBodies(cmd, cwd, limit)` | 4220 | splices interpreter script bodies into the judged text, or refuses. Text pass over the masked segments, then a parse pass that reads every interpreter program the text pass did not (same resolved file), and refuses on an expanded verb, any command the parser rejects, or a walk that disagrees with the parse | bash path step 4 |
 | `withoutWrittenHeredocBodies(cmd)` | 3358 | drops heredoc bodies written to files before scanning | overlay, outbound |
 | `commandHasOutboundNetwork(cmd)` | 1418 | outbound network classifier | tests only (no production caller) |
 | `bashApprovalRuleMatches` / `commandMatchesBashApprovalPattern` | 568/546 | host static-rule matching | bash path step 2 |

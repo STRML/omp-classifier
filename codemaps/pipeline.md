@@ -26,7 +26,7 @@ and the reason is JSON from `refusalPayload`. Every decision writes one audit li
 | 1 | `command.length > maxCommandLength` | block (refusal payload), `addRefusal(cap)` | `cap` |
 | 2 | host static rule deny, or `tools.approval.bash: deny` (`readHostPolicy`, per-segment for compounds) | return undefined (host denies) | — |
 | 3 | cwd input is an internal URL (`://`, `local:/`) | block | `cwd` |
-| 4 | `readInterpretedScriptBodies` refusal (an unreadable or oversized script operand) | block, `addRefusal(cap)` | `script-body` |
+| 4 | `readInterpretedScriptBodies` refusal (an unreadable or oversized script operand, a directory or verb the text cannot pin, a text reading that lost its place) | block, `addRefusal(cap)` | `script-body` |
 |   | `judgedCommand = script.text` (bodies spliced in); measure the 4 provenance tiers; build `cacheKey`; `priorRefusalFor` | | |
 | 5 | `scanCriticalPatterns(command, script.bodies, shellTrusted)` (critical-scan.ts): raw text with message operands blanked (never once `shellEnvTouched` holds the session), plus each shell body | `addRefusal(critical)` → `refuse(critical)` | `critical` |
 | 5a | a JS/Python body matched | names a process API, or no judge will run (`enabled false`, session off, static `prompt` rule, `tools.approval.bash: prompt`): `refuse(critical)`, no `addRefusal`. Otherwise `recordExtras.criticalPatternInScriptBody`, audit `criticalBodies`; judged, and a SAFE still blocks `flagged` (step 17) | (`critical`) |

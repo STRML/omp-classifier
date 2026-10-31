@@ -94,8 +94,17 @@ import { cfgToolsApproval } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 import { filterChildShellEnv, getPluginsDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
-import { heredocShadowedAt, maskHeredocBodiesAndAnsiSpans, openQuoteBefore, segmentWorkingDirectories, SHELL_WORD_EXPANSION } from "./shell-cwd";
-import { parseShell, shellDefinesFunction, substitutionSpans, verbName, type ShellCommand, type ShellRedirect } from "./shell-ast";
+import {
+	commandMayChangeDirectory,
+	directoryChangesAgree,
+	heredocShadowedAt,
+	maskHeredocBodiesAndAnsiSpans,
+	openQuoteBefore,
+	segmentCwdLookup,
+	segmentWorkingDirectories,
+	SHELL_WORD_EXPANSION,
+} from "./shell-cwd";
+import { parseShell, shellDefinesFunction, shellLayout, substitutionSpans, verbName, type ShellCommand, type ShellRedirect, type ShellWord } from "./shell-ast";
 import {
 	DEFAULT_JUDGE_BACKEND,
 	judgeBackendFor,
@@ -3595,6 +3604,19 @@ function isCommandLookup(words: readonly string[], start: number): boolean {
  * wrapper will not execute.
  */
 function interpreterInvocation(segment: string[]): InterpreterInvocation {
+	const head = commandHead(segment);
+	if (head === null || "opaque" in head) return head;
+	const verb = interpreterName(segment[head.index]);
+	if (!verb) return null;
+	return { verb, rest: segment.slice(head.index + 1), cwdChanges: head.cwdChanges, stdinOwner: head.stdinOwner };
+}
+
+/** Where a segment's own verb sits once wrappers are stepped through, or why
+ *  wrapper parsing stopped. Null when there is no verb, or when `command -v`
+ *  only looks the names up. */
+type CommandHead = { index: number; cwdChanges?: string[]; stdinOwner?: "wrapper" } | { opaque: string } | null;
+
+function commandHead(segment: string[]): CommandHead {
 	let i = 0;
 	let cwdChanges: string[] | undefined;
 	let stdinOwner: "wrapper" | undefined;
@@ -3625,9 +3647,7 @@ function interpreterInvocation(segment: string[]): InterpreterInvocation {
 		break;
 	}
 	if (i >= segment.length) return null;
-	const verb = interpreterName(segment[i]);
-	if (!verb) return null;
-	return { verb, rest: segment.slice(i + 1), cwdChanges, stdinOwner };
+	return { index: i, cwdChanges, stdinOwner };
 }
 
 function interpretersInSegment(segment: string[], rawStage: string): Array<{ verb: string; codeText: string | null }> {
@@ -4109,28 +4129,234 @@ function shellBodyHeredocRefusal(verb: string, body: string): string | null {
 	return `script body blocked: ${verb} body contains a heredoc or here-string whose executed payload cannot be scanned safely`;
 }
 
+/** The programs one command runs, or why the reader stops on it. */
+type CommandScriptRefs = { invocation: InterpreterInvocation; refs: InterpreterProgramRef[] } | { refusal: string };
+
+/**
+ * Every program word one command hands an interpreter: its operands, and a
+ * redirected stdin the interpreter executes. `redirects` is the parse's own
+ * redirect list for this command, or null when the command was read from text
+ * alone and carries none the reader could pair.
+ */
+function commandScriptRefs(words: string[], redirects: ShellRedirect[] | null): CommandScriptRefs {
+	const invocation = interpreterInvocation(words);
+	if (invocation !== null && "opaque" in invocation) return { refusal: invocation.opaque };
+	const syntaxOnly = interpreterSyntaxOnly(words);
+	const refs = interpreterProgramRefs(words).filter(ref => !syntaxOnly || ref.loader === true);
+	const flow = redirects !== null && redirects.length > 0 ? redirectedStdinFlow(redirects) : null;
+	const stdin = syntaxOnly || flow === null ? null : interpreterReadsRedirectedStdin(words);
+	if (stdin !== null && flow !== null) {
+		if (flow.kind === "unknown") return { refusal: "script body blocked: redirected stdin descriptor could not be resolved" };
+		if (flow.kind === "file") {
+			const target = flow.target;
+			if (!target.literal && !SHELL_WORD_EXPANSION.test(target.value)) {
+				return { refusal: `script body blocked: redirected stdin target ${target.source} is not literal` };
+			}
+			refs.push({ verb: stdin.verb, operand: target.value, arm: "stdin" });
+		}
+	}
+	return { invocation, refs };
+}
+
+/** The directory one program word is resolved from: its segment's directory
+ *  with the invocation's own `env -C` changes applied. Null when unknown. */
+function scriptRefDir(ref: InterpreterProgramRef, invocation: InterpreterInvocation, base: string | null): string | null {
+	let dir = base;
+	if (ref.arm !== "stdin" && invocation && !("opaque" in invocation) && invocation.cwdChanges) {
+		for (const change of invocation.cwdChanges) {
+			if (dir === null) break;
+			if (SHELL_WORD_EXPANSION.test(change) || change.startsWith("~")) dir = null;
+			else dir = resolveToCwd(change, dir);
+		}
+	}
+	return dir;
+}
+
+/** One program word, as both readers name it: the file the read would open.
+ *  Two refs share a key only when they resolve to the same path, so a parse
+ *  pass ref is never passed over for a text pass ref that read another file. */
+function scriptRefKey(ref: InterpreterProgramRef, dir: string | null): string {
+	let target: string;
+	try {
+		target = dir === null ? `?\0${ref.operand}` : resolveToCwd(ref.operand, dir);
+	} catch {
+		target = `?\0${ref.operand}\0${dir}`;
+	}
+	return `${ref.arm}\0${ref.verb}\0${target}`;
+}
+
+/** A command word that may name a file a program opens: what a verb the
+ *  reader cannot name might run. A word with whitespace and no script
+ *  extension is a message or a pattern (`-m 'rm -rf /'`), not a path. */
+const scriptShapedWord = (word: string): boolean =>
+	!word.startsWith("-") && (SCRIPT_FILE_EXTENSION.test(word) || (word.includes("/") && !/\s/u.test(word)));
+
+/**
+ * The verb word of a parsed command when the shell expands it, so the reader
+ * cannot name the program: a brace (`pyth{on3,}`, `{cd,dir}`), a glob, a
+ * variable (`$PY`, `cd${x}`), a substitution. `[` is the test builtin's name,
+ * not a glob. A path whose last component is plain text (`"$VENV/bin/python"`)
+ * still names its program, and the text reader already reads it by that name.
+ */
+function expandedVerb(command: ShellCommand): ShellWord | null {
+	const head = commandHead(command.words.map(word => word.value));
+	if (head === null || "opaque" in head) return null;
+	const verb = command.words[head.index];
+	if (verb === undefined || verb.fixed || verb.value === "[") return null;
+	if (!verb.literal) {
+		const slash = verb.value.lastIndexOf("/");
+		if (slash !== -1 && !/[$`{}*?[\]]/u.test(verb.value.slice(slash + 1))) return null;
+	}
+	return verb;
+}
+
+const ALIAS_DEFINITION = (command: ShellCommand): boolean =>
+	command.words[0]?.value === "alias" && command.words.slice(1).some(word => word.value.includes("="));
+
+/**
+ * Why a parsed command's verb stops the reader, or null. The shell expands
+ * the verb before it runs it, so it may be an interpreter running a script, or
+ * a `cd` moving the shell under every program after it.
+ *
+ * A brace or glob verb (`pyth{on3,}`, `{cd,dir}`) is never an ordinary command
+ * and always refuses: the expansion can even turn the verb's own pieces into
+ * the program operand (`pyth{on3,} p` runs `python3 python p`). A variable or
+ * substituted verb refuses when it matters: a program runs after it, or one of
+ * its operands could be a script (script-shaped, an existing file in the
+ * directory it runs in, or itself expanded). `"$@"` and `$EDITOR` with nothing
+ * to open stay open. An alias definition makes every later word a verb the
+ * reader cannot name, in the same way.
+ */
+function expandedVerbRefusal(commands: readonly ShellCommand[], programAt: readonly number[], cwdAt: (offset: number) => string | null): string | null {
+	// Source position is not execution order: a function body, or a word the
+	// shell expands into a function call, runs a program wherever it is
+	// called. So any program anywhere in the command counts.
+	const programAnywhere = programAt.length > 0;
+	const mayBeScript = (word: ShellWord, offset: number): boolean => {
+		if (word.value.startsWith("-")) return false;
+		if (!word.literal || scriptShapedWord(word.value)) return true;
+		const dir = cwdAt(offset);
+		if (dir === null) return true;
+		// Anything that exists may be a program: a directory too (python runs
+		// its `__main__.py`). Only a word that names nothing is passed over;
+		// a word the gate cannot even stat is not one it may clear.
+		try {
+			fs.statSync(resolveToCwd(word.value, dir));
+			return true;
+		} catch (err) {
+			return (err as NodeJS.ErrnoException).code !== "ENOENT";
+		}
+	};
+	for (const command of commands) {
+		const offset = command.sourceOffset ?? 0;
+		if (ALIAS_DEFINITION(command)) {
+			if (programAnywhere || commands.some(other => (other.sourceOffset ?? 0) > offset && other.words.some(word => scriptShapedWord(word.value)))) {
+				return "script body blocked: the command defines an alias, so the words after it are not the programs that run";
+			}
+			continue;
+		}
+		const verb = expandedVerb(command);
+		if (verb === null) continue;
+		const index = command.words.indexOf(verb);
+		if (verb.literal || programAnywhere || command.words.slice(index + 1).some(word => mayBeScript(word, offset))) {
+			return `script body blocked: the shell expands the command name ${verb.source}, so the classifier cannot tell which program it runs or where it leaves the shell`;
+		}
+	}
+	return null;
+}
+
+
 export function readInterpretedScriptBodies(command: string, cwd: string, limit: number): ReadScriptBodiesResult {
 	const bodies: InterpretedScriptBody[] = [];
 	let text = command;
 
 	// Discovery reads the MASKED text: a heredoc body is data to the shell (and a
 	// document written with one must not turn `python3 pkg` inside it into a
-	// program this scan insists on reading), while an ANSI-C or crossed quote
-	// span is text the shell never parses as a command either. The judged text
-	// below stays the whole command: masking is for the scan, not for the judge.
-	const masked = maskHeredocBodiesAndAnsiSpans(command).masked;
+	// program this scan insists on reading), a comment is not read at all, and
+	// an ANSI-C or crossed quote span is text the shell never parses as a
+	// command either. The judged text below stays the whole command: masking is
+	// for the scan, not for the judge.
+	const mask = maskHeredocBodiesAndAnsiSpans(command);
+	const masked = mask.masked;
+	const parsed = parseShell(command);
+	// A command the parser rejects is read from its text alone, and a text
+	// reading that lost its place (a quote it never saw close, a heredoc
+	// delimiter it could not read) blanked everything after that point: a
+	// program there was never looked for. Nothing else can vouch for the tail.
+	//
+	// A parse failure alone is not enough to trust the text either: bash runs
+	// a multi-line command line by line, so the lines before a syntax error
+	// still run (`time python3 p.py` above a stray `fi`), while everything the
+	// parse would have caught is missed. And no word test on raw text can say
+	// what a word becomes (`py\thon3`, `p"y"thon3`, `$X`, `pyth{on3,}`). A
+	// command the parser cannot read is refused.
+	if (!parsed.ok) {
+		return {
+			text,
+			bodies,
+			refusal: {
+				why: "script body blocked: the shell parser could not read the command, so the classifier cannot tell which programs it runs or from where",
+			},
+		};
+	}
+	// The walk's directories are used only when it agrees with the parse on
+	// every command that can move the shell. A `cd` in a comment, a function
+	// body or a loop is a `cd` the walk would apply in the wrong place. A
+	// function definition can also shadow the verb itself (`function cd { :;
+	// }` makes every later `cd` a no-op), so a command that defines one and
+	// moves the shell does not trust the walk at all.
+	const layout = parsed.ok ? shellLayout(command) : null;
+	const movesShell = parsed.ok && parsed.commands.some(other => commandMayChangeDirectory(other.words.map(word => word.value)));
+	const walkTrusted =
+		!parsed.ok ||
+		(layout !== null && !(movesShell && layout.functions.length > 0) && directoryChangesAgree(masked, parsed.commands, layout.deferred));
 	const segments = tokenizeShellSegments(masked);
 	// The walk resolves `cd` targets the way this reader resolves its operands:
 	// the host's `resolveToCwd` knows the internal URL schemes and the
 	// workspace-root alias that a plain `path.resolve` would silently turn into
 	// a relative-looking path. The network tier resolves config paths with
 	// `node:path` and hands the same walk its own resolver instead.
-	const dirs = segmentWorkingDirectories(masked, cwd, segments, resolveToCwd);
-	const shellAst = command.includes("<") ? parseShell(command) : null;
-	const shellCommands: ShellCommand[] = shellAst !== null && shellAst.ok
-		? shellAst.commands.filter(candidate => !candidate.nested && candidate.words.length > 0)
+	const dirs = walkTrusted ? segmentWorkingDirectories(masked, cwd, segments, resolveToCwd) : segments.map(() => null);
+	const shellCommands: ShellCommand[] = parsed.ok
+		? parsed.commands.filter(candidate => !candidate.nested && candidate.words.length > 0)
 		: [];
 	let shellCommandIndex = 0;
+
+	/** Read one program word from `base`, the directory its segment runs in.
+	 *  Returns a refusal, or null once the body is spliced in or passed over. */
+	const readRef = (ref: InterpreterProgramRef, dir: string | null): { why: string } | null => {
+		if (dir === null) {
+			// The shell's directory at this segment is not in the text (a
+			// `cd $DIR`, `cd -`, a bare `cd`, `pushd`, a target that does not
+			// exist yet, or a separator this walk and the tokenizer read
+			// differently). Reading from a guessed directory would judge a
+			// different file than the interpreter runs.
+			const scriptShaped = SCRIPT_FILE_EXTENSION.test(ref.operand) || ref.operand.includes("/");
+			if (ref.arm === "load" && !scriptShaped) return null;
+			return {
+				why:
+					`script body blocked: the working directory ${ref.verb} would run ${ref.operand} ` +
+					`from cannot be resolved from the command text`,
+			};
+		}
+		const label = ref.arm === "stdin"
+			? `\n# --- ${ref.verb} reads stdin from ${ref.operand}; body read from disk ---\n`
+			: `\n# --- ${ref.verb} runs ${ref.operand}; body read from disk ---\n`;
+		const endLabel = `\n# --- end of ${ref.operand} ---`;
+		const result = readScriptFile(ref, dir, limit - text.length - label.length - endLabel.length);
+		if (result.kind === "skip") return null;
+		if (result.kind === "refuse") return { why: result.why };
+		const heredocRefusal = shellBodyHeredocRefusal(ref.verb, result.body);
+		if (heredocRefusal !== null) return { why: heredocRefusal };
+		bodies.push({ verb: ref.verb, operand: ref.operand, body: result.body });
+		text += `${label}${result.body}${endLabel}`;
+		return null;
+	};
+
+	// Every program word the text pass looked at, read or passed over, with
+	// the directory it was resolved from. The parse pass below reads only what
+	// is left: the same word from the same directory is the same file.
+	const considered = new Map<string, number>();
 	for (let index = 0; index < segments.length; index++) {
 		const segment = segments[index];
 		if (segment.length === 0) continue;
@@ -4144,7 +4370,7 @@ export function readInterpretedScriptBodies(command: string, cwd: string, limit:
 		}
 		const head = segment[headIndex];
 		let shellCommand: ShellCommand | undefined;
-		if (head !== undefined && shellAst !== null && shellAst.ok) {
+		if (head !== undefined && parsed.ok) {
 			for (let candidateIndex = shellCommandIndex; candidateIndex < shellCommands.length; candidateIndex++) {
 				const candidate = shellCommands[candidateIndex];
 				if (commandBasename(candidate.words[0]?.value.toLowerCase() ?? "") !== commandBasename(head.toLowerCase())) continue;
@@ -4155,7 +4381,7 @@ export function readInterpretedScriptBodies(command: string, cwd: string, limit:
 		}
 
 		const redirectAt = segment.findIndex(word => word === "<" || word === "<>");
-		if (redirectAt !== -1 && (shellAst === null || !shellAst.ok || shellCommand === undefined)) {
+		if (redirectAt !== -1 && (!parsed.ok || shellCommand === undefined)) {
 			if (interpreterInvocation(segment.slice(0, redirectAt))) {
 				return {
 					text,
@@ -4166,75 +4392,59 @@ export function readInterpretedScriptBodies(command: string, cwd: string, limit:
 		}
 
 		const hasRedirects = (shellCommand?.redirects.length ?? 0) > 0;
-		const interpreterWords = hasRedirects && shellCommand
-			? shellCommand.words.map(word => word.value)
-			: segment;
-		const invocation = interpreterInvocation(interpreterWords);
-		if (invocation !== null && "opaque" in invocation) {
-			return { text, bodies, refusal: { why: invocation.opaque } };
+		const found = hasRedirects && shellCommand
+			? commandScriptRefs(shellCommand.words.map(word => word.value), shellCommand.redirects)
+			: commandScriptRefs(segment, null);
+		if ("refusal" in found) return { text, bodies, refusal: { why: found.refusal } };
+		for (const ref of found.refs) {
+			const dir = scriptRefDir(ref, found.invocation, dirs[index]);
+			const key = scriptRefKey(ref, dir);
+			considered.set(key, (considered.get(key) ?? 0) + 1);
+			const refusal = readRef(ref, dir);
+			if (refusal !== null) return { text, bodies, refusal };
 		}
-		const syntaxOnly = interpreterSyntaxOnly(interpreterWords);
-		const refs = interpreterProgramRefs(interpreterWords).filter(ref => !syntaxOnly || ref.loader === true);
-		const flow = hasRedirects && shellCommand ? redirectedStdinFlow(shellCommand.redirects) : null;
-		const stdin = syntaxOnly || flow === null ? null : interpreterReadsRedirectedStdin(interpreterWords);
-		if (stdin !== null && flow !== null) {
-			if (flow.kind === "unknown") {
-				return {
-					text,
-					bodies,
-					refusal: { why: "script body blocked: redirected stdin descriptor could not be resolved" },
-				};
-			}
-			if (flow.kind === "file") {
-				const target = flow.target;
-				if (!target.literal && !SHELL_WORD_EXPANSION.test(target.value)) {
-					return {
-						text,
-						bodies,
-						refusal: { why: `script body blocked: redirected stdin target ${target.source} is not literal` },
-					};
-				}
-				refs.push({ verb: stdin.verb, operand: target.value, arm: "stdin" });
-			}
-		}
+	}
 
-		for (const ref of refs) {
-			let dir = dirs[index];
-			if (ref.arm !== "stdin" && invocation && !("opaque" in invocation) && invocation.cwdChanges) {
-				for (const change of invocation.cwdChanges) {
-					if (dir === null) break;
-					if (SHELL_WORD_EXPANSION.test(change) || change.startsWith("~")) dir = null;
-					else dir = resolveToCwd(change, dir);
-				}
+	// The parse is the second reader, and it decides what the text pass missed.
+	// The text pass finds a program only where the tokenizer puts it at the head
+	// of a segment, so an interpreter after `then`, `do`, `time` or `!`, inside
+	// a quoted `"$(…)"` or backticks, or in an unquoted heredoc body that runs
+	// its substitutions, was never an interpreter to it. Every program word the
+	// parse finds that the text pass did not consider is read here, from the
+	// directory the walk gives the command's own offset.
+	const parsedRefs: Array<{ command: ShellCommand; invocation: InterpreterInvocation; refs: InterpreterProgramRef[] }> = [];
+	for (const parsedCommand of parsed.commands) {
+		if (parsedCommand.words.length === 0) continue;
+		const found = commandScriptRefs(parsedCommand.words.map(word => word.value), parsedCommand.redirects);
+		if ("refusal" in found) return { text, bodies, refusal: { why: found.refusal } };
+		if (found.refs.length > 0) parsedRefs.push({ command: parsedCommand, ...found });
+	}
+	const cwdAt = walkTrusted ? segmentCwdLookup(masked, cwd, resolveToCwd) : () => null;
+	const expanded = expandedVerbRefusal(parsed.commands, parsedRefs.map(entry => entry.command.sourceOffset ?? 0), cwdAt);
+	if (expanded !== null) return { text, bodies, refusal: { why: expanded } };
+	// A function definition can shadow any verb, `cd` and the interpreter
+	// included, and its body runs wherever it is called, so neither the walk
+	// nor the source order says where a program in such a command runs.
+	if (parsedRefs.length > 0 && (layout === null || layout.functions.length > 0)) {
+		return {
+			text,
+			bodies,
+			refusal: { why: "script body blocked: the command defines a shell function, so the classifier cannot tell which program runs where" },
+		};
+	}
+	for (const entry of parsedRefs) {
+		const offset = entry.command.sourceOffset;
+		const base = offset === undefined ? null : cwdAt(offset);
+		for (const ref of entry.refs) {
+			const dir = scriptRefDir(ref, entry.invocation, base);
+			const key = scriptRefKey(ref, dir);
+			const left = considered.get(key) ?? 0;
+			if (left > 0) {
+				considered.set(key, left - 1);
+				continue;
 			}
-			if (dir === null) {
-				// The shell's directory at this segment is not in the text (a
-				// `cd $DIR`, `cd -`, a bare `cd`, `pushd`, or a separator this
-				// walk and the tokenizer read differently). Reading from a guessed
-				// directory would judge a different file than the interpreter runs.
-				const scriptShaped = SCRIPT_FILE_EXTENSION.test(ref.operand) || ref.operand.includes("/");
-				if (ref.arm === "load" && !scriptShaped) continue;
-				return {
-					text,
-					bodies,
-					refusal: {
-						why:
-							`script body blocked: the working directory ${ref.verb} would run ${ref.operand} ` +
-							`from cannot be resolved from the command text`,
-					},
-				};
-			}
-			const label = ref.arm === "stdin"
-				? `\n# --- ${ref.verb} reads stdin from ${ref.operand}; body read from disk ---\n`
-				: `\n# --- ${ref.verb} runs ${ref.operand}; body read from disk ---\n`;
-			const endLabel = `\n# --- end of ${ref.operand} ---`;
-			const result = readScriptFile(ref, dir, limit - text.length - label.length - endLabel.length);
-			if (result.kind === "skip") continue;
-			if (result.kind === "refuse") return { text, bodies, refusal: { why: result.why } };
-			const heredocRefusal = shellBodyHeredocRefusal(ref.verb, result.body);
-			if (heredocRefusal !== null) return { text, bodies, refusal: { why: heredocRefusal } };
-			bodies.push({ verb: ref.verb, operand: ref.operand, body: result.body });
-			text += `${label}${result.body}${endLabel}`;
+			const refusal = readRef(ref, dir);
+			if (refusal !== null) return { text, bodies, refusal };
 		}
 	}
 	return { text, bodies, refusal: null };
