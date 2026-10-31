@@ -218,6 +218,12 @@ describe("second-execution markers read code, not prose", () => {
 		["builtin compile", "code = compile(src, 'x', 'exec')\n"],
 		["eval with an argument", "eval(payload)\n"],
 		["exec", "exec(payload)\n"],
+		["an import after a colon", "try: import subprocess\nexcept ImportError: pass\n"],
+		["an import continued with a backslash", "import os, \\\n    subprocess\n"],
+		["a parenthesized import list", "from pkg import (\n    os,\n    subprocess,\n)\n"],
+		["subprocess imported from a package", "from pkg import subprocess\n"],
+		["compile borrowed through an alias of re", "import builtins as re\nre.compile(src, 'x', 'exec')\n"],
+		["compile through a name assigned to re", "re = builtins\nre.compile(src, 'x', 'exec')\n"],
 	])("%s is still flagged", async (_name, body) => {
 		writeScript(root, "probe.py", body);
 		expect(refusalOf(await gate("python3 probe.py")).layer).toBe("flagged");

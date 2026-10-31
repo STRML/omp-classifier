@@ -2169,11 +2169,27 @@ const SCRIPT_FILE_EXTENSION = /\.(?:py|pyw|rb|js|mjs|cjs|ts|mts|cts|tsx|jsx|sh|b
 // shows every character it will run — so a SAFE verdict on plain code may
 // release it. A payload that decodes or re-execs is NOT the code the model
 // read, so the wrapper's SAFE says nothing about what actually runs.
-// Each marker matches code, not prose: `re.compile(` builds a regex and
-// `model.eval()` takes no code, and a docstring that says "subprocess" runs
-// nothing. Every literal way to reach the module still matches.
+// Each marker matches code, not prose: `model.eval()` takes no code, a
+// docstring that says "subprocess" imports nothing, and `re.compile(` builds a
+// regex. Any line that imports and names subprocess still matches, wherever
+// the statement starts (`try: import subprocess`) and across a `\` line
+// continuation or a parenthesized import list.
 const INTERPRETER_CODE_RISK =
-	/exec\(|eval\((?!\s*\))|os\.system|\bsubprocess\s*\.|(?:^|;)\s*import\s[^\n;]*\bsubprocess\b|(?:^|;)\s*from\s+subprocess\b|["']subprocess["']|create_subprocess_|base64|b64decode|(?<!\b(?:re|regex)\.)compile\(|__import__|marshal|\\x[0-9a-f]{2}/m;
+	/exec\(|eval\((?!\s*\))|os\.system|\bsubprocess\s*\.|\bimport\b[^\n]*\bsubprocess\b|\bimport\s*\([^)]*\bsubprocess\b|\bfrom\s+subprocess\b|["']subprocess["']|create_subprocess_|base64|b64decode|__import__|marshal|\\x[0-9a-f]{2}/;
+/** `compile(` as a builtin. `re.compile(` and `regex.compile(` are exempt only
+ *  while the text never rebinds those names, so `import builtins as re` cannot
+ *  borrow the exemption. */
+const COMPILE_CALL = /compile\(/;
+const REGEX_COMPILE_ONLY = /(?<!\b(?:re|regex)\.)compile\(/;
+const REBINDS_REGEX_NAME = /\bas\s+(?:re|regex)\b|(?<![\w.])(?:re|regex)\s*=(?!=)|\b(?:def|class|for)\s+(?:re|regex)\b/;
+
+/** Whether inline code or a script body carries a second-execution marker. */
+function hasInterpreterCodeRisk(text: string): boolean {
+	const joined = text.replace(/\\\r?\n/gu, " ");
+	if (INTERPRETER_CODE_RISK.test(joined)) return true;
+	if (!COMPILE_CALL.test(joined)) return false;
+	return REBINDS_REGEX_NAME.test(joined) || REGEX_COMPILE_ONLY.test(joined);
+}
 
 // Same token set as a word-boundary regex, for matching inside joined
 // interpreter-code text where a quoted payload arrives as one token
@@ -4475,7 +4491,7 @@ export function matchModerateRiskTokens(
 	const pipeStages = splitPipeStages(unmaskedNormalized);
 	for (let i = 1; i < pipeStages.length; i++) {
 		for (const { verb, codeText } of stdinExecutingInterpreters(pipeStages[i])) {
-			if (codeText !== null && !INTERPRETER_CODE_RISK.test(codeText) && !INTERPRETER_RISK_TOKEN_RE.test(codeText)) continue;
+			if (codeText !== null && !hasInterpreterCodeRisk(codeText) && !INTERPRETER_RISK_TOKEN_RE.test(codeText)) continue;
 			flags.add(`| ${verb}`);
 		}
 	}
@@ -4542,7 +4558,7 @@ export function matchModerateRiskTokens(
 				// bare command would have flagged (`bash -c 'rm -rf x'`
 				// keeps the backstop `rm -rf x` has).
 				const codeText = words.slice(2).join(" ");
-				if (INTERPRETER_CODE_RISK.test(codeText) || INTERPRETER_RISK_TOKEN_RE.test(codeText)) {
+				if (hasInterpreterCodeRisk(codeText) || INTERPRETER_RISK_TOKEN_RE.test(codeText)) {
 					flags.add(`${verb} ${next}`);
 				}
 			}
@@ -5050,6 +5066,18 @@ const REVIEWER_HARD_HAZARDS = ["exposes_secrets", "sends_local_data_outbound", "
  *  destructive or irreversible stays blocked, whatever the user said. */
 const REVIEWER_UNSAFE_BARRED = [...REVIEWER_HARD_HAZARDS, "destructive_or_irreversible"] as const;
 
+/**
+ * Whether a hard hazard bars review of this call. One exception: on an UNSURE,
+ * escalates_privilege yields when the user's words or an ask name the remote
+ * host an ssh, scp or rsync acts on (OMP session fa2bd2e7a500: root ssh to the
+ * user's own TV). A local sudo, a host the user never named, and an UNSAFE
+ * stay barred, and so does every other hard hazard.
+ */
+function hazardBars(hazard: string, verdict: string, command: string, transcript: () => readonly ReviewerTranscriptEntry[]): boolean {
+	if (hazard !== "escalates_privilege" || verdict !== "UNSURE") return true;
+	return !namesRemoteHost(command, transcript());
+}
+
 export interface StageTwoInput {
 	ctx: ExtensionContext;
 	judgement: Judgement;
@@ -5087,12 +5115,16 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	if (judgement.persistRefusal === false) return skip("one-hot answers");
 	if (judgement.jev === undefined) return skip("no stage-1 answers");
 	const { hazardReview, hazardBlock } = jevPolicyFor(config);
+	// Read the branch only once a check needs it: a call that skips on a hard
+	// hazard never touches the session.
+	let read: ReviewerTranscriptEntry[] | undefined;
+	const readTranscript = (): ReviewerTranscriptEntry[] => (read ??= reviewerTranscript(ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>, refusedToolCallIds));
 	const barred = judgement.verdict === "UNSAFE" ? REVIEWER_UNSAFE_BARRED : REVIEWER_HARD_HAZARDS;
-	const hard = barred.find(hazard => (judgement.jev?.hazards[hazard] ?? 0) >= hazardReview);
+	const hard = barred.find(hazard => (judgement.jev?.hazards[hazard] ?? 0) >= hazardReview && hazardBars(hazard, judgement.verdict, command, readTranscript));
 	if (hard !== undefined) return skip(`hazard ${hard}`);
 	// Jev all but certain the user never asked: there is no consent to review.
 	if (judgement.verdict === "UNSAFE" && (judgement.jev.hazards.unauthorized_consequential_action ?? 0) >= hazardBlock) return skip("hazard unauthorized_consequential_action");
-	const transcript = reviewerTranscript(ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>, refusedToolCallIds);
+	const transcript = readTranscript();
 	const userWords = transcript.flatMap(entry => (entry.from === "user" ? [entry.text] : entry.from === "ask" ? [entry.userAnswer] : []));
 	if (userWords.length === 0) return skip("no user words");
 	const programs = scriptsForReview(command, input.startCwd);
@@ -5176,14 +5208,114 @@ function reviewerLifts(prior: Refusal, judgement: Judgement, userQuote: string |
 	if (prior.source !== "model" || judgement.reasonCode !== "reviewer:allow" || userQuote === undefined) return false;
 	const anchors = consentAnchors(command);
 	if (anchors.size === 0) return false;
-	return consent.some(said => {
-		if (said.from === "agent-tool-call" || !quotesUserWords(userQuote, [said])) return false;
-		const named = said.from === "ask" ? `${said.agentQuestion}\n${said.userAnswer}` : said.text;
-		return named
-			.toLowerCase()
-			.split(/[^a-z0-9._-]+/u)
-			.some(word => anchors.has(word));
-	});
+	return consent.some(said => quotesUserWords(userQuote, [said]) && namesAnchor(said, anchors));
+}
+
+/** Whether a user entry, or the ask question it answers, names one of
+ *  `anchors` as a whole word. A sentence's closing period is not part of it. */
+function namesAnchor(said: ReviewerTranscriptEntry, anchors: ReadonlySet<string>): boolean {
+	if (said.from === "agent-tool-call") return false;
+	const named = said.from === "ask" ? `${said.agentQuestion}\n${said.userAnswer}` : said.text;
+	return named
+		.toLowerCase()
+		.split(/[^a-z0-9._-]+/u)
+		.some(word => anchors.has(word) || anchors.has(word.replace(/\.+$/u, "")));
+}
+
+/** Whether the user's words or an ask name the host this ssh, scp or rsync
+ *  acts on. The command must be that one ssh, scp or rsync, after a leading
+ *  cd and before a trailing output filter: a second command could be a root
+ *  ssh to a host nobody named, or a local sudo. Any other command, or one
+ *  whose host is not spelled out (an ssh run through a variable), names no
+ *  host. */
+export function namesRemoteHost(command: string, transcript: readonly ReviewerTranscriptEntry[]): boolean {
+	const unfiltered = withoutOutputFilter(command);
+	const parsed = parseShell(unfiltered);
+	if (!parsed.ok) return false;
+	// Every command counts, a substitution's too: `$(ssh other id)` runs first.
+	const commands = parsed.commands[0] !== undefined && verbName(parsed.commands[0]) === "cd" ? parsed.commands.slice(1) : parsed.commands;
+	const [remote] = commands;
+	// Every word as written: `$OPTS` can expand into `-oProxyCommand=sh`, and `{a,b}` into two hosts.
+	if (commands.length !== 1 || remote.assigns.length > 0 || !remote.words.every(word => word.fixed)) return false;
+	const words = remote.words.map(word => word.value);
+	// The program by its bare name only: `./ssh` or `/tmp/ssh` is whatever local file carries that name.
+	if (!remoteOptionsInert(words[0] ?? "", words.slice(1))) return false;
+	const read = commandOperands(unfiltered);
+	const hosts = read === undefined ? [] : remoteHosts(read.verb, read.operands);
+	// Every host the command acts on: an scp from the named host to another one is not consent for the other.
+	return hosts.length > 0 && hosts.every(host => transcript.some(said => namesAnchor(said, new Set([host]))));
+}
+
+/** The options each remote verb may carry under the named-host exception, by
+ *  allowlist: anything else may run a local program (ProxyCommand, -S, -e),
+ *  move the destination (HostName, -J, -F) or open a tunnel, so it fails closed. */
+const INERT_REMOTE_OPTIONS = new Map([
+	// No -A, -K, -X or -Y: forwarding the agent, credentials or display lends the remote root a local key or screen.
+	// ssh's operands end at the second one: options after the host still count (OpenSSH reads them), the words after the remote command's first word do not.
+	["ssh", { flags: "46aCknNqtTvxy", valued: "bceilmpo", operands: 1 }],
+	["scp", { flags: "346BCOpqrRTv", valued: "cilPo", operands: Infinity }],
+	["rsync", { flags: "aAbcCdDgHhIkKlLmnoOpPqrRStuUvWxXz", valued: "", operands: Infinity }],
+]);
+/** ssh `-o` settings that only tune the connection to the host as written. */
+const INERT_SSH_SETTINGS = new Set([
+	"stricthostkeychecking", "userknownhostsfile", "loglevel", "connecttimeout", "batchmode", "serveraliveinterval", "serveralivecountmax",
+	"port", "user", "identityfile", "identitiesonly", "connectionattempts", "compression", "requesttty", "passwordauthentication",
+	"pubkeyauthentication", "preferredauthentications", "hostkeyalgorithms", "pubkeyacceptedalgorithms", "pubkeyacceptedkeytypes", "updatehostkeys",
+]);
+
+/** Whether every option an ssh, scp or rsync carries is on the inert list.
+ *  ssh reads options before and after its host, and stops at the first word
+ *  of the remote command. */
+function remoteOptionsInert(verb: string, args: readonly string[]): boolean {
+	const spec = INERT_REMOTE_OPTIONS.get(verb);
+	if (spec === undefined) return false;
+	let operands = 0;
+	for (let at = 0; at < args.length; at++) {
+		const word = args[at];
+		if (word === "--") return true;
+		if (!word.startsWith("-") || word === "-") {
+			if (++operands > spec.operands) return true;
+			continue;
+		}
+		if (word.startsWith("--")) return false;
+		for (let index = 1; index < word.length; index++) {
+			const flag = word[index];
+			if (spec.flags.includes(flag)) continue;
+			if (!spec.valued.includes(flag)) return false;
+			const attached = word.slice(index + 1);
+			const value = attached !== "" ? attached : args[++at];
+			if (value === undefined) return false;
+			if (flag === "o" && !INERT_SSH_SETTINGS.has(value.split(/[=\s]/u)[0].toLowerCase())) return false;
+			break;
+		}
+	}
+	return true;
+}
+
+/** The hosts an ssh, scp or rsync command acts on, lowercased; none for any
+ *  other verb. */
+function remoteHosts(verb: string, operands: readonly string[]): string[] {
+	const hosts = verb === "ssh" ? [sshHost(operands[0])] : verb === "scp" || verb === "rsync" ? operands.filter(looksRemote).map(transferHost) : [];
+	// A host is a name or an address, never punctuation such as `.` or `_`.
+	// One that does not read that way (`[2001:db8::1]`) voids them all rather
+	// than drop out of the list: an scp to an unread host is not consent.
+	const read = hosts.map(host => host?.toLowerCase());
+	return read.every(host => host !== undefined && /^[a-z0-9][a-z0-9._-]*$/u.test(host)) ? (read as string[]) : [];
+}
+
+/** Whether an scp or rsync operand points at another machine: a URL, or a
+ *  user, host or bracket before the first slash. */
+function looksRemote(operand: string): boolean {
+	return /^[a-z][a-z0-9+.-]*:\/\//iu.test(operand) || /^[^/]*[:@[]/u.test(operand);
+}
+
+/** The host an scp or rsync operand names: `user@host:path`, `host::module`,
+ *  or a URL (`rsync://host/mod`, `scp://user@host/path`), whose scheme is not
+ *  its host. A local path names none. */
+function transferHost(operand: string): string | undefined {
+	const url = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]*@)?([^/:]+)/iu.exec(operand);
+	if (url !== null) return url[1];
+	return /^(?:[^@/:]+@)?([^/:]+):/u.exec(operand)?.[1];
 }
 
 /** What a user's words have to name for consent to reach this command: the
@@ -5192,11 +5324,8 @@ function consentAnchors(command: string): Set<string> {
 	const read = commandOperands(command);
 	if (read === undefined) return new Set();
 	const { verb, operands } = read;
-	if (verb === "ssh") return new Set([sshHost(operands[0])?.toLowerCase() ?? ""].filter(host => host !== ""));
-	if (verb === "scp" || verb === "rsync") {
-		const hosts = operands.map(operand => /^(?:[^@/:]+@)?([^/:]+):/u.exec(operand)?.[1]?.toLowerCase());
-		if (hosts.some(host => host !== undefined)) return new Set(hosts.filter((host): host is string => host !== undefined));
-	}
+	// A remote end anchors on its host alone; one whose host does not read anchors nothing.
+	if (verb === "ssh" || ((verb === "scp" || verb === "rsync") && operands.some(looksRemote))) return new Set(remoteHosts(verb, operands));
 	// git's subcommand is the action, not its target.
 	const targets = verb === "git" ? operands.slice(1) : operands;
 	return new Set(targets.map(operand => path.posix.basename(operand.replace(/\/+$/u, "")).toLowerCase()).filter(name => name.length >= 3));
@@ -6955,7 +7084,7 @@ export default function (pi: ExtensionAPI) {
 				// script that re-execs or decodes its real work, and that must not
 				// depend on the judge noticing which file it is reading.
 				for (const body of script.bodies) {
-					if (INTERPRETER_CODE_RISK.test(body.body)) flags.push(`${body.verb} runs ${body.operand}`);
+					if (hasInterpreterCodeRisk(body.body)) flags.push(`${body.verb} runs ${body.operand}`);
 				}
 				const lifts =
 					prior !== undefined &&
