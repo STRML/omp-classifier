@@ -509,6 +509,9 @@ describe("the floor reads the parser's view (plan 2026-09-22-real-shell-parser.m
 			fs.mkdirSync(nested);
 			fs.writeFileSync(path.join(nested, ".env"), "token");
 			expect(evaluateFloor({ command: "echo 漢字; cd nested && cat .e*", cwd }).asks).toBe(true);
+			// A cd inside a comment moves nothing: the glob stays in cwd, which
+			// holds no .env now.
+			expect(evaluateFloor({ command: "echo 漢字 # ; cd nested\ncat .e*", cwd }).asks).toBe(false);
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
