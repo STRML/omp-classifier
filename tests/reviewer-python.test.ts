@@ -58,12 +58,12 @@ function fakeInstall(base = "base", interpreter: string | Buffer = MACHO): strin
 }
 
 /** A venv over `python`, the way `python -m venv` lays one out. */
-function fakeVenv(python: string, venv = "venv", home = path.dirname(python)): string {
+function fakeVenv(python: string, venv = "venv", home = path.dirname(python), systemSite = false): string {
 	fs.mkdirSync(path.join(dir, venv, "bin"), { recursive: true });
 	fs.symlinkSync(python, path.join(dir, venv, "bin", "python3.12"));
 	fs.symlinkSync("python3.12", path.join(dir, venv, "bin", "python"));
 	fs.symlinkSync("python3.12", path.join(dir, venv, "bin", "python3"));
-	write(`${venv}/pyvenv.cfg`, `home = ${home}\ninclude-system-site-packages = false\nversion = 3.12.2\n`);
+	write(`${venv}/pyvenv.cfg`, `home = ${home}\ninclude-system-site-packages = ${systemSite}\nversion = 3.12.2\n`);
 	write(`${venv}/lib/python3.12/site-packages/pytest/__init__.py`, "");
 	return path.join(dir, venv, "bin", "python");
 }
@@ -535,11 +535,11 @@ describe("the gate's four guarantees hold however the code is spelled", () => {
 
 describe("startup code the interpreter runs before the body stays refused", () => {
 	test.each([
-		["a .pth file with an import line", "venv/lib/python3.12/site-packages/hook.pth", "import os; os.system('id')\n", "runs an import line at interpreter startup"],
-		["a sitecustomize in site-packages", "venv/lib/python3.12/site-packages/sitecustomize.py", "import os\n", "sitecustomize.py runs at interpreter startup"],
+		["a .pth file with an import line in the base install's site-packages", "base/lib/python3.12/site-packages/hook.pth", "import os; os.system('id')\n", "runs an import line at interpreter startup"],
+		["a sitecustomize in the base install's site-packages", "base/lib/python3.12/site-packages/sitecustomize.py", "import os\n", "sitecustomize.py runs at interpreter startup"],
 		["a usercustomize in the standard library", "base/lib/python3.12/usercustomize.py", "import os\n", "usercustomize.py runs at interpreter startup"],
 	])("%s", async (_name, rel, content, why) => {
-		const python = fakeVenv(fakeInstall());
+		const python = fakeVenv(fakeInstall(), "venv", undefined, true);
 		write(rel, content);
 		await expectRefused(`${python} -c "import json"`, why);
 	});
@@ -552,9 +552,9 @@ describe("startup code the interpreter runs before the body stays refused", () =
 		["a form feed", "# a\f\n", "line break the gate splits differently"],
 		["a byte-order mark", "\uFEFF# a\n", "line break the gate splits differently"],
 		["a Unicode line separator", "# a\u2028/opt/x\n", "line break the gate splits differently"],
-	])("a .pth file with %s refuses", async (_name, content, why) => {
-		const python = fakeVenv(fakeInstall());
-		write("venv/lib/python3.12/site-packages/hook.pth", content);
+	])("a .pth file in the base install's site-packages with %s refuses", async (_name, content, why) => {
+		const python = fakeVenv(fakeInstall(), "venv", undefined, true);
+		write("base/lib/python3.12/site-packages/hook.pth", content);
 		await expectRefused(`${python} -c "import json"`, why);
 	});
 
@@ -611,19 +611,32 @@ describe("startup code the interpreter runs before the body stays refused", () =
 		await expectReviewed(`${python} -S -c "import json"`);
 	});
 
-	test("-I still runs site, so a .pth import line refuses", async () => {
-		const python = fakeVenv(fakeInstall());
-		write("venv/lib/python3.12/site-packages/hook.pth", "import os; os.system('id')\n");
+	test("-I still runs site, so a base-install .pth import line refuses", async () => {
+		const python = fakeVenv(fakeInstall(), "venv", undefined, true);
+		write("base/lib/python3.12/site-packages/hook.pth", "import os; os.system('id')\n");
 		await expectRefused(`${python} -I -c "import json"`, "runs an import line at interpreter startup");
 	});
 
-	test("a shebang script whose interpreter's site-packages has a .pth import line", async () => {
-		const python = fakeVenv(fakeInstall());
-		write("venv/lib/python3.12/site-packages/hook.pth", "import os; os.system('id')\n");
+	test("a shebang script whose interpreter's base site-packages has a .pth import line", async () => {
+		const python = fakeVenv(fakeInstall(), "venv", undefined, true);
+		write("base/lib/python3.12/site-packages/hook.pth", "import os; os.system('id')\n");
 		write("probe.py", `#!${python}\nimport json\n`, 0o755);
 		await expectRefused("./probe.py", "runs an import line at interpreter startup");
 	});
+
+	// Sam, 2026-10-31 ("Trust user site-packages"): the venv's own
+	// site-packages is the user's installed tooling, read like the stdlib.
+	test.each([
+		["a .pth import line", "venv/lib/python3.12/site-packages/distutils-precedence.pth", "import os; var = 'X'; enabled = os.environ.get(var, 'local') == 'local'; enabled and __import__('_distutils_hack').add_shim();\n"],
+		["a .pth editable path", "venv/lib/python3.12/site-packages/__editable__.tool-0.1.0.pth", "/Users/you/git/tool/scripts\n"],
+		["a sitecustomize", "venv/lib/python3.12/site-packages/sitecustomize.py", "import os\n"],
+	])("%s in the venv's own site-packages is trusted", async (_name, rel, content) => {
+		const python = fakeVenv(fakeInstall());
+		write(rel, content);
+		await expectReviewed(`${python} -c "import json"`);
+	});
 });
+
 
 describe("an import alias refuses, since the name checks cannot follow it", () => {
 	test.each([

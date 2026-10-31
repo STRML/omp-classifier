@@ -4,6 +4,15 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### A venv's own site-packages is trusted at interpreter startup
+
+Sam's call (2026-10-31, "Trust user site-packages"). https://github.com/STRML/omp-classifier/pull/218 refused any Python run whose site-packages held a `.pth` file with an import line or a path, or a `sitecustomize`, because that code runs at startup and the reviewer never reads it. Ordinary venvs carry those files: setuptools' `distutils-precedence.pth`, coverage's `.pth`, and an editable install's path file. So every run of the agent's own venv refused. The venv's own site-packages is now trusted like the standard library. Startup files under the venv root are not checked. The base install's site-packages (for a venv that includes system site packages), the user site, a non-root `pythonXY.zip`, `PYTHON*` variables and a stdlib-named file beside the script are still checked as before. The accepted risk is code an earlier call planted in that venv.
+
+| Command | Before | After |
+|---|---|---|
+| `<venv>/bin/python -c "import json"` with setuptools' and coverage's `.pth` files | refused: runs an import line at interpreter startup | reviewed |
+| the same with a hook `.pth` in the base install's site-packages (system-site venv) | refused | refused |
+
 ### Redaction reads ANSI-C `$'…'` quoting
 
 https://github.com/STRML/omp-classifier/pull/223 bounds a secret at its shell word in commands. Its quote scanner treated `$'…'` as an ordinary single quote, but in ANSI-C quoting a backslash escapes the next character, a quote included. So `export TOKEN=$'hunter2\' rest'` ended the value at the escaped quote, and ` rest'` reached the audit log and the reviewer. The same happened inside a quoted header. Both scanners (the enclosing-quote pass and the word bound) now treat `$'` as its own state in which `\'` does not close. `$$` is read as one token (the PID), so `$$'…'` stays a plain single quote, and `$'` inside double quotes is literal: misreading either could stretch a redaction over the command after it and hide that command from the reviewer.

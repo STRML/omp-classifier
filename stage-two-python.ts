@@ -454,7 +454,7 @@ const CUSTOMIZE = /^(?:sitecustomize|usercustomize)(?:\.|$)/u;
  * `sitecustomize` and `usercustomize`. `flags` are the interpreter's own
  * options: `-S` skips all of it, and `-s` or `-I` skip the user site.
  */
-export function startupRefusal(libs: readonly string[], venv: { systemSite: boolean } | undefined, flags: readonly string[], real: string, isSystemProgram: (file: string) => boolean): string | undefined {
+export function startupRefusal(libs: readonly string[], venv: { root: string; systemSite: boolean } | undefined, flags: readonly string[], real: string, isSystemProgram: (file: string) => boolean): string | undefined {
 	const version = libs.map(dir => /^python(\d+\.\d+)$/u.exec(path.basename(dir))?.[1]).find(found => found !== undefined);
 	// The standard-library zip sits first on sys.path, -S or not, so a writable one shadows every stdlib module.
 	if (version !== undefined) {
@@ -466,11 +466,16 @@ export function startupRefusal(libs: readonly string[], venv: { systemSite: bool
 	// A venv turns the user site off unless it includes the system site.
 	const userSite = (venv === undefined || venv.systemSite) && !letters.includes("s") && !letters.includes("I") && version !== undefined;
 	const sites = [...libs.filter(dir => path.basename(dir) === "site-packages"), ...(userSite ? [path.join(os.homedir(), ".local", "lib", `python${version}`, "site-packages"), path.join(os.homedir(), "Library", "Python", version, "lib", "python", "site-packages")] : [])];
-	for (const dir of [...libs, ...sites]) {
+	// The venv's own site-packages is trusted like the standard library (Sam,
+	// 2026-10-31: "Trust user site-packages"): its .pth files and
+	// sitecustomize are the user's installed tooling. The base install's and
+	// the user site's directories outside the venv are still read.
+	const inVenv = (dir: string): boolean => venv !== undefined && (dir === venv.root || dir.startsWith(`${venv.root}${path.sep}`));
+	for (const dir of [...libs, ...sites].filter(dir => !inVenv(dir))) {
 		const custom = safeList(dir).find(entry => CUSTOMIZE.test(entry));
 		if (custom !== undefined) return `${path.join(dir, custom)} runs at interpreter startup, unread`;
 	}
-	for (const dir of sites) {
+	for (const dir of sites.filter(dir => !inVenv(dir))) {
 		for (const entry of safeList(dir).filter(name => name.endsWith(".pth"))) {
 			const why = pthRefusal(path.join(dir, entry));
 			if (why !== undefined) return why;
