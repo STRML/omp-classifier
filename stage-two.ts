@@ -205,9 +205,10 @@ export function readScriptForReview(spelled: string, file: string, handOff: (bod
  * Why a body runs a file this read did not cover, or undefined. A shell body
  * (any body whose shebang names no other interpreter) is parsed: a program
  * named by a path outside the system directories, a wrapper or interpreter
- * handed a path, or a construct the parser cannot decompose all count. A
- * bare variable as the program (`"$OMP"`) is allowed: the reviewer reads what
- * the body assigns it, and LOCAL_HANDOFF refuses a script-dir assignment.
+ * handed a path, or a construct the parser cannot decompose all count. So
+ * does a program named by an expansion (`"$OMP"`, `$X`): it can be any
+ * builtin or interpreter, it can split into a program and its arguments, and
+ * a pipe or an earlier `exec` can feed it a script on stdin.
  */
 function bodyHandOff(body: string, real: string): string | undefined {
 	const shebang = body.startsWith("#!") ? body.split("\n", 1)[0] : "";
@@ -260,8 +261,9 @@ const BINARY_TEST_OPERATORS = new Set(["=", "==", "!=", "<", ">", "-nt", "-ot", 
 const UNARY_TEST_OPERATORS = new Set(["-n", "-z", "-e", "-f", "-d", "-r", "-w", "-x", "-s", "-L", "-h", "-p", "-S", "-b", "-c", "-g", "-k", "-u", "-O", "-G", "-N", "-t"]);
 const NAME_TEST = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 
-/** A built word that stays one word: one double-quoted span. */
-const quotedOperand = (word: ShellWord): boolean => /^"[^"]*"$/u.test(word.source);
+/** A built word that stays one word: one double-quoted span with no `$@`,
+ *  `${a[@]}` or `${!p@}` inside, which expand to one word per element. */
+const quotedOperand = (word: ShellWord): boolean => /^"[^"]*"$/u.test(word.source) && !/\$\{?@|\[@\]|\$\{![^}]*@\}/u.test(word.source);
 
 /** Why a `test` argument list can evaluate a name, or undefined. With every
  *  word fixed, `-v`/`-R` must be followed by a plain name. With any word
@@ -324,12 +326,9 @@ function writesHiddenName(command: ShellCommand): string | undefined {
 		if (why !== undefined) return `${verb.value} ${why}`;
 	}
 	if (verb?.value === "wait" && command.words.slice(1).some(word => !word.fixed || /^-[A-Za-z]*p/u.test(word.value))) return "wait -p writes a variable whose name may carry a subscript";
-	// A verb spelled by an expansion can be any builtin, an interpreter
-	// reading stdin included: it reads only bare, with no argument and no
-	// input redirect.
-	if (verb !== undefined && !verb.literal && (command.words.length > 1 || command.redirects.some(redirect => redirect.direction !== "out"))) {
-		return "a program named by an expansion is handed arguments or input";
-	}
+	// A verb spelled by an expansion can be any builtin or interpreter, it can
+	// split into a program and its arguments, and a pipe can feed it a script.
+	if (verb !== undefined && !verb.literal) return "the program is named by an expansion, so the gate cannot tell what runs";
 	// `[` alone reads as a glob character but names the test builtin.
 	if (verb !== undefined && verb.literal && !verb.fixed && verb.value !== "[") return "the program word is rewritten by brace expansion or a glob";
 	return undefined;

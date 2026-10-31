@@ -4,6 +4,17 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### A program named by an expansion is never read in a script body
+
+Stage 2 let a body name its program with a variable (`"$OMP" status`), on the theory that the reviewer reads what the body assigns. https://github.com/STRML/omp-classifier/pull/230 limited that to a bare verb with no arguments or input. The security review found three ways past even that. `X='bash payload.txt'; $X` splits into a program and its argument. `cat payload.txt | "$X"` feeds it a script through a pipe. An earlier `exec <` can do the same through stdin. A verb built from an expansion now refuses outright. `test` also stops treating `"$@"`, `"${a[@]}"` or `"${!p@}"` as one operand, since each expands to one word per element.
+
+| Body | Before | After |
+|---|---|---|
+| `X='bash payload.txt'; $X` | reviewed | refused |
+| `cat payload.txt \| "$X"` | reviewed | refused |
+| `[ "$@" ]` | reviewed | refused |
+| `"$OMP"` alone | reviewed | refused |
+
 ### `test` with a built word reads only in fixed shapes, and an expanded verb only bare
 
 https://github.com/STRML/omp-classifier/pull/229 refused a `test` operator built at run time by its position (first, or after `!`, `-a`, `-o`, `(`). The security review showed position can't be trusted. An unquoted word splits (`s='-v a[w]'; [ $s ]` is `[ -v a[w] ]`), and the connective can be built too (`[ "$g" "$f" "$n" ]` with `g='!'`). `test` and `[` now read a word built at run time only in three shapes, with every built word one double-quoted span and every operator fixed: `[ "$x" ]`, `[ -n "$x" ]` (any string or file operator except `-v` and `-R`), and `[ "$a" = "$b" ]` (string, file or numeric comparison, which `[` does not evaluate). Any other shape refuses. A verb spelled by an expansion now reads only bare, with no argument and no input redirect, since it can be an interpreter reading a script on stdin (`$X < payload.txt`). `wait` refuses `-p` bundled with other flags (`-fp`).
