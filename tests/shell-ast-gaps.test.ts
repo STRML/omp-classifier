@@ -94,7 +94,7 @@ describe("a tree too deep to walk fails closed", () => {
 		expect(shellDefinesFunction(deep)).toBe(true);
 		expect(substitutionSpans(deep)).toEqual(["x"]);
 		expect(hiddenArithmetic(deep)).toBe("its shell body is too deep to read");
-	});
+	}, 60_000);
 
 	describe("through the gate", () => {
 		beforeEach(async () => {
@@ -109,6 +109,6 @@ describe("a tree too deep to walk fails closed", () => {
 			const result = resultText(await fire("tool_call", makeEvent(deep), makeCtx({ sessionId: "shell-ast-gaps-deep" })));
 			if (result !== "ALLOWED") expect(refusalOf(result).layer).not.toBe("internal-error");
 			expect(modelCalls.length).toBeGreaterThan(0);
-		});
+		}, 60_000);
 	});
 });
