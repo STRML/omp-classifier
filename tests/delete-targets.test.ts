@@ -16,7 +16,7 @@ import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, w
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildJevState, gateTempRoots, jevQuestions, JEV_POLICY_VERSION, JEV_V3_POLICY_VERSION, measureDeleteTargets } from "../jev";
-import { shellTmpdirFor } from "../index";
+import { shellTmpdirFor, touchesShellEnv } from "../index";
 import { fire, jevSafeAnswer, loadPlugin, makeCtx, makeEvent, makeSettings, modelCalls, removeConfigFile, setJevAnswer, stateOf } from "./fixtures";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "delete-targets-")));
@@ -135,6 +135,13 @@ describe("measureDeleteTargets", () => {
 			const spaced = join(tmp, "with space");
 			expect(withShell("trash $TMPDIR/a b.txt", spaced)).toEqual([null, null]);
 			expect(withShell(`trash "$TMPDIR/a b.txt"`, spaced)).toEqual([true]);
+			// An extglob pattern in the value expands to other names when the shell
+			// has extglob on; quoted, it is a literal directory name.
+			const pattern = join(tmp, "@(run|x)");
+			mkdirSync(pattern, { recursive: true });
+			writeFileSync(join(pattern, "f.txt"), "x");
+			expect(withShell("trash $TMPDIR/f.txt", pattern)).toEqual([null]);
+			expect(withShell(`trash "$TMPDIR/f.txt"`, pattern)).toEqual([true]);
 		});
 
 		test("anything on the line that could repoint TMPDIR or the path still unmeasures it", () => {
@@ -376,6 +383,33 @@ describe("delete targets through the gate", () => {
 		}
 	});
 
+	test("a $TMPDIR operand stays unmeasured after an earlier call in the session may have changed the shell", async () => {
+		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-touched-")));
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = real;
+		try {
+			mkdirSync(join(real, "x"));
+			writeFileSync(join(real, "x", "probe.md"), "x");
+			const command = 'trash "$TMPDIR/x/probe.md"';
+			const flagFor = async (id: string, line: string): Promise<unknown> => {
+				const before = modelCalls.length;
+				await fire("tool_call", makeEvent(line), makeCtx({ sessionId: id, cwd: home }));
+				return (stateOf(before).deleteTargets as Array<Record<string, unknown>> | undefined)?.[0]?.underTempRoot;
+			};
+			const touched = session();
+			const clean = session();
+			expect(await flagFor(touched, "export IFS=/")).toBeUndefined();
+			expect(await flagFor(touched, command)).toBeNull();
+			// The persistent shell is per session: another one is unaffected.
+			expect(await flagFor(clean, "ls -la")).toBeUndefined();
+			expect(await flagFor(clean, command)).toBe(true);
+		} finally {
+			if (saved === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = saved;
+			rmSync(real, { recursive: true, force: true });
+		}
+	});
+
 	test("a $TMPDIR operand stays unmeasured when an .envrc sits in the working directory", async () => {
 		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-envrc-")));
 		try {
@@ -450,6 +484,10 @@ describe("shellTmpdirFor", () => {
 		expect(shellTmpdirFor([nested], { TMPDIR: "/var/folders/zz/T" })).toBe("/var/folders/zz/T");
 	});
 
+	test("is null once an earlier command in the shell may have changed it", () => {
+		expect(shellTmpdirFor([cwd], { TMPDIR: "/var/folders/zz/T" }, true)).toBeNull();
+	});
+
 	test("reads process.env by default", () => {
 		const saved = process.env.TMPDIR;
 		process.env.TMPDIR = "/var/folders/yy/T";
@@ -458,6 +496,20 @@ describe("shellTmpdirFor", () => {
 		} finally {
 			if (saved === undefined) delete process.env.TMPDIR;
 			else process.env.TMPDIR = saved;
+		}
+	});
+});
+
+describe("touchesShellEnv", () => {
+	test("names that can change TMPDIR or IFS in the persistent shell", () => {
+		for (const command of ["export TMPDIR=/Users", "TMPDIR=/x", "unset TMPDIR", "IFS=/", "export IFS=:", "echo ${TMPDIR:=/x}", "eval \"$setup\"", "source ./env.sh", ". ./env.sh", "ls && . ./env.sh", "shopt -s extglob", "declare -x TMPDIR=/y"]) {
+			expect([command, touchesShellEnv(command)]).toEqual([command, true]);
+		}
+	});
+
+	test("plain reads and unrelated commands leave it alone", () => {
+		for (const command of ['trash "$TMPDIR/x"', "ls $TMPDIR", "echo ${TMPDIR}/a", "echo $IFS", "ls . src", "cat file.txt", "git status", "bun run evaluate", "export PATH=$PATH:/x", "echo sourcemap"]) {
+			expect([command, touchesShellEnv(command)]).toEqual([command, false]);
 		}
 	});
 });

@@ -2815,6 +2815,12 @@ function measureDeleteOperand(word: ShellWord, cwd: string | null, roots: readon
  *  not match. */
 const TMPDIR_OPERAND = /^(")?\$(?:TMPDIR(?![A-Za-z0-9_])|\{TMPDIR\})(\/[^"'$`\\*?[{]*)?\1$/u;
 
+/** What an unquoted expansion may hold and still stay one literal word: the
+ *  shell expands glob and extglob patterns (`@(a|b)`, `!(x)`) in it, so only
+ *  characters with no meaning there are trusted. (Splitting on a changed `IFS`
+ *  is the caller's to rule out: the session latch in index.ts.) */
+const UNQUOTED_SAFE_PATH = /^[A-Za-z0-9_.\/+@%,:=-]*$/u;
+
 /** The parts of a `$TMPDIR` operand, or null when the word is any other shape. */
 function tmpdirOperand(word: ShellWord): { quoted: boolean; rest: string } | null {
 	const match = TMPDIR_OPERAND.exec(word.source);
@@ -2825,12 +2831,12 @@ function tmpdirOperand(word: ShellWord): { quoted: boolean; rest: string } | nul
 /**
  * The path a `$TMPDIR` operand names in the shell that runs it (#176). The
  * caller supplies the shell's `TMPDIR`, or null when it cannot vouch for it (a
- * repo's `.envrc` may set its own). Unquoted, the value must stay one word:
- * no whitespace to split on and no glob character to expand.
+ * repo's `.envrc` may set its own). Unquoted, the value must also be free of
+ * characters a glob or extglob pattern could act on.
  */
 function expandTmpdirOperand(operand: { quoted: boolean; rest: string }, shellTmpdir: string | null): string | null {
 	if (shellTmpdir === null || !isAbsolute(shellTmpdir)) return null;
-	if (!operand.quoted && /[\s*?[\]{}]/u.test(shellTmpdir)) return null;
+	if (!operand.quoted && !(UNQUOTED_SAFE_PATH.test(shellTmpdir) && UNQUOTED_SAFE_PATH.test(operand.rest))) return null;
 	return shellTmpdir.replace(/\/+$/u, "") + operand.rest;
 }
 

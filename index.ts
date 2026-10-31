@@ -544,13 +544,14 @@ function normalizeUserPolicy(value: unknown): "allow" | "deny" | "prompt" | unde
  * or null when the gate cannot vouch for it (#176). The shell's environment is
  * this process's, filtered the way the host filters it for child shells
  * (`filterChildShellEnv` drops values a project dotenv file supplied), and the
- * session's shell snapshot never exports `TMPDIR`. The one other writer is a
+ * session's shell snapshot never exports `TMPDIR`. The other writers are a
  * repo's direnv, which loads the nearest `.envrc` above the start directory,
- * so any `.envrc` there leaves the value unknown. A caller-supplied `env`
+ * so any `.envrc` there leaves the value unknown, and an earlier command in
+ * the same persistent shell (`shellEnvTouched`). A caller-supplied `env`
  * blocks the call before judgment, so it never reaches this.
  */
-export function shellTmpdirFor(cwds: readonly string[], env: Record<string, string | undefined> = process.env): string | null {
-	if (cwds.some(hasEnvrcAbove)) return null;
+export function shellTmpdirFor(cwds: readonly string[], env: Record<string, string | undefined> = process.env, shellTouched = false): string | null {
+	if (shellTouched || cwds.some(hasEnvrcAbove)) return null;
 	const value = filterChildShellEnv(env).TMPDIR;
 	return value === undefined || value === "" ? null : value;
 }
@@ -568,11 +569,38 @@ function hasEnvrcAbove(cwd: string): boolean {
 	}
 }
 
+/** Reads of the two variables that change nothing, taken out before the check. */
+const SHELL_ENV_READS = /\$\{TMPDIR\}|\$TMPDIR(?![A-Za-z0-9_])|\$IFS(?![A-Za-z0-9_])/gu;
+/** A command that can leave `TMPDIR` or `IFS` changed in a persistent shell:
+ *  it names either as anything but a plain read, or runs `eval`, `source`,
+ *  `.` or `shopt`, which can set them from a string or a file. */
+const SHELL_ENV_WRITES = /(?<![A-Za-z0-9_])(?:TMPDIR|IFS)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_-])(?:eval|source|shopt)(?![A-Za-z0-9_-])|(?:^|[;&|(\n])\s*\.\s+\S/u;
+
+/** Whether `command` may change the persistent shell's `TMPDIR` or `IFS` for
+ *  the commands after it. Over-matching only costs an ask. */
+export const touchesShellEnv = (command: string): boolean => SHELL_ENV_WRITES.test(command.replace(SHELL_ENV_READS, ""));
+
+/** Sessions where an earlier bash command may have changed the persistent
+ *  shell's `TMPDIR` or `IFS` (the host reuses one shell per session), so a
+ *  later `$TMPDIR` cannot be read from this process's environment. */
+const shellEnvTouched = new Set<string>();
+
 /** The shell's `TMPDIR` only when the command names it: the walk and the env
  *  filter read files, and most commands have no use for either. Both the
  *  directory the host runs the command in (after it extracts a leading `cd`)
- *  and the one the text starts in are walked, so either `.envrc` counts. */
-const shellTmpdirIfNamed = (command: string, cwds: readonly string[]): string | null => (command.includes("TMPDIR") ? shellTmpdirFor(cwds) : null);
+ *  and the one the text starts in are walked, so either `.envrc` counts. A
+ *  call with no session id cannot be tracked, so it is not vouched for. */
+const shellTmpdirIfNamed = (command: string, cwds: readonly string[], sessionId: string | undefined): string | null =>
+	command.includes("TMPDIR") ? shellTmpdirFor(cwds, process.env, sessionId === undefined || shellEnvTouched.has(sessionId)) : null;
+
+/** The host session id, or undefined in an isolated SDK context that has none. */
+function sessionIdOf(ctx: ExtensionContext): string | undefined {
+	try {
+		return ctx.sessionManager.getSessionId();
+	} catch {
+		return undefined;
+	}
+}
 
 interface CanonicalEnv {
 	key: string;
@@ -5885,7 +5913,7 @@ export default function (pi: ExtensionAPI) {
 		// `startCwd` with the unmodified text, like the push and network tiers.
 		let deleteTargets: DeleteTarget[] | undefined;
 		try {
-			deleteTargets = language === "shell" ? measureDeleteTargets(command, startCwd, gateTempRoots(), shellTmpdirIfNamed(command, [cwd, startCwd])) : undefined;
+			deleteTargets = language === "shell" ? measureDeleteTargets(command, startCwd, gateTempRoots(), shellTmpdirIfNamed(command, [cwd, startCwd], sessionIdOf(ctx))) : undefined;
 		} catch {
 			deleteTargets = undefined;
 		}
@@ -6315,6 +6343,12 @@ export default function (pi: ExtensionAPI) {
 		const evalCode = isEval && typeof event.input?.code === "string" ? event.input.code : "";
 		if (isBash && command.trim() === "") return;
 		if (isEval && evalCode.trim() === "") return;
+		// The host runs bash calls in one persistent shell, so this command may
+		// leave TMPDIR or IFS changed for the next one (#176).
+		if (isBash && touchesShellEnv(command)) {
+			const touchedSession = sessionIdOf(ctx);
+			if (touchedSession !== undefined) shellEnvTouched.add(touchedSession);
+		}
 
 		// Agent-authored operator context (issue #31): every tool call may carry
 		// it; BashToolInput does not declare the field, so read it off the raw
@@ -6927,7 +6961,7 @@ export default function (pi: ExtensionAPI) {
 			const networkProvenanceForCache = measureNetworkProvenance(judgedCommand, startCwd);
 			// A delete target swapped for a link between two calls lands somewhere
 			// else (#166), so the measured landing rides in the key too.
-			const deleteTargetsForCache = measureDeleteTargets(judgedCommand, startCwd, gateTempRoots(), shellTmpdirIfNamed(judgedCommand, [cwd, startCwd]));
+			const deleteTargetsForCache = measureDeleteTargets(judgedCommand, startCwd, gateTempRoots(), shellTmpdirIfNamed(judgedCommand, [cwd, startCwd], sessionIdOf(ctx)));
 			const cacheKey = JSON.stringify([
 				config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, judgedCommand,
 				reviewEvidenceFingerprint,
@@ -7241,6 +7275,7 @@ export default function (pi: ExtensionAPI) {
 		// starts unpaused.
 		sessionOff.delete(sessionId);
 		floorTaint.delete(sessionId);
+		shellEnvTouched.delete(sessionId);
 		forgetReviewerBlocks(sessionId);
 	};
 	pi.on("session_start", dropCurrent);
@@ -7268,5 +7303,6 @@ export default function (pi: ExtensionAPI) {
 		// Same boundary rule for the session-scoped pause.
 		sessionOff.delete(sessionId);
 		floorTaint.delete(sessionId);
+		shellEnvTouched.delete(sessionId);
 	});
 }
