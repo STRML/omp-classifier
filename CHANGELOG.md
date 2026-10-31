@@ -4,6 +4,20 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### Stage 2 stops trusting names an earlier call or a hidden assignment can move
+
+Found while building https://github.com/STRML/omp-classifier/pull/218. Stage 2 checks that a script body never changes PATH, then resolves the body's bare names against the gate's own environment. Both halves had a gap.
+
+- **Inside a body:** the PATH check reads names as text, so a name the shell builds at run time slipped past it. `a=PA; b=TH; export "$a$b=/tmp/evil:/usr/bin"` set PATH, and the `git` on the next line ran from `/tmp/evil`. Arithmetic does the same without any `export`: `(( w ))`, `let w` and `[[ $w -eq 1 ]]` evaluate the value of `w` as an expression, and a value of `PATH=1` assigns PATH. So do `$(( w ))` and an array subscript (`${a[w]}`, `x[w]=1`). A body now refuses when a variable writer (`export`, `declare`, `typeset`, `local`, `readonly`, `read`, `mapfile`, `unset`, `getopts`) has a word built at run time, when `printf` takes `-v` or a format word built at run time, when `(( ))`, `let`, `$(( ))` (matched by depth, so nested parentheses count), the legacy `$[ ]`, a subscript or a substring offset (`${s:w:1}`) reads a name or an expansion, and when a `[[ ]]` numeric comparison has an operand that is not a plain integer. Line continuations are joined before these scans. `printf '%s' "$x"`, `$(( 1 + 2 ))` and `export FOO=bar` still reach the reviewer.
+- **Across calls:** the host runs every call of a session in one shell, so `export PATH=/tmp/evil:$PATH`, an alias or a function in one call changes what a bare name resolves to in the next. The gate's environment never sees that. Stage 2 now uses the latch from https://github.com/STRML/omp-classifier/issues/176: once a session has run a command that can change its shell, or an `.envrc` the host loads, or the host's shell prefix is set, the reviewer is skipped for the rest of the session. In the decision log since 2026-10-24, 13 of 120 sessions ran such a command.
+
+| Case | Before | After |
+|---|---|---|
+| body: `a=PA; b=TH; export "$a$b=..."` then `git status` | reviewed | refused, unread |
+| body: `w=x; (( w ))` / `let w` / `$((w))` / `${a[w]}` / `[[ $w -eq 1 ]]` | reviewed | refused, unread |
+| `export PATH=/tmp/evil:$PATH`, then `./update.sh` | reviewed | skipped: the session's shell may resolve names differently |
+| a session that never touched its shell | reviewed | reviewed |
+
 ### Stage 2 reads a Python run whose interpreter it can identify
 
 The machine that produced the log has `.pth` import lines in its venv, so every run there still refuses unless the command passes `-S`.
