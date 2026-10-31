@@ -204,6 +204,7 @@ describe("second-execution markers read code, not prose", () => {
 		["a comment that names subprocess", "# no subprocess here\nprint('ok')\n"],
 		["eval() with no argument", "model.eval()\nprint('ok')\n"],
 		["a trailing comment that names an import", "print(1) # do not import subprocess\n"],
+		["a comment that names a marker", "# decode base64 input\nprint(1)\n"],
 		["a comment line that names an import", "# do not import subprocess\nprint(1)\n"],
 		["re aliased as regex inside an import list", "import os, re as regex\nPAT = regex.compile(r'a+')\n"],
 		["re aliased as regex", "import re as regex\nPAT = regex.compile(r'a+')\n"],
@@ -239,6 +240,11 @@ describe("second-execution markers read code, not prose", () => {
 		["an import behind a comment under a utf-7 coding", "# -*- coding: utf-7 -*-\nx = 1 # +AAo-import subprocess\n"],
 		["an import under a #-prefixed name", "x = 1;#import subprocess\n"],
 		["a dotted module aliased as regex", "import evil.re as regex\nregex.compile(src)\n"],
+		["an import after a comment ending in a backslash", "# note \\\nimport subprocess as sp\n"],
+		["a JS private field named import", "class A {\n  #import = subprocess;\n}\n"],
+		["a from-import alias after an earlier import", "import os; from evil import re as regex\nregex.compile(src)\n"],
+		["an import after a carriage return in a comment", "x = 1 # note\rimport subprocess\n"],
+		["base64 after a comment cut is refused", "x = 1 # note ?>\nimport base64\n"],
 	])("%s is still flagged", async (_name, body) => {
 		writeScript(root, "probe.py", body);
 		expect(refusalOf(await gate("python3 probe.py")).layer).toBe("flagged");

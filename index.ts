@@ -2175,19 +2175,21 @@ const SCRIPT_FILE_EXTENSION = /\.(?:py|pyw|rb|js|mjs|cjs|ts|mts|cts|tsx|jsx|sh|b
 // the statement starts (`try: import subprocess`) and across a `\` line
 // continuation or a parenthesized import list.
 const INTERPRETER_CODE_RISK =
-	/exec\(|eval\((?!\s*\))|os\.system|\bsubprocess\s*\.|\bimport\s*\([^)]*\bsubprocess\b|\bfrom\s+subprocess\b|["']subprocess["']|create_subprocess_|base64|b64decode|__import__|marshal|\\x[0-9a-f]{2}/;
-/** A line that imports and names subprocess, read with its trailing comment
- *  cut (`trailingCommentCut`), so `print(1) # do not import subprocess` passes. */
-const IMPORTS_SUBPROCESS = /\bimport\b.*\bsubprocess\b/;
-/** A source-encoding declaration other than UTF-8 or ASCII: under one (utf-7
- *  decodes `+AAo-` to a newline) a comment can carry code, so none is cut. */
-const FOREIGN_CODING = /coding[:=][ \t]*(?!(?:utf-?8|ascii)\b)[-\w.]+/i;
+	/exec\(|eval\((?!\s*\))|os\.system|\bsubprocess\s*\.|\bimport\b[^\n]*\bsubprocess\b|\bimport\s*\([^)]*\bsubprocess\b|\bfrom\s+subprocess\b|["']subprocess["']|create_subprocess_|base64|b64decode|__import__|marshal|\\x[0-9a-f]{2}/;
+/** Text where some language sees a line break that a `\n` split does not
+ *  (`\r`, form feed, vertical tab, NEL, U+2028/9), or a source encoding other
+ *  than UTF-8 or ASCII (utf-7 decodes `+AAo-` to a newline). In either a
+ *  comment can carry code, so nothing is cut. */
+const NO_COMMENT_CUT = /[\r\f\v\u0085\u2028\u2029]|coding[:=][ \t]*(?!(?:utf-?8|ascii)\b)[-\w.]+/i;
 
 /** `line` without a trailing `#` comment, when cutting it cannot hide code: the
- *  `#` sits outside quotes after whitespace or at the start, and the comment
- *  holds no quote (it could close a multi-line string) and no `?>` (PHP ends
- *  a comment there). Any doubt keeps the line whole, which can only flag. */
+ *  `#` sits outside quotes at the start or after whitespace and is followed by
+ *  whitespace or the line end (a JS private field `#run` is code), the line
+ *  does not end in `\` (that would join the next line before the cut), and the
+ *  comment holds no quote (it could close a multi-line string) and no `?>`
+ *  (PHP ends a comment there). Any doubt keeps the line whole: it can only flag. */
 function trailingCommentCut(line: string): string {
+	if (line.endsWith("\\")) return line;
 	let quote = "";
 	for (let at = 0; at < line.length; at += 1) {
 		const ch = line[at];
@@ -2197,7 +2199,7 @@ function trailingCommentCut(line: string): string {
 			continue;
 		}
 		if (ch === "'" || ch === '"' || ch === "`") quote = ch;
-		else if (ch === "#" && (at === 0 || /\s/u.test(line[at - 1]))) {
+		else if (ch === "#" && (at === 0 || /\s/u.test(line[at - 1])) && /^#(?:\s|$)/u.test(line.slice(at))) {
 			const comment = line.slice(at);
 			return /['"`]|\?>/u.test(comment) ? line : line.slice(0, at);
 		}
@@ -2205,27 +2207,27 @@ function trailingCommentCut(line: string): string {
 	return line;
 }
 
-function importsSubprocess(text: string): boolean {
-	const cut = FOREIGN_CODING.test(text) ? (line: string) => line : trailingCommentCut;
-	return text.split("\n").some(line => IMPORTS_SUBPROCESS.test(cut(line)));
+/** The text every marker reads: trailing comments cut where that is safe,
+ *  then `\` continuations joined. */
+function markerText(text: string): string {
+	const code = NO_COMMENT_CUT.test(text) ? text : text.split("\n").map(trailingCommentCut).join("\n");
+	return code.replace(/\\\r?\n/gu, " ");
 }
 /** `compile(` as a builtin. `re.compile(` and `regex.compile(` are exempt only
  *  while the text never rebinds those names, so `import builtins as re` cannot
  *  borrow the exemption. */
 const COMPILE_CALL = /compile\(/;
 const REGEX_COMPILE_ONLY = /(?<!\b(?:re|regex)\.)compile\(/;
-/** An `import` line that aliases one regex module to the other (`import os,
- *  re as regex`) is not a rebind; any other `as re` is, including one in a
- *  `from` import, where the module could be anything. */
+/** A plain `import a, b as c, re as regex` statement that aliases one regex
+ *  module to the other is not a rebind: every module in it is a bare name, so
+ *  no `;`, `from` or dotted module can sit in front. Any other `as re` is. */
 const REBINDS_REGEX_NAME =
-	/(?<!^\s*import\s[^\n]*(?<![\w.])(?:re|regex)\s+)\bas\s+(?:re|regex)\b|(?<![\w.])(?:re|regex)\s*=(?!=)|\b(?:def|class|for)\s+(?:re|regex)\b/m;
+	/(?<!^[ \t]*import[ \t]+(?:\w+(?:[ \t]+as[ \t]+\w+)?[ \t]*,[ \t]*)*(?:re|regex)[ \t]+)\bas\s+(?:re|regex)\b|(?<![\w.])(?:re|regex)\s*=(?!=)|\b(?:def|class|for)\s+(?:re|regex)\b/m;
 
-/** Whether inline code or a script body carries a second-execution marker.
- *  Every marker but the subprocess import reads comments as code: where a
- *  `#` comment ends depends on the language. */
+/** Whether inline code or a script body carries a second-execution marker. */
 function hasInterpreterCodeRisk(text: string): boolean {
-	const joined = text.replace(/\\\r?\n/gu, " ");
-	if (INTERPRETER_CODE_RISK.test(joined) || importsSubprocess(joined)) return true;
+	const joined = markerText(text);
+	if (INTERPRETER_CODE_RISK.test(joined)) return true;
 	if (!COMPILE_CALL.test(joined)) return false;
 	return REBINDS_REGEX_NAME.test(joined) || REGEX_COMPILE_ONLY.test(joined);
 }
