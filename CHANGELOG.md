@@ -13,8 +13,9 @@ https://github.com/STRML/omp-classifier/issues/206. The shell reads an empty, `.
 | shape A program | looked up, empty entries skipped | refused while PATH has a non-absolute entry |
 | output filter after a script (`\| tail -5`) | looked up the same way | not a filter while PATH has a non-absolute entry |
 | `timeout <duration>` | already refused (https://github.com/STRML/omp-classifier/pull/205) | same check, one helper |
+| a bare name inside a reviewed shell body | looked up the same way | the body is not read while PATH has a non-absolute entry |
 
-A PATH with only absolute entries, the normal case, is unaffected.
+The refusal key still drops a trailing filter under any PATH: it reads only the filter's shape, which can only widen what a refusal covers. A PATH with only absolute entries, the normal case, is unaffected.
 
 ### Second-execution markers read code, not prose
 

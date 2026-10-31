@@ -217,6 +217,7 @@ function bodyHandOff(body: string): string | undefined {
 		const name = verbName(command);
 		const names = programNames(command);
 		if (isPathWord(program) && !isSystemProgram(program)) return `runs ${program}`;
+		if (program !== "" && !isPathWord(program) && pathHasRelativeEntry()) return "PATH has an empty or relative entry";
 		// An interpreter or `source` in a body runs code this read did not cover,
 		// whatever carries it: a file, a bare name, stdin, a pipe, a here-document
 		// or `-c` text. Each of those was a bypass in turn, so none is allowed.
@@ -359,16 +360,26 @@ const OUTPUT_FILTERS: Record<string, (args: readonly string[]) => boolean> = {
 	cat: args => args.every(arg => /^-[benstuv]+$/u.test(arg)),
 };
 
-/** Whether `command` is a system output filter reading the pipe it is on:
- *  `./x.sh | tail -60` runs what x.sh runs and prints part of it. */
-function isOutputFilter(command: ShellCommand): boolean {
+/** Whether `command` is shaped like an output filter on the pipe it is on: a
+ *  filter name, literal words, no redirect or assignment, and arguments that
+ *  name no file. The refusal key drops a filter of this shape, which can only
+ *  widen what a refusal covers. */
+function hasFilterShape(command: ShellCommand): boolean {
 	if (command.join !== "pipe" || command.nested || command.negated || command.unreadShape !== undefined) return false;
 	if (command.assigns.length > 0 || command.redirects.length > 0 || !command.words.every(isLiteral)) return false;
 	const name = command.words[0]?.value ?? "";
 	const filter = Object.hasOwn(OUTPUT_FILTERS, name) ? OUTPUT_FILTERS[name] : undefined;
-	if (filter === undefined || pathHasRelativeEntry()) return false;
-	const resolved = onPath(name);
-	return resolved !== undefined && isSystemProgram(resolved) && filter(command.words.slice(1).map(word => word.value));
+	return filter !== undefined && filter(command.words.slice(1).map(word => word.value));
+}
+
+/** Whether `command` is a system output filter reading the pipe it is on:
+ *  `./x.sh | tail -60` runs what x.sh runs and prints part of it. Stage 2
+ *  vouches for it only when the name resolves to a system binary through a
+ *  PATH of absolute entries. */
+function isOutputFilter(command: ShellCommand): boolean {
+	if (!hasFilterShape(command) || pathHasRelativeEntry()) return false;
+	const resolved = onPath(command.words[0].value);
+	return resolved !== undefined && isSystemProgram(resolved);
 }
 
 /** `command` with a trailing output filter cut off, so `./x.sh | tail -60`
@@ -377,7 +388,7 @@ export function withoutOutputFilter(command: string): string {
 	const parsed = parseShell(command);
 	if (!parsed.ok || parsed.commands.length < 2) return command;
 	const last = parsed.commands[parsed.commands.length - 1];
-	if (last.sourceOffset === undefined || !isOutputFilter(last)) return command;
+	if (last.sourceOffset === undefined || !hasFilterShape(last)) return command;
 	return command.slice(0, last.sourceOffset).replace(/\|&?\s*$/u, "").trimEnd();
 }
 

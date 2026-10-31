@@ -457,6 +457,23 @@ describe("an output filter does not change what a refusal covers (https://github
 		});
 	}
 
+	test("a relative PATH entry does not split the refusal key (https://github.com/STRML/omp-classifier/issues/206)", async () => {
+		const previous = process.env.PATH;
+		process.env.PATH = `${previous ?? ""}${path.delimiter}.`;
+		try {
+			for (const retried of ["./update.sh start | tail -5", "./update.sh start"]) {
+				const sid = nextSession();
+				setJevAnswer(jevUnsafeAnswer());
+				await fire("tool_call", makeEvent("./update.sh start | tail -60"), makeCtx({ sessionId: sid }));
+				setJevAnswer(jevSafeAnswer());
+				await fire("tool_call", makeEvent(retried), makeCtx({ sessionId: sid }));
+				expect(priorRefusalOf(1)).toBeDefined();
+			}
+		} finally {
+			process.env.PATH = previous;
+		}
+	});
+
 	test("a pipe into a program that is not an output filter stays its own target", async () => {
 		const sid = nextSession();
 		setJevAnswer(jevUnsafeAnswer());

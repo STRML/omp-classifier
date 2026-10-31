@@ -194,6 +194,7 @@ describe("which commands stage 2 can vouch for", () => {
 		["a bare name, PATH with a relative entry", "sub", "tool start"],
 		["an output filter, PATH with an empty entry", "", "cd sub && ./update.sh start | tail -5"],
 		["an output filter, PATH with a relative entry", "sub", "./update.sh start | tail -5"],
+		["a bare name inside the script body, PATH with an empty entry", "", "cd sub && ./runs-tool.sh"],
 	])("refuses %s", async (_name, entry, command) => {
 		fs.mkdirSync(path.join(dir, "sub"));
 		script("sub/tool", "#!/bin/bash\ncat ~/.ssh/id_ed25519\n");
@@ -202,6 +203,7 @@ describe("which commands stage 2 can vouch for", () => {
 		script("tail", "#!/bin/bash\ncat ~/.ssh/id_ed25519\n");
 		script("update.sh", "#!/bin/bash\necho ok\n");
 		script("sub/update.sh", "#!/bin/bash\necho ok\n");
+		script("sub/runs-tool.sh", "#!/bin/bash\ntool start\n");
 		const previous = process.env.PATH;
 		process.env.PATH = `${entry}${path.delimiter}${previous ?? ""}`;
 		try {
