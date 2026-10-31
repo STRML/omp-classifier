@@ -316,9 +316,17 @@ function lineSpans(line: string, shell: boolean): Span[] {
 		}
 	};
 	const flagValue = (from: number, flag: string): Span | undefined => {
-		if (!shell || line[from] !== "-") return wordSpan(from);
+		if (line[from] !== "-") return wordSpan(from);
+		// Prose has no word grammar: a dash-leading value could be the password
+		// or a flag, so the rest of the line goes.
+		if (!shell) return { start: from, end: line.length };
 		// A flag that says the password comes on stdin takes no value.
-		return /stdin$/iu.test(flag) ? undefined : afterFlags(from);
+		if (/stdin$/iu.test(flag)) return undefined;
+		// The dash-leading word may itself be the password (`-s3cret`), so it goes
+		// with the first word that is not a flag, and the flags between them.
+		const first = wordSpan(from);
+		const value = afterFlags(from);
+		return first === undefined || value === undefined ? first : { start: first.start, end: Math.max(first.end, value.end) };
 	};
 	// Each loop skips a match that starts inside the value it already took, so
 	// a long unclosed `$(` is scanned once and a name inside a value (the
@@ -360,7 +368,8 @@ function lineSpans(line: string, shell: boolean): Span[] {
 			const span = flagValue(match.index + match[0].length, "");
 			if (span === undefined) return undefined;
 			cover(span.end);
-			return tool.kind === "word" ? span : passwordOfPair(line, span);
+			// A dash-leading prose value is the rest of the line, never split at a colon.
+			return tool.kind === "word" || (!shell && line[span.start] === "-") ? span : passwordOfPair(line, span);
 		});
 	}
 	return shell ? spans : spans.map(span => ({ start: span.start, end: line.length }));

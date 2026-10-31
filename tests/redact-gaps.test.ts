@@ -166,17 +166,34 @@ describe("redaction replaces the value and leaves the command", () => {
 		for (const [text, expected] of cases) redacts(text, expected);
 	});
 
-	test("a secret flag followed by flags redacts the first word that is not a flag, and the command stays", () => {
+	test("a secret flag followed by flags redacts through the first word that is not a flag, and the command after it stays", () => {
 		// Action keys sort their flags ahead of the arguments: `mysql --password
 		// -e hunter2` is what a refusal key for `mysql --password hunter2 -e x` reads.
-		redacts("mysql --password -e hunter2", `mysql --password -e ${REDACTED}`);
-		redacts("sshpass -p -v hunter2", `sshpass -p -v ${REDACTED}`);
+		redacts("mysql --password -e hunter2", `mysql --password ${REDACTED}`);
+		redacts("sshpass -p -v hunter2", `sshpass -p ${REDACTED}`);
 		redacts("curl -u -s bob:hunter2", `curl -u -s bob:${REDACTED}`);
 		// `--password` and `-W` are booleans for these clients, so the command
 		// around them is what a reviewer must still read.
-		redacts('psql --password -h db -c "run the cleanup"', `psql --password -h ${REDACTED} -c "run the cleanup"`);
-		redacts("mysql --password -h db -e 'run the cleanup'", `mysql --password -h ${REDACTED} -e 'run the cleanup'`);
-		redacts("mysql --password -v && rm -rf build", "mysql --password -v && rm -rf build");
+		redacts('psql --password -h db -c "run the cleanup"', `psql --password ${REDACTED} -c "run the cleanup"`);
+		redacts("mysql --password -h db -e 'run the cleanup'", `mysql --password ${REDACTED} -e 'run the cleanup'`);
+		redacts("mysql --password -v && rm -rf build", `mysql --password ${REDACTED} && rm -rf build`);
+		// A password can start with a dash: it goes with the word it looks like a flag in front of.
+		for (const text of ["sshpass -p -s3cret ssh host", "mysql --password -s3cret -e x", "redis-cli -a -s3cret ping", "ssh-keygen -N -s3cret -f key"]) {
+			expect(redactCommand(text)).not.toContain("s3cret");
+			expect(redactCommand(redactCommand(text))).toBe(redactCommand(text));
+		}
+		// A dash-leading user:password pair is read as a value in a command and as a rest-of-line in prose.
+		for (const redact of [redactCommand, redactSecrets]) {
+			expect(redact("curl -u -s bob:hunter2 x")).not.toContain("hunter2");
+			expect(redact("curl -u -s bob:hunter2")).not.toContain("hunter2");
+			expect(redact("curl --user -s bob:hunter2 x")).not.toContain("hunter2");
+			expect(redact("sshpass -p -x hunter2 ssh h")).not.toContain("hunter2");
+			expect(redact("redis-cli -a -x hunter2 ping")).not.toContain("hunter2");
+			expect(redact("curl -u -bob:hunter2 x")).not.toContain("hunter2");
+		}
+		expect(redactCommand("curl -u -s bob:hunter2 x")).toBe(`curl -u -s bob:${REDACTED} x`);
+		expect(redactSecrets("curl -u -s bob:hunter2 x")).toBe(`curl -u ${REDACTED}`);
+		expect(JSON.stringify(redactValue(["curl", "-u", "-s", "bob:hunter2", "x"]))).not.toContain("hunter2");
 		// A flag that only says the password comes on stdin takes nothing.
 		untouched("docker login --password-stdin -u bob registry.example.com");
 		redacts("docker login --password-stdin registry.example.com && make", `docker login --password-stdin ${REDACTED} && make`);
@@ -275,12 +292,12 @@ describe("URL passwords and argv elements", () => {
 	});
 
 	test("an argv element another pass already changed is redacted whole", () => {
-		expect(redactValue(["curl", "--user=bob:hunter2 tail", "https://x.test"])).not.toContain("hunter2 tail");
+		expect(JSON.stringify(redactValue(["curl", "--user=bob:hunter2 tail", "https://x.test"]))).not.toContain("hunter2");
 		const out = redactValue(["mysql", "--password=hunter2 and more"]) as string[];
 		expect(out[1]).toBe(REDACTED);
 		const flagged = redactValue(["sshpass", "-p", "hunter2 extra", "ssh"]) as string[];
 		expect(flagged).toEqual(["sshpass", "-p", REDACTED, "ssh"]);
-		expect(redactValue(["mysql", "--password", "-e", "x"])).toEqual(["mysql", "--password", "-e", REDACTED]);
+		expect(redactValue(["mysql", "--password", "-e", "x"])).toEqual(["mysql", "--password", REDACTED, REDACTED]);
 	});
 });
 
@@ -319,51 +336,65 @@ describe("redactValue reads argv arrays and name/value pairs", () => {
 });
 
 describe("redaction stays linear on hostile input", () => {
-	const MB = 1_000_000;
-	const hostile: Array<[string, string]> = [
-		["many curl -u flags", `curl ${"-u ".repeat(MB)}`],
-		["a long -u cluster", `curl -${"s".repeat(2 * MB)}`],
-		["many -p flags", `sshpass ${"-p ".repeat(MB / 3)}`],
-		["attached mysql -p", `mysql ${"-pa ".repeat(MB / 4)}`],
-		["many URL starts", "a://b:".repeat(MB / 6)],
-		["a URL password with no end", `http://u:${"@".repeat(2 * MB)}`],
-		["a URL password of many parts", `http://u:${"a@".repeat(MB)}`],
-		["config set repeats", "config set ".repeat(MB / 11)],
-		["config set and a long name", `config set ${"a".repeat(2 * MB)}`],
-		["a long digit run", `${"1".repeat(2 * MB)}x=y`],
-		["a long digit-suffixed name", `${"A_".repeat(MB / 2)}1=y`],
-		["many assignments", "A_TOKEN=a ".repeat(MB / 10)],
-		["many nested substitutions", `A_TOKEN=${"$(".repeat(MB)}`],
-		["many open quotes", `A_TOKEN=${"'".repeat(2 * MB)}`],
-		["many escapes", `A_TOKEN=${'\\"'.repeat(MB)}`],
-		["many backticks", `A_TOKEN=${"`".repeat(2 * MB)}`],
-		["many token prefixes", "hf_ ya29. shpat_ sk_live_ ".repeat(MB / 26)],
-		["a long slack path", `hooks.slack.com/services/${"a/".repeat(MB)}`],
+	// Each shape is built at n and at 8n repeats. Linear time takes 8 times as
+	// long; a quadratic scan takes 64 times. Comparing the two sizes holds on a
+	// slow CI runner, where an absolute limit does not.
+	const SMALL = 40_000;
+	const LARGE = 8 * SMALL;
+	const hostile: Array<[string, (n: number) => string]> = [
+		["many curl -u flags", n => `curl ${"-u ".repeat(n)}`],
+		["a long -u cluster", n => `curl -${"s".repeat(n)}`],
+		["many -p flags", n => `sshpass ${"-p ".repeat(n)}`],
+		["attached mysql -p", n => `mysql ${"-pa ".repeat(n)}`],
+		["many URL starts", n => "a://b:".repeat(n)],
+		["a URL password with no end", n => `http://u:${"@".repeat(n)}`],
+		["a URL password of many parts", n => `http://u:${"a@".repeat(n)}`],
+		["config set repeats", n => "config set ".repeat(n)],
+		["config set and a long name", n => `config set ${"a".repeat(n)}`],
+		["a long digit run", n => `${"1".repeat(n)}x=y`],
+		["a long digit-suffixed name", n => `${"A_".repeat(n)}1=y`],
+		["many assignments", n => "A_TOKEN=a ".repeat(n)],
+		["many nested substitutions", n => `A_TOKEN=${"$(".repeat(n)}`],
+		["many open quotes", n => `A_TOKEN=${"'".repeat(n)}`],
+		["many escapes", n => `A_TOKEN=${'\\"'.repeat(n)}`],
+		["many backticks", n => `A_TOKEN=${"`".repeat(n)}`],
+		["many token prefixes", n => "hf_ ya29. shpat_ sk_live_ ".repeat(n)],
+		["a long slack path", n => `hooks.slack.com/services/${"a/".repeat(n)}`],
 		// A value that never closes ran to the end of the line once per flag.
-		["secret flags with an unclosed $(", "--password $( ".repeat(MB / 14)],
-		["sshpass -p with an unclosed $(", `sshpass ${"-p $( ".repeat(MB / 6)}`],
-		["curl -u with an unclosed $(", `curl ${"-u $( ".repeat(MB / 6)}`],
-		["config set with an unclosed $(", "config set token $( ".repeat(MB / 20)],
-		["nested $( flags that close at the end", `${"--password $(".repeat(MB / 14)}${")".repeat(MB / 14)}`],
-		["secret flags before a run of flags", "--password -a ".repeat(MB / 14)],
-		["a secret flag, a long run of flags, a value", `--password ${"-a ".repeat(MB / 3)} value`],
-		["many headers in one quoted argument", `curl -H "${"password: ".repeat(MB / 10)}" tail`],
+		["secret flags with an unclosed $(", n => "--password $( ".repeat(n)],
+		["sshpass -p with an unclosed $(", n => `sshpass ${"-p $( ".repeat(n)}`],
+		["curl -u with an unclosed $(", n => `curl ${"-u $( ".repeat(n)}`],
+		["config set with an unclosed $(", n => "config set token $( ".repeat(n)],
+		["nested $( flags that close at the end", n => `${"--password $(".repeat(n)}${")".repeat(n)}`],
+		["secret flags before a run of flags", n => "--password -a ".repeat(n)],
+		["a secret flag, a long run of flags, a value", n => `--password ${"-a ".repeat(n)} value`],
+		["many headers in one quoted argument", n => `curl -H "${"password: ".repeat(n)}" tail`],
 	];
-	test("each shape finishes in well under a second per megabyte, as a command and as prose", () => {
-		for (const [label, text] of hostile) {
+	const timeOf = (redact: (text: string) => string, text: string): number => {
+		const started = performance.now();
+		redact(text);
+		return performance.now() - started;
+	};
+
+	test("each shape takes about 8 times as long at 8 times the size, as a command and as prose", () => {
+		for (const [label, build] of hostile) {
 			for (const redact of [redactCommand, redactSecrets]) {
-				const started = performance.now();
-				redact(text);
-				const elapsed = performance.now() - started;
-				expect(elapsed, `${redact.name} ${label}`).toBeLessThan(1_000);
+				const small = Math.max(timeOf(redact, build(SMALL)), timeOf(redact, build(SMALL)));
+				const large = timeOf(redact, build(LARGE));
+				// Twice the linear ratio, plus a floor for timer noise.
+				expect(large, `${redact.name} ${label}: ${small.toFixed(1)} ms then ${large.toFixed(1)} ms`).toBeLessThan(16 * small + 100);
 			}
 		}
 	});
 
 	test("a large argv array is linear too", () => {
-		const argv = Array.from({ length: 200_000 }, (_, i) => (i % 2 === 0 ? "--flag" : `value ${i}`));
-		const started = performance.now();
-		redactValue({ argv });
-		expect(performance.now() - started).toBeLessThan(3_000);
+		const timeArgv = (length: number): number => {
+			const argv = Array.from({ length }, (_, i) => (i % 2 === 0 ? "--flag" : `value ${i}`));
+			const started = performance.now();
+			redactValue({ argv });
+			return performance.now() - started;
+		};
+		const small = timeArgv(SMALL);
+		expect(timeArgv(LARGE)).toBeLessThan(16 * small + 100);
 	});
 });
