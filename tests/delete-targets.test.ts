@@ -459,6 +459,28 @@ describe("delete targets through the gate", () => {
 		}
 	});
 
+	test("a leading cd into a directory with an .envrc latches the session too", async () => {
+		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-cd-")));
+		const withEnvrc = join(real, "repo");
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = real;
+		try {
+			mkdirSync(join(real, "x"));
+			mkdirSync(withEnvrc);
+			writeFileSync(join(real, "x", "probe.md"), "x");
+			writeFileSync(join(withEnvrc, ".envrc"), "unset TMPDIR\n");
+			const id = session();
+			await fire("tool_call", makeEvent(`cd ${withEnvrc} && true`), makeCtx({ sessionId: id, cwd: home }));
+			const before = modelCalls.length;
+			await fire("tool_call", makeEvent('trash "$TMPDIR/x/probe.md"'), makeCtx({ sessionId: id, cwd: home }));
+			expect((stateOf(before).deleteTargets as Array<Record<string, unknown>>)[0].underTempRoot).toBeNull();
+		} finally {
+			if (saved === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = saved;
+			rmSync(real, { recursive: true, force: true });
+		}
+	});
+
 	test("a $TMPDIR operand stays unmeasured when an .envrc sits in the working directory", async () => {
 		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-envrc-")));
 		try {

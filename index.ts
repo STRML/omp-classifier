@@ -637,15 +637,23 @@ const shellEnvTouched = new Set<string>();
 const shellTmpdirIfNamed = (command: string, cwds: readonly string[], sessionId: string | undefined): string | null =>
 	command.includes("TMPDIR") ? shellTmpdirFor(cwds, process.env, sessionId === undefined || shellEnvTouched.has(sessionId)) : null;
 
-/** The directory a bash call names in its own `cwd` input, else `fallback`. */
-function bashInputCwd(input: unknown, fallback: string): string {
+/** Every directory the host may load direnv from for this bash call: the
+ *  session's, the call's own `cwd` input, and the target of a leading
+ *  `cd X &&` the host strips and runs the command in. An unresolvable one is
+ *  stood in for by the session's, and the walk covers it. */
+function directoriesHostRunsIn(command: string, input: unknown, sessionCwd: string): string[] {
 	const named = typeof input === "object" && input !== null && "cwd" in input ? input.cwd : undefined;
-	if (typeof named !== "string" || named === "" || named.includes("://") || named.includes("local:/")) return fallback;
-	try {
-		return resolveToCwd(named, fallback);
-	} catch {
-		return fallback;
+	const candidates = [typeof named === "string" && named !== "" ? named : undefined, extractLeadingCdTarget(command)?.path];
+	const dirs = [sessionCwd];
+	for (const candidate of candidates) {
+		if (candidate === undefined || candidate.includes("://") || candidate.includes("local:/")) continue;
+		try {
+			dirs.push(resolveToCwd(candidate, sessionCwd));
+		} catch {
+			// unresolvable: the session's directory is already in the list
+		}
 	}
+	return dirs;
 }
 
 /** The host session id, or undefined in an isolated SDK context that has none. */
@@ -6402,7 +6410,7 @@ export default function (pi: ExtensionAPI) {
 		// leave TMPDIR or IFS changed for the next one (#176).
 		// So can the host's direnv preflight: it prepends `unset -v NAME` for a
 		// variable a repo's `.envrc` removes, to a command that reads quiet.
-		if (isBash && (touchesShellEnv(command) || hasEnvrcAbove(ctx.cwd) || hasEnvrcAbove(bashInputCwd(event.input, ctx.cwd)))) {
+		if (isBash && (touchesShellEnv(command) || directoriesHostRunsIn(command, event.input, ctx.cwd).some(hasEnvrcAbove))) {
 			const touchedSession = sessionIdOf(ctx);
 			if (touchedSession !== undefined) shellEnvTouched.add(touchedSession);
 		}
