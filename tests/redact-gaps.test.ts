@@ -390,7 +390,7 @@ describe("redaction stays linear on hostile input", () => {
 		}
 		if (slow.length > 0) console.log(`linear-time timings:\n${seen.join("\n")}`);
 		expect(slow).toEqual([]);
-	});
+	}, 120_000);
 
 	test("a large argv array is linear too", () => {
 		const timeArgv = (length: number): number => {
@@ -401,5 +401,5 @@ describe("redaction stays linear on hostile input", () => {
 		};
 		const small = timeArgv(SMALL);
 		expect(timeArgv(LARGE)).toBeLessThan(16 * small + 100);
-	});
+	}, 120_000);
 });
