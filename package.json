@@ -25,6 +25,7 @@
 		"typescript": "^7.0.2"
 	},
 	"dependencies": {
-		"mvdan-sh": "^0.10.1"
+		"mvdan-sh": "^0.10.1",
+		"tldts": "^7.4.19"
 	}
 }

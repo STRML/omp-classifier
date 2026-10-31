@@ -4,6 +4,19 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### A sibling host in the domain the user named is not a lookalike
+
+https://github.com/STRML/omp-classifier/issues/179. The lookalike measurement reported any destination that shared two trailing labels with a host the user named, so `curl https://api.example.com/health` under "the status page at status.example.com" asked on every model. It now reads the public suffix list (private section included) through `tldts`, the plugin's second runtime dependency:
+
+| Destination | User named | Registrable domains | Lookalike |
+|---|---|---|---|
+| `api.example.com` | `status.example.com` | `example.com`, `example.com` | no |
+| `neuralwatt.com` | `api.neuralwatt.com` | `neuralwatt.com`, `neuralwatt.com` | no |
+| `acme-docs.pages.dev` | `acme.pages.dev` | two Pages sites | yes |
+| `attacker.github.io` | `you.github.io` | two GitHub Pages sites | yes |
+
+The suffix list only removes a report. A bare suffix (`github.io`) or an IP address has no registrable domain, so naming one vouches for nothing under it.
+
 ### Stage 2 refuses a bare name when PATH has an empty or relative entry
 
 https://github.com/STRML/omp-classifier/issues/206. The shell reads an empty, `.` or relative PATH entry from the command's own directory after any `cd`, and the gate's PATH lookup skipped empty entries and read relative ones from its own directory. A planted `sub/tool` run as `cd sub && tool` could reach the reviewer as shape A with no body attached.

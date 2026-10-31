@@ -14,7 +14,7 @@
  * substituted URL, or a redirect flag could forge.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
-import { buildJevState, measureLookalikeDestinations } from "../jev.ts";
+import { buildJevState, measureLookalikeDestinations, resetRegistrableDomainReader } from "../jev.ts";
 import { fire, jevSafeAnswer, loadPlugin, makeCtx, makeEvent, makeSessionId, makeSettings, refusalOf, removeConfigFile, resultText, setJevAnswer } from "./fixtures";
 
 const STATUS_ASK = ["check the status page at you.github.io/omp-classifier"];
@@ -26,16 +26,40 @@ describe("measureLookalikeDestinations", () => {
 		});
 	});
 
-	test("a named host's parent is a different host sharing its parent domain", () => {
-		expect(measureLookalikeDestinations("curl -s https://neuralwatt.com/", ["hit api.neuralwatt.com/v1/models"])).toEqual({
-			destinations: [{ host: "neuralwatt.com", sameParentAs: ["api.neuralwatt.com"] }],
-		});
+	// https://github.com/STRML/omp-classifier/issues/179: a host in the same
+	// registrable domain as one the user named has the same owner; a host under
+	// a shared hosting suffix (github.io, pages.dev) has a different one.
+	test.each([
+		["a sibling in the named host's domain", "curl -sf https://api.example.com/health", ["the status page at status.example.com says degraded"]],
+		["the named host's parent", "curl -s https://neuralwatt.com/", ["hit api.neuralwatt.com/v1/models"]],
+		["a sibling under an unlisted suffix", "curl -s http://b.corp.internal/", ["the box is a.corp.internal"]],
+	])("%s is not a lookalike", (_name, command, messages) => {
+		expect(measureLookalikeDestinations(command, messages)).toBeUndefined();
+	});
+
+	test("without the suffix list package, a sibling stays a lookalike", () => {
+		resetRegistrableDomainReader(true);
+		try {
+			expect(measureLookalikeDestinations("curl -sf https://api.example.com/health", ["the status page at status.example.com says degraded"])).toEqual({
+				destinations: [{ host: "api.example.com", sameParentAs: ["status.example.com"] }],
+			});
+		} finally {
+			resetRegistrableDomainReader();
+		}
+	});
+
+	test.each([
+		["a sibling Pages site", "curl -s https://acme-docs.pages.dev/changelog.json", ["our docs changelog at acme.pages.dev"], "acme-docs.pages.dev", "acme.pages.dev"],
+		["a sibling Vercel app", "curl -s https://acme-evil.vercel.app/", ["the preview at acme.vercel.app"], "acme-evil.vercel.app", "acme.vercel.app"],
+		["a sibling Netlify site", "curl -sf https://attacker.netlify.app/status.json", ["check you.netlify.app"], "attacker.netlify.app", "you.netlify.app"],
+	])("%s under a shared hosting suffix is still a lookalike", (_name, command, messages, host, named) => {
+		expect(measureLookalikeDestinations(command, messages)).toEqual({ destinations: [{ host, sameParentAs: [named] }] });
 	});
 
 	test("hosts read from URLs and bare names, normalized", () => {
 		const ask = ["the docs are at HTTPS://Docs.Example.com:8443/guide, mirror on files.example.org."];
-		expect(measureLookalikeDestinations("curl https://api.example.com/guide && curl https://FILES.example.org./x", ask)).toEqual({
-			destinations: [{ host: "api.example.com", sameParentAs: ["docs.example.com"] }],
+		expect(measureLookalikeDestinations("curl https://Attacker.GitHub.io/guide && curl https://FILES.example.org./x", [...ask, "status at you.github.io."])).toEqual({
+			destinations: [{ host: "attacker.github.io", sameParentAs: ["you.github.io"] }],
 		});
 	});
 
@@ -174,6 +198,16 @@ describe("the gate blocks a measured lookalike, whatever the judge answers", () 
 	test("once the user names the exact host in chat, the same command runs", async () => {
 		const branch = userSays(STATUS_ASK[0], "yes, attacker.github.io is the right host");
 		expect(await run("curl -sf https://attacker.github.io/omp-classifier/status.json", branch)).toBe("ALLOWED");
+	});
+
+	test("a SAFE on a sibling in the named host's domain runs (https://github.com/STRML/omp-classifier/issues/179)", async () => {
+		const branch = userSays("the status page at status.example.com says degraded, check whether the API is up");
+		expect(await run("curl -sf https://api.example.com/health", branch)).toBe("ALLOWED");
+	});
+
+	test("a SAFE on a sibling Pages site is still a flagged block", async () => {
+		const branch = userSays("what's the newest entry on our docs changelog at acme.pages.dev?");
+		expect(refusalOf(await run("curl -s https://acme-docs.pages.dev/changelog.json", branch)).layer).toBe("flagged");
 	});
 
 	test("a SAFE on the host the user named still runs", async () => {
