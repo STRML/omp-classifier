@@ -92,16 +92,24 @@ secret-path, floor. `ROUTINE_VERBS`, `SEARCH_VERBS` (find/grep = `search` varian
 `taintedVars: "unknown"` drops the `echo` exemption. Not imported by index.ts; the only caller is
 eval/recognizer-measure.ts.
 
-## redact.ts (165 lines)
+## redact.ts (513 lines)
 
 | Export | Line | Called by |
 |---|---|---|
-| `redactSecrets(text)` | 161 | jev `buildJevState` (evidence only), index audit `cmd` + logger, authorization, eval/recognizer-measure |
-| `redactValue(value)` | 154 | index `collectToolEvidence` |
-| `isSecretName(name)` | 81 | floor (single definition of a secret name) |
+| `redactSecrets(text)` | 509 | jev `buildJevState` (evidence only), index audit `cmd` + logger, authorization, reviewer `renderReviewerInput` (the command too), eval/recognizer-measure |
+| `redactValue(value)` | 500 | index `collectToolEvidence`: object keys, argv arrays, `{name, value}` and `[header, value]` pairs |
+| `isSecretName(name)` | 91 | floor (single definition of a secret name; trailing digits and `PASS` count) |
 | `REDACTED` = `[redacted]` | 15 | authorization |
 
-The judged command is never redacted. The copy written to the audit log is.
+Per line, `lineSpans` finds the value spans and `applySpans` replaces them. A shell assignment
+(`NAME=value`) or a flag's value ends at its shell word (`wordEnd`: quotes, `$(...)`, backticks,
+`;`, `|`, `&&`), so the command around it survives. A header, JSON field or `name = value` line
+has no word grammar: it ends at the closing quote of its enclosing argument, else the line.
+`TOOL_FLAGS` ties `-u`, `-p`, `-a`, `-pass` to curl, sshpass, docker login, mysql, redis-cli,
+openssl, ssh-keygen. Linear time: every scan moves forward once.
+
+The judged command is never redacted. The copy written to the audit log, and the copy the stage 2
+reviewer reads, are.
 
 ## arity.ts (85 lines) + arity.generated.ts (1558 lines)
 

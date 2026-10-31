@@ -113,6 +113,23 @@ describe("log-side secret redaction", () => {
 		expect(record.cmd).not.toContain(secret);
 	});
 
+	test("an assignment's value is redacted and the command after it stays in both on-disk copies", async () => {
+		// The redactor used to cut from the first secret to the end of the line,
+		// so a destructive command chained after a secret-named variable was
+		// missing from the audit log and from the OMP log line.
+		seq += 1;
+		const secret = `hunter2-chained-${seq}`;
+		const command = `export X=1 AWS_SECRET_ACCESS_KEY=${secret} && rm -rf build-${seq}`;
+		await fire("tool_call", makeEvent(command), makeCtx({ sessionId: `redact-chain-${seq}` }));
+
+		expect(stateOf(0).command).toBe(command);
+		const record = lastDecision();
+		expect(record.cmd).toBe(`export X=1 AWS_SECRET_ACCESS_KEY=${REDACTED} && rm -rf build-${seq}`);
+		const line = loggerInfos.find(m => m.includes(`build-${seq}`));
+		expect(line).toBeDefined();
+		expect(loggerInfos.join("\n")).not.toContain(secret);
+	});
+
 	test("a value on a backslash-continued line is redacted, not stranded past the splice", async () => {
 		// `echo marker --password \` then `hunter2` is one logical argument:
 		// the shell deletes the backslash-newline pair before word splitting.
