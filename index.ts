@@ -2404,13 +2404,18 @@ export function evalRiskFlags(code: string): string[] {
 	for (const match of code.matchAll(new RegExp(EVAL_CODE_FLAG_RE.source, `${EVAL_CODE_FLAG_RE.flags}g`))) {
 		const end = (match.index ?? 0) + match[0].length;
 		const after = code.slice(end);
-		// A token being assigned (`rm = ...`, `rm => ...`), dereferenced
-		// (`rm.stdout`) or closing a tuple, list, call or object as a value
-		// (`("mxm", rm)`, `f(rm, x)`) is a program variable. A command a spawn runs
-		// sits inside a string or backtick, where its next character is a space,
-		// an argument or the closing quote, so `["rm", ...]`, `"rm -rf x"` and
-		// `` `rm x` `` all stay flagged.
-		if (/^\s*(=>|=[^=])/u.test(after) || /^\.\w/u.test(after) || /^\s*[,)\]}]/u.test(after)) continue;
+		// A token being assigned (`rm = ...`, `rm => ...`) or dereferenced
+		// (`rm.stdout`) is a program variable. So is a bare element of an
+		// argument list, tuple or list (`("mxm", rm)`, `f(x, rm)`, `[rm]`):
+		// both neighbours must be value punctuation, `(` `[` or `,` before and
+		// `,` `)` `]` `}` after. In shell text a command word follows a space,
+		// `;`, `|`, `$(` or `{`, so `"(ls | xargs rm)"`, `"echo $(rm)"`,
+		// `{rm,-rf,x}` (brace expansion runs rm) and `${rm}` all stay flagged.
+		// At worst the exemption covers `(rm)` or `(x,rm)` in a shell string,
+		// which run rm with no operand or no command named rm at all.
+		const before = code.slice(0, match.index ?? 0);
+		const listElement = /[([,]\s*$/u.test(before) && /^\s*[,)\]}]/u.test(after);
+		if (/^\s*(=>|=[^=])/u.test(after) || /^\.\w/u.test(after) || listElement) continue;
 		flags.add(match[0]);
 	}
 	return [...flags].sort();

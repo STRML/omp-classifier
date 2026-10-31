@@ -189,6 +189,10 @@ describe("eval gate routing", () => {
 		['import subprocess\nsubprocess.run("rm -rf build", shell=True)', "py"],
 		["import subprocess\nsubprocess.run(f\"cd x; rm\")\nsubprocess.run('rm build')", "py"],
 		["Bun.$`rm -rf ./build`", "js"],
+		['import os\nos.system("(cd x; rm)")', "py"],
+		['import os\nos.system("echo $(ls | xargs rm)")', "py"],
+		['import os\nos.system("{rm,-rf,build}")', "py"],
+		["const rm = name;\nBun.$`${rm} -rf ./build`", "js"],
 	])("a token a spawn runs still blocks on a SAFE: %s", async (code, language) => {
 		setJevAnswer(jevSafeAnswer());
 		expect(refusalOf(await gateEval(code, {}, language)).why).toContain("flags: rm");
