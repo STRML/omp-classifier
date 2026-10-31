@@ -538,6 +538,23 @@ describe("escalates_privilege on a remote host the user named", () => {
 		expect(resultText(result)).toBe("ALLOWED");
 	});
 
+	test.each([
+		["the session's ssh options", "ssh -i ~/.ssh/tv_root_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=8 root@192.168.86.53 'systemctl stop x'"],
+		["an scp of a local file to the named host", "scp -q build/tool root@192.168.86.53:/tmp/tool"],
+		["an rsync to the named host", "rsync -avz build/ root@192.168.86.53:/tmp/build/"],
+	])("%s reaches the reviewer", async (_name, command) => {
+		setJevAnswer(privileged());
+		scriptReviewer(reviewerReply("block"));
+		await fire("tool_call", makeEvent(command), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
+		expect(reviewerCalls).toHaveLength(1);
+	});
+
+	test("a URL host must be the named one: the scheme is not a host", async () => {
+		setJevAnswer(privileged());
+		await fire("tool_call", makeEvent("rsync -a ./d rsync://10.0.0.9/mod"), uiCtx(nextSession(), [user("u1", "rsync the data to 192.168.86.53")]));
+		expect(reviewerCalls).toHaveLength(0);
+	});
+
 	test("a host named at the end of a sentence counts", async () => {
 		setJevAnswer(privileged());
 		scriptReviewer(reviewerReply("block"));
@@ -575,6 +592,27 @@ describe("escalates_privilege on a remote host the user named", () => {
 		["a local sudo after the named ssh", `${stop}; sudo id`],
 		["a named ssh behind a local sudo", `sudo id; ${stop}`],
 		["the host smuggled in as a remote command word", "ssh root@10.0.0.9 192.168.86.53"],
+		["an ssh to an unnamed host in a substitution", "ssh root@192.168.86.53 $(ssh root@10.0.0.9 id)"],
+		["a substitution in a leading cd", "cd $(ssh root@10.0.0.9 id) && ssh root@192.168.86.53 id"],
+		["an scp between the named host and an unnamed one", "scp root@192.168.86.53:/a root@10.0.0.9:/b"],
+		["a ProxyCommand that runs its own ssh", `ssh -o ProxyCommand="ssh root@10.0.0.9 nc %h %p" root@192.168.86.53 id`],
+		["a ProxyCommand spelled -oProxyCommand=", "ssh -oProxyCommand=sh root@192.168.86.53 id"],
+		["a HostName option that moves the destination", "ssh -o HostName=10.0.0.9 root@192.168.86.53 id"],
+		["a jump host", "ssh -J root@10.0.0.9 root@192.168.86.53 id"],
+		["another ssh config file", "ssh -F ./cfg root@192.168.86.53 id"],
+		["a LocalCommand", "ssh -o PermitLocalCommand=yes -o LocalCommand=id root@192.168.86.53 id"],
+		["an scp transfer program", "scp -S ./evil local.txt root@192.168.86.53:/tmp/"],
+		["an rsync remote shell", "rsync -e 'ssh -J root@10.0.0.9' local.txt root@192.168.86.53:/tmp/"],
+		["an rsync remote shell in a short-flag cluster", "rsync -avze sh local.txt root@192.168.86.53:/tmp/"],
+		["a local sudo wrapping the ssh", "sudo ssh root@192.168.86.53 id"],
+		["a HostName option after the host", "ssh root@192.168.86.53 -o HostName=10.0.0.9 id"],
+		["a jump host after the host", "ssh -l root 192.168.86.53 -J 10.0.0.9 id"],
+		["an rsync daemon URL", "rsync -a ./d rsync://10.0.0.9/mod"],
+		["an scp URL", "scp -r ./d scp://root@10.0.0.9/tmp"],
+		["an sftp URL", "scp ./d sftp://root@10.0.0.9/tmp"],
+		["a local program named ssh", "./ssh root@192.168.86.53 id"],
+		["a program named ssh by path", "/tmp/ssh root@192.168.86.53 id"],
+		["an assignment before the ssh", "LD_PRELOAD=./x.so ssh root@192.168.86.53 id"],
 	])("%s stays barred", async (_name, command) => {
 		setJevAnswer(privileged());
 		await fire("tool_call", makeEvent(command), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));

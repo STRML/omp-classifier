@@ -108,12 +108,13 @@ BLOCK unless the user's words name both the action and its target. A general req
 - deploying to production, publishing a package, image or release, or merging a pull request;
 - changing shared state: a shared database, a cluster, a deployed service, another person's resources, CI settings;
 - pushing to a remote that is not this repository's own;
-- writing persistent configuration: shell startup files, git hooks, launch agents or services, permission or classifier settings.
+- writing persistent configuration: shell startup files, git hooks, launch agents or services, permission or classifier settings;
+- running as root on a remote machine the user named, such as stopping a service on their own device: the user's words must name the machine and the change.
 
 BLOCK always, whatever the user's words say:
 - sending local files, environment variables, credentials or keys to a host other than the service they belong to;
 - printing, copying, or writing out secret values;
-- running with elevated privileges (sudo, setuid, system services) or granting new access;
+- running with elevated privileges on this machine (sudo, setuid, system services), or granting new access anywhere (keys, accounts, permissions);
 - piping downloaded content into an interpreter;
 - scope escalation: acting on a repository, host, account, or path the user's task does not involve;
 - a command whose effect you cannot determine from the command and the script bodies.

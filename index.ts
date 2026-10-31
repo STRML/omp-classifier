@@ -5213,19 +5213,80 @@ export function namesRemoteHost(command: string, transcript: readonly ReviewerTr
 	const unfiltered = withoutOutputFilter(command);
 	const parsed = parseShell(unfiltered);
 	if (!parsed.ok) return false;
-	const top = parsed.commands.filter(entry => !entry.nested);
-	if (top.length - (top[0] !== undefined && verbName(top[0]) === "cd" ? 1 : 0) !== 1) return false;
+	// Every command counts, a substitution's too: `$(ssh other id)` runs first.
+	const commands = parsed.commands[0] !== undefined && verbName(parsed.commands[0]) === "cd" ? parsed.commands.slice(1) : parsed.commands;
+	const [remote] = commands;
+	if (commands.length !== 1 || remote.assigns.length > 0) return false;
+	const words = remote.words.map(word => word.value);
+	// The program by its bare name only: `./ssh` or `/tmp/ssh` is whatever local file carries that name.
+	if (!remoteOptionsInert(words[0] ?? "", words.slice(1))) return false;
 	const read = commandOperands(unfiltered);
-	const hosts = new Set(read === undefined ? [] : remoteHosts(read.verb, read.operands));
-	return hosts.size > 0 && transcript.some(said => namesAnchor(said, hosts));
+	const hosts = read === undefined ? [] : remoteHosts(read.verb, read.operands);
+	// Every host the command acts on: an scp from the named host to another one is not consent for the other.
+	return hosts.length > 0 && hosts.every(host => transcript.some(said => namesAnchor(said, new Set([host]))));
+}
+
+/** The options each remote verb may carry under the named-host exception, by
+ *  allowlist: anything else may run a local program (ProxyCommand, -S, -e),
+ *  move the destination (HostName, -J, -F) or open a tunnel, so it fails closed. */
+const INERT_REMOTE_OPTIONS = new Map([
+	// No -A, -K, -X or -Y: forwarding the agent, credentials or display lends the remote root a local key or screen.
+	// ssh's operands end at the second one: options after the host still count (OpenSSH reads them), the words after the remote command's first word do not.
+	["ssh", { flags: "46aCknNqtTvxy", valued: "bceilmpo", operands: 1 }],
+	["scp", { flags: "346BCOpqrRTv", valued: "cilPo", operands: Infinity }],
+	["rsync", { flags: "aAbcCdDgHhIkKlLmnoOpPqrRStuUvWxXz", valued: "", operands: Infinity }],
+]);
+/** ssh `-o` settings that only tune the connection to the host as written. */
+const INERT_SSH_SETTINGS = new Set([
+	"stricthostkeychecking", "userknownhostsfile", "loglevel", "connecttimeout", "batchmode", "serveraliveinterval", "serveralivecountmax",
+	"port", "user", "identityfile", "identitiesonly", "connectionattempts", "compression", "requesttty", "passwordauthentication",
+	"pubkeyauthentication", "preferredauthentications", "hostkeyalgorithms", "pubkeyacceptedalgorithms", "pubkeyacceptedkeytypes", "updatehostkeys",
+]);
+
+/** Whether every option an ssh, scp or rsync carries is on the inert list.
+ *  ssh reads options before and after its host, and stops at the first word
+ *  of the remote command. */
+function remoteOptionsInert(verb: string, args: readonly string[]): boolean {
+	const spec = INERT_REMOTE_OPTIONS.get(verb);
+	if (spec === undefined) return false;
+	let operands = 0;
+	for (let at = 0; at < args.length; at++) {
+		const word = args[at];
+		if (word === "--") return true;
+		if (!word.startsWith("-") || word === "-") {
+			if (++operands > spec.operands) return true;
+			continue;
+		}
+		if (word.startsWith("--")) return false;
+		for (let index = 1; index < word.length; index++) {
+			const flag = word[index];
+			if (spec.flags.includes(flag)) continue;
+			if (!spec.valued.includes(flag)) return false;
+			const attached = word.slice(index + 1);
+			const value = attached !== "" ? attached : args[++at];
+			if (value === undefined) return false;
+			if (flag === "o" && !INERT_SSH_SETTINGS.has(value.split(/[=\s]/u)[0].toLowerCase())) return false;
+			break;
+		}
+	}
+	return true;
 }
 
 /** The hosts an ssh, scp or rsync command acts on, lowercased; none for any
  *  other verb. */
 function remoteHosts(verb: string, operands: readonly string[]): string[] {
-	if (verb === "ssh") return [sshHost(operands[0])?.toLowerCase() ?? ""].filter(host => host !== "");
-	if (verb !== "scp" && verb !== "rsync") return [];
-	return operands.map(operand => /^(?:[^@/:]+@)?([^/:]+):/u.exec(operand)?.[1]?.toLowerCase()).filter((host): host is string => host !== undefined);
+	const hosts = verb === "ssh" ? [sshHost(operands[0])] : verb === "scp" || verb === "rsync" ? operands.map(transferHost) : [];
+	// A host is a name or an address, never punctuation such as `.` or `_`.
+	return hosts.map(host => host?.toLowerCase()).filter((host): host is string => host !== undefined && /^[a-z0-9][a-z0-9._-]*$/u.test(host));
+}
+
+/** The host an scp or rsync operand names: `user@host:path`, `host::module`,
+ *  or a URL (`rsync://host/mod`, `scp://user@host/path`), whose scheme is not
+ *  its host. A local path names none. */
+function transferHost(operand: string): string | undefined {
+	const url = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]*@)?([^/:]+)/iu.exec(operand);
+	if (url !== null) return url[1];
+	return /^(?:[^@/:]+@)?([^/:]+):/u.exec(operand)?.[1];
 }
 
 /** What a user's words have to name for consent to reach this command: the
