@@ -130,6 +130,9 @@ interface Span {
 const OUTSIDE = 0;
 const IN_SINGLE = 1;
 const IN_DOUBLE = 2;
+/** `$'…'`: ANSI-C quoting, where a backslash escapes the next character, a
+ *  quote included, so `\'` does not close it. */
+const IN_ANSI = 3;
 
 /** The quote around each position of a line, so a value found inside
  *  `bash -c "… TOKEN=x && …"` ends at the closing quote and not past it. One
@@ -144,11 +147,26 @@ function enclosingQuotes(line: string): Uint8Array {
 			if (c === "'") state = OUTSIDE;
 			continue;
 		}
+		if (state === IN_ANSI) {
+			if (c === "\\") {
+				i++;
+				states[i] = state;
+			} else if (c === "'") state = OUTSIDE;
+			continue;
+		}
 		if (c === "\\") {
 			i++;
 			states[i] = state;
 		} else if (c === '"') state = state === IN_DOUBLE ? OUTSIDE : IN_DOUBLE;
-		else if (c === "'" && state === OUTSIDE) state = IN_SINGLE;
+		// `$$` is the shell's PID: the quote after it opens a plain single quote.
+		else if (c === "$" && line[i + 1] === "$") {
+			i++;
+			states[i] = state;
+		} else if (c === "$" && line[i + 1] === "'" && state === OUTSIDE) {
+			i++;
+			states[i] = state;
+			state = IN_ANSI;
+		} else if (c === "'" && state === OUTSIDE) state = IN_SINGLE;
 	}
 	states[line.length] = state;
 	return states;
@@ -160,6 +178,8 @@ const WITHIN_SINGLE = 1;
 const WITHIN_DOUBLE = 2;
 /** `\"` … `\"`: a quote escaped for JSON or for a string around it. */
 const WITHIN_ESCAPED = 3;
+/** `$'…'` inside the word: a backslash escapes the next character. */
+const WITHIN_ANSI = 4;
 
 /** Characters that end an unquoted word at the top level of a shell line. */
 const WORD_TERMINATORS = new Set([";", "|", "<", ">", ")"]);
@@ -188,6 +208,11 @@ function wordEnd(line: string, from: number, outer: number): number {
 			else if (c === '"') inner = PLAIN;
 			continue;
 		}
+		if (inner === WITHIN_ANSI) {
+			if (c === "\\") i++;
+			else if (c === "'") inner = PLAIN;
+			continue;
+		}
 		if (inner === WITHIN_ESCAPED) {
 			if (c === "\\" && line[i + 1] === '"') {
 				inner = PLAIN;
@@ -206,8 +231,19 @@ function wordEnd(line: string, from: number, outer: number): number {
 			continue;
 		}
 		if (c === "'") {
-			if (outer === IN_SINGLE) return i;
+			if (outer === IN_SINGLE || outer === IN_ANSI) return i;
 			inner = WITHIN_SINGLE;
+			continue;
+		}
+		// `$$` is the PID, so `$$'…'` is a plain single quote; inside double
+		// quotes `$'` is literal text.
+		if (c === "$" && line[i + 1] === "$") {
+			i++;
+			continue;
+		}
+		if (c === "$" && line[i + 1] === "'" && outer !== IN_DOUBLE) {
+			inner = WITHIN_ANSI;
+			i++;
 			continue;
 		}
 		if (c === "`") {
@@ -269,9 +305,9 @@ const TOOL_FLAGS: readonly ToolFlag[] = [
  *  nothing encloses it or the quote never closes. */
 function closingQuoteAt(line: string, from: number, quote: number): number {
 	if (quote === OUTSIDE) return line.length;
-	const mark = quote === IN_SINGLE ? "'" : '"';
+	const mark = quote === IN_SINGLE || quote === IN_ANSI ? "'" : '"';
 	for (let i = from; i < line.length; i++) {
-		if (line[i] === "\\" && quote === IN_DOUBLE) i++;
+		if (line[i] === "\\" && (quote === IN_DOUBLE || quote === IN_ANSI)) i++;
 		else if (line[i] === mark) return i;
 	}
 	return line.length;
