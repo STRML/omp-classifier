@@ -6,6 +6,8 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ### Stage 2 reads a Python run whose interpreter it can identify
 
+The machine that produced the log has `.pth` import lines in its venv, so every run there still refuses unless the command passes `-S`.
+
 A venv's `bin/python` is a symlink into a user-owned install (pyenv, Homebrew, uv). Stage 2 only vouched for a program on a root-owned chain, so it took the venv interpreter for a local script, read the binary as its body, and refused with "a binary". The reviewer never saw a `python -c`, a `python - <<'PY'` or a `python x.py`. In the decision log since 2026-10-30, these made up 11 of the reviewer's 21 unread-script skips: 8 "a binary" and 3 here-documents refused as "reads a redirect". A bare `python3` was refused as well ("runs a program the gate does not read").
 
 Stage 2 now admits a third shape: one Python run, after at most one literal `cd X &&` and a bare `timeout <duration>`, optionally piped into an output filter. The program counts as Python when the file it resolves to is named `python`, `python3` or `python3.N`, starts with a Mach-O or ELF header, and is either a system program or the interpreter its venv's `pyvenv.cfg` names as `home`. A script named `python3.12` is read as the script it is. What the reviewer reads depends on the mode:
@@ -28,7 +30,15 @@ What the reviewer judges and what the gate guarantees are split. The reviewer re
 
 It also refuses an unquoted here-document, a here-string, stdin from a file, an option outside `-uBEsSIOqbP`, words built at run time, an assignment, and a set `PYTHONPATH` or `PYTHONHOME`. It refuses any import alias (`import json as j`, `from shutil import copy as c`), since the name checks cannot follow one, and any archive extraction (`extractall`, `extract`, `unpack_archive`), since the reviewer cannot read what an archive holds.
 
-Startup code counts too. Unless `-S` is given, `site` runs every `.pth` line that starts with `import` and imports `sitecustomize` and `usercustomize`, all before the body. The gate reads the site-packages directories the interpreter will process (and the user site, outside a venv or without `-s` or `-I`) and refuses when it finds any of them. A venv with setuptools' `distutils-precedence.pth` or a coverage `.pth` installed therefore stays refused unless the command passes `-S`.
+Startup code counts too, and the rules for it fail closed. The gate refuses when:
+
+- a `.pth` file in a site-packages directory the interpreter processes (the user site too, outside a venv and without `-s` or `-I`) contains `import` anywhere, holds a BOM, a `\r` or any other character Python reads as a line break, or has any line besides comments and blank lines (that line would add a directory to sys.path)
+- `sitecustomize` or `usercustomize` sits on the library path
+- `<prefix>/lib/pythonXY.zip` exists and is not root-owned (it is on sys.path even under `-S`)
+- any `PYTHON*` variable but `PYTHONDONTWRITEBYTECODE` and `PYTHONUNBUFFERED` is set in the host's child-shell environment (`filterChildShellEnv`), or the command carries an assignment prefix
+- the code imports `zipfile` or `tarfile`, or runs `-m zipfile` or `-m tarfile`
+
+`-S` skips the `.pth` and customize checks, since `site` then never runs.
 
 A script run by a Python shebang now gets the same checks against the interpreter its shebang names. Only `#!<absolute python>` and `#!/usr/bin/env <python name>` are read, followed by nothing but those flags. That interpreter must pass the same identity check, and its library is what the import check reads. Before this, any such body was shown with no checks at all. No reviewer run in the log had a `.py` program, so this changes no past decision.
 

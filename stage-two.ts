@@ -34,10 +34,11 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { filterChildShellEnv } from "@oh-my-pi/pi-utils";
 import { isSecretPath } from "./floor";
 import { REVIEWER_SCRIPT_MAX_BYTES, type ReviewerScriptBody } from "./reviewer";
 import { parseShell, type ShellCommand, type ShellWord } from "./shell-ast";
-import { isNativeExecutable, leadingFlags, libraryDirs, PYTHON_ENVIRONMENT, PYTHON_FLAGS, PYTHON_NAME, parserPython, pythonHandOff, startupRefusal, pythonMode, pythonModuleRefusal, venvOf } from "./stage-two-python";
+import { isNativeExecutable, leadingFlags, libraryDirs, PYTHON_FLAGS, PYTHON_NAME, parserPython, pythonEnvironmentRefusal, pythonHandOff, startupRefusal, pythonMode, pythonModuleRefusal, venvOf } from "./stage-two-python";
 
 export interface ReadScript extends ReviewerScriptBody {
 	/** The path the command names, resolved but not through links. */
@@ -497,6 +498,8 @@ function pythonAt(located: string): PythonInterpreter | undefined {
  * import check reads.
  */
 function shebangPythonHandOff(shebang: string, body: string, real: string): string | undefined {
+	const env = pythonEnvironmentRefusal(filterChildShellEnv(process.env));
+	if (env !== undefined) return env;
 	const [program = "", ...args] = shebang.slice(2).trim().split(/[ \t]+/u);
 	if (!path.isAbsolute(program)) return "its shebang names no absolute interpreter";
 	let located: string | undefined = program;
@@ -513,7 +516,7 @@ function shebangPythonHandOff(shebang: string, body: string, real: string): stri
 	const libs = libraryDirs(python.real, python.venv);
 	const parser = parserPython(isSystemProgram);
 	if (libs === undefined) return "the gate cannot find its interpreter's standard library";
-	const startup = startupRefusal(libs, python.venv, flags);
+	const startup = startupRefusal(libs, python.venv, flags, python.real, isSystemProgram);
 	if (startup !== undefined) return startup;
 	return parser === undefined ? NO_PARSER : pythonHandOff(body, [path.dirname(real)], libs, parser);
 }
@@ -535,8 +538,8 @@ function isQuotedHeredoc(redirect: ShellCommand["redirects"][number]): boolean {
 function pythonScripts(run: ShellCommand, dir: string, python: PythonInterpreter): CommandScripts {
 	const why = runRefusal(run);
 	if (why !== undefined) return refuse(why);
-	const env = PYTHON_ENVIRONMENT.find(name => (process.env[name] ?? "") !== "");
-	if (env !== undefined) return refuse(`${env} is set, so Python may load code the gate did not read`);
+	const env = pythonEnvironmentRefusal(filterChildShellEnv(process.env));
+	if (env !== undefined) return refuse(env);
 	const mode = pythonMode(run.words.slice(timeoutWords(run) + 1));
 	if (typeof mode === "string") return refuse(mode);
 	const inputs = run.redirects.filter(redirect => redirect.direction !== "out" && !redirect.duplicate);
@@ -545,7 +548,7 @@ function pythonScripts(run: ShellCommand, dir: string, python: PythonInterpreter
 	if (inputs.length > 0 && heredoc === undefined) return refuse("the script reads a redirect");
 	const libs = libraryDirs(python.real, python.venv);
 	if (libs === undefined) return refuse(`${programWord(run)}: the gate cannot find its standard library`);
-	const startup = startupRefusal(libs, python.venv, leadingFlags(run.words.slice(timeoutWords(run) + 1).map(word => word.value)));
+	const startup = startupRefusal(libs, python.venv, leadingFlags(run.words.slice(timeoutWords(run) + 1).map(word => word.value)), python.real, isSystemProgram);
 	if (startup !== undefined) return refuse(startup);
 	const refused = (reason: string | undefined): CommandScripts => (reason === undefined ? { kind: "scripts", scripts: [] } : refuse(reason));
 	// A module run hands the reviewer no code of its own, so nothing to parse.

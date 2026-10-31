@@ -99,7 +99,7 @@ const BUILTIN_MODULES = new Set(["atexit", "errno", "faulthandler", "gc", "itert
 const DYNAMIC_MODULES = new Set(["importlib", "imp", "runpy", "zipimport", "pkgutil", "site", "sitecustomize", "usercustomize", "builtins", "code", "codeop", "ctypes", "pickle", "cPickle", "marshal", "shelve"]);
 
 /** `python -m` modules that run a file or string they are handed. */
-const RUNNER_MODULES = new Set(["runpy", "pdb", "bdb", "cProfile", "profile", "trace", "timeit", "code", "doctest", "idlelib", "pickle", "pickletools", "zipapp", "pydoc", "unittest", "multiprocessing"]);
+const RUNNER_MODULES = new Set(["zipfile", "tarfile", "runpy", "pdb", "bdb", "cProfile", "profile", "trace", "timeit", "code", "doctest", "idlelib", "pickle", "pickletools", "zipapp", "pydoc", "unittest", "multiprocessing"]);
 
 /** Names that run a string as code, or reach code or a namespace by a
  *  computed name, so the reviewer cannot read what runs. */
@@ -417,10 +417,15 @@ const CUSTOMIZE = /^(?:sitecustomize|usercustomize)(?:\.|$)/u;
  * `sitecustomize` and `usercustomize`. `flags` are the interpreter's own
  * options: `-S` skips all of it, and `-s` or `-I` skip the user site.
  */
-export function startupRefusal(libs: readonly string[], venv: { systemSite: boolean } | undefined, flags: readonly string[]): string | undefined {
+export function startupRefusal(libs: readonly string[], venv: { systemSite: boolean } | undefined, flags: readonly string[], real: string, isSystemProgram: (file: string) => boolean): string | undefined {
+	const version = libs.map(dir => /^python(\d+\.\d+)$/u.exec(path.basename(dir))?.[1]).find(found => found !== undefined);
+	// The standard-library zip sits first on sys.path, -S or not, so a writable one shadows every stdlib module.
+	if (version !== undefined) {
+		const zip = path.join(path.dirname(path.dirname(real)), "lib", `python${version.replace(".", "")}.zip`);
+		if (fs.existsSync(zip) && !isSystemProgram(zip)) return `${zip} is on sys.path and not root-owned`;
+	}
 	const letters = flags.join("");
 	if (letters.includes("S")) return undefined;
-	const version = libs.map(dir => /^python(\d+\.\d+)$/u.exec(path.basename(dir))?.[1]).find(found => found !== undefined);
 	// A venv turns the user site off unless it includes the system site.
 	const userSite = (venv === undefined || venv.systemSite) && !letters.includes("s") && !letters.includes("I") && version !== undefined;
 	const sites = [...libs.filter(dir => path.basename(dir) === "site-packages"), ...(userSite ? [path.join(os.homedir(), ".local", "lib", `python${version}`, "site-packages"), path.join(os.homedir(), "Library", "Python", version, "lib", "python", "site-packages")] : [])];
@@ -430,18 +435,36 @@ export function startupRefusal(libs: readonly string[], venv: { systemSite: bool
 	}
 	for (const dir of sites) {
 		for (const entry of safeList(dir).filter(name => name.endsWith(".pth"))) {
-			const file = path.join(dir, entry);
-			let text: string;
-			try {
-				const stat = fs.statSync(file);
-				if (!stat.isFile() || stat.size > PTH_MAX_BYTES) return `${file} could not be checked for startup code`;
-				text = fs.readFileSync(file, "utf8");
-			} catch {
-				return `${file} could not be checked for startup code`;
-			}
-			if (text.split(/\r?\n/u).some(line => /^import[ \t]/u.test(line))) return `${file} runs an import line at interpreter startup, unread`;
+			const why = pthRefusal(path.join(dir, entry));
+			if (why !== undefined) return why;
 		}
 	}
+	return undefined;
+}
+
+/** Characters Python's line splitting treats as a line break, beyond `\n`, and a BOM. */
+const PTH_LINE_BREAKS = /[\r\v\f\x1c\x1d\x1e\x85\u2028\u2029\uFEFF]/u;
+
+/**
+ * Why one `.pth` file `site` processes is refused: fail closed on anything
+ * but comments and blank lines. A line starting with `import` runs as code,
+ * and any other line adds a directory to sys.path, which could hold a
+ * `sitecustomize` or a module the gate never looked for. The word `import`
+ * anywhere, or a line break the gate splits differently from Python, also
+ * refuses, so no reading of the file can hide a line.
+ */
+function pthRefusal(file: string): string | undefined {
+	let text: string;
+	try {
+		const stat = fs.statSync(file);
+		if (!stat.isFile() || stat.size > PTH_MAX_BYTES) return `${file} could not be checked for startup code`;
+		text = fs.readFileSync(file, "utf8");
+	} catch {
+		return `${file} could not be checked for startup code`;
+	}
+	if (text.includes("import")) return `${file} runs an import line at interpreter startup, unread`;
+	if (PTH_LINE_BREAKS.test(text)) return `${file} holds a BOM or a line break the gate splits differently from Python`;
+	if (text.split("\n").some(line => line.trim() !== "" && !line.startsWith("#"))) return `${file} adds a directory to sys.path at interpreter startup`;
 	return undefined;
 }
 
@@ -500,5 +523,14 @@ export function pythonMode(words: readonly ShellWord[]): PythonMode | string {
 	return "python with no program reads the terminal's stdin";
 }
 
-/** Environment that points Python's imports or startup at other code. */
-export const PYTHON_ENVIRONMENT = ["PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT", "PYTHONUSERBASE", "PYTHONPLATLIBDIR", "PYTHONEXECUTABLE"];
+/** The two `PYTHON*` variables that change nothing about which code runs. */
+const HARMLESS_PYTHON_ENVIRONMENT = new Set(["PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED"]);
+
+/** Why the environment the command's shell inherits lets Python load or run
+ *  code the gate did not read: any set `PYTHON*` variable but the harmless
+ *  two (PYTHONPATH, PYTHONSTARTUP, PYTHONHOME, PYTHONUSERBASE, ...). `env` is
+ *  the host's child-shell view (`filterChildShellEnv`). */
+export function pythonEnvironmentRefusal(env: Readonly<Record<string, string | undefined>>): string | undefined {
+	const set = Object.keys(env).find(name => name.startsWith("PYTHON") && env[name] !== undefined && !HARMLESS_PYTHON_ENVIRONMENT.has(name));
+	return set === undefined ? undefined : `${set} is set, so Python may load code the gate did not read`;
+}

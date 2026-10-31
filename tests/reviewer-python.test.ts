@@ -459,7 +459,7 @@ describe("the gate's four guarantees hold however the code is spelled", () => {
 		["a package __init__ written", "import os\nos.makedirs('json', exist_ok=True)\nopen('json/__init__.py', 'w')\n", "writes json/__init__.py"],
 		["a shutil copy onto a module name", "import shutil\nshutil.copy('payload.txt', 'json.py')\n", "writes json.py"],
 		["a shutil copy to a computed path", "import shutil, sys\nshutil.copytree('a', sys.argv[1])\n", "path built at run time"],
-		["an archive extracted", "import tarfile\ntarfile.open('x.tar').extractall()\n", "unpacks an archive"],
+		["an archive extracted", "import tarfile\ntarfile.open('x.tar').extractall()\n", "imports tarfile"],
 		// The fourth security round: each is a write the allowlist must catch.
 		["str.replace with computed arguments (a possible Path.replace)", "import sys\nprint(sys.argv[0].replace(sys.argv[1], 'x'))\n", "path built at run time"],
 		["io.FileIO opened for writing", "import io\nio.FileIO('json.py', 'w')\n", "writes json.py"],
@@ -475,7 +475,8 @@ describe("the gate's four guarantees hold however the code is spelled", () => {
 		["attrgetter imported by name", "from operator import attrgetter\n", "attrgetter"],
 		// The fifth security round.
 		["an archive unpacked to a literal directory", "import shutil\nshutil.unpack_archive('x.tar', 'out')\n", "unpacks an archive"],
-		["an archive member extracted", "import tarfile\ntarfile.open('x.tar').extract('m', path='out')\n", "unpacks an archive"],
+		["an archive member extracted", "import tarfile\ntarfile.open('x.tar').extract('m', path='out')\n", "imports tarfile"],
+		["any call into zipfile", "import zipfile\nzipfile.ZipFile('x.zip').namelist()\n", "imports zipfile"],
 		["logging.config", "import logging.config\n", "logging.config"],
 		["logging.config imported by name", "from logging import config\n", "logging.config"],
 		["pydoc", "import pydoc\n", "imports pydoc"],
@@ -515,10 +516,65 @@ describe("startup code the interpreter runs before the body stays refused", () =
 		await expectRefused(`${python} -c "import json"`, why);
 	});
 
-	test("a .pth file that only adds a path is fine", async () => {
+	test.each([
+		["a path line, which adds a directory to sys.path", "/opt/extra\n", "adds a directory to sys.path"],
+		["the word import past the start of a line", "  import os; os.system('id')\n", "runs an import line"],
+		["a carriage return, which Python reads as a line break", "# note\rimport os\n".replace("import", "imp" + "ort"), "runs an import line"],
+		["a carriage return alone", "# a\r# b\n", "line break the gate splits differently"],
+		["a form feed", "# a\f\n", "line break the gate splits differently"],
+		["a byte-order mark", "\uFEFF# a\n", "line break the gate splits differently"],
+		["a Unicode line separator", "# a\u2028/opt/x\n", "line break the gate splits differently"],
+	])("a .pth file with %s refuses", async (_name, content, why) => {
 		const python = fakeVenv(fakeInstall());
-		write("venv/lib/python3.12/site-packages/paths.pth", "/opt/extra\n");
+		write("venv/lib/python3.12/site-packages/hook.pth", content);
+		await expectRefused(`${python} -c "import json"`, why);
+	});
+
+	test("a .pth file of comments and blank lines is fine", async () => {
+		const python = fakeVenv(fakeInstall());
+		write("venv/lib/python3.12/site-packages/notes.pth", "# nothing here\n\n");
 		await expectReviewed(`${python} -c "import json"`);
+	});
+
+	test("a standard-library zip on sys.path that is not root-owned refuses, even under -S", async () => {
+		const python = fakeVenv(fakeInstall());
+		write("base/lib/python312.zip", "PK");
+		await expectRefused(`${python} -S -c "import json"`, "python312.zip is on sys.path and not root-owned");
+	});
+
+	test.each([["PYTHONSAFEPATH"], ["PYTHONSTARTUP"], ["PYTHONWARNINGS"]])("%s set in the inherited environment refuses", async name => {
+		const python = fakeVenv(fakeInstall());
+		const previous = process.env[name];
+		process.env[name] = "1";
+		try {
+			await expectRefused(`${python} -c "import json"`, `${name} is set`);
+		} finally {
+			if (previous === undefined) delete process.env[name];
+			else process.env[name] = previous;
+		}
+	});
+
+	test("PYTHONUNBUFFERED set in the inherited environment is fine", async () => {
+		const python = fakeVenv(fakeInstall());
+		const previous = process.env.PYTHONUNBUFFERED;
+		process.env.PYTHONUNBUFFERED = "1";
+		try {
+			await expectReviewed(`${python} -c "import json"`);
+		} finally {
+			if (previous === undefined) delete process.env.PYTHONUNBUFFERED;
+			else process.env.PYTHONUNBUFFERED = previous;
+		}
+	});
+
+	test("a PYTHON* assignment prefix on the command refuses", async () => {
+		const python = fakeVenv(fakeInstall());
+		await expectRefused(`PYTHONSTARTUP=payload.py ${python} -c "import json"`, "assignment");
+	});
+
+	test.each([["zipfile"], ["tarfile"]])("python -m %s refuses", async module => {
+		const python = fakeVenv(fakeInstall());
+		write(`base/lib/python3.12/${module}.py`, "");
+		await expectRefused(`${python} -m ${module} -e x.zip out`, `python -m ${module} runs a file or string`);
 	});
 
 	test("-S skips site, so a .pth import line does not run", async () => {
