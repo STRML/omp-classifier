@@ -83,14 +83,9 @@ describe("data operands do not match the critical patterns", () => {
 		["-m attached", `git commit "-mnote: reboot required"`],
 		["a short cluster ending in m", `git commit -am "note: reboot required"`],
 		["-C before the subcommand", `git -C /Users/you/repo commit -m "note: reboot required"`],
-		["a heredoc fed to cat inside -m", `git commit -m "$(cat <<'EOF'\nfix: survive a reboot\n\nafter a reboot the root is gone\nEOF\n)"`],
-		["a heredoc on -F -", `git commit -F - <<'EOF'\nfix: survive a reboot\nEOF`],
-		["a here-string on --file=-", `git commit --file=- <<< 'fix: a reboot now survives'`],
 		["a message with non-ASCII text before the match", `git commit -m "café 漢字 🚀: a reboot now" && git log -1`],
-		["a commit piped to tail",`git commit -m "note: reboot required" 2>&1 | tail -5`],
-		["gh pr create --body", `gh pr create --title "fix: reboot handling" --body "Before: a reboot lost state. Never rm -rf / here."`],
-		["gh issue comment -b", `gh issue comment 12 -b "after a reboot the root is gone"`],
-		["gh pr create --body-file - with a heredoc", `gh pr create --title x --body-file - <<'EOF'\nafter a reboot\nEOF`],
+		["stderr joined to stdout", `git commit -m "note: reboot required" 2>&1 && git status -s`],
+		["several -m paragraphs", `git commit -m "fix: survive a reboot" -m "after a reboot the root is gone"`],
 	])("%s", async (_name, command) => {
 		expect(await gate(command)).toBe("ALLOWED");
 		expect(modelCalls.length).toBe(1);
@@ -99,6 +94,13 @@ describe("data operands do not match the critical patterns", () => {
 
 describe("anything that executes the same text stays critical", () => {
 	test.each([
+		// Shapes the narrowed blanking no longer reads: scanned in full.
+		["a heredoc fed to cat inside -m", `git commit -m "$(cat <<'EOF'\nfix: survive a reboot\nEOF\n)"`],
+		["a quoted substitution with a glob part", `git commit -m "$(cat <<'EOF'\na reboot now\nEOF\n)"*`],
+		["a heredoc on -F -", `git commit -F - <<'EOF'\nfix: a reboot now\nEOF`],
+		["a commit piped to tail", `git commit -m "note: reboot required" 2>&1 | tail -5`],
+		["gh pr create --body", `gh pr create --title x --body "Never rm -rf / here."`],
+		["echo after the commit", `git commit -m "note: reboot required" && echo done`],
 		["a bare rm -rf /", "rm -rf /"],
 		["bash -c", `bash -c "rm -rf /"`],
 		["sh -c", `sh -c 'rm -rf /'`],

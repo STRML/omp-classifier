@@ -10,18 +10,19 @@
  * "reboot", or a test file whose fixture strings read `rm -rf /`. This module
  * narrows what they read in two ways, and neither strips text with a regex.
  *
- * 1. The raw command. The parser names the word operands that are message
- *    text for `git commit` and `gh pr|issue`, and those spans are blanked in
- *    place. Every other byte is scanned exactly as before. Blanking happens
- *    only when every command in the parse comes from a small set of verbs
- *    that cannot execute text, with no env prefix, no redirect that writes a
- *    file, and nothing run out of source order. Any other shape, and any
+ * 1. The raw command. When the whole command is a plain chain of `git add`,
+ *    `git commit`, `git log` and `git status`, the parser names the
+ *    `git commit` message words and those spans are blanked in place. Every
+ *    other byte is scanned exactly as before. Every word must reach git as
+ *    written, every flag must be on a short allowlist, and the session's shell
+ *    must be one no earlier call could have changed. Any other shape, and any
  *    parse failure, scans the whole text.
  * 2. Spliced script bodies (issue #67). The host never reads them, so this
  *    scan is coverage the gate adds on its own. A body the shell runs keeps
  *    the critical refusal. A JavaScript or Python body's hit refuses, with no
  *    refusal record, when the body names a process API. Otherwise it goes to
- *    the judge with the hit named in its state.
+ *    the judge with the hit named in its state, as a risk flag a SAFE alone
+ *    cannot release.
  */
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { parseShell, type ShellCommand, type ShellRedirect, type ShellWord, shellRunsInSourceOrder } from "./shell-ast";
@@ -30,18 +31,9 @@ export function matchesCriticalPattern(text: string): boolean {
 	return CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(text));
 }
 
-/** Verbs that read or print and never execute their input. A chain made only
- *  of these, plus allowed `git` and `gh` invocations, cannot run the message
- *  text it carries: no shell, `eval`, `xargs`, interpreter, `sudo` or
- *  wrapper, and no unknown program that might be one. `printf` is absent
- *  because `printf -v NAME` assigns a variable the persistent session shell
- *  keeps. `cd` stays: it moves the directory and carries no text. */
-const INERT_VERBS: ReadonlySet<string> = new Set(["cat", "echo", "head", "tail", "wc", "grep", "ls", "pwd", "cd", "true"]);
-
-/** The flags an allowed invocation may carry. Any other word that starts with
- *  `-` (before a `--`) ends the blanking: `git log --output=<file>` writes a
- *  file, `git push --receive-pack=<cmd>` names a program, `gh pr create -e`
- *  opens an editor. Positional words are operands (paths, refs, numbers). */
+/** The flags one git subcommand may carry. Any other word that starts with
+ *  `-` ends the blanking: `git log --output=<file>` writes a file, and
+ *  `git commit -e` opens an editor. Positional words are paths and refs. */
 interface FlagSpec {
 	/** Flags that take no value. */
 	bare: ReadonlySet<string>;
@@ -55,41 +47,24 @@ interface FlagSpec {
 
 const set = (...items: string[]): ReadonlySet<string> => new Set(items);
 
-/** git subcommands, each with the flags it may carry. An unknown subcommand
+/** The only git subcommands a blanked chain may hold. An unknown subcommand
  *  may be an alias, and `!`-aliases are shell commands. */
 const GIT_FLAGS: Readonly<Record<string, FlagSpec>> = {
 	commit: {
-		bare: set("-a", "--all", "-q", "--quiet", "-s", "--signoff", "-v", "--verbose", "--amend", "--no-edit", "--no-verify", "-n", "--allow-empty", "--allow-empty-message"),
-		value: set("-m", "--message", "-F", "--file"),
-		attached: ["--message=", "--file="],
-		// `-am`, `-qm`, `-mtext`, `-F-`, and boolean clusters such as `-aq`.
-		shapes: [/^-[aqsvn]*m/u, /^-[aqsvn]+$/u, /^-F-$/u],
+		bare: set("-a", "--all", "-q", "--quiet", "-s", "--signoff", "-v", "--verbose", "--amend", "--no-edit", "--no-verify", "-n", "--allow-empty"),
+		value: set("-m", "--message"),
+		attached: ["--message="],
+		// `-am`, `-qm`, `-mtext`, and boolean clusters such as `-aq`.
+		shapes: [/^-[aqsvn]*m/u, /^-[aqsvn]+$/u],
 	},
-	add: { bare: set("-A", "--all", "-u", "--update", "-v", "--verbose", "-N", "--intent-to-add"), value: set(), attached: [], shapes: [] },
+	add: { bare: set("-A", "--all", "-u", "--update", "-v", "--verbose"), value: set(), attached: [], shapes: [] },
 	log: {
 		bare: set("--oneline", "--stat", "--graph", "--decorate", "--no-decorate", "--name-only", "--name-status", "--no-patch", "-s", "--reverse", "--first-parent"),
 		value: set("-n"),
-		attached: ["--format=", "--pretty=", "--max-count=", "--since=", "--until="],
+		attached: ["--format=", "--pretty=", "--max-count="],
 		shapes: [/^-\d+$/u],
 	},
 	status: { bare: set("-s", "--short", "-b", "--branch", "-sb", "--porcelain"), value: set(), attached: [], shapes: [] },
-	push: { bare: set("-u", "--set-upstream", "-q", "--quiet", "--force-with-lease"), value: set(), attached: ["--force-with-lease="], shapes: [] },
-	"rev-parse": { bare: set("--short", "--abbrev-ref", "--show-toplevel", "--git-dir"), value: set(), attached: ["--short="], shapes: [] },
-};
-
-/** `gh pr|issue create|edit|comment`, and the flags they may carry. `--web`
- *  and `--editor` are absent: both start another program. */
-const GH_GROUPS: ReadonlySet<string> = set("pr", "issue");
-const GH_ACTIONS: ReadonlySet<string> = set("create", "edit", "comment");
-const GH_FLAGS: FlagSpec = {
-	bare: set("--draft", "-d", "--fill", "--fill-first", "--fill-verbose"),
-	value: set(
-		"-b", "--body", "-t", "--title", "-F", "--body-file", "-B", "--base", "-H", "--head", "-R", "--repo",
-		"-l", "--label", "-a", "--assignee", "-r", "--reviewer", "-m", "--milestone",
-		"--add-label", "--remove-label", "--add-assignee", "--remove-assignee", "--add-reviewer", "--remove-reviewer",
-	),
-	attached: ["--body=", "--title=", "--body-file=", "--base=", "--head=", "--repo=", "--label="],
-	shapes: [/^-[bt]./u],
 };
 
 /** git options allowed before the subcommand. `-c`, `--config-env` and
@@ -97,252 +72,98 @@ const GH_FLAGS: FlagSpec = {
  *  `alias.*` values execute. */
 const GIT_GLOBAL_FLAGS: ReadonlySet<string> = set("--no-pager", "-P", "--no-optional-locks");
 
-/** Whether every flag from `start` on is one the spec names. */
-function flagsAllowed(words: readonly ShellWord[], start: number, spec: FlagSpec): boolean {
-	for (let index = start; index < words.length; index++) {
-		const word = words[index];
-		// Every word must reach the program as written. An expansion, a glob
-		// or a brace (`{--output=x,-1}`, `--outp*`) can turn one word into a
-		// flag this list never saw, or into several words.
-		if (!word.fixed) return false;
-		const flag = word.value;
-		if (!flag.startsWith("-") || flag === "-") continue;
-		if (flag === "--") return words.slice(index + 1).every(rest => rest.fixed);
-		if (spec.value.has(flag)) {
-			index += 1;
-			// A flag's value is one word too. The one non-literal value read is
-			// a message spelled as a quoted `"$(cat <<'EOF' … EOF)"`.
-			const value = words[index];
-			if (value !== undefined && !value.fixed && !isQuotedCatHeredoc(value)) return false;
-		} else if (!spec.bare.has(flag) && !spec.attached.some(prefix => flag.startsWith(prefix)) && !spec.shapes.some(shape => shape.test(flag))) return false;
-	}
-	return true;
-}
-
-/** `"$(cat <<'EOF' … EOF)"` as one double-quoted word: quoted, so it stays
- *  one word, and its only command prints a literal heredoc. */
-function isQuotedCatHeredoc(word: ShellWord): boolean {
-	return word.source.startsWith('"$(') && word.source.endsWith(')"') && catHeredocData(word) !== undefined;
-}
-
-/** Where a git command's own argv starts after its subcommand, or -1 when
- *  the command is not one this module reads. */
+/** Where a git command's own argv starts after its subcommand, or -1. */
 function gitSubcommandIndex(words: readonly ShellWord[]): number {
 	let index = 1;
 	while (index < words.length && words[index].value.startsWith("-")) {
 		const flag = words[index].value;
-		if (!words[index].fixed) return -1;
-		if (flag === "-C") {
-			if (words[index + 1]?.fixed !== true) return -1;
-			index += 2;
-		} else if (GIT_GLOBAL_FLAGS.has(flag)) index += 1;
+		if (flag === "-C") index += 2;
+		else if (GIT_GLOBAL_FLAGS.has(flag)) index += 1;
 		else return -1;
 	}
 	const sub = words[index];
-	return sub !== undefined && sub.fixed && Object.hasOwn(GIT_FLAGS, sub.value) ? index : -1;
+	return sub !== undefined && Object.hasOwn(GIT_FLAGS, sub.value) ? index : -1;
 }
 
-function isAllowedGit(words: readonly ShellWord[]): boolean {
-	const sub = gitSubcommandIndex(words);
-	return sub !== -1 && flagsAllowed(words, sub + 1, GIT_FLAGS[words[sub].value]);
+/** Whether every flag from `start` on is one the spec names. */
+function flagsAllowed(words: readonly ShellWord[], start: number, spec: FlagSpec): boolean {
+	for (let index = start; index < words.length; index++) {
+		const flag = words[index].value;
+		if (!flag.startsWith("-") || flag === "-") continue;
+		if (flag === "--") return true;
+		if (spec.value.has(flag)) index += 1;
+		else if (!spec.bare.has(flag) && !spec.attached.some(prefix => flag.startsWith(prefix)) && !spec.shapes.some(shape => shape.test(flag))) return false;
+	}
+	return true;
 }
 
-function isGhMessageCommand(words: readonly ShellWord[]): boolean {
-	return words.length >= 3 && words[1].fixed && words[2].fixed && GH_GROUPS.has(words[1].value) && GH_ACTIONS.has(words[2].value);
-}
-
-/** A redirect that writes no file and starts no program. Writing a file is
- *  how carried text becomes a later program (`> .git/hooks/pre-push`). A
- *  duplicate may only join stdout and stderr: the host keeps one shell per
- *  session, so a descriptor such as 3 can still be open on a file or a
- *  process from an earlier call. */
+/** A redirect that writes no file: `2>&1`, `>&2`, `>/dev/null`. The host
+ *  keeps one shell per session, so any other descriptor may still be open on
+ *  a file or a process from an earlier call. */
 function isInertRedirect(redirect: ShellRedirect): boolean {
-	if (redirect.here) return true;
-	if (!redirect.target.literal) return false;
-	if (redirect.duplicate) return ["", "1", "2"].includes(redirect.fd) && ["1", "2", "-"].includes(redirect.target.value);
-	if (redirect.direction === "in") return true;
+	if (redirect.here || !redirect.target.fixed) return false;
+	if (redirect.duplicate) return ["", "1", "2"].includes(redirect.fd) && ["1", "2"].includes(redirect.target.value);
 	return redirect.direction === "out" && redirect.target.value === "/dev/null";
 }
 
-function isInertCommand(command: ShellCommand): boolean {
-	if (command.unreadShape !== undefined || command.expression !== undefined) return false;
+/** A git command this module reads: every word reaches git as written (no
+ *  expansion, substitution, glob or brace, so `{--output=x,-1}` cannot become
+ *  a flag), an allowed subcommand, allowed flags, no env prefix. */
+function isPlainGit(command: ShellCommand): boolean {
+	if (command.nested || command.unreadShape !== undefined || command.expression !== undefined) return false;
 	if (command.assigns.length > 0 || command.words.length === 0) return false;
+	if (!command.words.every(word => word.fixed)) return false;
 	if (!command.redirects.every(isInertRedirect)) return false;
-	const verb = command.words[0];
-	if (!verb.literal || !verb.fixed) return false;
-	if (INERT_VERBS.has(verb.value)) return true;
-	if (verb.value === "git") return isAllowedGit(command.words);
-	if (verb.value === "gh") return isGhMessageCommand(command.words) && flagsAllowed(command.words, 3, GH_FLAGS);
-	return false;
+	if (command.words[0].value !== "git") return false;
+	const sub = gitSubcommandIndex(command.words);
+	return sub !== -1 && flagsAllowed(command.words, sub + 1, GIT_FLAGS[command.words[sub].value]);
 }
 
-/** The text a here-document or here-string hands its command, when that text
- *  expands nothing. An unquoted heredoc that substitutes runs code. */
-function hereData(redirect: ShellRedirect): ShellWord | undefined {
-	if (!redirect.here) return undefined;
-	const data = redirect.body ?? redirect.target;
-	return data.literal ? data : undefined;
-}
-
-/** The spans of a message operand: the word itself when it is literal, or the
- *  heredoc body of `"$(cat <<'EOF' … EOF)"`, the one substitution whose only
- *  output is literal text. */
-function messageSpans(word: ShellWord | undefined): ShellWord[] {
-	if (word === undefined) return [];
-	if (word.fixed) return [word];
-	const data = isQuotedCatHeredoc(word) ? catHeredocData(word) : undefined;
-	return data === undefined ? [] : [data];
-}
-
-/** The heredoc a `$(cat <<EOF … EOF)` word prints, when that is all it runs. */
-function catHeredocData(word: ShellWord): ShellWord | undefined {
-	if (word.commands.length !== 1) return undefined;
-	const [inner] = word.commands;
-	if (inner.assigns.length > 0 || inner.words.length !== 1 || inner.words[0].value !== "cat" || !inner.words[0].fixed) return undefined;
-	if (inner.redirects.length !== 1) return undefined;
-	return hereData(inner.redirects[0]);
-}
-
-/** Option grammar shared by the two message-carrying commands. */
-interface MessageGrammar {
-	/** Flags whose next word is message text. */
-	message: ReadonlySet<string>;
-	/** `--flag=` prefixes whose remainder is message text. */
-	messagePrefix: readonly string[];
-	/** Flags whose next word names a file to read the message from. */
-	file: ReadonlySet<string>;
-	/** Short flags that take no value and may cluster before a message flag. */
-	boolean: string;
-	/** Short flags whose attached remainder or next word is message text. */
-	messageShort: string;
-	/** Short flags that take a value (not message text). */
-	valueShort: string;
-	/** Long flags whose next word is a value (not message text). */
-	valueLong: ReadonlySet<string>;
-}
-
-const GIT_COMMIT_GRAMMAR: MessageGrammar = {
-	message: new Set(["-m", "--message"]),
-	messagePrefix: ["--message="],
-	file: new Set(["-F", "--file"]),
-	boolean: "apzsneioqv",
-	messageShort: "m",
-	valueShort: "CcFtSu",
-	valueLong: new Set(["--author", "--date", "--fixup", "--squash", "--trailer", "--cleanup", "--reuse-message", "--reedit-message", "--template", "--pathspec-from-file"]),
-};
-
-const GH_GRAMMAR: MessageGrammar = {
-	message: new Set(["-b", "--body", "-t", "--title"]),
-	messagePrefix: ["--body=", "--title="],
-	file: new Set(["-F", "--body-file"]),
-	boolean: "",
-	messageShort: "bt",
-	valueShort: "",
-	valueLong: new Set(),
-};
-
-/** Read one argv against a grammar: the message spans it carries, and whether
- *  the message comes from stdin. */
-function readMessageArgs(words: readonly ShellWord[], start: number, grammar: MessageGrammar): { spans: ShellWord[]; stdin: boolean } {
-	const spans: ShellWord[] = [];
-	let stdin = false;
-	for (let index = start; index < words.length; index++) {
-		const word = words[index];
-		const value = word.value;
-		if (!word.literal) continue;
-		if (value === "--") break;
-		if (grammar.message.has(value)) {
-			spans.push(...messageSpans(words[index + 1]));
-			index += 1;
-			continue;
-		}
-		if (grammar.messagePrefix.some(prefix => value.startsWith(prefix))) {
-			spans.push(word);
-			continue;
-		}
-		if (grammar.file.has(value)) {
-			if (words[index + 1]?.literal && words[index + 1].value === "-") stdin = true;
-			index += 1;
-			continue;
-		}
-		const eq = value.indexOf("=");
-		if (value.startsWith("--") && eq !== -1 && grammar.file.has(value.slice(0, eq))) {
-			if (value.slice(eq + 1) === "-") stdin = true;
-			continue;
-		}
-		if (grammar.valueLong.has(value)) {
-			index += 1;
-			continue;
-		}
-		if (!/^-[A-Za-z]/u.test(value)) continue;
-		for (let at = 1; at < value.length; at++) {
-			const flag = value[at];
-			if (grammar.boolean.includes(flag)) continue;
-			const rest = value.slice(at + 1);
-			if (grammar.messageShort.includes(flag)) {
-				if (rest === "") {
-					spans.push(...messageSpans(words[index + 1]));
-					index += 1;
-				} else {
-					spans.push(word);
-				}
-			} else if (flag === "F") {
-				if (rest === "-") stdin = true;
-				else if (rest === "") {
-					if (words[index + 1]?.literal && words[index + 1].value === "-") stdin = true;
-					index += 1;
-				}
-			} else if (grammar.valueShort.includes(flag) && rest === "") {
-				index += 1;
-			}
-			break;
-		}
-	}
-	return { spans, stdin };
-}
-
-/** The data spans one top-level command carries. */
-function commandDataSpans(command: ShellCommand): ShellWord[] {
+/** The message words of a `git commit`, in a command `isPlainGit` accepted. */
+function commitMessageWords(command: ShellCommand): ShellWord[] {
 	const { words } = command;
-	let read: { spans: ShellWord[]; stdin: boolean } | undefined;
-	if (words[0].value === "git") {
-		const sub = gitSubcommandIndex(words);
-		if (sub !== -1 && words[sub].value === "commit") read = readMessageArgs(words, sub + 1, GIT_COMMIT_GRAMMAR);
-	} else if (words[0].value === "gh" && isGhMessageCommand(words)) {
-		read = readMessageArgs(words, 3, GH_GRAMMAR);
-	}
-	if (read === undefined) return [];
-	const spans = [...read.spans];
-	if (read.stdin) {
-		for (const redirect of command.redirects) {
-			const data = hereData(redirect);
-			if (data !== undefined) spans.push(data);
+	const sub = gitSubcommandIndex(words);
+	if (words[sub].value !== "commit") return [];
+	const spans: ShellWord[] = [];
+	for (let index = sub + 1; index < words.length; index++) {
+		const value = words[index].value;
+		if (value === "--") break;
+		if (value === "-m" || value === "--message") {
+			if (words[index + 1] !== undefined) spans.push(words[index + 1]);
+			index += 1;
+		} else if (value.startsWith("--message=")) {
+			spans.push(words[index]);
+		} else if (/^-[aqsvn]*m/u.test(value)) {
+			// `-am "text"` takes the next word; `-amtext` carries it attached.
+			if (value.endsWith("m")) {
+				if (words[index + 1] !== undefined) spans.push(words[index + 1]);
+				index += 1;
+			} else {
+				spans.push(words[index]);
+			}
 		}
 	}
 	return spans;
 }
 
 /**
- * The raw command with its message operands blanked to spaces, the same
+ * The raw command with its commit message words blanked to spaces, the same
  * length as the input so every other byte keeps its place. Returns the input
- * unchanged whenever any guard fails: that is today's full scan.
+ * unchanged whenever any guard fails: that is the full scan.
  *
  * `shellTrusted` false skips blanking outright. The host keeps one shell per
  * session, so once an earlier call may have defined a function, an alias or a
- * hashed path, `git` and `cat` need not be the programs this module reasons
- * about.
+ * hashed path, `git` need not be git.
  */
 export function criticalScanText(command: string, shellTrusted = true): string {
 	if (!shellTrusted) return command;
-	// Only a gate on doing work: a command naming neither verb has nothing to
-	// blank, and a false hit here costs a parse, never a byte of the scan.
-	if (!/\bgit\b|\bgh\b/u.test(command)) return command;
+	// Only a gate on doing work: a false hit here costs a parse, never a byte of the scan.
+	if (!command.includes("commit")) return command;
 	const parsed = parseShell(command);
 	if (!parsed.ok || parsed.commands.length === 0) return command;
 	if (!shellRunsInSourceOrder(command)) return command;
-	if (!parsed.commands.every(isInertCommand)) return command;
-	const spans = parsed.commands.filter(candidate => !candidate.nested).flatMap(commandDataSpans);
-	if (spans.length === 0) return command;
+	if (!parsed.commands.every(isPlainGit)) return command;
+	const spans = parsed.commands.flatMap(commitMessageWords);
 	// Word offsets are UTF-16 string indexes (shell-ast converts the parser's
 	// byte offsets), and split("") indexes by UTF-16 unit too.
 	const out = command.split("");

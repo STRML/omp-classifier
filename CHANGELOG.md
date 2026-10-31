@@ -10,16 +10,16 @@ The gate ran the host's `CRITICAL_BASH_PATTERNS` over the judged text: the raw c
 
 The scan now lives in `critical-scan.ts` and reads two things separately. Neither uses a regex to cut text.
 
-- **The raw command.** The shell parser finds message operands, and those spans are blanked in place. Every other byte is scanned as before. The operands are `git commit` `-m`/`--message`/`-m<text>`/clusters ending in `m`, the literal heredoc of `-m "$(cat <<'EOF' … EOF)"`, a literal heredoc or here-string on `-F -`, and `gh pr|issue create|edit|comment` `--body`/`-b`/`--title`/`-t`/`--body-file -`. Blanking happens only when all of these hold:
+- **The raw command.** When the whole command is a plain chain of `git add`, `git commit`, `git log` and `git status`, the shell parser finds the `git commit` message words (`-m`, `--message`, `--message=`, `-m<text>`, clusters ending in `m`) and blanks those spans in place. Every other byte is scanned as before. Blanking happens only when all of these hold:
   - the parse succeeds and everything runs in source order;
-  - every command, nested ones included, is an inert verb (`cat`, `echo`, `head`, `tail`, `wc`, `grep`, `ls`, `pwd`, `cd`, `true`) or an allowed `git`/`gh` invocation;
-  - an allowed invocation carries only flags from a per-subcommand allowlist (`git commit`, `add`, `log`, `status`, `push`, `rev-parse`; `gh pr|issue create|edit|comment`), so `git log --output=<file>`, `git push --receive-pack=<cmd>`, `git commit -e`, `git -c …`, `gh pr create --editor` and `--web` all scan the whole text;
-  - every word of an allowed invocation reaches the program as written: no glob, brace or expansion (`{--output=x,-1}`, `$MSG`), except a quoted `"$(cat <<'EOF' … EOF)"` message;
+  - every command is one of those four git subcommands, with no other verb anywhere in the chain (no pipe, no `echo`, no substitution);
+  - every flag is on that subcommand's allowlist, and nothing before the subcommand but `-C <dir>`, `--no-pager`, `-P` or `--no-optional-locks`, so `git log --output=<file>`, `git commit -e`, `git commit -F`, `git -c …` and an alias all scan the whole text;
+  - every word reaches git as written: no glob, brace, expansion or substitution (`{--output=x,-1}`, `$MSG`, `"$(cat <<'EOF' …)"`);
   - the session's shell is trusted: once any call in the session may have changed the persistent shell (the `$TMPDIR` latch from https://github.com/STRML/omp-classifier/pull/215, which now also trips on a function definition and on `hash`), or the call has no session id, nothing is blanked;
   - no command has an env prefix;
-  - no redirect writes a file other than `/dev/null`, and a duplicate joins only stdout and stderr (the host's shell persists across calls, so a descriptor such as 3 may still be open from an earlier one).
+  - the only redirects are `2>&1`/`>&2` and `>/dev/null`, since the host's shell persists across calls and a descriptor such as 3 may still be open from an earlier one.
 
-  `printf` is not inert, because `printf -v` assigns a variable the session shell keeps. `echo` arguments are never blanked, because stdout is how carried text reaches a shell.
+  A wider first version also read `gh` bodies, heredoc messages and chains with `cat` or `echo`. Seven rounds of security review kept finding ways to make those shapes run the text, so they now scan in full.
 - **Spliced bodies.** Each body is scanned on its own. The host never reads bodies, so this scan was coverage the gate added on its own. A shell body keeps the critical refusal, recorded. A body counts as shell unless all of these hold: the verb is `node`, `bun`, `deno` or `python*`, the operand is not named `.sh`/`.bash`/`.zsh`/`.fish`/`.dash`/`.ksh`, and the file has no shell shebang. A hit in a non-shell body:
   - refuses at the critical layer, with no refusal record, when the body names a process API (`child_process`, `Bun.$`, a tagged `` $` ``, `spawn(`, `exec(`, `Deno.Command`, `os.system`, `subprocess`, `eval(`, `Function(`, dynamic `import(` and the like). The same file refuses on every call, and a record would keep refusing the target after the file is fixed;
   - refuses the same way when no judge will run: `enabled false`, `/classifier off`, a static `prompt` rule, or `tools.approval.bash: prompt` with no rule;
@@ -28,8 +28,8 @@ The scan now lives in `critical-scan.ts` and reads two things separately. Neithe
 | Command | Before | After |
 |---|---|---|
 | `git commit -q -m "… after a spontaneous reboot …" && git log --oneline -2` | `critical`, locked for the session | judged |
-| `git commit -m "$(cat <<'EOF' … reboot … EOF)"` | `critical` | judged |
-| `gh pr create --body "… rm -rf / …"` | `critical` | judged |
+| `git commit -m "$(cat <<'EOF' … reboot … EOF)"` | `critical` | `critical` (not read) |
+| `gh pr create --body "… rm -rf / …"` | `critical` | `critical` (not read) |
 | `bun test tests/gate.test.ts` whose fixtures say `rm -rf /` and name no process API | `critical`, locked | judged with `criticalPatternInScriptBody` in state; `flagged` on a SAFE, not recorded |
 | `git commit -m "… reboot …"` after `git() { …; }` earlier in the session | `critical`, locked | `critical` |
 | `bun test tests/reviewer.test.ts` (its fixtures also name `child_process`) | `critical`, locked | `critical`, not recorded |
