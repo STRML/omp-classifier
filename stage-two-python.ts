@@ -5,14 +5,18 @@
  * The reviewer reads the code Python is handed: a `-c` operand, a quoted
  * here-document, or a script file. Python can still run code nobody read: a
  * module next to the code, a spawned process, a string run as code, an edited
- * import path. This module refuses the ones a read of the text can see. It is
- * a deny list over text, the same kind of check stage 2 applies to a shell
- * body, and the reviewer is told that anything the code hands off to is
- * unknown.
+ * import path. This module refuses the ones Python's own parse shows: the
+ * code goes to `ast.parse` under a root-owned Python, never to a pattern
+ * over its text, because every pattern misread some corner of the tokenizer.
+ * The checks over the parse are still a deny list, the same kind stage 2
+ * applies to a shell body, and the reviewer is told that anything the code
+ * hands off to is unknown.
  *
  * It decides nothing about which file is the interpreter; stage-two.ts does.
  */
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { ShellWord } from "./shell-ast";
 
@@ -134,43 +138,96 @@ const HANDOFF_MODULES = new Set([
 	"joblib",
 	"marshal",
 	"shelve",
+	"interpreters",
 ]);
 
-/** The same, reached without an import statement: dynamic code, reflection
- *  by a computed name, the import machinery, a spawn imported by name, and
- *  loaders that unpickle. */
-const HANDOFF_MARKERS: readonly RegExp[] = [
-	/(?<![.\w])(?:exec|eval|compile|execfile|breakpoint)\s*\(/u,
-	/\b(?:__import__|__builtins__|__dict__|__getattribute__|__subclasses__|__globals__|__code__|__loader__|getattr|setattr|delattr|attrgetter|methodcaller|globals|locals|vars)\b/u,
-	/\bsys\s*\.\s*(?:path|meta_path|path_hooks|path_importer_cache|modules)\b/u,
-	/(?<!platform\s*)\.\s*(?:system|popen\d?|exec[lv]p?e?|spawn[lv]p?e?|posix_spawnp?|startfile|create_subprocess_(?:exec|shell))\b/u,
-	/(?<![.\w])(?:system|popen\d?|exec[lv]p?e?|spawn[lv]p?e?|posix_spawnp?|startfile)\s*\(/u,
-	/pickle|\bunsafe_load\b|\bUnsafeLoader\b|\byaml\s*\.\s*load\s*\(|\btorch\s*\.\s*load\b/u,
-];
-
-/** A name that starts a process, wherever an import brings it in. */
-const SPAWN_NAME = /\b(?:system|popen\d?|exec[lv]p?e?|spawn[lv]p?e?|posix_spawnp?|startfile|create_subprocess_\w+)\b/u;
+/** A name that starts a process: `os.system`, `posix.execv`, `asyncio.create_subprocess_exec`. */
+const SPAWN_NAME = /^(?:system|popen\d?|exec[lv]p?e?|spawn[lv]p?e?|posix_spawnp?|startfile|create_subprocess_\w+)$/u;
 /** Modules whose star import brings a spawn in under its bare name. */
 const SPAWN_MODULES = new Set(["os", "posix", "nt", "asyncio"]);
+/** Names that run a string as code or reach an object by a computed name. */
+const DYNAMIC_NAMES = new Set(["exec", "eval", "compile", "execfile", "breakpoint", "__import__", "__builtins__", "getattr", "setattr", "delattr", "attrgetter", "methodcaller", "globals", "locals", "vars"]);
+/** Attributes that reach code or namespaces by a route the gate cannot follow. */
+const DYNAMIC_ATTRIBUTES = new Set(["__dict__", "__getattribute__", "__subclasses__", "__globals__", "__code__", "__builtins__", "__loader__", "__import__", "attrgetter", "methodcaller", "unsafe_load", "UnsafeLoader"]);
+/** `sys` attributes that change where an import is found. */
+const SYS_IMPORT_STATE = new Set(["path", "meta_path", "path_hooks", "path_importer_cache", "modules"]);
+const IMPORT_ITEM = /^([A-Za-z_]\w*)(?:\.\w+)*$/u;
 
-/** Text Python reads differently from the gate: a backslash-newline joins
- *  two lines into one statement, and a form feed is whitespace to Python. */
-const LINE_JOIN = /\\\r?\n|\f/u;
-/** PEP 263: a comment on line 1 or 2 naming an encoding. Under utf-7 the
- *  scanned text and the code Python runs differ, so any declaration refuses. */
-const CODING_DECLARATION = /^[ \t]*#.*?coding[:=]/u;
+/**
+ * The parser: run under a root-owned Python with `-I -S`, the code on stdin.
+ * `ast.parse` reads the bytes through the tokenizer that runs them, so an
+ * encoding declaration, a backslash-newline, a form feed or a comment inside
+ * a name list come out as Python reads them. It parses and never executes.
+ */
+const PARSER = String.raw`import ast, io, json, sys, tokenize
+src = sys.stdin.buffer.read()
+encoding = tokenize.detect_encoding(io.BytesIO(src).readline)[0]
+tree = ast.parse(src)
+head = set()
+for at, stmt in enumerate(tree.body):
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        head.add(id(stmt))
+    elif not (at == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)):
+        break
+def dotted(node):
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+imports, names, attrs, keywords = [], set(), [], set()
+for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            imports.append({"module": alias.name, "level": 0, "names": [], "asname": alias.asname, "head": id(node) in head})
+    elif isinstance(node, ast.ImportFrom):
+        imports.append({"module": node.module or "", "level": node.level, "names": [n for a in node.names for n in (a.name, a.asname) if n], "asname": None, "head": id(node) in head})
+    elif isinstance(node, ast.Name):
+        names.add(node.id)
+    elif isinstance(node, ast.Attribute):
+        attrs.append([dotted(node.value), node.attr])
+    elif isinstance(node, ast.keyword) and node.arg:
+        keywords.add(node.arg)
+print(json.dumps({"encoding": encoding, "imports": imports, "names": sorted(names), "attrs": attrs, "keywords": sorted(keywords)}))
+`;
 
-const IMPORT_STATEMENT = /(?:^|[;:])[ \t]*import[ \t]+([^\n;#]+)/gmu;
-/** `from X import names`, with a parenthesized name list read across lines. */
-const FROM_STATEMENT = /(?:^|[;:])[ \t]*from[ \t]+(\S+)[ \t]+import\b[ \t]*(\([^)]*\)|[^\n;#]*)/gmu;
-const IMPORT_ITEM = /^([A-Za-z_]\w*)(?:\.\w+)*(?:\s+as\s+\w+)?$/u;
+interface ParsedImport {
+	module: string;
+	level: number;
+	names: string[];
+	asname: string | null;
+	head: boolean;
+}
 
-/** A literal that names a file Python would import, and a call that writes
- *  a file: together they can plant a module the import check never saw. */
-const MODULE_FILE_LITERAL = /['"][^'"\n]*(?:\.(?:py|pyc|pyw|pth|so)|__init__|sitecustomize|usercustomize)['"]/u;
-/** `str.replace` is common in read-only code, so `replace` counts only from
- *  `os` or with a module file name as its first argument (`Path.replace`). */
-const FILE_WRITE = /\b(?:write_text|write_bytes|write|writelines|copy\w*|move|rename|symlink\w*|link|hardlink_to|extract\w*|unpack_archive|mkstemp|NamedTemporaryFile|open)\s*\(|\bos\s*\.\s*replace\s*\(|\.replace\s*\(\s*['"][^'"\n]*(?:\.(?:py|pyc|pyw|pth|so)|__init__|sitecustomize|usercustomize)['"]/u;
+interface PythonFacts {
+	encoding: string;
+	imports: ParsedImport[];
+	names: string[];
+	attrs: Array<[string | null, string]>;
+	keywords: string[];
+}
+
+const PARSER_TIMEOUT_MS = 3000;
+const PARSER_MAX_OUTPUT = 8 * 1024 * 1024;
+
+/** What `parser` (a root-owned Python) reads in `code`, or why it could not. */
+function parsePython(code: string, parser: string): PythonFacts | string {
+	const result = spawnSync(parser, ["-I", "-S", "-B", "-c", PARSER], { input: Buffer.from(code, "utf8"), timeout: PARSER_TIMEOUT_MS, maxBuffer: PARSER_MAX_OUTPUT, env: {}, cwd: os.tmpdir() });
+	if (result.error !== undefined || result.status !== 0) {
+		const last = result.stderr?.toString("utf8").trim().split("\n").at(-1) ?? "";
+		return `the gate's Python could not parse it (${result.error?.message ?? (last || `exit ${String(result.status)}`)})`;
+	}
+	try {
+		const facts = JSON.parse(result.stdout.toString("utf8")) as PythonFacts;
+		if (typeof facts.encoding !== "string" || !Array.isArray(facts.imports) || !Array.isArray(facts.names) || !Array.isArray(facts.attrs) || !Array.isArray(facts.keywords)) return "the gate's Python returned a shape it does not read";
+		return facts;
+	} catch {
+		return "the gate's Python returned output it could not read";
+	}
+}
 
 function safeList(dir: string): string[] {
 	try {
@@ -206,77 +263,87 @@ function installed(name: string, libs: readonly string[]): boolean {
 	return libs.some(dir => safeList(dir).some(entry => entry === name || entry === `${name}.py` || (entry.startsWith(`${name}.`) && entry.endsWith(".so"))));
 }
 
-/**
- * The top-level names `code` imports, or the reason an import cannot be read.
- * Every `import` word in the text must sit inside a statement this read
- * parsed: one anywhere else (a statement shape the patterns miss, or the
- * word in a string or comment) refuses rather than being skipped.
- */
-function importedNames(code: string): string[] | string {
-	const names: string[] = [];
-	const spans: Array<[number, number]> = [];
-	for (const match of code.matchAll(FROM_STATEMENT)) {
-		spans.push([match.index, match.index + match[0].length]);
-		const module = match[1];
-		if (module.startsWith(".")) return "a relative import runs a local module";
-		const top = IMPORT_ITEM.exec(module)?.[1];
-		if (top === undefined) return `an import the gate cannot read (from ${module})`;
-		const imported = match[2];
-		const spawn = SPAWN_NAME.exec(imported)?.[0] ?? (SPAWN_MODULES.has(top) && imported.includes("*") ? "*" : undefined);
-		if (spawn !== undefined) return `imports ${spawn} from ${module}, which can run code the gate did not read`;
-		names.push(top);
-	}
-	for (const match of code.matchAll(IMPORT_STATEMENT)) {
-		spans.push([match.index, match.index + match[0].length]);
-		for (const item of match[1].split(",")) {
-			const top = IMPORT_ITEM.exec(item.trim())?.[1];
-			if (top === undefined) return `an import the gate cannot read (import ${item.trim()})`;
-			names.push(top);
-		}
-	}
-	for (const word of code.matchAll(/\bimport\b/gu)) {
-		if (!spans.some(([start, end]) => word.index >= start && word.index < end)) return "the word import outside an import statement the gate read";
-	}
-	return names;
-}
-
-/** Why one module name runs code the gate did not read, or undefined. */
+/** Why one module name runs code the gate did not read, or undefined. A
+ *  private module (`_posixsubprocess`, `_ctypes`, `_interpreters`) is the C
+ *  side of the public ones, so every one but `__future__` refuses. */
 function moduleRefusal(name: string, roots: readonly string[], libs: readonly string[]): string | undefined {
-	if (HANDOFF_MODULES.has(name)) return `imports ${name}, which runs code the gate did not read`;
+	if (HANDOFF_MODULES.has(name) || (name.startsWith("_") && name !== "__future__")) return `imports ${name}, which runs code the gate did not read`;
 	if (roots.some(root => shadows(root, name))) return `imports the local module ${name}`;
 	if (!installed(name, libs)) return `imports ${name}, which is not in the interpreter's library`;
 	return undefined;
 }
 
+/** Why one import statement runs code the gate did not read. `aliases`
+ *  collects what `import a.b as c` binds, for the attribute checks. */
+function importRefusal(item: ParsedImport, roots: readonly string[], libs: readonly string[], aliases: Map<string, string>): string | undefined {
+	if (item.level > 0) return "a relative import runs a local module";
+	const top = IMPORT_ITEM.exec(item.module)?.[1];
+	if (top === undefined) return `an import the gate cannot read (${item.module})`;
+	// Every import must run before any other statement, so the code cannot
+	// write a module into sys.path[0] before importing it.
+	if (!item.head) return `imports ${item.module} after other code runs, or inside a block`;
+	// A submodule or imported name can be a hand-off too: `concurrent.interpreters`.
+	const nested = [...item.module.split(".").slice(1), ...item.names].find(name => HANDOFF_MODULES.has(name));
+	if (nested !== undefined) return `imports ${nested} from ${item.module}, which runs code the gate did not read`;
+	const spawn = item.names.find(name => SPAWN_NAME.test(name) || DYNAMIC_NAMES.has(name) || name.includes("pickle")) ??(SPAWN_MODULES.has(top) && item.names.includes("*") ? "*" : undefined);
+	if (spawn !== undefined) return `imports ${spawn} from ${item.module}, which can run code the gate did not read`;
+	const state = top === "sys" ? item.names.find(name => SYS_IMPORT_STATE.has(name)) : undefined;
+	if (state !== undefined) return `imports sys.${state}, which changes where imports come from`;
+	aliases.set(item.asname ?? top, item.asname === null ? top : item.module);
+	return moduleRefusal(top, roots, libs);
+}
+
+/** Why one attribute access reaches code the gate did not read. */
+function attributeRefusal(base: string | null, attr: string, aliases: ReadonlyMap<string, string>): string | undefined {
+	const owner = (base === null ? "" : (aliases.get(base) ?? base)).split(".").at(-1) ?? "";
+	const spelled = `${base ?? "…"}.${attr}`;
+	if (SPAWN_NAME.test(attr) && owner !== "platform") return `uses ${spelled}, which can run code the gate did not read`;
+	if (DYNAMIC_ATTRIBUTES.has(attr) || attr.includes("pickle")) return `uses ${spelled}, which can run code the gate did not read`;
+	if (owner === "sys" && SYS_IMPORT_STATE.has(attr)) return `uses ${spelled}, which changes where imports come from`;
+	if (attr === "load" && (owner === "yaml" || owner === "torch")) return `uses ${spelled}, which can unpickle code`;
+	return undefined;
+}
+
 /**
- * Why Python `code` runs code the gate did not read, or undefined. `roots`
- * are the directories Python searches before its library (`sys.path[0]`):
- * the script's own directory, or the working directory for `-c` and stdin.
- * `libs` are the library directories; a name found in none of them is
- * refused, so a module the code writes before it imports it cannot slip
- * through, and a literal module file name beside a file write refuses too,
- * since such a write can shadow a name that is installed.
+ * Why Python `code` runs code the gate did not read, or undefined, read from
+ * Python's own parse of it (`parser` is a root-owned Python). `roots` are the
+ * directories Python searches before its library (`sys.path[0]`): the
+ * script's own directory, or the working directory for `-c` and stdin.
+ * `libs` are the library directories; an imported name found in none of
+ * them is refused.
  *
- * The whole text is scanned, comments and strings included: a mention
- * refuses, which errs toward blocking, and nothing is stripped by a pattern
- * that could misjudge where a comment or string ends.
+ * Imports must all sit at the head of the module, before any other
+ * statement, so the code cannot plant a module and then import it. A library
+ * that imports lazily after the code writes a file is the planted-file class
+ * the plan doc leaves uncovered.
  */
-export function pythonHandOff(code: string, roots: readonly string[], libs: readonly string[]): string | undefined {
-	const text = code.startsWith("﻿") ? code.slice(1) : code;
-	if (text.split(/\r\n|\r|\n/u, 2).some(line => CODING_DECLARATION.test(line))) return "an encoding declaration: Python may decode it differently from the text the gate read";
-	if (LINE_JOIN.test(text)) return "a backslash-newline or form feed: Python joins what the gate reads apart";
-	for (const marker of HANDOFF_MARKERS) {
-		const hit = marker.exec(text);
-		if (hit !== null) return `uses ${hit[0].trim()}, which can run code the gate did not read`;
+export function pythonHandOff(code: string, roots: readonly string[], libs: readonly string[], parser: string): string | undefined {
+	const facts = parsePython(code, parser);
+	if (typeof facts === "string") return facts;
+	// The reviewer reads the text: code in another encoding is not what it sees.
+	if (!/^utf-8(?:-sig)?$/u.test(facts.encoding)) return `declares the encoding ${facts.encoding}, so the code that runs is not the text the reviewer reads`;
+	const aliases = new Map<string, string>();
+	for (const item of facts.imports) {
+		const why = importRefusal(item, roots, libs, aliases);
+		if (why !== undefined) return why;
 	}
-	if (MODULE_FILE_LITERAL.test(text) && FILE_WRITE.test(text)) return "writes a file named like a Python module, which an import could then load";
-	const names = importedNames(text);
-	if (typeof names === "string") return names;
-	for (const name of names) {
-		const why = moduleRefusal(name, roots, libs);
+	const name = facts.names.find(id => DYNAMIC_NAMES.has(id) || SPAWN_NAME.test(id) || id.includes("pickle"));
+	if (name !== undefined) return `uses ${name}, which can run code the gate did not read`;
+	const keyword = facts.keywords.find(arg => arg.includes("pickle"));
+	if (keyword !== undefined) return `passes ${keyword}, which can unpickle code`;
+	for (const [base, attr] of facts.attrs) {
+		const why = attributeRefusal(base, attr, aliases);
 		if (why !== undefined) return why;
 	}
 	return undefined;
+}
+
+/** A Python on a root-owned chain to parse with, or undefined. Not the
+ *  interpreter the command runs: that one is user-owned, and running it at
+ *  gate time would run a planted binary before any verdict. */
+export function parserPython(isSystemProgram: (file: string) => boolean): string | undefined {
+	const candidates = process.platform === "darwin" ? ["/Library/Developer/CommandLineTools/usr/bin/python3"] : ["/usr/bin/python3"];
+	return candidates.find(candidate => isSystemProgram(candidate));
 }
 
 /** Why `python -m <module>` runs code the gate did not read, or undefined. An

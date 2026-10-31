@@ -51,7 +51,7 @@ function write(rel: string, content: string | Buffer, mode = 0o644): string {
 /** An install under `base/`: the interpreter, its standard library, its site-packages. */
 function fakeInstall(base = "base", interpreter: string | Buffer = MACHO): string {
 	const python = write(`${base}/bin/python3.12`, interpreter, 0o755);
-	for (const module of ["json/__init__.py", "pathlib.py", "re/__init__.py", "os.py", "shutil.py", "subprocess.py", "importlib/__init__.py", "xml/etree/ElementTree.py", "collections/__init__.py"]) write(`${base}/lib/python3.12/${module}`, "");
+	for (const module of ["json/__init__.py", "pathlib.py", "platform.py", "re/__init__.py", "os.py", "shutil.py", "subprocess.py", "importlib/__init__.py", "xml/etree/ElementTree.py", "collections/__init__.py"]) write(`${base}/lib/python3.12/${module}`, "");
 	write(`${base}/lib/python3.12/lib-dynload/_json.cpython-312-darwin.so`, "");
 	write(`${base}/lib/python3.12/site-packages/requests/__init__.py`, "");
 	return python;
@@ -233,8 +233,8 @@ describe("Python the gate cannot read all of stays refused", () => {
 		["subprocess", "import subprocess; subprocess.run(['./x.sh'])", "subprocess"],
 		["os.system", "import os; os.system('./x.sh')", "system"],
 		["a spawn imported by name", "from os import execv", "execv"],
-		["exec", "exec(open('payload.txt').read())", "exec("],
-		["eval", "eval(input())", "eval("],
+		["exec", "exec(open('payload.txt').read())", "uses exec"],
+		["eval", "eval(input())", "uses eval"],
 		["__import__", "__import__('subprocess')", "__import__"],
 		["importlib", "import importlib; importlib.import_module('helpers')", "importlib"],
 		["an import path edit", "import sys; sys.path.insert(0, 'scripts')", "sys.path"],
@@ -393,19 +393,46 @@ describe("a Python script run by its shebang reads under the same rules", () => 
 	});
 });
 
+describe("Python's own parse decides, so prose about imports is not an import", () => {
+	test.each([
+		["an import mentioned only in a comment", "# import helpers_missing\nimport json\nprint(1)\n"],
+		["the word import in a string", "import json\nprint('import helpers_missing')\n"],
+		["a docstring before the imports", '"""Probe."""\nimport json\nprint(json.dumps(1))\n'],
+		["platform.system, which reads a name", "import platform\nprint(platform.system())\n"],
+		["a utf-8 coding declaration", "# -*- coding: utf-8 -*-\nimport json\n"],
+		["a write after every import", "import json, pathlib\npathlib.Path('out.json').write_text(json.dumps(1))\n"],
+	])("%s is reviewed", async (_name, code) => {
+		const python = fakeVenv(fakeInstall());
+		write("probe.py", code);
+		await expectReviewed(`${python} probe.py`);
+	});
+});
+
 describe("text Python reads differently from the gate stays refused", () => {
 	test.each([
-		["a backslash-newline joining an import", "import \\\nsubprocess\n", "backslash-newline"],
-		["a backslash-newline joining a from-import", "from \\\nos import system\nsystem('id')\n", "backslash-newline"],
-		["a form feed before an import", "\fimport subprocess\n", "form feed"],
-		["a utf-7 coding declaration", "# -*- coding: utf-7 -*-\n+AGkAbQBwAG8AcgB0ACAAcwB1AGIAcAByAG8AYwBlAHMAcw-\n", "encoding declaration"],
-		["a coding declaration on line 2", "#!/usr/bin/env python3\n# vim: set fileencoding=utf-7 :\nprint(1)\n", "encoding declaration"],
+		["a backslash-newline joining an import", "import \\\nsubprocess\n", "imports subprocess"],
+		["a backslash-newline joining a from-import", "from \\\nos import system\nsystem('id')\n", "imports system from os"],
+		["a form feed before an import", "\fimport subprocess\n", "imports subprocess"],
+		["a utf-7 coding declaration", "# -*- coding: utf-7 -*-\n+AGkAbQBwAG8AcgB0ACAAcwB1AGIAcAByAG8AYwBlAHMAcw-\n", "declares the encoding utf-7"],
+		["a coding declaration on line 2", "#!/usr/bin/env python3\n# vim: set fileencoding=utf-7 :\nprint(1)\n", "declares the encoding utf-7"],
 		["a multi-line parenthesized from-import with an alias", "from os import (\n    system as s\n)\ns('id')\n", "imports system from os"],
 		["a star import from os", "from os import *\n", "imports * from os"],
-		["the word import where no import statement parses", "x = 1 if True else 0; y = [__name__ for _ in ()] or import_me\nprint('import subprocess')\n", "the word import"],
-		["an import mentioned only in a comment", "# import subprocess\nprint(1)\n", "the word import"],
-		["a module file written and then imported", "import json\nopen('json.py', 'w').write('import os')\nimport json\n", "writes a file named like a Python module"],
-		["a file moved onto a module name and then imported", "import json, pathlib\npathlib.Path('payload.txt').replace('json.py')\nimport json\n", "writes a file named like a Python module"],
+		["a module file written and then imported", "import json\nopen('json.py', 'w').write('import os')\nimport json\n", "after other code runs"],
+		["a file moved onto a module name and then imported", "import json, pathlib\npathlib.Path('payload.txt').replace('json.py')\nimport json\n", "after other code runs"],
+		["a computed write target, then an import", "import json, pathlib\npathlib.Path('js' + 'on.py').write_text('x')\nimport json\n", "after other code runs"],
+		["a ) inside a comment in a parenthesized from-import", "from os import (  # )\n    system as s\n)\ns('id')\n", "imports system from os"],
+		["a # comment hiding a name in a parenthesized from-import", "from os import (path,  # spawn below\n    execv as run)\nrun('/bin/sh', ['sh'])\n", "imports execv from os"],
+		["an import inside a function", "def main():\n    import helpers_missing\nmain()\n", "inside a block"],
+		["an import inside try/except", "try:\n    import json\nexcept ImportError:\n    json = None\n", "inside a block"],
+		["sys.path imported by name", "from sys import path\npath.insert(0, 'scripts')\n", "imports sys.path"],
+		["sys.path through an alias", "import sys as s\ns.path.insert(0, 'scripts')\n", "changes where imports come from"],
+		["a spawn through a module alias", "import os as o\no.system('id')\n", "o.system"],
+		["reflection through __dict__", "import os\nos.__dict__['sys' + 'tem']('id')\n", "__dict__"],
+		["a keyword that unpickles", "import json\njson.loads('{}', allow_pickle=True)\n", "allow_pickle"],
+		["code that does not parse", "def broken(:\n", "could not parse"],
+		["a private C module that spawns", "import _posixsubprocess\n", "imports _posixsubprocess"],
+		["a hand-off submodule of an allowed package", "from concurrent import interpreters\n", "imports interpreters from concurrent"],
+		["a hand-off submodule by its dotted name", "import concurrent.interpreters\n", "imports interpreters from concurrent.interpreters"],
 	])("%s", async (_name, code, why) => {
 		const python = fakeVenv(fakeInstall());
 		write("probe.py", code);

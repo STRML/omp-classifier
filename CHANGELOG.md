@@ -17,21 +17,20 @@ Stage 2 now admits a third shape: one Python run, after at most one literal `cd 
 | `FILE` | the file, read and hashed like a shape-B body |
 | `-m MODULE`, installed | nothing more, like `bun test` |
 
-The gate still refuses code it can see running something it did not read:
+The gate reads the code through Python's own parser, not a pattern over its text. It runs `ast.parse` under a root-owned Python (the Command Line Tools python on macOS, `/usr/bin/python3` on Linux) with `-I -S`, the code on stdin. It parses and never executes. Encoding declarations, backslash-newlines, form feeds and comments inside a name list therefore come out exactly as Python reads them. Code the parser cannot parse (newer syntax than its version included) is refused. The interpreter the command names is never run at gate time: it is user-owned, and running it would run a planted binary before any verdict. The gate then refuses, from the parse:
 
 - an import of a module in `sys.path[0]` (the script's own directory, or the working directory for `-c` and stdin)
 - a relative import
 - an import of a name missing from the interpreter's standard library and site-packages
-- a spawn: `subprocess`, `os.system`, an `exec*` or `spawn*`
+- an import anywhere but the head of the module (after other code, or inside a function or `try`), so the code cannot write a module and then import it
+- a spawn: `subprocess`, `os.system`, an `exec*` or `spawn*`, by attribute, by name, or imported under an alias
 - `exec`, `eval` or `compile`
-- the import machinery, an edit to `sys.path`, or reflection by name (`getattr`, `__import__`)
+- the import machinery, `sys.path` or `sys.modules`, or reflection by name (`getattr`, `__import__`, `__dict__`)
 - a module whose job is running a string or file (`runpy`, `timeit`, `pdb`, `code`)
 - unpickling
-- a literal module file name (`json.py`, `__init__`, a `.pth`) beside a file write, which could plant a module that shadows an installed one
-- text Python reads differently from the gate: a backslash-newline, a form feed, or an encoding declaration on line 1 or 2 (a utf-7 body hides code from a UTF-8 read)
-- the word `import` anywhere outside an import statement the gate parsed, comments and strings included
+- an encoding other than UTF-8 (a utf-7 body hides its code from the reviewer, who reads the text)
 
-The scan reads the whole text and strips nothing, so a mention in a comment or string refuses. It also refuses an unquoted here-document, a here-string, stdin from a file, an option outside `-uBEsSIOqbP`, words built at run time, an assignment, and a set `PYTHONPATH` or `PYTHONHOME`.
+It also refuses an unquoted here-document, a here-string, stdin from a file, an option outside `-uBEsSIOqbP`, words built at run time, an assignment, and a set `PYTHONPATH` or `PYTHONHOME`.
 
 A script run by a Python shebang now gets the same checks against the interpreter its shebang names. Only `#!<absolute python>` and `#!/usr/bin/env <python name>` are read, followed by nothing but those flags. That interpreter must pass the same identity check, and its library is what the import check reads. Before this, any such body was shown with no checks at all. No reviewer run in the log had a `.py` program, so this changes no past decision.
 
@@ -44,7 +43,7 @@ A script run by a Python shebang now gets the same checks against the interprete
 | `timeout 2400 ~/.venv/bin/python -m scripts.flow "name" \| tail -40` | refused, "a binary" | refused, "imports the local module scripts" |
 | `python3 -c ...`, `python3` from Homebrew, no venv | refused | refused |
 
-Not covered: a module that the code's imports pull in transitively, shadowed by a file someone planted in `sys.path[0]` (the same class as a planted binary, judged when it is written), a planting write whose file name is built at run time, a `.pth` file or a modified package in site-packages (a venv's site-packages is user-writable; it is trusted the way the user-owned Homebrew prefix every shape-A binary resolves into is trusted, and no further), the local code an installed `-m` runner loads (pytest's `conftest.py`), and a copy of another binary saved as `python3.12` in a venv.
+Not covered: a module that the code's imports pull in transitively, shadowed by a file someone planted in `sys.path[0]` (the same class as a planted binary, judged when it is written), a library that imports lazily after the code wrote a file into `sys.path[0]`, a `.pth` file or a modified package in site-packages (a venv's site-packages is user-writable; it is trusted the way the user-owned Homebrew prefix every shape-A binary resolves into is trusted, and no further), the local code an installed `-m` runner loads (pytest's `conftest.py`), and a copy of another binary saved as `python3.12` in a venv.
 
 ### `command -v` and a Python variable named `rm` no longer block
 

@@ -37,7 +37,7 @@ import * as path from "node:path";
 import { isSecretPath } from "./floor";
 import { REVIEWER_SCRIPT_MAX_BYTES, type ReviewerScriptBody } from "./reviewer";
 import { parseShell, type ShellCommand, type ShellWord } from "./shell-ast";
-import { isNativeExecutable, libraryDirs, PYTHON_ENVIRONMENT, PYTHON_FLAGS, PYTHON_NAME, pythonHandOff, pythonMode, pythonModuleRefusal, venvOf } from "./stage-two-python";
+import { isNativeExecutable, libraryDirs, PYTHON_ENVIRONMENT, PYTHON_FLAGS, PYTHON_NAME, parserPython, pythonHandOff, pythonMode, pythonModuleRefusal, venvOf } from "./stage-two-python";
 
 export interface ReadScript extends ReviewerScriptBody {
 	/** The path the command names, resolved but not through links. */
@@ -446,6 +446,9 @@ function runRefusal(run: ShellCommand): string | undefined {
 	return undefined;
 }
 
+/** Why a Python body went unread when no root-owned Python can parse it. */
+const NO_PARSER = "no root-owned Python to parse it with (macOS: the Command Line Tools)";
+
 interface PythonInterpreter {
 	/** The interpreter file, after links. */
 	real: string;
@@ -508,8 +511,9 @@ function shebangPythonHandOff(shebang: string, body: string, real: string): stri
 	const python = located === undefined ? undefined : pythonAt(located);
 	if (python === undefined) return "its shebang names a python the gate cannot identify";
 	const libs = libraryDirs(python.real, python.venv);
+	const parser = parserPython(isSystemProgram);
 	if (libs === undefined) return "the gate cannot find its interpreter's standard library";
-	return pythonHandOff(body, [path.dirname(real)], libs);
+	return parser === undefined ? NO_PARSER : pythonHandOff(body, [path.dirname(real)], libs, parser);
 }
 
 /** Whether a redirect is a here-document on stdin whose delimiter is quoted,
@@ -540,14 +544,17 @@ function pythonScripts(run: ShellCommand, dir: string, python: PythonInterpreter
 	const libs = libraryDirs(python.real, python.venv);
 	if (libs === undefined) return refuse(`${programWord(run)}: the gate cannot find its standard library`);
 	const refused = (reason: string | undefined): CommandScripts => (reason === undefined ? { kind: "scripts", scripts: [] } : refuse(reason));
-	if (mode.mode === "code") return refused(pythonHandOff(mode.code, [dir], libs));
-	if (heredoc !== undefined) return refused(pythonHandOff(heredoc, [dir], libs));
+	// A module run hands the reviewer no code of its own, so nothing to parse.
 	if (mode.mode === "module") return refused(pythonModuleRefusal(mode.module, dir, libs));
+	const parser = parserPython(isSystemProgram);
+	if (parser === undefined) return refuse(NO_PARSER);
+	if (mode.mode === "code") return refused(pythonHandOff(mode.code, [dir], libs, parser));
+	if (heredoc !== undefined) return refused(pythonHandOff(heredoc, [dir], libs, parser));
 	if (mode.mode !== "file") return refuse("python - reads stdin the gate cannot see");
 	const file = path.resolve(dir, expandHome(mode.spelled));
 	if (!fs.existsSync(file)) return refuse(`${mode.spelled} does not exist yet`);
 	// Python puts the script's own directory, after links, first on sys.path.
-	const read = readScriptForReview(mode.spelled, file, (body, real) => pythonHandOff(body, [path.dirname(real)], libs));
+	const read = readScriptForReview(mode.spelled, file, (body, real) => pythonHandOff(body, [path.dirname(real)], libs, parser));
 	if (read.body === null) return refuse(`${mode.spelled}: ${read.unread ?? "not read"}`);
 	return { kind: "scripts", scripts: [read] };
 }
