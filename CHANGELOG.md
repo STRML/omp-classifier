@@ -4,6 +4,55 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### Stage 2 reads a Python run whose interpreter it can identify
+
+The machine that produced the log has `.pth` import lines in its venv, so every run there still refuses unless the command passes `-S`.
+
+A venv's `bin/python` is a symlink into a user-owned install (pyenv, Homebrew, uv). Stage 2 only vouched for a program on a root-owned chain, so it took the venv interpreter for a local script, read the binary as its body, and refused with "a binary". The reviewer never saw a `python -c`, a `python - <<'PY'` or a `python x.py`. In the decision log since 2026-10-30, these made up 11 of the reviewer's 21 unread-script skips: 8 "a binary" and 3 here-documents refused as "reads a redirect". A bare `python3` was refused as well ("runs a program the gate does not read").
+
+Stage 2 now admits a third shape: one Python run, after at most one literal `cd X &&` and a bare `timeout <duration>`, optionally piped into an output filter. The program counts as Python when the file it resolves to is named `python`, `python3` or `python3.N`, starts with a Mach-O or ELF header, and is either a system program or the interpreter its venv's `pyvenv.cfg` names as `home`. A script named `python3.12` is read as the script it is. What the reviewer reads depends on the mode:
+
+| Mode | What the reviewer reads |
+|---|---|
+| `-c CODE` | the code, in the command |
+| `-` with a quoted here-document | the here-document body, in the command |
+| `FILE` | the file, read and hashed like a shape-B body |
+| `-m MODULE`, installed | nothing more, like `bun test` |
+
+What the reviewer judges and what the gate guarantees are split. The reviewer reads the whole body and judges what it does: a `subprocess.run([...])` or an `os.system("...")` it can see is its call, and stage 1's interpreter-code overlay still flags those after an allow. The gate guarantees only that what runs is the body the reviewer read. It reads the code through Python's own parser, never a pattern over its text: `ast.parse` under a root-owned Python (the Command Line Tools python on macOS, `/usr/bin/python3` on Linux) with `-I -S -B`, an empty environment and a timeout, the code on stdin. It parses and never executes, so encoding declarations, backslash-newlines, form feeds and comments inside a name list come out exactly as Python reads them. The interpreter the command names is never run at gate time: it is user-owned, and running it would run a planted binary before any verdict. From the parse, the gate refuses:
+
+| Guarantee | Refused |
+|---|---|
+| every import is of the standard library | an import anywhere (any block, lazy or not) of a name missing from the interpreter's standard library, site-packages included; one shadowed in `sys.path[0]` (the script's directory, or the working directory for `-c` and stdin); a relative, private (`_posixsubprocess`) or star import; code the parser cannot parse; an encoding other than UTF-8 |
+| no code runs from a string, a computed name or bytes on disk | `exec`, `eval`, `compile`, `__import__`, `importlib`, `runpy`, `getattr`, `operator.attrgetter` and other reflection, `__dict__`/`__globals__`/`__subclasses__`, `pickle`, `marshal`, `ctypes` |
+| nothing touches where imports come from | an attribute named `path`, `meta_path`, `path_hooks`, `path_importer_cache` or `modules` on any base but an `os` the code never rebinds; `from sys import path`; rebinding `os`, `sys`, `shutil`, `pathlib`, `Path` or `open`, importing one under another name, or passing one of those modules anywhere but as an attribute base |
+| no write can plant a module | an allowlist, not a list of writers: a call that may write (opened with a write or computed mode, or named with write, copy, move, rename, replace, link, extract, retrieve, dump, save, touch or unpack, or taking a `target`, `dst` or `path` keyword) must take only literal paths, none a module file name (`.py`, `.pyc`, `.pth`, `.so`, `__init__`), none a directory on `sys.path` itself, and none under a module name inside one (`json/`); a write-like function named without a call refuses too |
+
+It also refuses an unquoted here-document, a here-string, stdin from a file, an option outside `-uBEsSIOqbP`, words built at run time, an assignment, and a set `PYTHONPATH` or `PYTHONHOME`. It refuses any import alias (`import json as j`, `from shutil import copy as c`), since the name checks cannot follow one, and any archive extraction (`extractall`, `extract`, `unpack_archive`), since the reviewer cannot read what an archive holds.
+
+Startup code counts too, and the rules for it fail closed. The gate refuses when:
+
+- a `.pth` file in a site-packages directory the interpreter processes (the user site too, outside a venv and without `-s` or `-I`) contains `import` anywhere, holds a BOM, a `\r` or any other character Python reads as a line break, or has any line besides comments and blank lines (that line would add a directory to sys.path)
+- `sitecustomize` or `usercustomize` sits on the library path
+- `<prefix>/lib/pythonXY.zip` exists and is not root-owned (it is on sys.path even under `-S`)
+- any `PYTHON*` variable but `PYTHONDONTWRITEBYTECODE` and `PYTHONUNBUFFERED` is set in the host's child-shell environment (`filterChildShellEnv`), or the command carries an assignment prefix
+- the code imports `zipfile` or `tarfile`, or runs `-m zipfile` or `-m tarfile`
+
+`-S` skips the `.pth` and customize checks, since `site` then never runs.
+
+A script run by a Python shebang now gets the same checks against the interpreter its shebang names. Only `#!<absolute python>` and `#!/usr/bin/env <python name>` are read, followed by nothing but those flags. That interpreter must pass the same identity check, and its library is what the import check reads. Before this, any such body was shown with no checks at all. No reviewer run in the log had a `.py` program, so this changes no past decision.
+
+| Command (from the log, anonymized) | Before | After |
+|---|---|---|
+| `cd /Users/you/repo && ~/.venv/bin/python - <<'PY'` (re, pathlib, xml.etree, read-only) | refused, "reads a redirect" | reviewed in a venv with no startup hooks, or under `-S`; the measured venv has two `.pth` import lines, so refused there |
+| same, with `sys.path.insert(0, "scripts")` | refused | refused, "sys.path" |
+| `cd /Users/you/repo && ~/.venv/bin/python -c "import shutil, pathlib; ...copytree(src, dst)"` | refused, "a binary" | refused, a write to a computed path |
+| `~/.venv/bin/python -m pytest tests/x.py -q \| tail -25` | refused, "a binary" | same |
+| `timeout 2400 ~/.venv/bin/python -m scripts.flow "name" \| tail -40` | refused, "a binary" | refused, "runs the local module scripts" |
+| `python3 -c ...`, `python3` from Homebrew, no venv | refused | refused |
+
+Not covered: a module planted in `sys.path[0]` by an earlier command (the same class as a planted binary, judged when it is written), a `.pth` file or a modified package in site-packages (a venv's site-packages is user-writable and is trusted the way the user-owned Homebrew prefix every shape-A binary resolves into is trusted, and no further), the local code an installed `-m` runner loads (pytest's `conftest.py`), and a copy of another binary saved as `python3.12` in a venv. With no root-owned Python to parse with, every Python run stays refused.
+
 ### A quoted redirect onto a system file is critical too
 
 `echo x > /etc/passwd` matched the built-in critical pattern, but `echo x > "/etc/passwd"` did not: the raw text puts a quote between `>` and the path, and the shell removes it before opening the file. On a SAFE that write ran. No moderate-risk token covers a plain `echo`, so nothing else stopped it. The critical scan now also renders each file redirect as `> <target as the shell reads it>` and scans that. Only redirect targets are dequoted. `echo "rm -rf /"` prints data, and dequoting arguments would turn every quoted mention into a refusal that never yields. A target with an expansion is left to the raw scan and the judge, as before.

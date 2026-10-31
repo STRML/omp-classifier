@@ -6,7 +6,7 @@
  * the body it is shown has to be the program that runs. Guessing that from
  * shell heuristics failed review after review: every wrapper flag, `cd`, PATH
  * entry or substitution was another way to run a file other than the one
- * read. So this module does not guess. It admits two command shapes and
+ * read. So this module does not guess. It admits three command shapes and
  * refuses every other one, which keeps the stage-1 block:
  *
  *   A. no local program: every program is a bare name that is not a script,
@@ -14,7 +14,10 @@
  *      program, and no PATH change;
  *   B. one local script: the whole command is one simple command, after at
  *      most one literal `cd <dir> &&`, its program a literal path to an
- *      existing script, every word literal, no assignment, no pipe.
+ *      existing script, every word literal, no assignment, no pipe;
+ *   C. one Python run in the same frame, its program a file the gate can
+ *      tell is a Python interpreter (`pythonInterpreter`), running code the
+ *      reviewer reads and stage-two-python.ts checks for hand-offs.
  *
  * A shape-B body is read under rules a model must not be trusted to enforce:
  * a secret path, a non-regular file, a binary, an oversized file, or a body
@@ -31,9 +34,11 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { filterChildShellEnv } from "@oh-my-pi/pi-utils";
 import { isSecretPath } from "./floor";
 import { REVIEWER_SCRIPT_MAX_BYTES, type ReviewerScriptBody } from "./reviewer";
 import { parseShell, type ShellCommand, type ShellWord } from "./shell-ast";
+import { isNativeExecutable, leadingFlags, libraryDirs, PYTHON_FLAGS, PYTHON_NAME, parserPython, pythonEnvironmentRefusal, pythonHandOff, startupRefusal, pythonMode, pythonModuleRefusal, venvOf } from "./stage-two-python";
 
 export interface ReadScript extends ReviewerScriptBody {
 	/** The path the command names, resolved but not through links. */
@@ -161,8 +166,16 @@ function isScriptFile(file: string): boolean {
 	}
 }
 
-/** Read one program file under the reviewer's rules. */
-export function readScriptForReview(spelled: string, file: string): ReadScript {
+/** Why a file run as a program runs code the read did not cover: it must be
+ *  a script, by shebang or extension, and its body must hand off nothing. */
+function programHandOff(body: string, real: string): string | undefined {
+	if (!body.startsWith("#!") && !SCRIPT_EXTENSION.test(real)) return "not a script";
+	return bodyHandOff(body, real);
+}
+
+/** Read one program file under the reviewer's rules. `handOff` says why a
+ *  body runs code the read did not cover; a Python run passes its own. */
+export function readScriptForReview(spelled: string, file: string, handOff: (body: string, real: string) => string | undefined = programHandOff): ReadScript {
 	let real: string;
 	let stat: fs.Stats;
 	try {
@@ -183,9 +196,8 @@ export function readScriptForReview(spelled: string, file: string): ReadScript {
 	if (bytes.byteLength !== stat.size) return unread(spelled, "changed while it was read");
 	if (bytes.includes(0)) return unread(spelled, "a binary");
 	const body = bytes.toString("utf8");
-	if (!body.startsWith("#!") && !SCRIPT_EXTENSION.test(real)) return unread(spelled, "not a script");
-	const handOff = bodyHandOff(body);
-	if (handOff !== undefined) return unread(spelled, handOff);
+	const why = handOff(body, real);
+	if (why !== undefined) return unread(spelled, why);
 	return { path: spelled, body, file, realPath: real, sha256: sha256(bytes) };
 }
 
@@ -197,7 +209,11 @@ export function readScriptForReview(spelled: string, file: string): ReadScript {
  * bare variable as the program (`"$OMP"`) is allowed: the reviewer reads what
  * the body assigns it, and LOCAL_HANDOFF refuses a script-dir assignment.
  */
-function bodyHandOff(body: string): string | undefined {
+function bodyHandOff(body: string, real: string): string | undefined {
+	const shebang = body.startsWith("#!") ? body.split("\n", 1)[0] : "";
+	// A shebang that mentions Python gets Python's checks, against the
+	// interpreter it names: its imports search the script's own directory first.
+	if (/python/u.test(shebang)) return shebangPythonHandOff(shebang, body, real);
 	const code = body
 		.split("\n")
 		.filter(line => !/^\s*#/u.test(line))
@@ -207,7 +223,6 @@ function bodyHandOff(body: string): string | undefined {
 	// later bare names would resolve where this check did not look. Reading
 	// `$PATH` or `${PATH}` is fine.
 	if (/(?<![$\w{])(?:PATH|BASH_ENV|ENV|CDPATH)\b|\$\{(?:PATH|BASH_ENV|ENV|CDPATH):?=/u.test(code)) return "changes PATH or what a shell loads";
-	const shebang = body.startsWith("#!") ? body.split("\n", 1)[0] : "";
 	if (shebang !== "" && !/\b(?:ba|z|da|k)?sh\b/u.test(shebang)) return undefined;
 	const parsed = parseShell(body);
 	if (!parsed.ok) return "its shell body could not be parsed";
@@ -406,6 +421,151 @@ export function withoutFilterForKey(command: string): string {
 	return withoutTrailing(command, hasFilterShape);
 }
 
+/** The program a command runs, past a leading `timeout <duration>`. */
+const programWord = (item: ShellCommand): string => item.words[timeoutWords(item)]?.value ?? "";
+
+/** The one run shapes B and C admit: `[cd <literal> &&] <run> [| <output
+ *  filter>]`, with the directory the run starts in. A string is a cd the gate
+ *  cannot pin, and undefined is any other shape. */
+function oneRun(commands: readonly ShellCommand[], startCwd: string): { run: ShellCommand; dir: string } | string | undefined {
+	let dir = startCwd;
+	let rest = commands.length > 1 && isOutputFilter(commands[commands.length - 1]) ? commands.slice(0, -1) : commands;
+	if (rest.length === 2 && verbName(rest[0]) === "cd" && rest[1].join === "and") {
+		const cd = rest[0];
+		if (cd.words.length !== 2 || !cd.words[1].fixed || cd.assigns.length > 0 || cd.redirects.length > 0) return "the cd before the script is not one literal directory";
+		dir = path.resolve(startCwd, expandHome(cd.words[1].value));
+		rest = rest.slice(1);
+	}
+	return rest.length === 1 ? { run: rest[0], dir } : undefined;
+}
+
+/** Why the one run cannot be read word for word, or undefined. */
+function runRefusal(run: ShellCommand): string | undefined {
+	if (run.nested || run.negated || run.unreadShape !== undefined) return "the script runs inside a construct the gate cannot read";
+	if (run.assigns.length > 0) return "the script runs with an assignment";
+	if (!run.words.every(isLiteral)) return "the script's words are built at run time";
+	return undefined;
+}
+
+/** Why a Python body went unread when no root-owned Python can parse it. */
+const NO_PARSER = "no root-owned Python to parse it with (macOS: the Command Line Tools)";
+
+interface PythonInterpreter {
+	/** The interpreter file, after links. */
+	real: string;
+	venv?: { root: string; systemSite: boolean };
+}
+
+/**
+ * The Python interpreter `run` starts, or undefined when the gate cannot tell
+ * it is one. The file the program resolves to must be named python, python3
+ * or python3.N, start with a native executable's header (so a script under
+ * that name is read as the script it is), and be either a system program or
+ * the interpreter a venv's pyvenv.cfg names. A copy of another binary saved
+ * under that name passes; that is the same accepted risk as a copy of bash
+ * saved as `~/bin/git`, and planting it is a command the gate judges first.
+ */
+function pythonInterpreter(run: ShellCommand, dir: string): PythonInterpreter | undefined {
+	const word = run.words[timeoutWords(run)];
+	if (word === undefined || !word.fixed) return undefined;
+	const spelled = word.value;
+	const located = isPathWord(spelled) ? path.resolve(dir, expandHome(spelled)) : pathHasRelativeEntry() ? undefined : onPath(spelled);
+	return located === undefined ? undefined : pythonAt(located);
+}
+
+/** The interpreter at `located` (the program as the shell or kernel finds
+ *  it, before links), under the rules `pythonInterpreter` states. */
+function pythonAt(located: string): PythonInterpreter | undefined {
+	let real: string;
+	try {
+		real = fs.realpathSync(located);
+	} catch {
+		return undefined;
+	}
+	if (!PYTHON_NAME.test(path.basename(real)) || !isNativeExecutable(real)) return undefined;
+	if (isSystemProgram(located)) return { real };
+	const venv = venvOf(located, real);
+	return venv === undefined ? undefined : { real, venv };
+}
+
+/**
+ * Python's checks for a script whose shebang mentions Python. Only two
+ * spellings are read: `#!<absolute path to python>` and `#!/usr/bin/env
+ * <python name>`, each followed by nothing but PYTHON_FLAGS. An env option
+ * (`-S` splits the rest into more arguments), an assignment, `-m`, `-c`, `-W`
+ * or `-X` refuses. The interpreter the shebang reaches must pass the same
+ * identity check as a command's (`pythonAt`), and its library is what the
+ * import check reads.
+ */
+function shebangPythonHandOff(shebang: string, body: string, real: string): string | undefined {
+	const env = pythonEnvironmentRefusal(filterChildShellEnv(process.env));
+	if (env !== undefined) return env;
+	const [program = "", ...args] = shebang.slice(2).trim().split(/[ \t]+/u);
+	if (!path.isAbsolute(program)) return "its shebang names no absolute interpreter";
+	let located: string | undefined = program;
+	let flags = args;
+	if (path.basename(program) === "env") {
+		const [name = "", ...rest] = args;
+		if (!PYTHON_NAME.test(name)) return "its shebang hands env something other than a python name";
+		located = pathHasRelativeEntry() ? undefined : onPath(name);
+		flags = rest;
+	} else if (!PYTHON_NAME.test(path.basename(program))) return "its shebang names an interpreter the gate does not read";
+	if (!flags.every(flag => PYTHON_FLAGS.test(flag))) return "its shebang passes the interpreter an option the gate does not know";
+	const python = located === undefined ? undefined : pythonAt(located);
+	if (python === undefined) return "its shebang names a python the gate cannot identify";
+	const libs = libraryDirs(python.real, python.venv);
+	const parser = parserPython(isSystemProgram);
+	if (libs === undefined) return "the gate cannot find its interpreter's standard library";
+	const startup = startupRefusal(libs, python.venv, flags, python.real, isSystemProgram);
+	if (startup !== undefined) return startup;
+	return parser === undefined ? NO_PARSER : pythonHandOff(body, [path.dirname(real)], libs, parser);
+}
+
+/** Whether a redirect is a here-document on stdin whose delimiter is quoted,
+ *  so the shell hands its body over exactly as the command spells it. */
+function isQuotedHeredoc(redirect: ShellCommand["redirects"][number]): boolean {
+	return redirect.here && redirect.direction === "in" && redirect.fd === "" && redirect.body?.literal === true && redirect.target.source !== redirect.target.value;
+}
+
+/**
+ * Shape C: one Python run. The code is the `-c` operand or a quoted
+ * here-document, both in the command the reviewer reads, or a script file,
+ * read and hashed like a shape-B body. `-m` runs an installed module, like
+ * `bun test`. Anything the code imports must come from the interpreter's
+ * library, and pythonHandOff refuses what a read of the text sees running
+ * other code.
+ */
+function pythonScripts(run: ShellCommand, dir: string, python: PythonInterpreter): CommandScripts {
+	const why = runRefusal(run);
+	if (why !== undefined) return refuse(why);
+	const env = pythonEnvironmentRefusal(filterChildShellEnv(process.env));
+	if (env !== undefined) return refuse(env);
+	const mode = pythonMode(run.words.slice(timeoutWords(run) + 1));
+	if (typeof mode === "string") return refuse(mode);
+	const inputs = run.redirects.filter(redirect => redirect.direction !== "out" && !redirect.duplicate);
+	const heredoc = mode.mode === "stdin" && inputs.length === 1 && isQuotedHeredoc(inputs[0]) ? inputs[0].body?.value : undefined;
+	if (mode.mode === "stdin" && inputs.length === 0) return refuse("python - reads stdin the gate cannot see");
+	if (inputs.length > 0 && heredoc === undefined) return refuse("the script reads a redirect");
+	const libs = libraryDirs(python.real, python.venv);
+	if (libs === undefined) return refuse(`${programWord(run)}: the gate cannot find its standard library`);
+	const startup = startupRefusal(libs, python.venv, leadingFlags(run.words.slice(timeoutWords(run) + 1).map(word => word.value)), python.real, isSystemProgram);
+	if (startup !== undefined) return refuse(startup);
+	const refused = (reason: string | undefined): CommandScripts => (reason === undefined ? { kind: "scripts", scripts: [] } : refuse(reason));
+	// A module run hands the reviewer no code of its own, so nothing to parse.
+	if (mode.mode === "module") return refused(pythonModuleRefusal(mode.module, dir, libs));
+	const parser = parserPython(isSystemProgram);
+	if (parser === undefined) return refuse(NO_PARSER);
+	if (mode.mode === "code") return refused(pythonHandOff(mode.code, [dir], libs, parser));
+	if (heredoc !== undefined) return refused(pythonHandOff(heredoc, [dir], libs, parser));
+	if (mode.mode !== "file") return refuse("python - reads stdin the gate cannot see");
+	const file = path.resolve(dir, expandHome(mode.spelled));
+	if (!fs.existsSync(file)) return refuse(`${mode.spelled} does not exist yet`);
+	// Python puts the script's own directory, after links, first on sys.path.
+	const read = readScriptForReview(mode.spelled, file, (body, real) => pythonHandOff(body, [path.dirname(real)], libs, parser));
+	if (read.body === null) return refuse(`${mode.spelled}: ${read.unread ?? "not read"}`);
+	return { kind: "scripts", scripts: [read] };
+}
+
 /**
  * What the gate can show the reviewer about the programs `command` runs,
  * starting from `startCwd` (the directory before any `cd` in the command).
@@ -416,26 +576,21 @@ export function scriptsForReview(command: string, startCwd: string): CommandScri
 	const parsed = parseShell(command);
 	if (!parsed.ok) return refuse("the command could not be parsed");
 	const commands = parsed.commands;
-	const programWord = (item: ShellCommand): string => item.words[timeoutWords(item)]?.value ?? "";
+	const framed = oneRun(commands, startCwd);
+	if (typeof framed === "object") {
+		const python = pythonInterpreter(framed.run, framed.dir);
+		if (python !== undefined) return pythonScripts(framed.run, framed.dir, python);
+	}
 	const runsLocalPath = commands.some(item => isPathWord(programWord(item)) && !isSystemProgram(programWord(item)));
 	if (!runsLocalPath) {
 		const why = shapeARefusal(commands);
 		return why === undefined ? { kind: "scripts", scripts: [] } : refuse(why);
 	}
-	// Shape B: [cd <literal> &&] [timeout <duration>] <literal path> <literal args> [| <output filter>], and nothing else.
-	let dir = startCwd;
-	let rest = commands.length > 1 && isOutputFilter(commands[commands.length - 1]) ? commands.slice(0, -1) : commands;
-	if (rest.length === 2 && verbName(rest[0]) === "cd" && rest[1].join === "and") {
-		const cd = rest[0];
-		if (cd.words.length !== 2 || !cd.words[1].fixed || cd.assigns.length > 0 || cd.redirects.length > 0) return refuse("the cd before the script is not one literal directory");
-		dir = path.resolve(startCwd, expandHome(cd.words[1].value));
-		rest = rest.slice(1);
-	}
-	if (rest.length !== 1) return refuse("a local script runs inside a compound command");
-	const run = rest[0];
-	if (run.nested || run.negated || run.unreadShape !== undefined) return refuse("the script runs inside a construct the gate cannot read");
-	if (run.assigns.length > 0) return refuse("the script runs with an assignment");
-	if (!run.words.every(isLiteral)) return refuse("the script's words are built at run time");
+	if (typeof framed === "string") return refuse(framed);
+	if (framed === undefined) return refuse("a local script runs inside a compound command");
+	const { run, dir } = framed;
+	const why = runRefusal(run);
+	if (why !== undefined) return refuse(why);
 	if (run.redirects.some(redirect => redirect.direction !== "out" && !redirect.duplicate)) return refuse("the script reads a redirect");
 	const spelled = programWord(run);
 	const file = path.resolve(dir, expandHome(spelled));
