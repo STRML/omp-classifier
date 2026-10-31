@@ -4,6 +4,15 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### Redaction reads ANSI-C `$'…'` quoting
+
+https://github.com/STRML/omp-classifier/pull/223 bounds a secret at its shell word in commands. Its quote scanner treated `$'…'` as an ordinary single quote, but in ANSI-C quoting a backslash escapes the next character, a quote included. So `export TOKEN=$'hunter2\' rest'` ended the value at the escaped quote, and ` rest'` reached the audit log and the reviewer. The same happened inside a quoted header. Both scanners (the enclosing-quote pass and the word bound) now treat `$'` as its own state in which `\'` does not close.
+
+| Command | Before | After |
+|---|---|---|
+| `export TOKEN=$'hunter2\' rest' && rm -rf build` | `TOKEN=[redacted] rest' && rm -rf build` | `TOKEN=[redacted] && rm -rf build` |
+| `curl -H $'Authorization: Bearer hunter2\' rest' https://…` | `…[redacted]' rest' https://…` | `…[redacted]' https://…` |
+
 ### Arithmetic trust follows source order, and the reader sees through alias and path-verb spellings
 
 Security review findings on https://github.com/STRML/omp-classifier/pull/232, https://github.com/STRML/omp-classifier/pull/233 and https://github.com/STRML/omp-classifier/pull/224:

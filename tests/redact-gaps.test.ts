@@ -244,6 +244,22 @@ describe("redaction replaces the value and leaves the command", () => {
 	});
 });
 
+describe("ANSI-C $'…' quoting, where a backslash escapes the quote", () => {
+	test.each([
+		["an assignment", "export TOKEN=$'hunter2\\' rest' && rm -rf build", "rm -rf build"],
+		["a header", "curl -H $'Authorization: Bearer hunter2\\' rest' https://api.example.com/x", "https://api.example.com/x"],
+	])("%s keeps no part of the secret and keeps the command after it", (_name, command, tail) => {
+		const out = redactCommand(command);
+		expect(out).not.toContain("hunter2");
+		expect(out).not.toContain("rest");
+		expect(out).toContain(tail);
+	});
+
+	test("an ANSI-C string that holds no secret is left as written", () => {
+		expect(redactCommand("echo $'it\\'s' && ls")).toBe("echo $'it\\'s' && ls");
+	});
+});
+
 describe("prose is cut at the end of the line, only a command is bounded at its word", () => {
 	test("evidence text keeps end-of-line redaction, so a secret with spaces or terminators leaks no tail", () => {
 		const cases: Array<[string, string]> = [
