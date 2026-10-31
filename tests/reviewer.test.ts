@@ -342,6 +342,14 @@ describe("consent given after a refusal", () => {
 		expect(readDecisions().at(-1)?.why).toContain("runs past the refusal");
 	});
 
+	test("a host named at the end of a sentence lifts it", async () => {
+		const sid = nextSession();
+		await refuseDeploy(sid);
+		scriptReviewer(reviewerReply("allow", "Deploy now"));
+		const closing = [...before(), askAnswer("a1", "Copy the rebuilt tool to buildhost.", "Deploy now")];
+		expect(resultText(await fire("tool_call", makeEvent(deploy), uiCtx(sid, closing)))).toBe("ALLOWED");
+	});
+
 	test("a stage-1 SAFE on a refused target goes to the reviewer, which can lift it", async () => {
 		const sid = nextSession();
 		await refuseDeploy(sid);

@@ -5054,9 +5054,9 @@ const REVIEWER_UNSAFE_BARRED = [...REVIEWER_HARD_HAZARDS, "destructive_or_irreve
  * user's own TV). A local sudo, a host the user never named, and an UNSAFE
  * stay barred, and so does every other hard hazard.
  */
-function hazardBars(hazard: string, verdict: string, command: string, transcript: readonly ReviewerTranscriptEntry[]): boolean {
+function hazardBars(hazard: string, verdict: string, command: string, transcript: () => readonly ReviewerTranscriptEntry[]): boolean {
 	if (hazard !== "escalates_privilege" || verdict !== "UNSURE") return true;
-	return !namesRemoteHost(command, transcript);
+	return !namesRemoteHost(command, transcript());
 }
 
 export interface StageTwoInput {
@@ -5096,12 +5096,16 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	if (judgement.persistRefusal === false) return skip("one-hot answers");
 	if (judgement.jev === undefined) return skip("no stage-1 answers");
 	const { hazardReview, hazardBlock } = jevPolicyFor(config);
-	const transcript = reviewerTranscript(ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>, refusedToolCallIds);
+	// Read the branch only once a check needs it: a call that skips on a hard
+	// hazard never touches the session.
+	let read: ReviewerTranscriptEntry[] | undefined;
+	const readTranscript = (): ReviewerTranscriptEntry[] => (read ??= reviewerTranscript(ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>, refusedToolCallIds));
 	const barred = judgement.verdict === "UNSAFE" ? REVIEWER_UNSAFE_BARRED : REVIEWER_HARD_HAZARDS;
-	const hard = barred.find(hazard => (judgement.jev?.hazards[hazard] ?? 0) >= hazardReview && hazardBars(hazard, judgement.verdict, command, transcript));
+	const hard = barred.find(hazard => (judgement.jev?.hazards[hazard] ?? 0) >= hazardReview && hazardBars(hazard, judgement.verdict, command, readTranscript));
 	if (hard !== undefined) return skip(`hazard ${hard}`);
 	// Jev all but certain the user never asked: there is no consent to review.
 	if (judgement.verdict === "UNSAFE" && (judgement.jev.hazards.unauthorized_consequential_action ?? 0) >= hazardBlock) return skip("hazard unauthorized_consequential_action");
+	const transcript = readTranscript();
 	const userWords = transcript.flatMap(entry => (entry.from === "user" ? [entry.text] : entry.from === "ask" ? [entry.userAnswer] : []));
 	if (userWords.length === 0) return skip("no user words");
 	const programs = scriptsForReview(command, input.startCwd);
