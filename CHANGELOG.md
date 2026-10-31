@@ -4,6 +4,18 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### Names that builtins evaluate, quoted arithmetic and loop headers count too
+
+The security review of https://github.com/STRML/omp-classifier/pull/228 found four more places bash evaluates a value the gate did not read:
+
+- A builtin that takes a variable name evaluates a subscript in it, so `unset 'a[$(cmd)]'` runs `cmd` and `read "a[w]"` evaluates `w`. Each of `unset`, `read`, `declare`, `typeset`, `local`, `export`, `readonly`, `mapfile`, `getopts`, `printf`, `wait`, `let`, `test` and `[`, handed a word shaped `name[expr]` with anything but an integer inside, now refuses. So does `[[ -v ]]` or `[[ -R ]]` on anything but a plain name.
+- Arithmetic read only `Lit` nodes, so `(( 'w' ))` and `let "w"` (quoted operands) passed. Arithmetic is now an allowlist: integer literals under arithmetic operators read nothing, and any other node counts as reading.
+- `for (( i=w; ...; ... ))` headers are arithmetic and are checked now.
+- `${!w}` expands the variable whose name is the value of `w`, and a subscript in that value is evaluated, so indirect expansion refuses.
+- A verb spelled by an expansion (`$v X=1` with `v=export`) can be any of those builtins. It refuses when handed an argument shaped like a name to write, a subscripted name, or a word built at run time.
+
+The cost is a counter loop such as `for ((i=0; i<3; i++))`. It reads `i`, which the gate cannot prove holds an integer, so a script with one is not read by the reviewer.
+
 ### Stage 2 reads hidden arithmetic from the parse, not the text
 
 https://github.com/STRML/omp-classifier/pull/225 refused script bodies whose arithmetic reads a name, because bash evaluates the variable's value as an expression and a value of `PATH=/x` assigns PATH. It found those spots with regexes over the body text, and every review round found another spelling: a substring offset on `${1:w}`, `${@:w}` or `${a[0]:w}`, a compound array `( [w]=1 )`, a `[[ ]]` comparison split over lines, `declare -i` (later plain assignments become arithmetic), `declare -n` (a name becomes an alias of another), and a verb rewritten by brace expansion (`{ex,}port`). `hiddenArithmetic` in `shell-ast.ts` now reads the parse. It checks `ArithmCmd`, `let`, `$(( ))`, `$[ ]`, every subscript and substring offset (read off the node, since the walker does not descend into them), and `[[ ]]` comparisons whose operator the runtime derives from a parse of `-eq` through `-ge`. Any one of them that reads a name, an expansion or a substitution refuses. `declare`, `typeset` and `local` with `-i` or `-n`, or with a flag word built at run time, refuse outright, as does a verb that brace expansion or a glob rewrites. The text scans are removed.

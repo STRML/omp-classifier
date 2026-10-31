@@ -250,6 +250,12 @@ function bodyHandOff(body: string, real: string): string | undefined {
 	return undefined;
 }
 
+/** Builtins whose words are variable names, where a subscript is evaluated. */
+const NAME_TAKERS = new Set(["unset", "read", "declare", "typeset", "local", "export", "readonly", "mapfile", "readarray", "getopts", "printf", "wait", "let", "test", "["]);
+/** `name[expr]` with anything but an integer between the brackets. */
+const SUBSCRIPTED_NAME = /^[A-Za-z_][A-Za-z0-9_]*\[[^\]]*[^0-9\s\]][^\]]*\]/u;
+const ASSIGNMENT_SHAPED = /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/u;
+
 /** Builtins that write a variable named by one of their words. */
 const VARIABLE_WRITERS = new Set(["export", "declare", "typeset", "local", "readonly", "read", "mapfile", "readarray", "unset", "getopts"]);
 /**
@@ -275,6 +281,16 @@ function writesHiddenName(command: ShellCommand): string | undefined {
 	}
 	// A verb brace expansion or a glob rewrites can be any builtin, writers
 	// included: `{ex,}port` is `export port`.
+	// A builtin that takes a variable NAME evaluates a subscript in it:
+	// `unset 'a[$(cmd)]'` runs cmd, and `read "a[w]"` evaluates w.
+	if (verb !== undefined && NAME_TAKERS.has(verb.value) && command.words.slice(1).some(word => SUBSCRIPTED_NAME.test(word.value))) {
+		return `${verb.value} evaluates the subscript in a name it is given`;
+	}
+	// A verb spelled by an expansion can be any of those builtins: refuse it
+	// with an argument shaped like a name to write or one built at run time.
+	if (verb !== undefined && !verb.literal && command.words.slice(1).some(word => !word.fixed || ASSIGNMENT_SHAPED.test(word.value) || SUBSCRIPTED_NAME.test(word.value))) {
+		return "a program named by an expansion is handed an argument it could write to";
+	}
 	// `[` alone reads as a glob character but names the test builtin.
 	if (verb !== undefined && verb.literal && !verb.fixed && verb.value !== "[") return "the program word is rewritten by brace expansion or a glob";
 	return undefined;

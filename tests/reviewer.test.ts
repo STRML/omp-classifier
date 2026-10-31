@@ -586,6 +586,13 @@ describe("what never reaches the reviewer", () => {
 		["a script whose [[ ]] numeric comparison spans a newline", () => script("wrap.sh", "#!/bin/bash\nw=x\n[[ $w\n -eq 1 ]]\ngit status\n"), "./wrap.sh"],
 		["a script that declares an integer name", () => script("wrap.sh", "#!/bin/bash\ndeclare -i x\nx=w\ngit status\n"), "./wrap.sh"],
 		["a script that declares a nameref", () => script("wrap.sh", "#!/bin/bash\nn=x\ndeclare -n r=\"$n\"\nr=/tmp/evil\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a quoted name", () => script("wrap.sh", "#!/bin/bash\nw=x\n(( 'w' ))\ngit status\n"), "./wrap.sh"],
+		["a script whose for (( )) loop reads a name", () => script("wrap.sh", "#!/bin/bash\nw=x\nfor ((i=w; i<1; i++)); do :; done\ngit status\n"), "./wrap.sh"],
+		["a script whose indirect expansion names a variable at run time", () => script("wrap.sh", "#!/bin/bash\nw=x\necho ${!w}\ngit status\n"), "./wrap.sh"],
+		["a script whose [[ -v ]] tests a subscripted name", () => script("wrap.sh", "#!/bin/bash\nw=x\n[[ -v 'a[w]' ]]\ngit status\n"), "./wrap.sh"],
+		["a script that unsets a subscripted name", () => script("wrap.sh", "#!/bin/bash\nunset 'a[$(id)]'\ngit status\n"), "./wrap.sh"],
+		["a script that reads into a subscripted name", () => script("wrap.sh", "#!/bin/bash\nread -r 'a[w]' < /dev/null\ngit status\n"), "./wrap.sh"],
+		["a script whose expanded verb is handed a name to write", () => script("wrap.sh", "#!/bin/bash\nv=export\n$v X=1\ngit status\n"), "./wrap.sh"],
 		["a script whose verb is a brace expansion", () => script("wrap.sh", "#!/bin/bash\n{ex,}port X=1\ngit status\n"), "./wrap.sh"],
 		["a script whose printf -v format is built at run time", () => script("wrap.sh", "#!/bin/bash\nprintf \"${O:--v}\" X y\ngit status\n"), "./wrap.sh"],
 		[
