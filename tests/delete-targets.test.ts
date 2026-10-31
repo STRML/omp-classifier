@@ -437,6 +437,28 @@ describe("delete targets through the gate", () => {
 		}
 	});
 
+	test("a call from a directory with an .envrc latches the session: direnv may have changed the shell", async () => {
+		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-direnv-")));
+		const withEnvrc = join(real, "repo");
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = real;
+		try {
+			mkdirSync(join(real, "x"));
+			mkdirSync(withEnvrc);
+			writeFileSync(join(real, "x", "probe.md"), "x");
+			writeFileSync(join(withEnvrc, ".envrc"), "unset TMPDIR\n");
+			const id = session();
+			await fire("tool_call", makeEvent("ls"), makeCtx({ sessionId: id, cwd: withEnvrc }));
+			const before = modelCalls.length;
+			await fire("tool_call", makeEvent('trash "$TMPDIR/x/probe.md"'), makeCtx({ sessionId: id, cwd: home }));
+			expect((stateOf(before).deleteTargets as Array<Record<string, unknown>>)[0].underTempRoot).toBeNull();
+		} finally {
+			if (saved === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = saved;
+			rmSync(real, { recursive: true, force: true });
+		}
+	});
+
 	test("a $TMPDIR operand stays unmeasured when an .envrc sits in the working directory", async () => {
 		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-envrc-")));
 		try {
@@ -545,6 +567,10 @@ describe("touchesShellEnv", () => {
 		// wrappers, lookups and traps
 		"command export X=1", "builtin export X=1", "enable -n test", "alias trash=ls", "unalias -a", "trap 'IFS=/' DEBUG", "exec 3>&1", "exec bash",
 		// shapes the gate cannot read
+		// arithmetic hidden in a test, a subscript or an offset
+		"[[ $((IFS=x)) ]]", "[[ a -eq b ]]", "[[ -n x ]]", "echo ${a[i=1]}", "echo ${s:i=2}", "echo ${s:1:2}", 'echo "${a[$(cmd)]}"',
+		// an option an expansion spells
+		'printf "${OPT:--v}" T"MP"DIR /Users', 'printf "$opt" x',
 		"FOO=1", 'v=1; ls', "$cmd x", '"$cmd" x', "f() { export A=1; }", "(( X=1 ))", "echo $(( X=1 ))", "let x=1", "echo (",
 	];
 	for (const command of touching) {

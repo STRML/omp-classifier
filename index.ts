@@ -578,9 +578,10 @@ function hasEnvrcAbove(cwd: string): boolean {
 /** Reads of the two variables that change nothing, taken out before the name check. */
 const SHELL_ENV_READS = /\$\{TMPDIR\}|\$TMPDIR(?![A-Za-z0-9_])|\$IFS(?![A-Za-z0-9_])/gu;
 /** Either name as anything but a plain read (an assignment, `unset`, a `for`
- *  variable, `${TMPDIR:=x}`), or a `${...:=...}` / `$((...))` that can assign
- *  to a name built some other way. */
-const SHELL_ENV_NAMES = /(?<![A-Za-z0-9_])(?:TMPDIR|IFS)(?![A-Za-z0-9_])|:=|\$\(\(/u;
+ *  variable, `${TMPDIR:=x}`), or an expansion that evaluates arithmetic and
+ *  can assign to a name built some other way: `${...:=...}`, `$((...))`, an
+ *  array subscript (`${a[i=1]}`) and a substring offset (`${s:i=2}`). */
+const SHELL_ENV_NAMES = /(?<![A-Za-z0-9_])(?:TMPDIR|IFS)(?![A-Za-z0-9_])|:=|\$\(\(|\$\{[^}]*\[|\$\{[A-Za-z0-9_]+:(?![-=+?])/u;
 /** Builtins and keywords that write a shell variable, run text or a file in
  *  the current shell, or change how later commands are looked up. */
 const SHELL_STATE_VERBS = new Set([
@@ -590,15 +591,18 @@ const SHELL_STATE_VERBS = new Set([
 
 /** Whether one parsed command can leave the persistent shell changed. */
 function commandTouchesShell(command: ShellCommand): boolean {
-	if (command.unreadShape !== undefined || command.expression === "arithmetic") return true;
+	// `[[ ]]` evaluates its operands as arithmetic (`[[ a -eq b ]]`, a
+	// subscript in `[[ ${x[i=1]} ]]`), and `(( ))` and `let` assign outright.
+	if (command.unreadShape !== undefined || command.expression !== undefined) return true;
 	const verb = command.words[0];
 	// A bare assignment persists; a prefix one lasts for its command only.
 	if (verb === undefined) return command.assigns.length > 0 || command.redirects.length > 0;
 	// A verb built from an expansion could be any builtin.
 	if (!verb.literal) return true;
 	if (SHELL_STATE_VERBS.has(verb.value)) return true;
-	// `printf -v name` writes a variable.
-	if (verb.value === "printf" && command.words.some(word => /^-[A-Za-z]*v/u.test(word.value))) return true;
+	// `printf -v name` writes a variable, and an expanded option (`"${O:--v}"`)
+	// can spell it.
+	if (verb.value === "printf" && command.words.some(word => !word.literal || /^-[A-Za-z]*v/u.test(word.value))) return true;
 	return false;
 }
 
@@ -632,6 +636,17 @@ const shellEnvTouched = new Set<string>();
  *  call with no session id cannot be tracked, so it is not vouched for. */
 const shellTmpdirIfNamed = (command: string, cwds: readonly string[], sessionId: string | undefined): string | null =>
 	command.includes("TMPDIR") ? shellTmpdirFor(cwds, process.env, sessionId === undefined || shellEnvTouched.has(sessionId)) : null;
+
+/** The directory a bash call names in its own `cwd` input, else `fallback`. */
+function bashInputCwd(input: unknown, fallback: string): string {
+	const named = typeof input === "object" && input !== null && "cwd" in input ? input.cwd : undefined;
+	if (typeof named !== "string" || named === "" || named.includes("://") || named.includes("local:/")) return fallback;
+	try {
+		return resolveToCwd(named, fallback);
+	} catch {
+		return fallback;
+	}
+}
 
 /** The host session id, or undefined in an isolated SDK context that has none. */
 function sessionIdOf(ctx: ExtensionContext): string | undefined {
@@ -6385,7 +6400,9 @@ export default function (pi: ExtensionAPI) {
 		if (isEval && evalCode.trim() === "") return;
 		// The host runs bash calls in one persistent shell, so this command may
 		// leave TMPDIR or IFS changed for the next one (#176).
-		if (isBash && touchesShellEnv(command)) {
+		// So can the host's direnv preflight: it prepends `unset -v NAME` for a
+		// variable a repo's `.envrc` removes, to a command that reads quiet.
+		if (isBash && (touchesShellEnv(command) || hasEnvrcAbove(ctx.cwd) || hasEnvrcAbove(bashInputCwd(event.input, ctx.cwd)))) {
 			const touchedSession = sessionIdOf(ctx);
 			if (touchedSession !== undefined) shellEnvTouched.add(touchedSession);
 		}
