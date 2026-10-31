@@ -263,6 +263,12 @@ describe("a session whose shell an earlier call may have changed", () => {
 		expect(resultText(await fire("tool_call", makeEvent("./update.sh start"), uiCtx(nextSession(), [user("u1", "update fork main")])))).toBe("ALLOWED");
 	});
 
+	test("arithmetic over names the body sets to integers still reaches the reviewer", async () => {
+		script("update.sh", "#!/bin/bash\nstart=$SECONDS\nn=0\nfor ((i=0; i<2; i++)); do (( n++ )); done\necho \"took $((SECONDS - start))s, n=$n\"\n[[ $n -eq 2 ]] && git fetch origin\n");
+		scriptReviewer(reviewerReply("allow", "update fork main"));
+		expect(resultText(await fire("tool_call", makeEvent("./update.sh start"), uiCtx(nextSession(), [user("u1", "update fork main")])))).toBe("ALLOWED");
+	});
+
 	test("a session that never touched its shell still reaches the reviewer", async () => {
 		const session = nextSession();
 		const branch = [user("u1", "update fork main")];
@@ -588,6 +594,21 @@ describe("what never reaches the reviewer", () => {
 		["a script that declares a nameref", () => script("wrap.sh", "#!/bin/bash\nn=x\ndeclare -n r=\"$n\"\nr=/tmp/evil\ngit status\n"), "./wrap.sh"],
 		["a script whose arithmetic reads a quoted name", () => script("wrap.sh", "#!/bin/bash\nw=x\n(( 'w' ))\ngit status\n"), "./wrap.sh"],
 		["a script whose for (( )) loop reads a name", () => script("wrap.sh", "#!/bin/bash\nw=x\nfor ((i=w; i<1; i++)); do :; done\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name filled by read", () => script("wrap.sh", "#!/bin/bash\nread -r w < /dev/null\necho $((w + 1))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a for-loop word", () => script("wrap.sh", "#!/bin/bash\nfor w in a b; do echo $((w)); done\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a substitution's result", () => script("wrap.sh", "#!/bin/bash\nw=$(cat count.txt)\n(( w++ ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name a default assigned", () => script("wrap.sh", "#!/bin/bash\n: \"${w:=$(cat count.txt)}\"\n(( w ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name a plain default assigned", () => script("wrap.sh", "#!/bin/bash\n: ${w=x}\necho $((w))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads REPLY, which read sets on its own", () => script("wrap.sh", "#!/bin/bash\nread < /dev/null\n(( REPLY ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a bundled read -a target", () => script("wrap.sh", "#!/bin/bash\nread -aw < /dev/null\n(( w ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a special it redefined", () => script("wrap.sh", "#!/bin/bash\nSECONDS=x\n(( SECONDS ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name it never assigns", () => script("wrap.sh", "#!/bin/bash\n(( i++ ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic assigns a name from its own old value", () => script("wrap.sh", "#!/bin/bash\n(( x = x + 1 ))\ngit status\n"), "./wrap.sh"],
+		["a script that reads into a name built at run time before its arithmetic", () => script("wrap.sh", "#!/bin/bash\nx=0; n=x\nread \"$n\" < /dev/null\n(( x ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads REPLY after assigning it", () => script("wrap.sh", "#!/bin/bash\nREPLY=0\nread < /dev/null\n(( REPLY ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name declared with no value", () => script("wrap.sh", "#!/bin/bash\nlocal x\n(( x ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name it appended to", () => script("wrap.sh", "#!/bin/bash\nx=0\nx+=1\n(( x ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a positional parameter", () => script("wrap.sh", "#!/bin/bash\n(( $1 ))\ngit status\n"), "./wrap.sh"],
 		["a script whose indirect expansion names a variable at run time", () => script("wrap.sh", "#!/bin/bash\nw=x\necho ${!w}\ngit status\n"), "./wrap.sh"],
 		["a script whose [[ -v ]] tests a subscripted name", () => script("wrap.sh", "#!/bin/bash\nw=x\n[[ -v 'a[w]' ]]\ngit status\n"), "./wrap.sh"],
 		["a script whose [ -v ] tests a name built at run time", () => script("wrap.sh", "#!/bin/bash\nn='a[w]'\n[ -v \"$n\" ]\ngit status\n"), "./wrap.sh"],
@@ -603,6 +624,7 @@ describe("what never reaches the reviewer", () => {
 		["a script whose [ ] gets \"$@\", which expands to many words", () => script("wrap.sh", "#!/bin/bash\n[ \"$@\" ]\ngit status\n"), "./wrap.sh"],
 		["a script whose expanded verb reads a script on stdin", () => script("wrap.sh", "#!/bin/bash\nX=bash\n$X < payload.txt\ngit status\n"), "./wrap.sh"],
 		["a script whose wait bundles -p", () => script("wrap.sh", "#!/bin/bash\nwait -fp 'a[w]'\ngit status\n"), "./wrap.sh"],
+		["a script that hands declare a compound assignment as text", () => script("wrap.sh", "#!/bin/bash\ndeclare 'a=([w]=1)'\ngit status\n"), "./wrap.sh"],
 		["a script that unsets a subscripted name", () => script("wrap.sh", "#!/bin/bash\nunset 'a[$(id)]'\ngit status\n"), "./wrap.sh"],
 		["a script that reads into a subscripted name", () => script("wrap.sh", "#!/bin/bash\nread -r 'a[w]' < /dev/null\ngit status\n"), "./wrap.sh"],
 		["a script whose expanded verb is handed a name to write", () => script("wrap.sh", "#!/bin/bash\nv=export\n$v X=1\ngit status\n"), "./wrap.sh"],

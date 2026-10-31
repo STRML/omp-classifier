@@ -4,6 +4,22 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### Arithmetic over names the body sets to integers reads again, and `[[ ]]` is not a glob
+
+Two over-refusals from today's hardening, plus one more gap.
+
+- **Every `[[ ]]` body was refused.** https://github.com/STRML/omp-classifier/pull/228 refused a verb that brace expansion or a glob rewrites, and `[[` reads as a glob character. It now gets the same exemption `[` had.
+- **Any name in arithmetic was refused**, so `start=$SECONDS; echo $((SECONDS - start))`, `n=0; (( n++ ))` and `for ((i=0; i<3; i++))` made the whole script unreadable. The danger is a name whose value the reviewer cannot see, because bash evaluates it as an expression. Names are now trusted deny-by-default. A name is trusted when the body assigns it, every assignment is an integer (digits, `$(( ))`, an integer special, or a plain `=` inside arithmetic whose right side is integers), and nothing else writes it. An integer special such as `SECONDS`, `RANDOM`, `$#` or `$?` is trusted when the body never writes it. Every other name is untrusted. That includes a name the body never assigns (the environment can hold anything), a name bash fills on its own (`REPLY`, `MAPFILE`, `OPTARG`, `BASH_REMATCH` and the like, whatever the body assigns), a declaration with no value, and an append (`x+=…`). It also includes a name any `read` (bundled `-aNAME` too), `mapfile`, `getopts`, `printf -v` or `unset`, a `for`/`select` word, a `${w:=…}` default or a non-integer assignment touches.
+- **`declare 'a=([w]=1)'`** hands `declare` a compound assignment as text, which it parses again and whose subscripts it evaluates. `declare`, `typeset`, `local`, `readonly` and `export` now refuse a word shaped `name=(`.
+
+| Body | Before | After |
+|---|---|---|
+| `[[ -n $x ]] && git fetch` | refused | reviewed |
+| `start=$SECONDS; echo $((SECONDS - start))` | refused | reviewed |
+| `n=0; for ((i=0; i<2; i++)); do (( n++ )); done; [[ $n -eq 2 ]]` | refused | reviewed |
+| `read -r w; echo $((w + 1))`, `w=$(cat f); (( w++ ))`, `(( $1 ))`, `read; (( REPLY ))`, `(( i++ ))` with no assignment, `SECONDS=x; (( SECONDS ))` | refused | refused |
+| `declare 'a=([w]=1)'` | reviewed | refused |
+
 ### A program named by an expansion is never read in a script body
 
 Stage 2 let a body name its program with a variable (`"$OMP" status`), on the theory that the reviewer reads what the body assigns. https://github.com/STRML/omp-classifier/pull/230 limited that to a bare verb with no arguments or input. The security review found three ways past even that. `X='bash payload.txt'; $X` splits into a program and its argument. `cat payload.txt | "$X"` feeds it a script through a pipe. An earlier `exec <` can do the same through stdin. A verb built from an expansion now refuses outright. `test` also stops treating `"$@"`, `"${a[@]}"` or `"${!p@}"` as one operand, since each expands to one word per element.

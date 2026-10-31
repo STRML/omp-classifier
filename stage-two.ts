@@ -312,6 +312,11 @@ function writesHiddenName(command: ShellCommand): string | undefined {
 	// included: `{ex,}port` is `export port`.
 	// A builtin that takes a variable NAME evaluates a subscript in it:
 	// `unset 'a[$(cmd)]'` runs cmd, and `read "a[w]"` evaluates w.
+	// `declare 'a=([w]=1)'` hands declare a compound assignment as text, which
+	// it parses again and whose subscripts it evaluates.
+	if (verb !== undefined && ["declare", "typeset", "local", "readonly", "export"].includes(verb.value) && command.words.slice(1).some(word => /^[A-Za-z_][A-Za-z0-9_]*\+?=\(/u.test(word.value))) {
+		return `${verb.value} parses a compound assignment it is handed as text`;
+	}
 	if (verb !== undefined && NAME_TAKERS.has(verb.value) && command.words.slice(1).some(word => SUBSCRIPTED_NAME.test(word.value))) {
 		return `${verb.value} evaluates the subscript in a name it is given`;
 	}
@@ -329,8 +334,8 @@ function writesHiddenName(command: ShellCommand): string | undefined {
 	// A verb spelled by an expansion can be any builtin or interpreter, it can
 	// split into a program and its arguments, and a pipe can feed it a script.
 	if (verb !== undefined && !verb.literal) return "the program is named by an expansion, so the gate cannot tell what runs";
-	// `[` alone reads as a glob character but names the test builtin.
-	if (verb !== undefined && verb.literal && !verb.fixed && verb.value !== "[") return "the program word is rewritten by brace expansion or a glob";
+	// `[` and `[[` read as glob characters but name the test builtin and keyword.
+	if (verb !== undefined && verb.literal && !verb.fixed && verb.value !== "[" && verb.value !== "[[") return "the program word is rewritten by brace expansion or a glob";
 	return undefined;
 }
 

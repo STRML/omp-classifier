@@ -74,6 +74,8 @@ interface ShellRuntime {
 	/** `[[ -v ]]` and `[[ -R ]]`: their operand is a variable name, and a
 	 *  subscript in it is evaluated. */
 	nameTests: ReadonlySet<number>;
+	/** The plain `=` inside arithmetic: it sets an integer without reading the name first. */
+	arithmeticAssign: number;
 }
 
 let runtime: ShellRuntime | undefined;
@@ -99,7 +101,7 @@ const deriveRuntime = (mod: unknown): ShellRuntime => {
 	 * renumbers them silently wrong in a security boundary, so each one is
 	 * read back from a parse of the spelling it belongs to.
 	 */
-	const operatorOf = (source: string, type: "Redirect" | "BinaryCmd" | "BinaryTest" | "UnaryTest"): number => {
+	const operatorOf = (source: string, type: "Redirect" | "BinaryCmd" | "BinaryTest" | "UnaryTest" | "BinaryArithm"): number => {
 		// Local walk, not the module-level one: walk() calls getShell(), and
 		// the runtime is not assigned until this function returns, so touching
 		// it here would re-enter this derivation forever.
@@ -155,7 +157,9 @@ const deriveRuntime = (mod: unknown): ShellRuntime => {
 
 	const nameTests = new Set(["-v", "-R"].map(op => operatorOf(`[[ ${op} x ]]`, "UnaryTest")));
 
-	return { syntax, parser, redirect, binary, redirectDirection, arithmeticTests, nameTests };
+	const arithmeticAssign = operatorOf("(( a = 1 ))", "BinaryArithm");
+
+	return { syntax, parser, redirect, binary, redirectDirection, arithmeticTests, nameTests, arithmeticAssign };
 };
 
 /** The live runtime, loading and deriving the parser on first use. */
@@ -981,18 +985,115 @@ const literalWordText = (word: any): string => {
  *  closed. */
 const PLAIN_ARITHMETIC = new Set(["Word", "Lit", "BinaryArithm", "UnaryArithm", "ParenArithm"]);
 
-/** Whether an arithmetic expression (or any node under it) reads something
- *  other than a plain integer. */
+/** Specials whose value bash itself sets to an integer. */
+const INTEGER_SPECIALS = new Set(["SECONDS", "RANDOM", "SRANDOM", "EPOCHSECONDS", "LINENO", "BASHPID", "PPID", "UID", "EUID", "#", "?", "$", "!"]);
+/** Names bash fills on its own (`read` with no name sets REPLY, `=~` sets
+ *  BASH_REMATCH): never trusted, whatever the body assigns. */
+const BASH_MANAGED = new Set(["REPLY", "MAPFILE", "OPTARG", "OPTIND", "OPTERR", "BASH_REMATCH", "COPROC", "PIPESTATUS", "BASH_ARGV", "BASH_ARGC", "FUNCNAME", "BASH_SOURCE", "BASH_LINENO", "DIRSTACK", "GROUPS", "COMP_WORDS", "COMPREPLY", "READLINE_LINE", "PWD", "OLDPWD", "IFS", "PATH"]);
+/** Builtins that write the names they are handed from input the text does not show. */
+const INPUT_WRITERS = new Set(["read", "mapfile", "readarray", "getopts"]);
+
+/** A plain `$NAME` or `${NAME}`: no subscript, slice, default or indirection. */
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function arithmeticReadsAnything(node: any): boolean {
+const plainParam = (node: any): string | undefined =>
+	nodeType(node) === "ParamExp" && !node.Excl && !node.Length && !node.Width && !node.Index && !node.Slice && !node.Repl && !node.Exp && !node.Names ? (node.Param?.Value ?? undefined) : undefined;
+
+/** Whether an assignment's value is one bash makes an integer, or an empty
+ *  one: digits, an arithmetic expansion, or an integer special. The
+ *  arithmetic inside `$(( ))` is checked where it sits. */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function integerValue(word: any): boolean {
+	if (!word) return true;
+	// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+	const parts: any[] = word.Parts ?? [];
+	if (parts.length !== 1) return parts.length === 0;
+	const [part] = parts;
+	const type = nodeType(part);
+	if (type === "Lit") return /^[0-9]+$/u.test(part.Value ?? "");
+	if (type === "ArithmExp") return true;
+	const name = plainParam(part);
+	return name !== undefined && INTEGER_SPECIALS.has(name);
+}
+
+/**
+ * The names arithmetic may read: deny by default. A name is trusted when the
+ * body assigns it, every assignment is an integer (digits, `$(( ))`, an
+ * integer special, or a plain `=` inside arithmetic, which sets it without
+ * reading it first), and nothing else writes it. An integer special the body
+ * never writes is trusted too. Everything else is not: a name the body never
+ * assigns (bash sets `REPLY`, `MAPFILE`, `OPTARG`, `BASH_REMATCH` and more on
+ * its own, and the environment can hold anything), a positional parameter,
+ * and any name a `read`/`mapfile`/`getopts`/`printf -v`/`unset`, a `for` or
+ * `select` word, a `${w:=…}` default (any default operator counts) or a
+ * non-integer assignment touches.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function trustedNames(tree: any): Set<string> {
+	const { arithmeticAssign } = getShell();
+	const integerAssigned = new Set<string>();
+	const written = new Set<string>();
+	const writtenNames = (words: readonly unknown[]): void => {
+		for (const word of words) {
+			const text = literalWordText(word);
+			// `-aNAME`, `-vNAME` or a bundle ending in a name: take every identifier run.
+			for (const name of text.replace(/\[.*$/u, "").match(/[A-Za-z_][A-Za-z0-9_]*/gu) ?? []) written.add(name);
+			if (text === "\0") written.add("\0");
+		}
+	};
+	walk(tree, (node: unknown) => {
+		if (!node) return true;
+		const type = nodeType(node);
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		const n = node as any;
+		// No value (`local x`, `declare x`) keeps whatever the name held, and
+		// `x+=…` appends text: neither sets an integer the body vouches for.
+		if (type === "Assign" && n.Name?.Value) (n.Array || n.Index || n.Append || !n.Value || !integerValue(n.Value) ? written : integerAssigned).add(n.Name.Value);
+		if ((type === "WordIter" || type === "SelectClause") && n.Name?.Value) written.add(n.Name.Value);
+		if (type === "ParamExp" && n.Exp && n.Param?.Value) written.add(n.Param.Value);
+		// `(( x = x + 1 ))` reads x before it sets it, so only a right side of
+		// plain integers makes the assignment one the body vouches for.
+		if (type === "BinaryArithm" && n.Op === arithmeticAssign && !arithmeticReadsAnything(n.Y, new Set()) && nodeType(n.X) === "Word" && (n.X.Parts ?? []).length === 1 && nodeType(n.X.Parts[0]) === "Lit") integerAssigned.add(n.X.Parts[0].Value ?? "");
+		if (type === "CallExpr") {
+			// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+			const words: any[] = n.Args ?? [];
+			const verb = words[0] && literalWordText(words[0]);
+			if (INPUT_WRITERS.has(verb) || verb === "unset" || verb === "printf") writtenNames(words.slice(1));
+		}
+		return true;
+	});
+	const trusted = new Set<string>();
+	// A writer whose target is built at run time (`read "$n"`) can write any
+	// name, so nothing the body assigns can be trusted.
+	if (written.has("\0")) return trusted;
+	for (const name of integerAssigned) if (!written.has(name) && !INTEGER_SPECIALS.has(name) && !BASH_MANAGED.has(name)) trusted.add(name);
+	for (const name of INTEGER_SPECIALS) if (!written.has(name) && !integerAssigned.has(name)) trusted.add(name);
+	return trusted;
+}
+
+/** Whether an arithmetic expression (or any node under it) reads something
+ *  that is not an integer the body can vouch for: an untrusted name, a quoted
+ *  word, a substitution, or any node outside integer arithmetic. */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function arithmeticReadsAnything(node: any, trusted: ReadonlySet<string>): boolean {
 	if (!node) return false;
-	if (Array.isArray(node)) return node.some(arithmeticReadsAnything);
+	if (Array.isArray(node)) return node.some(inner => arithmeticReadsAnything(inner, trusted));
 	let reads = false;
 	walk(node, (inner: unknown) => {
 		if (reads || !inner) return !reads;
 		const type = nodeType(inner);
 		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
-		if (!PLAIN_ARITHMETIC.has(type) || (type === "Lit" && !/^[0-9\s]*$/u.test((inner as any).Value ?? ""))) reads = true;
+		const value: string = (inner as any).Value ?? "";
+		if (type === "ParamExp") {
+			const name = plainParam(inner);
+			reads = name === undefined || !trusted.has(name);
+			return false;
+		}
+		if (type === "Lit") {
+			if (/^[0-9\s]*$/u.test(value)) return true;
+			reads = !IDENTIFIER.test(value) || !trusted.has(value);
+			return !reads;
+		}
+		if (!PLAIN_ARITHMETIC.has(type)) reads = true;
 		return !reads;
 	});
 	return reads;
@@ -1017,21 +1118,23 @@ export function hiddenArithmetic(text: string): string | undefined {
 		return "its shell body could not be parsed";
 	}
 	const { arithmeticTests, nameTests } = getShell();
+	const trusted = trustedNames(tree);
+	const reads = (node: unknown): boolean => arithmeticReadsAnything(node, trusted);
 	let why: string | undefined;
 	walk(tree, (node: unknown) => {
 		if (why !== undefined || !node) return why === undefined;
 		const type = nodeType(node);
 		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
 		const n = node as any;
-		if ((type === "ArithmCmd" || type === "LetClause" || type === "ArithmExp") && arithmeticReadsAnything(n.X ?? n.Exprs ?? n)) why = "arithmetic evaluates a variable, which can assign any name";
-		else if (type === "CStyleLoop" && (arithmeticReadsAnything(n.Init) || arithmeticReadsAnything(n.Cond) || arithmeticReadsAnything(n.Post))) why = "a for (( )) loop evaluates a variable, which can assign any name";
+		if ((type === "ArithmCmd" || type === "LetClause" || type === "ArithmExp") && reads(n.X ?? n.Exprs ?? n)) why = "arithmetic evaluates a variable, which can assign any name";
+		else if (type === "CStyleLoop" && (reads(n.Init) || reads(n.Cond) || reads(n.Post))) why = "a for (( )) loop evaluates a variable, which can assign any name";
 		// `${!w}` expands the variable whose name is w's value, and a subscript
 		// in that value (`a[$(cmd)]`) is evaluated.
 		else if (type === "ParamExp" && n.Excl) why = "an indirect expansion names its variable at run time";
 		else if (type === "UnaryTest" && nameTests.has(n.Op) && !(nodeType(n.X) === "Word" && (n.X.Parts ?? []).length === 1 && nodeType(n.X.Parts[0]) === "Lit" && IDENTIFIER.test(n.X.Parts[0].Value ?? ""))) why = "a -v or -R test evaluates the subscript in a name";
-		else if (type === "ParamExp" && (arithmeticReadsAnything(n.Index) || arithmeticReadsAnything(n.Slice?.Offset) || arithmeticReadsAnything(n.Slice?.Length))) why = "a subscript or substring offset evaluates a variable, which can assign any name";
-		else if ((type === "Assign" || type === "ArrayElem") && arithmeticReadsAnything(n.Index)) why = "a subscript evaluates a variable, which can assign any name";
-		else if (type === "BinaryTest" && arithmeticTests.has(n.Op) && (arithmeticReadsAnything(n.X) || arithmeticReadsAnything(n.Y))) why = "a numeric comparison evaluates a variable, which can assign any name";
+		else if (type === "ParamExp" && (reads(n.Index) || reads(n.Slice?.Offset) || reads(n.Slice?.Length))) why = "a subscript or substring offset evaluates a variable, which can assign any name";
+		else if ((type === "Assign" || type === "ArrayElem") && reads(n.Index)) why = "a subscript evaluates a variable, which can assign any name";
+		else if (type === "BinaryTest" && arithmeticTests.has(n.Op) && (reads(n.X) || reads(n.Y))) why = "a numeric comparison evaluates a variable, which can assign any name";
 		else if (type === "DeclClause") {
 			// biome-ignore lint/suspicious/noExplicitAny: untyped AST
 			const flags = (n.Args ?? []).filter((arg: any) => arg.Naked && arg.Value).map((arg: any) => literalWordText(arg.Value));
