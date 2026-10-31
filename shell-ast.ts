@@ -71,6 +71,9 @@ interface ShellRuntime {
 	redirectDirection: Record<number, ShellRedirect["direction"] | undefined>;
 	/** `[[ ]]` operators that evaluate both operands as arithmetic. */
 	arithmeticTests: ReadonlySet<number>;
+	/** `[[ -v ]]` and `[[ -R ]]`: their operand is a variable name, and a
+	 *  subscript in it is evaluated. */
+	nameTests: ReadonlySet<number>;
 }
 
 let runtime: ShellRuntime | undefined;
@@ -96,7 +99,7 @@ const deriveRuntime = (mod: unknown): ShellRuntime => {
 	 * renumbers them silently wrong in a security boundary, so each one is
 	 * read back from a parse of the spelling it belongs to.
 	 */
-	const operatorOf = (source: string, type: "Redirect" | "BinaryCmd" | "BinaryTest"): number => {
+	const operatorOf = (source: string, type: "Redirect" | "BinaryCmd" | "BinaryTest" | "UnaryTest"): number => {
 		// Local walk, not the module-level one: walk() calls getShell(), and
 		// the runtime is not assigned until this function returns, so touching
 		// it here would re-enter this derivation forever.
@@ -150,7 +153,9 @@ const deriveRuntime = (mod: unknown): ShellRuntime => {
 
 	const arithmeticTests = new Set(["-eq", "-ne", "-lt", "-le", "-gt", "-ge"].map(op => operatorOf(`[[ 1 ${op} 1 ]]`, "BinaryTest")));
 
-	return { syntax, parser, redirect, binary, redirectDirection, arithmeticTests };
+	const nameTests = new Set(["-v", "-R"].map(op => operatorOf(`[[ ${op} x ]]`, "UnaryTest")));
+
+	return { syntax, parser, redirect, binary, redirectDirection, arithmeticTests, nameTests };
 };
 
 /** The live runtime, loading and deriving the parser on first use. */
@@ -970,8 +975,14 @@ const literalWordText = (word: any): string => {
 	return parts.every((part: any) => nodeType(part) === "Lit") ? parts.map((part: any) => part.Value ?? "").join("") : "\0";
 };
 
+/** Node types an arithmetic expression may hold and still read nothing:
+ *  operators over integer literals. Anything else (a name, a quoted word, an
+ *  expansion, a substitution) counts as reading, so an unknown shape fails
+ *  closed. */
+const PLAIN_ARITHMETIC = new Set(["Word", "Lit", "BinaryArithm", "UnaryArithm", "ParenArithm"]);
+
 /** Whether an arithmetic expression (or any node under it) reads something
- *  other than a plain integer: a name, an expansion or a substitution. */
+ *  other than a plain integer. */
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 function arithmeticReadsAnything(node: any): boolean {
 	if (!node) return false;
@@ -981,7 +992,7 @@ function arithmeticReadsAnything(node: any): boolean {
 		if (reads || !inner) return !reads;
 		const type = nodeType(inner);
 		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
-		if (type === "ParamExp" || type === "CmdSubst" || type === "ProcSubst" || type === "ArithmExp" || (type === "Lit" && /[^0-9\s]/u.test((inner as any).Value ?? ""))) reads = true;
+		if (!PLAIN_ARITHMETIC.has(type) || (type === "Lit" && !/^[0-9\s]*$/u.test((inner as any).Value ?? ""))) reads = true;
 		return !reads;
 	});
 	return reads;
@@ -1005,7 +1016,7 @@ export function hiddenArithmetic(text: string): string | undefined {
 	} catch {
 		return "its shell body could not be parsed";
 	}
-	const { arithmeticTests } = getShell();
+	const { arithmeticTests, nameTests } = getShell();
 	let why: string | undefined;
 	walk(tree, (node: unknown) => {
 		if (why !== undefined || !node) return why === undefined;
@@ -1013,6 +1024,11 @@ export function hiddenArithmetic(text: string): string | undefined {
 		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
 		const n = node as any;
 		if ((type === "ArithmCmd" || type === "LetClause" || type === "ArithmExp") && arithmeticReadsAnything(n.X ?? n.Exprs ?? n)) why = "arithmetic evaluates a variable, which can assign any name";
+		else if (type === "CStyleLoop" && (arithmeticReadsAnything(n.Init) || arithmeticReadsAnything(n.Cond) || arithmeticReadsAnything(n.Post))) why = "a for (( )) loop evaluates a variable, which can assign any name";
+		// `${!w}` expands the variable whose name is w's value, and a subscript
+		// in that value (`a[$(cmd)]`) is evaluated.
+		else if (type === "ParamExp" && n.Excl) why = "an indirect expansion names its variable at run time";
+		else if (type === "UnaryTest" && nameTests.has(n.Op) && !(nodeType(n.X) === "Word" && (n.X.Parts ?? []).length === 1 && nodeType(n.X.Parts[0]) === "Lit" && IDENTIFIER.test(n.X.Parts[0].Value ?? ""))) why = "a -v or -R test evaluates the subscript in a name";
 		else if (type === "ParamExp" && (arithmeticReadsAnything(n.Index) || arithmeticReadsAnything(n.Slice?.Offset) || arithmeticReadsAnything(n.Slice?.Length))) why = "a subscript or substring offset evaluates a variable, which can assign any name";
 		else if ((type === "Assign" || type === "ArrayElem") && arithmeticReadsAnything(n.Index)) why = "a subscript evaluates a variable, which can assign any name";
 		else if (type === "BinaryTest" && arithmeticTests.has(n.Op) && (arithmeticReadsAnything(n.X) || arithmeticReadsAnything(n.Y))) why = "a numeric comparison evaluates a variable, which can assign any name";
