@@ -569,6 +569,19 @@ describe("escalates_privilege on a remote host the user named", () => {
 		expect(reviewerAudit()).toMatchObject({ skipped: "hazard exposes_secrets" });
 	});
 
+	test.each([
+		["a second ssh to a host nobody named", `${stop}; ssh root@10.0.0.9 'id'`],
+		["a second ssh joined by &&", `${stop} && ssh root@10.0.0.9 'id'`],
+		["a local sudo after the named ssh", `${stop}; sudo id`],
+		["a named ssh behind a local sudo", `sudo id; ${stop}`],
+		["the host smuggled in as a remote command word", "ssh root@10.0.0.9 192.168.86.53"],
+	])("%s stays barred", async (_name, command) => {
+		setJevAnswer(privileged());
+		await fire("tool_call", makeEvent(command), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
+		expect(reviewerCalls).toHaveLength(0);
+		expect(reviewerAudit()).toMatchObject({ skipped: "hazard escalates_privilege" });
+	});
+
 	test("an ssh run through a variable has no host to name, so it stays barred", async () => {
 		setJevAnswer(privileged());
 		const indirect = `SSH="ssh root@192.168.86.53"; $SSH 'systemctl stop contents-recognition-service'`;

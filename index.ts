@@ -5204,10 +5204,18 @@ function namesAnchor(said: ReviewerTranscriptEntry, anchors: ReadonlySet<string>
 }
 
 /** Whether the user's words or an ask name the host this ssh, scp or rsync
- *  acts on. Any other command, or one whose host is not spelled out (an ssh
- *  run through a variable), names no host. */
+ *  acts on. The command must be that one ssh, scp or rsync, after a leading
+ *  cd and before a trailing output filter: a second command could be a root
+ *  ssh to a host nobody named, or a local sudo. Any other command, or one
+ *  whose host is not spelled out (an ssh run through a variable), names no
+ *  host. */
 export function namesRemoteHost(command: string, transcript: readonly ReviewerTranscriptEntry[]): boolean {
-	const read = commandOperands(command);
+	const unfiltered = withoutOutputFilter(command);
+	const parsed = parseShell(unfiltered);
+	if (!parsed.ok) return false;
+	const top = parsed.commands.filter(entry => !entry.nested);
+	if (top.length - (top[0] !== undefined && verbName(top[0]) === "cd" ? 1 : 0) !== 1) return false;
+	const read = commandOperands(unfiltered);
 	const hosts = new Set(read === undefined ? [] : remoteHosts(read.verb, read.operands));
 	return hosts.size > 0 && transcript.some(said => namesAnchor(said, hosts));
 }

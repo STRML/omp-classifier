@@ -16,6 +16,7 @@ On an UNSURE, `escalates_privilege` no longer bars review when the user's words,
 | UNSURE, `escalates_privilege`, host never named | skipped, as before |
 | UNSURE, local `sudo` whose operand the user named | skipped, as before |
 | UNSURE, ssh run through a variable (`$SSH '…'`) | skipped: there is no host to name |
+| UNSURE, the named ssh plus any second command (`; ssh <other host>`, `&& sudo …`) | skipped: the command must be that one ssh, scp or rsync, with only a leading `cd` and a trailing output filter around it |
 | UNSAFE with `escalates_privilege` | skipped, as before |
 | `exposes_secrets`, `sends_local_data_outbound`, `state_contains_injection` | skipped, as before |
 | headless session | skipped, as before |
