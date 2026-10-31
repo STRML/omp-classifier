@@ -8,7 +8,7 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 The security review of https://github.com/STRML/omp-classifier/pull/228 found four more places bash evaluates a value the gate did not read:
 
-- A builtin that takes a variable name evaluates a subscript in it, so `unset 'a[$(cmd)]'` runs `cmd` and `read "a[w]"` evaluates `w`. Each of `unset`, `read`, `declare`, `typeset`, `local`, `export`, `readonly`, `mapfile`, `getopts`, `printf`, `wait`, `let`, `test` and `[`, handed a word shaped `name[expr]` with anything but an integer inside, now refuses. So does `[[ -v ]]` or `[[ -R ]]` on anything but a plain name.
+- A builtin that takes a variable name evaluates a subscript in it, so `unset 'a[$(cmd)]'` runs `cmd` and `read "a[w]"` evaluates `w`. Each of `unset`, `read`, `declare`, `typeset`, `local`, `export`, `readonly`, `mapfile`, `getopts`, `printf`, `wait`, `let`, `test` and `[`, handed a word shaped `name[expr]` with anything but an integer inside, now refuses. So does `[[ -v ]]`, `[[ -R ]]`, `test -v`, `[ -R ]` or `wait -p` on anything but a plain name written in the text.
 - Arithmetic read only `Lit` nodes, so `(( 'w' ))` and `let "w"` (quoted operands) passed. Arithmetic is now an allowlist: integer literals under arithmetic operators read nothing, and any other node counts as reading.
 - `for (( i=w; ...; ... ))` headers are arithmetic and are checked now.
 - `${!w}` expands the variable whose name is the value of `w`, and a subscript in that value is evaluated, so indirect expansion refuses.

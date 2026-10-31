@@ -286,6 +286,14 @@ function writesHiddenName(command: ShellCommand): string | undefined {
 	if (verb !== undefined && NAME_TAKERS.has(verb.value) && command.words.slice(1).some(word => SUBSCRIPTED_NAME.test(word.value))) {
 		return `${verb.value} evaluates the subscript in a name it is given`;
 	}
+	// `test -v NAME`, `[ -R NAME ]` and `wait -p NAME` take a variable name
+	// as the word after the flag, and a value built at run time can carry a
+	// subscript (`n='a[$(cmd)]'; [ -v "$n" ]`).
+	const takesName = (flags: readonly string[]): boolean =>
+		command.words.some((word, index) => index > 0 && flags.includes(word.value) && !(command.words[index + 1]?.fixed && /^[A-Za-z_][A-Za-z0-9_]*$/u.test(command.words[index + 1]?.value ?? "")));
+	if (verb !== undefined && (((verb.value === "test" || verb.value === "[") && takesName(["-v", "-R"])) || (verb.value === "wait" && takesName(["-p"])))) {
+		return `${verb.value} evaluates the subscript in a name it is given`;
+	}
 	// A verb spelled by an expansion can be any of those builtins: refuse it
 	// with an argument shaped like a name to write or one built at run time.
 	if (verb !== undefined && !verb.literal && command.words.slice(1).some(word => !word.fixed || ASSIGNMENT_SHAPED.test(word.value) || SUBSCRIPTED_NAME.test(word.value))) {
