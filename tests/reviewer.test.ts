@@ -617,9 +617,21 @@ describe("escalates_privilege on a remote host the user named", () => {
 		expect(reviewerAudit()).toMatchObject({ skipped: "hazard escalates_privilege" });
 	});
 
-	test("an UNSAFE stays barred even when the user named the host", async () => {
-		setJevAnswer(jevUnsafeAnswer({ escalates_privilege: jevNoul(0.88) }));
+	test("an UNSAFE reaches the reviewer too when the user named the host", async () => {
+		// OMP session 01a17b9f: the same root ssh climbed from 0.64 to 0.94 on
+		// repeated retries and the UNSAFE then barred the reviewer, so the user's
+		// "you run this" could not reach a decision. Naming the host is the same
+		// consent question at either verdict.
+		setJevAnswer(jevUnsafeAnswer({ escalates_privilege: jevNoul(0.94) }));
+		scriptReviewer(reviewerReply("allow", "stop content recognition service on 192.168.86.53"));
 		const result = await fire("tool_call", makeEvent(stop), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
+		expect(reviewerCalls).toHaveLength(1);
+		expect(resultText(result)).toBe("ALLOWED");
+	});
+
+	test("an UNSAFE on an unnamed host stays barred", async () => {
+		setJevAnswer(jevUnsafeAnswer({ escalates_privilege: jevNoul(0.94) }));
+		const result = await fire("tool_call", makeEvent(stop), uiCtx(nextSession(), [user("u1", "run it")]));
 		expect(refusalOf(result).layer).toBe("unsafe");
 		expect(reviewerCalls).toHaveLength(0);
 		expect(reviewerAudit()).toMatchObject({ skipped: "hazard escalates_privilege" });
@@ -677,6 +689,37 @@ describe("escalates_privilege on a remote host the user named", () => {
 		await fire("tool_call", makeEvent(indirect), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
 		expect(reviewerCalls).toHaveLength(0);
 		expect(reviewerAudit()).toMatchObject({ skipped: "hazard escalates_privilege" });
+	});
+});
+
+describe("exposes_secrets on an identity file presented to the host the user named", () => {
+	// OMP session 01a17b9f: `ssh -i ~/.ssh/tv_root_ed25519 … root@192.168.86.53`
+	// scored exposes_secrets 0.57, above the review line, so even with the
+	// privilege exemption the reviewer never saw the user's permission. The key's
+	// signature is what travels; the value stays on this machine.
+	const keyed = "ssh -i ~/.ssh/tv_root_ed25519 -o BatchMode=yes root@192.168.86.53 'systemctl status x'";
+	const named = () => [user("u1", "check that service on 192.168.86.53")];
+	const secret = () => jevUnsafeAnswer({ escalates_privilege: jevNoul(0.2), exposes_secrets: jevNoul(0.72) });
+
+	test("the reviewer reads it when the user named the host", async () => {
+		setJevAnswer(secret());
+		scriptReviewer(reviewerReply("allow", "check that service on 192.168.86.53"));
+		const result = await fire("tool_call", makeEvent(keyed), uiCtx(nextSession(), named()));
+		expect(reviewerCalls).toHaveLength(1);
+		expect(resultText(result)).toBe("ALLOWED");
+	});
+
+	test.each([
+		["a host nobody named", "ssh -i ~/.ssh/tv_root_ed25519 root@10.0.0.9 'systemctl status x'"],
+		["no identity file at all", "ssh -o BatchMode=yes root@192.168.86.53 'systemctl status x'"],
+		["a second secret-shaped word", "ssh -i ~/.ssh/tv_root_ed25519 root@192.168.86.53 'cat /root/.env'"],
+		["a keychain read alongside it", "ssh -i ~/.ssh/tv_root_ed25519 root@192.168.86.53 'id' && security find-generic-password -s x -w"],
+		["a transfer program that runs its own command", "scp -S ./evil -i ~/.ssh/tv_root_ed25519 local.txt root@192.168.86.53:/tmp/"],
+	])("%s stays hard", async (_name, command) => {
+		setJevAnswer(secret());
+		await fire("tool_call", makeEvent(command), uiCtx(nextSession(), named()));
+		expect(reviewerCalls).toHaveLength(0);
+		expect(reviewerAudit()).toMatchObject({ skipped: "hazard exposes_secrets" });
 	});
 });
 

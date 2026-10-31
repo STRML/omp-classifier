@@ -102,8 +102,12 @@ Output `hostHandoff`: `run` | `block` | `host-prompt` (a static prompt rule: the
 ## Refusal memory sources (`addRefusal` source field)
 
 `cap` (length or script-body), `critical`, `model` (UNSAFE with persistRefusal). Each records
-the newest user message id (`newestUserMessageId`). Fed back to the judge as
-`recordExtras.priorRefusal`. A record is never erased mid-session; `priorRefusalFor` ignores evidence
+the newest user message id (`newestUserMessageId`). The record is the gate's own bookkeeping and
+is never sent to the judge: it used to ride in the state as `recordExtras.priorRefusal`, and a
+retry scored lower on every pass until a hazard crossed its block line and no chat reply could
+clear it. `logJudgedStates` therefore holds no refusal record; the audit line's `priorRefusal`
+field says when the memory, not the verdict, decided a block. A record is never erased
+mid-session; `priorRefusalFor` ignores evidence
 changes. One bash call runs past a model refusal when `priorRefusalLifts` holds: SAFE,
 authorization `grounded`, and `literalMatch` over the user messages after the recorded one
 (`userMessagesSince`). Or when `reviewerLifts` holds: a stage 2 allow whose quote is in the

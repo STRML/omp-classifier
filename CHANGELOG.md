@@ -4,6 +4,18 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### A host you named reaches the reviewer at UNSAFE too, and refusal memory stops deciding the next verdict
+
+OMP session `01a17b9f`, 2026-10-30/31: the user asked for root ssh to their own TV, said "you run it" repeatedly, and every attempt was refused. The same command scored `escalates_privilege` 0.63, 0.64, 0.70, 0.80, 0.87, 0.88 across six retries, then 0.94 twice the next day. At or above `hazardBlock` the derive takes branch 1 to UNSAFE, and an UNSAFE with that hazard was barred from the reviewer unconditionally, so the user's permission never reached a decision. The message was in the state and the v3 shadow read it as `authorization: goal`; the live jev-v2 path does not consult authorization at all.
+
+| What was wrong | Change |
+|---|---|
+| `escalates_privilege` barred the reviewer on an UNSAFE even when the user named every host the command acts on | the named-host exemption (`namesRemoteHost`) now covers UNSAFE, not just UNSURE; a local sudo, an unnamed host and `destructive_or_irreversible` stay barred |
+| `exposes_secrets` 0.57 on `ssh -i ~/.ssh/key root@host` barred the same command even after that | it yields only for a remote command whose one local secret is the identity file it presents — allowlisted options, named hosts, no other secret-shaped word |
+| The gate's own refusal rode in the judge's state (`recordExtras.priorRefusal`), and each retry scored lower | refusal memory stays out of the state entirely; the refusal still blocks a retried SAFE and still needs the user's words or the reviewer to lift it, and the audit line records `priorRefusal: true` when the memory decided the block |
+
+`logJudgedStates` no longer carries a refusal record, and `tests/refusal-memory.test.ts` reads the audit line instead of the judged state.
+
 ### A sibling host in the domain the user named is not a lookalike
 
 https://github.com/STRML/omp-classifier/issues/179. The lookalike measurement reported any destination that shared two trailing labels with a host the user named, so `curl https://api.example.com/health` under "the status page at status.example.com" asked on every model. It now reads the public suffix list (private section included) through `tldts`, the plugin's second runtime dependency:
