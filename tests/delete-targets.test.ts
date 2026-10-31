@@ -16,6 +16,7 @@ import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, w
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildJevState, gateTempRoots, jevQuestions, JEV_POLICY_VERSION, JEV_V3_POLICY_VERSION, measureDeleteTargets } from "../jev";
+import { shellTmpdirFor, touchesShellEnv } from "../index";
 import { fire, jevSafeAnswer, loadPlugin, makeCtx, makeEvent, makeSettings, modelCalls, removeConfigFile, setJevAnswer, stateOf } from "./fixtures";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "delete-targets-")));
@@ -84,6 +85,7 @@ describe("measureDeleteTargets", () => {
 
 	test("an expansion is never resolved with the gate's own environment", () => {
 		expect(flags(`TMPDIR=$HOME; trash "$TMPDIR/Documents/notes.md"`)).toEqual([null]);
+		// Without a shell TMPDIR the caller vouches for, `$TMPDIR` stays unread.
 		expect(flags(`trash "$TMPDIR/run/report.json"`)).toEqual([null]);
 		// A quoted `~` is a file named `~`, not HOME.
 		expect(flags(`trash "~/Documents/report.pdf"`)).toEqual([null]);
@@ -91,6 +93,63 @@ describe("measureDeleteTargets", () => {
 		expect(flags(`trash ${tmp}/*.md`)).toEqual([null]);
 		// A prefix assignment rides on the delete itself.
 		expect(flags(`FOO=1 trash ${tmp}/notes.md`)).toEqual([null]);
+	});
+
+	describe("$TMPDIR read with the shell's own value (#176)", () => {
+		const withShell = (command: string, shellTmpdir: string | null = tmp, cwd = home) => measureDeleteTargets(command, cwd, roots, shellTmpdir)?.map(entry => entry.underTempRoot);
+
+		test("a file under the shell's TMPDIR measures true, in each spelling", () => {
+			expect(measureDeleteTargets(`trash "$TMPDIR/run/report.json"`, home, roots, tmp)).toEqual([{ target: "$TMPDIR/run/report.json", underTempRoot: true }]);
+			expect(withShell(`trash "\${TMPDIR}/run/report.json"`)).toEqual([true]);
+			expect(withShell("trash $TMPDIR/run/report.json")).toEqual([true]);
+			expect(withShell("rm -rf $TMPDIR/run")).toEqual([true]);
+			// A trailing slash on the value joins cleanly.
+			expect(withShell(`trash "$TMPDIR/notes.md"`, `${tmp}/`)).toEqual([true]);
+		});
+
+		test("the expanded path is measured like any literal one", () => {
+			expect(withShell(`trash "$TMPDIR"`)).toEqual([false]);
+			expect(withShell(`trash "$TMPDIR/../home/notes.md"`)).toEqual([false]);
+			expect(withShell(`trash "$TMPDIR/docs-link/report.pdf"`)).toEqual([false]);
+			expect(withShell(`trash "$TMPDIR/missing.txt"`)).toEqual([null]);
+			// A TMPDIR outside every temp root is no temp directory.
+			expect(withShell(`trash "$TMPDIR/notes.md"`, home)).toEqual([false]);
+		});
+
+		test("an unknown shell TMPDIR leaves it unread", () => {
+			expect(withShell(`trash "$TMPDIR/run/report.json"`, null)).toEqual([null]);
+			expect(withShell(`trash "$TMPDIR/run/report.json"`, "relative/tmp")).toEqual([null]);
+		});
+
+		test("only a bare $TMPDIR with a plain path after it is read", () => {
+			expect(withShell(`trash "\${TMPDIR:-/tmp}/run/report.json"`)).toEqual([null]);
+			expect(withShell(`trash "$TMPDIRX/run/report.json"`)).toEqual([null]);
+			expect(withShell(`trash "$TMPDIR/$NAME"`)).toEqual([null]);
+			expect(withShell(`trash "$TMPDIR"/*.md`)).toEqual([null]);
+			expect(withShell("trash $TMPDIR/*.md")).toEqual([null]);
+			expect(withShell(`trash "$TMPDIR/$(echo run)"`)).toEqual([null]);
+			expect(withShell(`trash x"$TMPDIR/notes.md"`)).toEqual([null]);
+		});
+
+		test("an unquoted $TMPDIR whose value would split or glob is not read", () => {
+			const spaced = join(tmp, "with space");
+			expect(withShell("trash $TMPDIR/a b.txt", spaced)).toEqual([null, null]);
+			expect(withShell(`trash "$TMPDIR/a b.txt"`, spaced)).toEqual([true]);
+			// An extglob pattern in the value expands to other names when the shell
+			// has extglob on; quoted, it is a literal directory name.
+			const pattern = join(tmp, "@(run|x)");
+			mkdirSync(pattern, { recursive: true });
+			writeFileSync(join(pattern, "f.txt"), "x");
+			expect(withShell("trash $TMPDIR/f.txt", pattern)).toEqual([null]);
+			expect(withShell(`trash "$TMPDIR/f.txt"`, pattern)).toEqual([true]);
+		});
+
+		test("anything on the line that could repoint TMPDIR or the path still unmeasures it", () => {
+			expect(withShell(`TMPDIR=${home}; trash "$TMPDIR/notes.md"`)).toEqual([null]);
+			expect(withShell(`TMPDIR=${home} trash "$TMPDIR/notes.md"`)).toEqual([null]);
+			expect(withShell(`export TMPDIR=${home}; trash "$TMPDIR/notes.md"`)).toEqual([null]);
+			expect(withShell(`ln -sfn ${home} ${tmp}/run && trash "$TMPDIR/run/report.json"`)).toEqual([null]);
+		});
 	});
 
 	test("~ reads the gate's home in the direction that asks only", () => {
@@ -297,6 +356,145 @@ describe("delete targets through the gate", () => {
 		}
 	});
 
+	/** Runs `command` with the process TMPDIR pointed at `shellTmp`, from `cwd`. */
+	const stateWithTmpdir = async (shellTmp: string, command: string, cwd: string): Promise<Array<Record<string, unknown>>> => {
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = shellTmp;
+		try {
+			const before = modelCalls.length;
+			await fire("tool_call", makeEvent(command), makeCtx({ sessionId: session(), cwd }));
+			return stateOf(before).deleteTargets as Array<Record<string, unknown>>;
+		} finally {
+			if (saved === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = saved;
+		}
+	};
+
+	test("a $TMPDIR operand is read with the gate's TMPDIR when nothing can rewrite it", async () => {
+		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-")));
+		try {
+			mkdirSync(join(real, "x"));
+			writeFileSync(join(real, "x", "probe.md"), "x");
+			const entries = await stateWithTmpdir(real, 'trash "$TMPDIR/x/probe.md"', home);
+			expect(entries).toHaveLength(1);
+			expect(entries[0]).toMatchObject({ target: '$TMPDIR/x/probe.md', underTempRoot: true });
+		} finally {
+			rmSync(real, { recursive: true, force: true });
+		}
+	});
+
+	test("a $TMPDIR operand stays unmeasured after an earlier call in the session may have changed the shell", async () => {
+		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-touched-")));
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = real;
+		try {
+			mkdirSync(join(real, "x"));
+			writeFileSync(join(real, "x", "probe.md"), "x");
+			const command = 'trash "$TMPDIR/x/probe.md"';
+			const flagFor = async (id: string, line: string): Promise<unknown> => {
+				const before = modelCalls.length;
+				await fire("tool_call", makeEvent(line), makeCtx({ sessionId: id, cwd: home }));
+				return (stateOf(before).deleteTargets as Array<Record<string, unknown>> | undefined)?.[0]?.underTempRoot;
+			};
+			const touched = session();
+			const clean = session();
+			expect(await flagFor(touched, "export IFS=/")).toBeUndefined();
+			expect(await flagFor(touched, command)).toBeNull();
+			// The persistent shell is per session: another one is unaffected.
+			expect(await flagFor(clean, "ls -la")).toBeUndefined();
+			expect(await flagFor(clean, command)).toBe(true);
+		} finally {
+			if (saved === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = saved;
+			rmSync(real, { recursive: true, force: true });
+		}
+	});
+
+	test("the latch survives a session boundary and a builtin that writes a variable trips it", async () => {
+		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-bound-")));
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = real;
+		try {
+			mkdirSync(join(real, "x"));
+			writeFileSync(join(real, "x", "probe.md"), "x");
+			const command = 'trash "$TMPDIR/x/probe.md"';
+			const flagFor = async (ctx: ReturnType<typeof makeCtx>, line: string): Promise<unknown> => {
+				const before = modelCalls.length;
+				await fire("tool_call", makeEvent(line), ctx);
+				return (stateOf(before).deleteTargets as Array<Record<string, unknown>> | undefined)?.[0]?.underTempRoot;
+			};
+			const ctx = makeCtx({ sessionId: session(), cwd: home });
+			await flagFor(ctx, 'declare "TMP""DIR=/Users"');
+			expect(await flagFor(ctx, command)).toBeNull();
+			for (const event of ["session_start", "session_before_switch", "session_switch", "session_shutdown"]) {
+				await fire(event, {}, ctx);
+				expect(await flagFor(ctx, command)).toBeNull();
+			}
+		} finally {
+			if (saved === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = saved;
+			rmSync(real, { recursive: true, force: true });
+		}
+	});
+
+	test("a call from a directory with an .envrc latches the session: direnv may have changed the shell", async () => {
+		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-direnv-")));
+		const withEnvrc = join(real, "repo");
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = real;
+		try {
+			mkdirSync(join(real, "x"));
+			mkdirSync(withEnvrc);
+			writeFileSync(join(real, "x", "probe.md"), "x");
+			writeFileSync(join(withEnvrc, ".envrc"), "unset TMPDIR\n");
+			const id = session();
+			await fire("tool_call", makeEvent("ls"), makeCtx({ sessionId: id, cwd: withEnvrc }));
+			const before = modelCalls.length;
+			await fire("tool_call", makeEvent('trash "$TMPDIR/x/probe.md"'), makeCtx({ sessionId: id, cwd: home }));
+			expect((stateOf(before).deleteTargets as Array<Record<string, unknown>>)[0].underTempRoot).toBeNull();
+		} finally {
+			if (saved === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = saved;
+			rmSync(real, { recursive: true, force: true });
+		}
+	});
+
+	test("a leading cd into a directory with an .envrc latches the session too", async () => {
+		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-cd-")));
+		const withEnvrc = join(real, "repo");
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = real;
+		try {
+			mkdirSync(join(real, "x"));
+			mkdirSync(withEnvrc);
+			writeFileSync(join(real, "x", "probe.md"), "x");
+			writeFileSync(join(withEnvrc, ".envrc"), "unset TMPDIR\n");
+			const id = session();
+			await fire("tool_call", makeEvent(`cd ${withEnvrc} && true`), makeCtx({ sessionId: id, cwd: home }));
+			const before = modelCalls.length;
+			await fire("tool_call", makeEvent('trash "$TMPDIR/x/probe.md"'), makeCtx({ sessionId: id, cwd: home }));
+			expect((stateOf(before).deleteTargets as Array<Record<string, unknown>>)[0].underTempRoot).toBeNull();
+		} finally {
+			if (saved === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = saved;
+			rmSync(real, { recursive: true, force: true });
+		}
+	});
+
+	test("a $TMPDIR operand stays unmeasured when an .envrc sits in the working directory", async () => {
+		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-envrc-")));
+		try {
+			mkdirSync(join(real, "x"));
+			writeFileSync(join(real, "x", "probe.md"), "x");
+			writeFileSync(join(real, ".envrc"), "export TMPDIR=$HOME\n");
+			const entries = await stateWithTmpdir(real, 'trash "$TMPDIR/x/probe.md"', real);
+			expect(entries).toHaveLength(1);
+			expect(entries[0].underTempRoot).toBeNull();
+		} finally {
+			rmSync(real, { recursive: true, force: true });
+		}
+	});
+
 	test("a command with no delete carries no field", async () => {
 		const before = modelCalls.length;
 		await fire("tool_call", makeEvent("ls -la"), makeCtx({ sessionId: session(), cwd: home }));
@@ -329,4 +527,84 @@ describe("delete targets through the gate", () => {
 			rmSync(outside, { recursive: true, force: true });
 		}
 	});
+});
+
+describe("shellTmpdirFor", () => {
+	const cwd = mkdtempSync(join(base, "shell-tmpdir-"));
+	const nested = join(cwd, "a", "b");
+	mkdirSync(nested, { recursive: true });
+
+	test("returns the process TMPDIR when no .envrc is above the working directories", () => {
+		expect(shellTmpdirFor([cwd], { TMPDIR: "/var/folders/zz/T" })).toBe("/var/folders/zz/T");
+	});
+
+	test("is null when TMPDIR is unset or empty", () => {
+		expect(shellTmpdirFor([cwd], {})).toBeNull();
+		expect(shellTmpdirFor([cwd], { TMPDIR: "" })).toBeNull();
+	});
+
+	test("is null when an .envrc sits at or above any of the working directories", () => {
+		writeFileSync(join(cwd, ".envrc"), "export TMPDIR=/x\n");
+		try {
+			expect(shellTmpdirFor([cwd], { TMPDIR: "/var/folders/zz/T" })).toBeNull();
+			expect(shellTmpdirFor([nested], { TMPDIR: "/var/folders/zz/T" })).toBeNull();
+			expect(shellTmpdirFor([home, nested], { TMPDIR: "/var/folders/zz/T" })).toBeNull();
+		} finally {
+			rmSync(join(cwd, ".envrc"), { force: true });
+		}
+		expect(shellTmpdirFor([nested], { TMPDIR: "/var/folders/zz/T" })).toBe("/var/folders/zz/T");
+	});
+
+	test("is null once an earlier command in the shell may have changed it", () => {
+		expect(shellTmpdirFor([cwd], { TMPDIR: "/var/folders/zz/T" }, true)).toBeNull();
+	});
+
+	test("is null when the host prepends a shell prefix to every command", () => {
+		expect(shellTmpdirFor([cwd], { TMPDIR: "/var/folders/zz/T", PI_SHELL_PREFIX: "TMPDIR=/Users;" })).toBeNull();
+		expect(shellTmpdirFor([cwd], { TMPDIR: "/var/folders/zz/T", CLAUDE_CODE_SHELL_PREFIX: "TMPDIR=/Users;" })).toBeNull();
+		expect(shellTmpdirFor([cwd], { TMPDIR: "/var/folders/zz/T", PI_SHELL_PREFIX: "" })).toBe("/var/folders/zz/T");
+	});
+
+	test("reads process.env by default", () => {
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = "/var/folders/yy/T";
+		try {
+			expect(shellTmpdirFor([cwd])).toBe("/var/folders/yy/T");
+		} finally {
+			if (saved === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = saved;
+		}
+	});
+});
+
+describe("touchesShellEnv", () => {
+	const touching = [
+		// the names, spelled out
+		"export TMPDIR=/Users", "TMPDIR=/x", "unset TMPDIR", "IFS=/", "export IFS=:", "echo ${TMPDIR:=/x}", "for TMPDIR in /a /b; do ls; done",
+		// text or a file run in the current shell
+		'eval "$setup"', "source ./env.sh", ". ./env.sh", "ls && . ./env.sh", "shopt -s extglob",
+		// builtins that write a variable, whatever the name looks like
+		"declare -x TMPDIR=/y", 'declare "TMP""DIR=/x"', 'typeset "T"MPDIR=/x', "export ${v}=/x", 'export "$v=/x"', "local x=1", "readonly X=1",
+		"read -r TMPDIR", "read name", "printf -v name %s /x", "printf -vname %s /x", "mapfile -t lines < f", "readarray lines < f", "unset v", "set -a", "getopts ab opt",
+		// wrappers, lookups and traps
+		"command export X=1", "builtin export X=1", "enable -n test", "alias trash=ls", "unalias -a", "trap 'IFS=/' DEBUG", "exec 3>&1", "exec bash",
+		// shapes the gate cannot read
+		// arithmetic hidden in a test, a subscript or an offset
+		"[[ $((IFS=x)) ]]", "[[ a -eq b ]]", "[[ -n x ]]", "echo ${a[i=1]}", "echo ${s:i=2}", "echo ${s:1:2}", 'echo "${a[$(cmd)]}"',
+		// an option an expansion spells
+		'printf "${OPT:--v}" T"MP"DIR /Users', 'printf "$opt" x',
+		"FOO=1", 'v=1; ls', "$cmd x", '"$cmd" x', "f() { export A=1; }", "(( X=1 ))", "echo $(( X=1 ))", "let x=1", "echo (",
+	];
+	for (const command of touching) {
+		test(`trips on ${command}`, () => {
+			expect(touchesShellEnv(command)).toBe(true);
+		});
+	}
+
+	const quiet = ['trash "$TMPDIR/x"', "ls $TMPDIR", "echo ${TMPDIR}/a", "echo $IFS", "ls . src", "cat file.txt", "git status", "bun run evaluate", "echo sourcemap", "FOO=1 ls", 'printf "%s\\n" x', "ls | head -3", "cd /tmp && ls", "echo $(date)"];
+	for (const command of quiet) {
+		test(`stays quiet on ${command}`, () => {
+			expect(touchesShellEnv(command)).toBe(false);
+		});
+	}
 });

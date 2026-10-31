@@ -2720,8 +2720,10 @@ function deleteLineIsInert(commands: readonly ShellCommand[]): boolean {
 		// Every word reaches the command as written: `-[a]` or `-{f,x}` reads as
 		// a flag here and globs or brace-expands into operands the gate never
 		// saw, and `$VAR` may split into several. `~` expands to one word and
-		// is measured toward false only, so it stays.
-		if (!command.words.every(word => word.fixed)) return false;
+		// is measured toward false only, so it stays. A `$TMPDIR` operand is
+		// one word whenever the gate can expand it (#176); the operand measure
+		// decides that.
+		if (!command.words.every(word => word.fixed || tmpdirOperand(word) !== null)) return false;
 		const verb = literalVerb(command);
 		if (DELETE_NEIGHBOUR_VERBS[verb] !== true) return false;
 		return DELETE_VERBS[verb] === true || pinnedDirectoryChange(command);
@@ -2785,8 +2787,13 @@ const strictlyInside = (real: string, roots: readonly string[]): boolean => root
  * name must sit inside a temp root: a link inside temp that points outside is
  * read as where it points, which is what `rm -r link/` deletes.
  */
-function measureDeleteOperand(word: ShellWord, cwd: string | null, roots: readonly string[]): boolean | null {
+function measureDeleteOperand(word: ShellWord, cwd: string | null, roots: readonly string[], shellTmpdir: string | null): boolean | null {
 	if (cwd === null || word.substitution) return null;
+	const underTmpdir = tmpdirOperand(word);
+	if (underTmpdir !== null) {
+		const expanded = expandTmpdirOperand(underTmpdir, shellTmpdir);
+		return expanded === null ? null : landsUnderTempRoot(expanded, roots);
+	}
 	// An unquoted `~` or `~/…` is the shell's HOME, which a repo's direnv or the
 	// session's shell snapshot may set differently from this process's. The
 	// gate's own home stands in for it only in the direction that asks: a path
@@ -2800,6 +2807,37 @@ function measureDeleteOperand(word: ShellWord, cwd: string | null, roots: readon
 	// that the gate leaves unread rather than guessing which spelling it is.
 	if (word.value === "" || word.value.startsWith("~") || /[*?[{]/u.test(word.value)) return null;
 	return landsUnderTempRoot(isAbsolute(word.value) ? word.value : `${cwd}${sep}${word.value}`, roots);
+}
+
+/** `$TMPDIR` or `${TMPDIR}` opening a word, optionally double-quoted as a
+ *  whole, followed by nothing or a plain `/path`: no other expansion, quote,
+ *  escape, glob or brace. `${TMPDIR:-x}`, `$TMPDIRX` and `"$TMPDIR"/*.md` do
+ *  not match. */
+const TMPDIR_OPERAND = /^(")?\$(?:TMPDIR(?![A-Za-z0-9_])|\{TMPDIR\})(\/[^"'$`\\*?[{]*)?\1$/u;
+
+/** What an unquoted expansion may hold and still stay one literal word: the
+ *  shell expands glob and extglob patterns (`@(a|b)`, `!(x)`) in it, so only
+ *  characters with no meaning there are trusted. (Splitting on a changed `IFS`
+ *  is the caller's to rule out: the session latch in index.ts.) */
+const UNQUOTED_SAFE_PATH = /^[A-Za-z0-9_.\/+@%,:=-]*$/u;
+
+/** The parts of a `$TMPDIR` operand, or null when the word is any other shape. */
+function tmpdirOperand(word: ShellWord): { quoted: boolean; rest: string } | null {
+	const match = TMPDIR_OPERAND.exec(word.source);
+	if (match === null || word.substitution) return null;
+	return { quoted: match[1] === "\"", rest: match[2] ?? "" };
+}
+
+/**
+ * The path a `$TMPDIR` operand names in the shell that runs it (#176). The
+ * caller supplies the shell's `TMPDIR`, or null when it cannot vouch for it (a
+ * repo's `.envrc` may set its own). Unquoted, the value must also be free of
+ * characters a glob or extglob pattern could act on.
+ */
+function expandTmpdirOperand(operand: { quoted: boolean; rest: string }, shellTmpdir: string | null): string | null {
+	if (shellTmpdir === null || !isAbsolute(shellTmpdir)) return null;
+	if (!operand.quoted && !(UNQUOTED_SAFE_PATH.test(shellTmpdir) && UNQUOTED_SAFE_PATH.test(operand.rest))) return null;
+	return shellTmpdir.replace(/\/+$/u, "") + operand.rest;
 }
 
 /**
@@ -2843,9 +2881,10 @@ function landsUnderTempRoot(path: string, roots: readonly string[]): boolean | n
  * delete, or one the parser could not read, carries no field. A delete whose
  * line holds anything that could change the filesystem first measures every
  * operand null, and so does any operand with an expansion, a glob, a `~`, or a
- * path that does not exist.
+ * path that does not exist. The one expansion read is a leading `$TMPDIR`,
+ * and only with `shellTmpdir`, the value the caller vouches the shell holds.
  */
-export function measureDeleteTargets(command: string, cwd: string, roots: readonly string[] = gateTempRoots()): DeleteTarget[] | undefined {
+export function measureDeleteTargets(command: string, cwd: string, roots: readonly string[] = gateTempRoots(), shellTmpdir: string | null = null): DeleteTarget[] | undefined {
 	const parsed = parseShell(command);
 	if (!parsed.ok || parsed.commands.some(entry => entry.unreadShape !== undefined)) return undefined;
 	const deletes = parsed.commands.filter(entry => DELETE_VERBS[literalVerb(entry)] === true);
@@ -2863,7 +2902,7 @@ export function measureDeleteTargets(command: string, cwd: string, roots: readon
 		const segmentCwd = measurable && at !== undefined ? segmentCwdAt(masked, at, cwd) : null;
 		for (const word of deleteOperands(entry)) {
 			if (entries.length >= DELETE_TARGET_CAP) return entries;
-			entries.push({ target: word.value, underTempRoot: measurable ? measureDeleteOperand(word, segmentCwd, roots) : null });
+			entries.push({ target: word.value, underTempRoot: measurable ? measureDeleteOperand(word, segmentCwd, roots, shellTmpdir) : null });
 		}
 	}
 	return entries;
