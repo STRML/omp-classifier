@@ -382,14 +382,28 @@ function isOutputFilter(command: ShellCommand): boolean {
 	return resolved !== undefined && isSystemProgram(resolved);
 }
 
-/** `command` with a trailing output filter cut off, so `./x.sh | tail -60`
- *  and `./x.sh` name one action. Any other command comes back unchanged. */
-export function withoutOutputFilter(command: string): string {
+/** `command` with its last command cut off when `drops` accepts it. */
+function withoutTrailing(command: string, drops: (last: ShellCommand) => boolean): string {
 	const parsed = parseShell(command);
 	if (!parsed.ok || parsed.commands.length < 2) return command;
 	const last = parsed.commands[parsed.commands.length - 1];
-	if (last.sourceOffset === undefined || !hasFilterShape(last)) return command;
+	if (last.sourceOffset === undefined || !drops(last)) return command;
 	return command.slice(0, last.sourceOffset).replace(/\|&?\s*$/u, "").trimEnd();
+}
+
+/** `command` without a trailing system output filter, for checks that vouch
+ *  for what runs: the filter must resolve to a system binary. Any other
+ *  command comes back unchanged. */
+export function withoutOutputFilter(command: string): string {
+	return withoutTrailing(command, isOutputFilter);
+}
+
+/** `command` without a trailing filter-shaped command, for refusal and
+ *  reviewer-block keys: `./x.sh | tail -60` and `./x.sh` name one action under
+ *  any PATH. Dropping more than a vouched filter only widens what a key
+ *  covers, so it errs toward blocking. */
+export function withoutFilterForKey(command: string): string {
+	return withoutTrailing(command, hasFilterShape);
 }
 
 /**

@@ -579,6 +579,22 @@ describe("escalates_privilege on a remote host the user named", () => {
 		expect(reviewerCalls).toHaveLength(1);
 	});
 
+	test.each([
+		["a tail that is not on PATH", "/nonexistent"],
+		["a tail on a relative PATH entry", ".:/usr/bin:/bin"],
+	])("a root ssh piped into %s stays barred", async (_name, pathValue) => {
+		setJevAnswer(privileged());
+		const previous = process.env.PATH;
+		process.env.PATH = pathValue;
+		try {
+			const result = await fire("tool_call", makeEvent(`${stop} | tail -5`), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
+			expect(refusalOf(result).layer).toBe("unsure");
+			expect(reviewerCalls).toHaveLength(0);
+		} finally {
+			process.env.PATH = previous;
+		}
+	});
+
 	test("a URL host must be the named one: the scheme is not a host", async () => {
 		setJevAnswer(privileged());
 		await fire("tool_call", makeEvent("rsync -a ./d rsync://10.0.0.9/mod"), uiCtx(nextSession(), [user("u1", "rsync the data to 192.168.86.53")]));
