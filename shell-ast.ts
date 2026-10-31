@@ -74,6 +74,8 @@ interface ShellRuntime {
 	/** `[[ -v ]]` and `[[ -R ]]`: their operand is a variable name, and a
 	 *  subscript in it is evaluated. */
 	nameTests: ReadonlySet<number>;
+	/** The plain `=` inside arithmetic: it sets an integer without reading the name first. */
+	arithmeticAssign: number;
 }
 
 let runtime: ShellRuntime | undefined;
@@ -99,7 +101,7 @@ const deriveRuntime = (mod: unknown): ShellRuntime => {
 	 * renumbers them silently wrong in a security boundary, so each one is
 	 * read back from a parse of the spelling it belongs to.
 	 */
-	const operatorOf = (source: string, type: "Redirect" | "BinaryCmd" | "BinaryTest" | "UnaryTest"): number => {
+	const operatorOf = (source: string, type: "Redirect" | "BinaryCmd" | "BinaryTest" | "UnaryTest" | "BinaryArithm"): number => {
 		// Local walk, not the module-level one: walk() calls getShell(), and
 		// the runtime is not assigned until this function returns, so touching
 		// it here would re-enter this derivation forever.
@@ -155,7 +157,9 @@ const deriveRuntime = (mod: unknown): ShellRuntime => {
 
 	const nameTests = new Set(["-v", "-R"].map(op => operatorOf(`[[ ${op} x ]]`, "UnaryTest")));
 
-	return { syntax, parser, redirect, binary, redirectDirection, arithmeticTests, nameTests };
+	const arithmeticAssign = operatorOf("(( a = 1 ))", "BinaryArithm");
+
+	return { syntax, parser, redirect, binary, redirectDirection, arithmeticTests, nameTests, arithmeticAssign };
 };
 
 /** The live runtime, loading and deriving the parser on first use. */
@@ -1009,49 +1013,62 @@ function integerValue(word: any): boolean {
 }
 
 /**
- * The names a body fills with something the reviewer cannot vouch for as an
- * integer: an assignment from text, a substitution or another variable, an
- * array, `read`/`mapfile`/`getopts`/`printf -v` targets, a `for`/`select`
- * word list, a `${w:=…}`/`${w=…}` default (any default operator taints), and
- * the positional parameters. Arithmetic reading one of these
- * can evaluate an injected expression. A name the body never assigns comes
- * from the environment, which the session latch guards (#176).
+ * The names arithmetic may read: deny by default. A name is trusted when the
+ * body assigns it, every assignment is an integer (digits, `$(( ))`, an
+ * integer special, or a plain `=` inside arithmetic, which sets it without
+ * reading it first), and nothing else writes it. An integer special the body
+ * never writes is trusted too. Everything else is not: a name the body never
+ * assigns (bash sets `REPLY`, `MAPFILE`, `OPTARG`, `BASH_REMATCH` and more on
+ * its own, and the environment can hold anything), a positional parameter,
+ * and any name a `read`/`mapfile`/`getopts`/`printf -v`/`unset`, a `for` or
+ * `select` word, a `${w:=…}` default (any default operator counts) or a
+ * non-integer assignment touches.
  */
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function taintedNames(tree: any): Set<string> {
-	const tainted = new Set(["1", "2", "3", "4", "5", "6", "7", "8", "9", "@", "*", "0", "_"]);
+function trustedNames(tree: any): Set<string> {
+	const { arithmeticAssign } = getShell();
+	const integerAssigned = new Set<string>();
+	const written = new Set<string>();
+	const writtenNames = (words: readonly unknown[]): void => {
+		for (const word of words) {
+			const text = literalWordText(word);
+			// `-aNAME`, `-vNAME` or a bundle ending in a name: take every identifier run.
+			for (const name of text.replace(/\[.*$/u, "").match(/[A-Za-z_][A-Za-z0-9_]*/gu) ?? []) written.add(name);
+			if (text === "\0") written.add("\0");
+		}
+	};
 	walk(tree, (node: unknown) => {
 		if (!node) return true;
 		const type = nodeType(node);
 		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
 		const n = node as any;
-		if (type === "Assign" && n.Name?.Value && (n.Array || n.Index || !integerValue(n.Value))) tainted.add(n.Name.Value);
-		if ((type === "WordIter" || type === "SelectClause") && n.Name?.Value) tainted.add(n.Name.Value);
-		// `${w:=text}` and `${w=text}` assign w. Any default operator taints,
-		// which costs only a later arithmetic read of the same name.
-		if (type === "ParamExp" && n.Exp && n.Param?.Value) tainted.add(n.Param.Value);
+		if (type === "Assign" && n.Name?.Value) (n.Array || n.Index || !integerValue(n.Value) ? written : integerAssigned).add(n.Name.Value);
+		if ((type === "WordIter" || type === "SelectClause") && n.Name?.Value) written.add(n.Name.Value);
+		if (type === "ParamExp" && n.Exp && n.Param?.Value) written.add(n.Param.Value);
+		// `(( x = x + 1 ))` reads x before it sets it, so only a right side of
+		// plain integers makes the assignment one the body vouches for.
+		if (type === "BinaryArithm" && n.Op === arithmeticAssign && !arithmeticReadsAnything(n.Y, new Set()) && nodeType(n.X) === "Word" && (n.X.Parts ?? []).length === 1 && nodeType(n.X.Parts[0]) === "Lit") integerAssigned.add(n.X.Parts[0].Value ?? "");
 		if (type === "CallExpr") {
 			// biome-ignore lint/suspicious/noExplicitAny: untyped AST
 			const words: any[] = n.Args ?? [];
 			const verb = words[0] && literalWordText(words[0]);
-			const writes = INPUT_WRITERS.has(verb) || (verb === "printf" && words.some((word: unknown) => /^-[A-Za-z]*v/u.test(literalWordText(word))));
-			if (writes) for (const word of words.slice(1)) {
-				const name = literalWordText(word).replace(/\[.*$/u, "");
-				if (IDENTIFIER.test(name)) tainted.add(name);
-			}
+			if (INPUT_WRITERS.has(verb) || verb === "unset" || verb === "printf") writtenNames(words.slice(1));
 		}
 		return true;
 	});
-	return tainted;
+	const trusted = new Set<string>();
+	for (const name of integerAssigned) if (!written.has(name) && !INTEGER_SPECIALS.has(name)) trusted.add(name);
+	for (const name of INTEGER_SPECIALS) if (!written.has(name) && !integerAssigned.has(name)) trusted.add(name);
+	return trusted;
 }
 
 /** Whether an arithmetic expression (or any node under it) reads something
- *  that is not an integer the body can vouch for: a tainted name, a quoted
+ *  that is not an integer the body can vouch for: an untrusted name, a quoted
  *  word, a substitution, or any node outside integer arithmetic. */
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function arithmeticReadsAnything(node: any, tainted: ReadonlySet<string>): boolean {
+function arithmeticReadsAnything(node: any, trusted: ReadonlySet<string>): boolean {
 	if (!node) return false;
-	if (Array.isArray(node)) return node.some(inner => arithmeticReadsAnything(inner, tainted));
+	if (Array.isArray(node)) return node.some(inner => arithmeticReadsAnything(inner, trusted));
 	let reads = false;
 	walk(node, (inner: unknown) => {
 		if (reads || !inner) return !reads;
@@ -1060,12 +1077,12 @@ function arithmeticReadsAnything(node: any, tainted: ReadonlySet<string>): boole
 		const value: string = (inner as any).Value ?? "";
 		if (type === "ParamExp") {
 			const name = plainParam(inner);
-			reads = name === undefined || tainted.has(name);
+			reads = name === undefined || !trusted.has(name);
 			return false;
 		}
 		if (type === "Lit") {
 			if (/^[0-9\s]*$/u.test(value)) return true;
-			reads = !IDENTIFIER.test(value) || tainted.has(value);
+			reads = !IDENTIFIER.test(value) || !trusted.has(value);
 			return !reads;
 		}
 		if (!PLAIN_ARITHMETIC.has(type)) reads = true;
@@ -1093,8 +1110,8 @@ export function hiddenArithmetic(text: string): string | undefined {
 		return "its shell body could not be parsed";
 	}
 	const { arithmeticTests, nameTests } = getShell();
-	const tainted = taintedNames(tree);
-	const reads = (node: unknown): boolean => arithmeticReadsAnything(node, tainted);
+	const trusted = trustedNames(tree);
+	const reads = (node: unknown): boolean => arithmeticReadsAnything(node, trusted);
 	let why: string | undefined;
 	walk(tree, (node: unknown) => {
 		if (why !== undefined || !node) return why === undefined;

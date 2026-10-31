@@ -9,7 +9,7 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 Two over-refusals from today's hardening, plus one more gap.
 
 - **Every `[[ ]]` body was refused.** https://github.com/STRML/omp-classifier/pull/228 refused a verb that brace expansion or a glob rewrites, and `[[` reads as a glob character. It now gets the same exemption `[` had.
-- **Any name in arithmetic was refused**, so `start=$SECONDS; echo $((SECONDS - start))`, `n=0; (( n++ ))` and `for ((i=0; i<3; i++))` stopped stage 2 from reading the script. The danger is a name whose value the reviewer cannot see, because bash evaluates it as an expression. A name now taints only when the body fills it with something other than an integer: an assignment from text, a substitution or another variable, an array, a `read`, `mapfile`, `getopts` or `printf -v` target, a `for`/`select` word, a `${w:=…}` or `${w=…}` default (any default operator taints), or a positional parameter. Arithmetic reading a tainted name still refuses. A name the body sets only from digits, `$(( ))` or an integer special (`SECONDS`, `RANDOM`, `$#`, `$?`, …) reads, and so does one the body never assigns: that one comes from the environment, which the session shell latch from https://github.com/STRML/omp-classifier/issues/176 guards.
+- **Any name in arithmetic was refused**, so `start=$SECONDS; echo $((SECONDS - start))`, `n=0; (( n++ ))` and `for ((i=0; i<3; i++))` made the whole script unreadable. The danger is a name whose value the reviewer cannot see, because bash evaluates it as an expression. Names are now trusted deny-by-default. A name is trusted when the body assigns it, every assignment is an integer (digits, `$(( ))`, an integer special, or a plain `=` inside arithmetic whose right side is integers), and nothing else writes it. An integer special such as `SECONDS`, `RANDOM`, `$#` or `$?` is trusted when the body never writes it. Every other name is untrusted. That includes a name the body never assigns, since bash sets `REPLY`, `MAPFILE`, `OPTARG` and `BASH_REMATCH` on its own and the environment can hold anything. It also includes a name any `read` (bundled `-aNAME` too), `mapfile`, `getopts`, `printf -v` or `unset`, a `for`/`select` word, a `${w:=…}` default or a non-integer assignment touches.
 - **`declare 'a=([w]=1)'`** hands `declare` a compound assignment as text, which it parses again and whose subscripts it evaluates. `declare`, `typeset`, `local`, `readonly` and `export` now refuse a word shaped `name=(`.
 
 | Body | Before | After |
@@ -17,7 +17,7 @@ Two over-refusals from today's hardening, plus one more gap.
 | `[[ -n $x ]] && git fetch` | refused | reviewed |
 | `start=$SECONDS; echo $((SECONDS - start))` | refused | reviewed |
 | `n=0; for ((i=0; i<2; i++)); do (( n++ )); done; [[ $n -eq 2 ]]` | refused | reviewed |
-| `read -r w; echo $((w + 1))`, `w=$(cat f); (( w++ ))`, `(( $1 ))` | refused | refused |
+| `read -r w; echo $((w + 1))`, `w=$(cat f); (( w++ ))`, `(( $1 ))`, `read; (( REPLY ))`, `(( i++ ))` with no assignment, `SECONDS=x; (( SECONDS ))` | refused | refused |
 | `declare 'a=([w]=1)'` | reviewed | refused |
 
 ### A program named by an expansion is never read in a script body
