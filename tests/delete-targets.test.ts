@@ -84,6 +84,7 @@ describe("measureDeleteTargets", () => {
 
 	test("an expansion is never resolved with the gate's own environment", () => {
 		expect(flags(`TMPDIR=$HOME; trash "$TMPDIR/Documents/notes.md"`)).toEqual([null]);
+		// Without a shell TMPDIR the caller vouches for, `$TMPDIR` stays unread.
 		expect(flags(`trash "$TMPDIR/run/report.json"`)).toEqual([null]);
 		// A quoted `~` is a file named `~`, not HOME.
 		expect(flags(`trash "~/Documents/report.pdf"`)).toEqual([null]);
@@ -91,6 +92,56 @@ describe("measureDeleteTargets", () => {
 		expect(flags(`trash ${tmp}/*.md`)).toEqual([null]);
 		// A prefix assignment rides on the delete itself.
 		expect(flags(`FOO=1 trash ${tmp}/notes.md`)).toEqual([null]);
+	});
+
+	describe("$TMPDIR read with the shell's own value (#176)", () => {
+		const withShell = (command: string, shellTmpdir: string | null = tmp, cwd = home) => measureDeleteTargets(command, cwd, roots, shellTmpdir)?.map(entry => entry.underTempRoot);
+
+		test("a file under the shell's TMPDIR measures true, in each spelling", () => {
+			expect(measureDeleteTargets(`trash "$TMPDIR/run/report.json"`, home, roots, tmp)).toEqual([{ target: "$TMPDIR/run/report.json", underTempRoot: true }]);
+			expect(withShell(`trash "\${TMPDIR}/run/report.json"`)).toEqual([true]);
+			expect(withShell("trash $TMPDIR/run/report.json")).toEqual([true]);
+			expect(withShell("rm -rf $TMPDIR/run")).toEqual([true]);
+			// A trailing slash on the value joins cleanly.
+			expect(withShell(`trash "$TMPDIR/notes.md"`, `${tmp}/`)).toEqual([true]);
+		});
+
+		test("the expanded path is measured like any literal one", () => {
+			expect(withShell(`trash "$TMPDIR"`)).toEqual([false]);
+			expect(withShell(`trash "$TMPDIR/../home/notes.md"`)).toEqual([false]);
+			expect(withShell(`trash "$TMPDIR/docs-link/report.pdf"`)).toEqual([false]);
+			expect(withShell(`trash "$TMPDIR/missing.txt"`)).toEqual([null]);
+			// A TMPDIR outside every temp root is no temp directory.
+			expect(withShell(`trash "$TMPDIR/notes.md"`, home)).toEqual([false]);
+		});
+
+		test("an unknown shell TMPDIR leaves it unread", () => {
+			expect(withShell(`trash "$TMPDIR/run/report.json"`, null)).toEqual([null]);
+			expect(withShell(`trash "$TMPDIR/run/report.json"`, "relative/tmp")).toEqual([null]);
+		});
+
+		test("only a bare $TMPDIR with a plain path after it is read", () => {
+			expect(withShell(`trash "\${TMPDIR:-/tmp}/run/report.json"`)).toEqual([null]);
+			expect(withShell(`trash "$TMPDIRX/run/report.json"`)).toEqual([null]);
+			expect(withShell(`trash "$TMPDIR/$NAME"`)).toEqual([null]);
+			expect(withShell(`trash "$TMPDIR"/*.md`)).toEqual([null]);
+			expect(withShell("trash $TMPDIR/*.md")).toEqual([null]);
+			expect(withShell(`trash "$TMPDIR/$(echo run)"`)).toEqual([null]);
+			expect(withShell(`trash x"$TMPDIR/notes.md"`)).toEqual([null]);
+		});
+
+		test("an unquoted $TMPDIR whose value would split or glob is not read", () => {
+			const spaced = join(tmp, "with space");
+			expect(withShell("trash $TMPDIR/a b.txt", spaced)).toEqual([null, null]);
+			expect(withShell(`trash "$TMPDIR/a b.txt"`, spaced)).toEqual([true]);
+		});
+
+		test("anything on the line that could repoint TMPDIR or the path still unmeasures it", () => {
+			expect(withShell(`TMPDIR=${home}; trash "$TMPDIR/notes.md"`)).toEqual([null]);
+			expect(withShell(`TMPDIR=${home} trash "$TMPDIR/notes.md"`)).toEqual([null]);
+			expect(withShell(`export TMPDIR=${home}; trash "$TMPDIR/notes.md"`)).toEqual([null]);
+			expect(withShell(`ln -sfn ${home} ${tmp}/run && trash "$TMPDIR/run/report.json"`)).toEqual([null]);
+		});
 	});
 
 	test("~ reads the gate's home in the direction that asks only", () => {

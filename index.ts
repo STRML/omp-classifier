@@ -93,7 +93,7 @@ import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { cfgToolsApproval } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
-import { getPluginsDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
+import { filterChildShellEnv, getPluginsDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
 import { heredocShadowedAt, maskHeredocBodiesAndAnsiSpans, openQuoteBefore, segmentWorkingDirectories, SHELL_WORD_EXPANSION } from "./shell-cwd";
 import { parseShell, substitutionSpans, verbName, type ShellCommand, type ShellRedirect } from "./shell-ast";
@@ -127,6 +127,7 @@ import {
 	type JevAnswers,
 	type JevVerdict,
 	type NetworkProvenance,
+	gateTempRoots,
 	lookalikeDestinationFlags,
 	measureDeleteTargets,
 	measureGitPushProvenance,
@@ -537,6 +538,41 @@ function normalizeUserPolicy(value: unknown): "allow" | "deny" | "prompt" | unde
 	const lowered = value.trim().toLowerCase();
 	return lowered === "allow" || lowered === "deny" || lowered === "prompt" ? lowered : undefined;
 }
+
+/**
+ * The `TMPDIR` the bash tool's shell will hold for a command started in `cwd`,
+ * or null when the gate cannot vouch for it (#176). The shell's environment is
+ * this process's, filtered the way the host filters it for child shells
+ * (`filterChildShellEnv` drops values a project dotenv file supplied), and the
+ * session's shell snapshot never exports `TMPDIR`. The one other writer is a
+ * repo's direnv, which loads the nearest `.envrc` above the start directory,
+ * so any `.envrc` there leaves the value unknown. A caller-supplied `env`
+ * blocks the call before judgment, so it never reaches this.
+ */
+export function shellTmpdirFor(cwds: readonly string[], env: Record<string, string | undefined> = process.env): string | null {
+	if (cwds.some(hasEnvrcAbove)) return null;
+	const value = filterChildShellEnv(env).TMPDIR;
+	return value === undefined || value === "" ? null : value;
+}
+
+/** Whether `cwd` or any directory above it holds an `.envrc`, the file the
+ *  host's direnv preflight walks up to. */
+function hasEnvrcAbove(cwd: string): boolean {
+	for (let dir = path.resolve(cwd); ; dir = path.dirname(dir)) {
+		try {
+			if (fs.statSync(path.join(dir, ".envrc")).isFile()) return true;
+		} catch {
+			// no .envrc here, keep walking up
+		}
+		if (path.dirname(dir) === dir) return false;
+	}
+}
+
+/** The shell's `TMPDIR` only when the command names it: the walk and the env
+ *  filter read files, and most commands have no use for either. Both the
+ *  directory the host runs the command in (after it extracts a leading `cd`)
+ *  and the one the text starts in are walked, so either `.envrc` counts. */
+const shellTmpdirIfNamed = (command: string, cwds: readonly string[]): string | null => (command.includes("TMPDIR") ? shellTmpdirFor(cwds) : null);
 
 interface CanonicalEnv {
 	key: string;
@@ -5849,7 +5885,7 @@ export default function (pi: ExtensionAPI) {
 		// `startCwd` with the unmodified text, like the push and network tiers.
 		let deleteTargets: DeleteTarget[] | undefined;
 		try {
-			deleteTargets = language === "shell" ? measureDeleteTargets(command, startCwd) : undefined;
+			deleteTargets = language === "shell" ? measureDeleteTargets(command, startCwd, gateTempRoots(), shellTmpdirIfNamed(command, [cwd, startCwd])) : undefined;
 		} catch {
 			deleteTargets = undefined;
 		}
@@ -6891,7 +6927,7 @@ export default function (pi: ExtensionAPI) {
 			const networkProvenanceForCache = measureNetworkProvenance(judgedCommand, startCwd);
 			// A delete target swapped for a link between two calls lands somewhere
 			// else (#166), so the measured landing rides in the key too.
-			const deleteTargetsForCache = measureDeleteTargets(judgedCommand, startCwd);
+			const deleteTargetsForCache = measureDeleteTargets(judgedCommand, startCwd, gateTempRoots(), shellTmpdirIfNamed(judgedCommand, [cwd, startCwd]));
 			const cacheKey = JSON.stringify([
 				config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, judgedCommand,
 				reviewEvidenceFingerprint,
