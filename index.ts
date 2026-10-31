@@ -2185,16 +2185,13 @@ const REGEX_COMPILE_ONLY = /(?<!\b(?:re|regex)\.)compile\(/;
  *  other, so they are not a rebind; any other `as re` is. */
 const REBINDS_REGEX_NAME =
 	/(?<!^\s*import\s+(?:re|regex)\s+)\bas\s+(?:re|regex)\b|(?<![\w.])(?:re|regex)\s*=(?!=)|\b(?:def|class|for)\s+(?:re|regex)\b/m;
-/** A whole-line `#` comment (or the shebang) in a file. `#` must be followed by
- *  whitespace, `!` or the line end, so a JS private field (`#run = …`) stays code. */
-const COMMENT_LINE = /^[ \t]*#(?:[ \t!].*)?$/gmu;
 
 /** Whether inline code or a script body carries a second-execution marker.
- *  `body` is true for a file read from disk, whose comment lines are dropped
- *  first; inline code keeps them, since its line breaks may not survive. */
-function hasInterpreterCodeRisk(text: string, body = false): boolean {
-	const code = body ? text.replace(COMMENT_LINE, "") : text;
-	const joined = code.replace(/\\\r?\n/gu, " ");
+ *  Comments are scanned like code: where a `#` comment ends depends on the
+ *  language (PHP ends one at `?>`, and a Python coding declaration can turn
+ *  one into code), so a comment that names an import still flags. */
+function hasInterpreterCodeRisk(text: string): boolean {
+	const joined = text.replace(/\\\r?\n/gu, " ");
 	if (INTERPRETER_CODE_RISK.test(joined)) return true;
 	if (!COMPILE_CALL.test(joined)) return false;
 	return REBINDS_REGEX_NAME.test(joined) || REGEX_COMPILE_ONLY.test(joined);
@@ -7093,7 +7090,7 @@ export default function (pi: ExtensionAPI) {
 				// script that re-execs or decodes its real work, and that must not
 				// depend on the judge noticing which file it is reading.
 				for (const body of script.bodies) {
-					if (hasInterpreterCodeRisk(body.body, true)) flags.push(`${body.verb} runs ${body.operand}`);
+					if (hasInterpreterCodeRisk(body.body)) flags.push(`${body.verb} runs ${body.operand}`);
 				}
 				const lifts =
 					prior !== undefined &&
