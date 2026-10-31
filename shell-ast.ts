@@ -1187,8 +1187,10 @@ const literalWordText = (word: any): string => {
  *  closed. */
 const PLAIN_ARITHMETIC = new Set(["Word", "Lit", "BinaryArithm", "UnaryArithm", "ParenArithm"]);
 
-/** Specials whose value bash itself sets to an integer. */
-const INTEGER_SPECIALS = new Set(["SECONDS", "RANDOM", "SRANDOM", "EPOCHSECONDS", "LINENO", "BASHPID", "PPID", "UID", "EUID", "#", "?", "$", "!"]);
+/** Specials whose value bash itself sets to an integer, in every bash that
+ *  runs a reviewed body: macOS still ships 3.2, which has no `SRANDOM`,
+ *  `EPOCHSECONDS` or `BASHPID`, so there those are ordinary names. */
+const INTEGER_SPECIALS = new Set(["SECONDS", "RANDOM", "LINENO", "PPID", "UID", "EUID", "#", "?", "$", "!"]);
 /** Names bash fills on its own (`read` with no name sets REPLY, `=~` sets
  *  BASH_REMATCH): never trusted, whatever the body assigns. */
 const BASH_MANAGED = new Set(["_", "REPLY", "MAPFILE", "OPTARG", "OPTIND", "OPTERR", "COPROC", "PIPESTATUS", "FUNCNAME", "DIRSTACK", "GROUPS", "COMP_WORDS", "COMPREPLY", "READLINE_LINE", "READLINE_POINT", "READLINE_MARK", "HISTCMD", "COLUMNS", "LINES", "PWD", "OLDPWD", "IFS", "PATH"]);
@@ -1233,7 +1235,7 @@ function integerValue(word: any): boolean {
  * non-integer assignment touches.
  */
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function trustedNames(tree: any): Set<string> {
+function trustedNames(tree: any): Map<string, number> {
 	const { arithmeticAssign } = getShell();
 	const integerAssigned = new Set<string>();
 	const written = new Set<string>();
@@ -1257,7 +1259,7 @@ function trustedNames(tree: any): Set<string> {
 		if (type === "ParamExp" && n.Exp && n.Param?.Value) written.add(n.Param.Value);
 		// `(( x = x + 1 ))` reads x before it sets it, so only a right side of
 		// plain integers makes the assignment one the body vouches for.
-		if (type === "BinaryArithm" && n.Op === arithmeticAssign && !arithmeticReadsAnything(n.Y, new Set()) && nodeType(n.X) === "Word" && (n.X.Parts ?? []).length === 1 && nodeType(n.X.Parts[0]) === "Lit") integerAssigned.add(n.X.Parts[0].Value ?? "");
+		if (type === "BinaryArithm" && n.Op === arithmeticAssign && !arithmeticReadsAnything(n.Y, new Map()) && nodeType(n.X) === "Word" && (n.X.Parts ?? []).length === 1 && nodeType(n.X.Parts[0]) === "Lit") integerAssigned.add(n.X.Parts[0].Value ?? "");
 		if (type === "CallExpr") {
 			// biome-ignore lint/suspicious/noExplicitAny: untyped AST
 			const words: any[] = n.Args ?? [];
@@ -1266,20 +1268,66 @@ function trustedNames(tree: any): Set<string> {
 		}
 		return true;
 	});
-	const trusted = new Set<string>();
+	// The name to its first top-level, unconditional integer assignment: a
+	// plain assignment statement (not a prefix on a command, not backgrounded,
+	// not inside a function, subshell, condition or loop body), a top-level
+	// `(( x = 1 ))`, or the init of a top-level `for (( x = 0; … ))`. A read
+	// earlier in the text, or one the assignment may never reach, sees
+	// whatever the name held before.
+	const defined = new Map<string, number>();
+	const define = (name: string, at: number): void => {
+		if (!defined.has(name)) defined.set(name, at);
+	};
+	// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+	const arithmeticDefines = (expr: any): void => {
+		if (expr && nodeType(expr) === "BinaryArithm" && expr.Op === arithmeticAssign && !arithmeticReadsAnything(expr.Y, new Map()) && nodeType(expr.X) === "Word" && (expr.X.Parts ?? []).length === 1 && nodeType(expr.X.Parts[0]) === "Lit") define(expr.X.Parts[0].Value ?? "", expr.End().Offset());
+	};
+	// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+	for (const stmt of (tree as any)?.Stmts ?? []) {
+		const cmd = stmt?.Cmd;
+		// A redirect on the statement (a heredoc above all) is expanded before
+		// the statement's own assignments take effect.
+		if (!cmd || stmt.Background || stmt.Coprocess || stmt.Negated || (stmt.Redirs ?? []).length > 0) continue;
+		const type = nodeType(cmd);
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		if (type === "CallExpr" && (cmd.Args ?? []).length === 0) for (const assign of cmd.Assigns ?? []) if (assign.Name?.Value && !assign.Array && !assign.Index && !assign.Append && assign.Value && integerValue(assign.Value)) define(assign.Name.Value, assign.End().Offset());
+		if (type === "ArithmCmd") arithmeticDefines(cmd.X);
+		if (type === "ForClause" && nodeType(cmd.Loop) === "CStyleLoop") arithmeticDefines(cmd.Loop.Init);
+	}
+	const trusted = new Map<string, number>();
 	// A writer whose target is built at run time (`read "$n"`) can write any
 	// name, so nothing the body assigns can be trusted.
 	if (written.has("\0")) return trusted;
-	for (const name of integerAssigned) if (!written.has(name) && !INTEGER_SPECIALS.has(name) && !bashManaged(name)) trusted.add(name);
-	for (const name of INTEGER_SPECIALS) if (!written.has(name) && !integerAssigned.has(name)) trusted.add(name);
+	for (const name of integerAssigned) {
+		const at = defined.get(name);
+		if (at !== undefined && !written.has(name) && !INTEGER_SPECIALS.has(name) && !bashManaged(name)) trusted.set(name, at);
+	}
+	for (const name of INTEGER_SPECIALS) if (!written.has(name) && !integerAssigned.has(name)) trusted.set(name, -1);
 	return trusted;
 }
+
+/** Whether `name` is trusted where `node` reads it: after its defining assignment. */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+const trustedAt = (trusted: ReadonlyMap<string, number>, name: string, node: any): boolean => {
+	const at = trusted.get(name);
+	if (at === undefined) return false;
+	if (at < 0) return true;
+	const offset: number = node?.Pos?.().Offset?.() ?? -1;
+	// A heredoc body is expanded when its command runs, before the commands
+	// after it on the same line, though its text comes later: inside one, the
+	// assignment must come before the `<<` that owns the body.
+	const heredoc = (HEREDOC_RANGES.get(trusted) ?? []).find(([from, to]) => offset >= from && offset <= to);
+	return at < (heredoc === undefined ? offset : heredoc[2]);
+};
+
+/** The heredoc body spans of the text a trusted-name map was built from. */
+const HEREDOC_RANGES = new WeakMap<ReadonlyMap<string, number>, Array<[number, number, number]>>();
 
 /** Whether an arithmetic expression (or any node under it) reads something
  *  that is not an integer the body can vouch for: an untrusted name, a quoted
  *  word, a substitution, or any node outside integer arithmetic. */
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
-function arithmeticReadsAnything(node: any, trusted: ReadonlySet<string>): boolean {
+function arithmeticReadsAnything(node: any, trusted: ReadonlyMap<string, number>): boolean {
 	if (!node) return false;
 	if (Array.isArray(node)) return node.some(inner => arithmeticReadsAnything(inner, trusted));
 	let reads = false;
@@ -1290,12 +1338,20 @@ function arithmeticReadsAnything(node: any, trusted: ReadonlySet<string>): boole
 		const value: string = (inner as any).Value ?? "";
 		if (type === "ParamExp") {
 			const name = plainParam(inner);
-			reads = name === undefined || !trusted.has(name);
+			reads = name === undefined || !trustedAt(trusted, name, inner);
+			return false;
+		}
+		// `x = 5` over plain integers writes x without reading it: only the
+		// right side is a read.
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		const n = inner as any;
+		if (type === "BinaryArithm" && n.Op === getShell().arithmeticAssign && nodeType(n.X) === "Word" && (n.X.Parts ?? []).length === 1 && nodeType(n.X.Parts[0]) === "Lit" && IDENTIFIER.test(n.X.Parts[0].Value ?? "")) {
+			reads = arithmeticReadsAnything(n.Y, trusted);
 			return false;
 		}
 		if (type === "Lit") {
 			if (/^[0-9\s]*$/u.test(value)) return true;
-			reads = !IDENTIFIER.test(value) || !trusted.has(value);
+			reads = !IDENTIFIER.test(value) || !trustedAt(trusted, value, inner);
 			return !reads;
 		}
 		if (!PLAIN_ARITHMETIC.has(type)) reads = true;
@@ -1337,6 +1393,15 @@ export function hiddenArithmetic(text: string): string | undefined {
 function walkArithmetic(tree: unknown, report: (why: string) => void): void {
 	const { arithmeticTests, nameTests } = getShell();
 	const trusted = trustedNames(tree);
+	const heredocs: Array<[number, number, number]> = [];
+	walk(tree, (node: unknown) => {
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		const hdoc = node && nodeType(node) === "Redirect" ? (node as any).Hdoc : undefined;
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		if (hdoc) heredocs.push([hdoc.Pos().Offset(), hdoc.End().Offset(), (node as any).Pos().Offset()]);
+		return true;
+	});
+	HEREDOC_RANGES.set(trusted, heredocs);
 	const reads = (node: unknown): boolean => arithmeticReadsAnything(node, trusted);
 	let why: string | undefined;
 	walk(tree, (node: unknown) => {

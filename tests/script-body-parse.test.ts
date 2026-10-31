@@ -182,6 +182,8 @@ describe("a verb the shell expands is not an interpreter the reader can name", (
 		["a variable verb reading a heredoc", "$X <<'EOF'\nimport os\nEOF"],
 		["a variable verb fed by a pipe", "cat p.py | $X"],
 		["a variable verb reading stdin by -", "$X -"],
+		["a path verb whose last component is built", "\"$D/py\"$V p.py"],
+		["a path verb whose last component is an arithmetic expansion", "$D/$((1)) p.py"],
 	])("%s refuses", async (_name, command) => {
 		write(path.join(start, "payload"), HARMFUL);
 		write(path.join(start, "pkgdir", "__main__.py"), HARMFUL);
@@ -190,6 +192,22 @@ describe("a verb the shell expands is not an interpreter the reader can name", (
 		const result = await gate(command);
 		expect(refusalOf(result).layer).toBe("script-body");
 		expect(refusalOf(result).why).toContain("expands the command name");
+	});
+
+	test.each([
+		["builtin alias", "builtin alias run=python3; run p.py"],
+		["command alias", "command alias run=python3; run p.py"],
+		["a backslashed alias", "\\alias run=python3; run p.py"],
+		["an alias and a later command with any operand", "alias run=python3; run payload"],
+		["builtin -- alias", "builtin -- alias run=python3; run p.py"],
+		["command -p alias", "command -p alias run=python3; run p.py"],
+		["an alias and a later command fed by a redirect", "alias run=python3; run < p.py"],
+	])("an alias definition spelled as %s refuses", async (_name, command) => {
+		write(path.join(start, "p.py"), HARMFUL);
+		write(path.join(start, "payload"), HARMFUL);
+		const result = await gate(command);
+		expect(refusalOf(result).layer).toBe("script-body");
+		expect(refusalOf(result).why).toContain("defines an alias");
 	});
 
 	test.each([

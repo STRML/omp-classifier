@@ -4185,11 +4185,6 @@ function scriptRefKey(ref: InterpreterProgramRef, dir: string | null): string {
 	return `${ref.arm}\0${ref.verb}\0${target}`;
 }
 
-/** A command word that may name a file a program opens: what a verb the
- *  reader cannot name might run. A word with whitespace and no script
- *  extension is a message or a pattern (`-m 'rm -rf /'`), not a path. */
-const scriptShapedWord = (word: string): boolean =>
-	!word.startsWith("-") && (SCRIPT_FILE_EXTENSION.test(word) || (word.includes("/") && !/\s/u.test(word)));
 
 /**
  * The verb word of a parsed command when the shell expands it, so the reader
@@ -4204,14 +4199,21 @@ function expandedVerb(command: ShellCommand): ShellWord | null {
 	const verb = command.words[head.index];
 	if (verb === undefined || verb.fixed || verb.value === "[") return null;
 	if (!verb.literal) {
-		const slash = verb.value.lastIndexOf("/");
-		if (slash !== -1 && !/[$`{}*?[\]]/u.test(verb.value.slice(slash + 1))) return null;
+		// Read the last component off the source, not the expanded value: only
+		// text the command spells as a plain filename names the program.
+		const slash = verb.source.lastIndexOf("/");
+		if (slash !== -1 && /^[A-Za-z0-9._+-]+["']?$/u.test(verb.source.slice(slash + 1))) return null;
 	}
 	return verb;
 }
 
-const ALIAS_DEFINITION = (command: ShellCommand): boolean =>
-	command.words[0]?.value === "alias" && command.words.slice(1).some(word => word.value.includes("="));
+/** An `alias` definition, however it is spelled: `builtin alias`,
+ *  `command alias` and `\alias` all reach the same builtin. */
+const ALIAS_DEFINITION = (command: ShellCommand): boolean => {
+	let index = 0;
+	while (command.words[index]?.value === "builtin" || command.words[index]?.value === "command" || (index > 0 && command.words[index]?.value.startsWith("-"))) index++;
+	return command.words[index]?.value === "alias" && command.words.slice(index + 1).some(word => word.value.includes("="));
+};
 
 /**
  * Why a parsed command's verb stops the reader, or null. The shell expands
@@ -4232,7 +4234,9 @@ function expandedVerbRefusal(commands: readonly ShellCommand[], programAt: reado
 	for (const command of commands) {
 		const offset = command.sourceOffset ?? 0;
 		if (ALIAS_DEFINITION(command)) {
-			if (programAnywhere || commands.some(other => (other.sourceOffset ?? 0) > offset && other.words.some(word => scriptShapedWord(word.value)))) {
+			// Any later command at all could be the alias, handed code by an
+			// operand, a redirect or a pipe.
+			if (programAnywhere || commands.some(other => (other.sourceOffset ?? 0) > offset)) {
 				return "script body blocked: the command defines an alias, so the words after it are not the programs that run";
 			}
 			continue;
