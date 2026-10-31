@@ -21,10 +21,10 @@ What the reviewer judges and what the gate guarantees are split. The reviewer re
 
 | Guarantee | Refused |
 |---|---|
-| every import is of the standard library | an import anywhere (any block, lazy or not) of a name missing from the interpreter's standard library, site-packages included; one shadowed in `sys.path[0]` (the script's directory, or the working directory for `-c` and stdin); a relative or private (`_posixsubprocess`) import; code the parser cannot parse; an encoding other than UTF-8 |
-| no code runs from a string, a computed name or bytes on disk | `exec`, `eval`, `compile`, `__import__`, `importlib`, `runpy`, `getattr` and other reflection, `__dict__`/`__globals__`/`__subclasses__`, `pickle`, `marshal`, `ctypes` |
+| every import is of the standard library | an import anywhere (any block, lazy or not) of a name missing from the interpreter's standard library, site-packages included; one shadowed in `sys.path[0]` (the script's directory, or the working directory for `-c` and stdin); a relative, private (`_posixsubprocess`) or star import; code the parser cannot parse; an encoding other than UTF-8 |
+| no code runs from a string, a computed name or bytes on disk | `exec`, `eval`, `compile`, `__import__`, `importlib`, `runpy`, `getattr`, `operator.attrgetter` and other reflection, `__dict__`/`__globals__`/`__subclasses__`, `pickle`, `marshal`, `ctypes` |
 | nothing touches where imports come from | an attribute named `path`, `meta_path`, `path_hooks`, `path_importer_cache` or `modules` on any base but an `os` the code never rebinds; `from sys import path`; rebinding `os`, `sys`, `shutil`, `pathlib`, `Path` or `open`, importing one under another name, or passing one of those modules anywhere but as an attribute base |
-| no write can plant a module | a file write (`open` with `w`/`a`/`x`/`+` or a computed mode, `Path.write_*`, `rename`, `replace`, `link`, `symlink`, the `shutil` copies and `move`, archive extraction) whose target is built at run time or ends in `.py`, `.pyc`, `.pth`, `.so` or `__init__` |
+| no write can plant a module | an allowlist, not a list of writers: a call that may write (opened with a write or computed mode, or named with write, copy, move, rename, replace, link, extract, retrieve, dump, save, touch or unpack, or taking a `target`, `dst` or `path` keyword) must take only literal paths, none a module file name (`.py`, `.pyc`, `.pth`, `.so`, `__init__`), none a directory on `sys.path` itself, and none under a module name inside one (`json/`); a write-like function named without a call refuses too |
 
 It also refuses an unquoted here-document, a here-string, stdin from a file, an option outside `-uBEsSIOqbP`, words built at run time, an assignment, and a set `PYTHONPATH` or `PYTHONHOME`.
 

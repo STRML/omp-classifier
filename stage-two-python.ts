@@ -103,8 +103,8 @@ const RUNNER_MODULES = new Set(["runpy", "pdb", "bdb", "cProfile", "profile", "t
 
 /** Names that run a string as code, or reach code or a namespace by a
  *  computed name, so the reviewer cannot read what runs. */
-const DYNAMIC_NAMES = new Set(["exec", "eval", "compile", "execfile", "breakpoint", "__import__", "__builtins__", "getattr", "setattr", "delattr", "globals", "locals", "vars"]);
-const DYNAMIC_ATTRIBUTES = new Set(["__dict__", "__getattribute__", "__subclasses__", "__globals__", "__code__", "__builtins__", "__loader__", "__import__"]);
+const DYNAMIC_NAMES = new Set(["exec", "eval", "compile", "execfile", "breakpoint", "__import__", "__builtins__", "getattr", "setattr", "delattr", "globals", "locals", "vars", "attrgetter", "methodcaller"]);
+const DYNAMIC_ATTRIBUTES = new Set(["attrgetter", "methodcaller", "__dict__", "__getattribute__", "__subclasses__", "__globals__", "__code__", "__builtins__", "__loader__", "__import__"]);
 
 /** Attributes that hold where imports come from (`sys.path`, `sys.modules`).
  *  Refused on any base: only `os.path` is exempt, and only while `os` is the
@@ -133,8 +133,12 @@ src = sys.stdin.buffer.read()
 encoding = tokenize.detect_encoding(io.BytesIO(src).readline)[0]
 tree = ast.parse(src)
 MODULES = {"os", "sys", "shutil", "pathlib", "posix"}
-WRITE_METHODS = {"write_text", "write_bytes", "touch", "symlink_to", "hardlink_to", "link_to"}
-TWO_PATH = {"rename", "replace", "link", "symlink", "copy", "copy2", "copyfile", "copytree", "move"}
+OPENERS = {"open", "FileIO", "fdopen"}
+WRITE_WORDS = ("write", "copy", "move", "rename", "replace", "link", "extract", "retrieve", "dump", "save", "touch", "unpack", "filehandler", "temporary", "mkstemp", "mkdtemp")
+NOT_WRITES = {"write", "writelines", "dumps", "deepcopy"}
+RECEIVER_IS_TARGET = {"write_text", "write_bytes", "touch", "symlink_to", "hardlink_to", "link_to"}
+DEFAULTS_TO_CWD = ("extract", "unpack")
+TARGET_KEYWORDS = {"target", "dst", "dest", "path", "file", "filename", "dir", "extract_dir"}
 def text(node):
     return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
 def literal_path(node):
@@ -149,34 +153,38 @@ def literal_path(node):
     return None
 def base_name(node):
     return node.id if isinstance(node, ast.Name) else None
-def write_target(node):
+def callee(node):
     f = node.func
-    name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+    return f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+def writes_like(name):
+    return name not in NOT_WRITES and (name in OPENERS or any(word in name.lower() for word in WRITE_WORDS))
+def write_targets(node):
+    """The paths a call may write, each a literal or None, or None for a call that writes nothing."""
+    f = node.func
+    name = callee(node)
     method = isinstance(f, ast.Attribute)
     args = node.args
     kw = {k.arg: k.value for k in node.keywords if k.arg}
-    if name == "open":
-        builtin = not method or base_name(f.value) in ("os", "io", "codecs")
+    named = [kw[k] for k in TARGET_KEYWORDS & set(kw) if name not in OPENERS]
+    if name is None:
+        return [None] if named else None
+    if name in OPENERS:
+        builtin = not method or base_name(f.value) in ("os", "io", "codecs", "builtins")
         mode = kw.get("mode", kw.get("flags", (args[1] if len(args) > 1 else None) if builtin else (args[0] if args else None)))
-        if mode is None:
+        if mode is None or (text(mode) is not None and not any(c in text(mode) for c in "wax+")):
             return None
-        if text(mode) is not None and not any(c in text(mode) for c in "wax+"):
-            return None
-        return [literal_path(args[0]) if builtin and args else literal_path(kw.get("file")) if builtin else literal_path(f.value)]
-    if method and name in WRITE_METHODS:
-        return [literal_path(f.value)]
-    if name in ("extractall", "unpack_archive"):
+        return [literal_path(args[0]) if args else literal_path(kw.get("file"))] if builtin else [literal_path(f.value)]
+    if not writes_like(name):
+        return [literal_path(v) for v in named] or None
+    if method and name in RECEIVER_IS_TARGET:
+        return [literal_path(f.value)] + [literal_path(v) for v in named]
+    targets = [literal_path(a) for a in args] + [literal_path(v) for v in kw.values()]
+    if not targets and any(word in name.lower() for word in DEFAULTS_TO_CWD):
         return [None]
-    if name in TWO_PATH:
-        if len(args) >= 2 and (name != "replace" or not method or base_name(f.value) == "os"):
-            return [literal_path(args[1])]
-        if len(args) == 1 and method and name in ("rename", "replace"):
-            return [literal_path(args[0])]
-        if "dst" in kw:
-            return [literal_path(kw["dst"])]
-    return None
+    return targets
+call_functions = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
 attribute_bases = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
-imports, names, bare, bound, attrs, writes = [], set(), set(), set(), [], []
+imports, names, bare, bound, attrs, writes, refs = [], set(), set(), set(), [], [], set()
 for node in ast.walk(tree):
     if isinstance(node, ast.Import):
         for alias in node.names:
@@ -188,6 +196,8 @@ for node in ast.walk(tree):
             names.add(node.id)
             if node.id in MODULES and id(node) not in attribute_bases:
                 bare.add(node.id)
+            if writes_like(node.id) and id(node) not in call_functions:
+                refs.add(node.id)
         else:
             bound.add(node.id)
     elif isinstance(node, ast.arg):
@@ -200,11 +210,13 @@ for node in ast.walk(tree):
         bound.update(node.names)
     elif isinstance(node, ast.Attribute):
         attrs.append([base_name(node.value), node.attr])
+        if writes_like(node.attr) and id(node) not in call_functions:
+            refs.add(node.attr)
     if isinstance(node, ast.Call):
-        target = write_target(node)
-        if target is not None:
-            writes.append(target[0])
-print(json.dumps({"encoding": encoding, "imports": imports, "names": sorted(names), "bare": sorted(bare), "bound": sorted(bound), "attrs": attrs, "writes": writes}))
+        targets = write_targets(node)
+        if targets is not None:
+            writes.extend({"call": callee(node) or "a computed callee", "target": t} for t in targets)
+print(json.dumps({"encoding": encoding, "imports": imports, "names": sorted(names), "bare": sorted(bare), "bound": sorted(bound), "attrs": attrs, "writes": writes, "refs": sorted(refs)}))
 `;
 
 interface ParsedImport {
@@ -225,8 +237,13 @@ interface PythonFacts {
 	bound: string[];
 	/** Every attribute, with its base when the base is a plain name. */
 	attrs: Array<[string | null, string]>;
-	/** Each file write's target path, or null when it is computed. */
-	writes: Array<string | null>;
+	/** Every path a call that may write takes, or null when it is computed. A
+	 *  call may write when it opens with a write or computed mode, its name
+	 *  holds write, copy, move, rename, replace, link, extract, retrieve, dump,
+	 *  save, touch or unpack, or it passes a target, dst or path keyword. */
+	writes: Array<{ call: string; target: string | null }>;
+	/** Write-like functions named without being called (`w = Path.write_text`). */
+	refs: string[];
 }
 
 const PARSER_TIMEOUT_MS = 3000;
@@ -241,7 +258,7 @@ function parsePython(code: string, parser: string): PythonFacts | string {
 	}
 	try {
 		const facts = JSON.parse(result.stdout.toString("utf8")) as PythonFacts;
-		const lists = [facts.imports, facts.names, facts.bare, facts.bound, facts.attrs, facts.writes];
+		const lists = [facts.imports, facts.names, facts.bare, facts.bound, facts.attrs, facts.writes, facts.refs];
 		if (typeof facts.encoding !== "string" || !lists.every(Array.isArray)) return "the gate's Python returned a shape it does not read";
 		return facts;
 	} catch {
@@ -291,6 +308,8 @@ function standardLibrary(libs: readonly string[]): string[] {
 /** Why one import brings in code the reviewer cannot read, or undefined. */
 function importRefusal(item: ParsedImport, roots: readonly string[], stdlib: readonly string[]): string | undefined {
 	if (item.level > 0) return "a relative import runs a local module";
+	// A star import binds names the gate cannot list: `from sys import *` is `path`.
+	if (item.names.includes("*")) return `a star import from ${item.module} binds names the gate cannot list`;
 	const top = IMPORT_ITEM.exec(item.module)?.[1];
 	if (top === undefined) return `an import the gate cannot read (${item.module})`;
 	const dynamic = [...item.module.split("."), ...item.names].find(name => DYNAMIC_MODULES.has(name) || DYNAMIC_NAMES.has(name));
@@ -305,6 +324,26 @@ function importRefusal(item: ParsedImport, roots: readonly string[], stdlib: rea
 	const guarded = [item.asname, ...item.names].find(name => name !== null && GUARDED_NAMES.has(name) && !(name === "Path" && top === "pathlib") && !(name === "path" && top === "os"));
 	if (guarded !== undefined && guarded !== top) return `binds ${guarded} by import, which the gate's checks rely on`;
 	if (item.asname !== null && GUARDED_NAMES.has(top)) return `imports ${top} as ${item.asname}, a name the gate does not follow`;
+	return undefined;
+}
+
+/**
+ * Why one path a possible write takes could plant code an import loads. The
+ * target must be a literal: not a module file name, not a directory on
+ * `sys.path` itself, and not inside one under a name an import could load
+ * (`json/`, `json.py`). A path outside every root is fine.
+ */
+function writeRefusal(call: string, target: string | null, roots: readonly string[], stdlib: readonly string[]): string | undefined {
+	if (target === null) return `${call} may write to a path built at run time, which could plant a module an import then loads`;
+	if (MODULE_FILE.test(target)) return `${call} writes ${target}, a file an import could load`;
+	for (const root of roots) {
+		const relative = path.relative(root, path.resolve(root, target));
+		if (relative === "") return `${call} writes into ${root}, a directory on sys.path`;
+		if (relative.startsWith("..") || path.isAbsolute(relative)) continue;
+		const first = relative.split(path.sep)[0];
+		const module = first.replace(/\..*$/u, "");
+		if (MODULE_FILE.test(first) || installed(module, stdlib)) return `${call} writes ${target}, under a name an import could load`;
+	}
 	return undefined;
 }
 
@@ -342,9 +381,10 @@ export function pythonHandOff(code: string, roots: readonly string[], libs: read
 		if (DYNAMIC_ATTRIBUTES.has(attr)) return `uses .${attr}, which reaches code the reviewer cannot read`;
 		if (IMPORT_STATE.has(attr) && !(attr === "path" && base === "os")) return `uses ${base ?? "…"}.${attr}, which can change where imports come from`;
 	}
-	for (const target of facts.writes) {
-		if (target === null) return "writes a file at a path built at run time, which could plant a module an import then loads";
-		if (MODULE_FILE.test(target)) return `writes ${target}, a file an import could load`;
+	if (facts.refs.length > 0) return `names ${facts.refs[0]} without calling it, so the gate cannot check what it writes`;
+	for (const { call, target } of facts.writes) {
+		const why = writeRefusal(call, target, roots, stdlib);
+		if (why !== undefined) return why;
 	}
 	return undefined;
 }

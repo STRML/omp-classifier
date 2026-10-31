@@ -51,7 +51,7 @@ function write(rel: string, content: string | Buffer, mode = 0o644): string {
 /** An install under `base/`: the interpreter, its standard library, its site-packages. */
 function fakeInstall(base = "base", interpreter: string | Buffer = MACHO): string {
 	const python = write(`${base}/bin/python3.12`, interpreter, 0o755);
-	for (const module of ["json/__init__.py", "pathlib.py", "platform.py", "tarfile.py", "sys.py", "pickle.py", "importlib/__init__.py", "_posixsubprocess.py", "re/__init__.py", "os.py", "shutil.py", "subprocess.py", "importlib/__init__.py", "xml/etree/ElementTree.py", "collections/__init__.py"]) write(`${base}/lib/python3.12/${module}`, "");
+	for (const module of ["json/__init__.py", "pathlib.py", "platform.py", "io.py", "logging/__init__.py", "threading.py", "operator.py", "urllib/request.py", "tarfile.py", "sys.py", "pickle.py", "importlib/__init__.py", "_posixsubprocess.py", "re/__init__.py", "os.py", "shutil.py", "subprocess.py", "importlib/__init__.py", "xml/etree/ElementTree.py", "collections/__init__.py"]) write(`${base}/lib/python3.12/${module}`, "");
 	write(`${base}/lib/python3.12/lib-dynload/_json.cpython-312-darwin.so`, "");
 	write(`${base}/lib/python3.12/site-packages/requests/__init__.py`, "");
 	return python;
@@ -460,6 +460,19 @@ describe("the gate's four guarantees hold however the code is spelled", () => {
 		["a shutil copy onto a module name", "import shutil\nshutil.copy('payload.txt', 'json.py')\n", "writes json.py"],
 		["a shutil copy to a computed path", "import shutil, sys\nshutil.copytree('a', sys.argv[1])\n", "path built at run time"],
 		["an archive extracted", "import tarfile\ntarfile.open('x.tar').extractall()\n", "path built at run time"],
+		// The fourth security round: each is a write the allowlist must catch.
+		["str.replace with computed arguments (a possible Path.replace)", "import sys\nprint(sys.argv[0].replace(sys.argv[1], 'x'))\n", "path built at run time"],
+		["io.FileIO opened for writing", "import io\nio.FileIO('json.py', 'w')\n", "writes json.py"],
+		["urlretrieve to a computed path", "import sys, urllib.request\nurllib.request.urlretrieve('https://example.com/x', sys.argv[1])\n", "path built at run time"],
+		["a logging file handler", "import logging\nlogging.FileHandler('json.py')\n", "writes json.py"],
+		["a target= keyword", "import sys, threading\nthreading.Thread(target=sys.exit)\n", "path built at run time"],
+		["a write function named without a call", "import pathlib\nw = pathlib.Path.write_text\n", "without calling it"],
+		["a copy into a directory named like a module", "import shutil\nshutil.copytree('payload', 'json')\n", "under a name an import could load"],
+		["a copy into sys.path[0] itself", "import shutil\nshutil.copytree('payload', '.', dirs_exist_ok=True)\n", "a directory on sys.path"],
+		["a json.dump to an open file", "import json, sys\njson.dump({}, sys.stdout)\n", "path built at run time"],
+		["a star import", "from sys import *\npath.insert(0, 'x')\n", "star import"],
+		["operator.attrgetter", "import operator\noperator.attrgetter('system')\n", "attrgetter"],
+		["attrgetter imported by name", "from operator import attrgetter\n", "attrgetter"],
 	])("%s", async (_name, code, why) => {
 		const python = fakeVenv(fakeInstall());
 		write("helpers.py", "import os\nos.system('id')\n");
@@ -473,9 +486,10 @@ describe("the gate's four guarantees hold however the code is spelled", () => {
 		["a write to a literal path", "import json, pathlib\npathlib.Path('out.json').write_text(json.dumps(1))\n"],
 		["a write through open with a literal path", "with open('out.txt', 'w') as f:\n    f.write('x')\n"],
 		["a read through open with a computed path", "import sys\nprint(open(sys.argv[1]).read())\n"],
-		["str.replace with computed arguments", "import sys\nprint(sys.argv[0].replace(sys.argv[1], 'x'))\n"],
+		["str.replace with literal arguments", "import sys\nprint(sys.argv[0].replace('a', 'b'))\n"],
 		["platform.system", "import platform\nprint(platform.system())\n"],
 		["an import inside a function, of the standard library", "def main():\n    import json\n    print(json.dumps(1))\nmain()\n"],
+		["a copy to a literal directory that is not a module name", "import shutil\nshutil.copytree('a', 'configs/out')\n"],
 	])("%s is reviewed", async (_name, code) => {
 		const python = fakeVenv(fakeInstall());
 		write("probe.py", code);
