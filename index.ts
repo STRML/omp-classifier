@@ -89,14 +89,13 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 import { cfgBashPatterns } from "@oh-my-pi/pi-coding-agent/exec/settings";
-import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { cfgToolsApproval } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 import { filterChildShellEnv, getPluginsDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, type FloorEntry } from "./floor";
 import { heredocShadowedAt, maskHeredocBodiesAndAnsiSpans, openQuoteBefore, segmentWorkingDirectories, SHELL_WORD_EXPANSION } from "./shell-cwd";
-import { parseShell, substitutionSpans, verbName, type ShellCommand, type ShellRedirect } from "./shell-ast";
+import { parseShell, shellDefinesFunction, substitutionSpans, verbName, type ShellCommand, type ShellRedirect } from "./shell-ast";
 import {
 	DEFAULT_JUDGE_BACKEND,
 	judgeBackendFor,
@@ -106,6 +105,7 @@ import {
 	type JudgeBackendConfig,
 } from "./jev-judge";
 import { buildAuthorizationState, DEFAULT_AUTHORIZATION_POLICY, deriveAuthorization, summarizeActions, type ActionSummaryEntry, type JevAuthorizationLevel } from "./authorization";
+import { CRITICAL_BODY_NOTE, scanCriticalPatterns } from "./critical-scan";
 import { deriveDecisionOrder, type DecisionBranch } from "./decision-order";
 import { literalMatch } from "./literal-match";
 import { redactSecrets, redactValue } from "./redact";
@@ -586,7 +586,7 @@ const SHELL_ENV_NAMES = /(?<![A-Za-z0-9_])(?:TMPDIR|IFS)(?![A-Za-z0-9_])|:=|\$\(
  *  the current shell, or change how later commands are looked up. */
 const SHELL_STATE_VERBS = new Set([
 	"export", "declare", "typeset", "local", "readonly", "read", "mapfile", "readarray", "unset", "set", "getopts", "wait",
-	"eval", "source", ".", "shopt", "enable", "alias", "unalias", "trap", "builtin", "command", "exec", "let", "coproc", "function",
+	"eval", "source", ".", "shopt", "enable", "alias", "unalias", "hash", "trap", "builtin", "command", "exec", "let", "coproc", "function",
 ]);
 
 /** Whether one parsed command can leave the persistent shell changed. */
@@ -617,7 +617,8 @@ function commandTouchesShell(command: ShellCommand): boolean {
 export function touchesShellEnv(command: string): boolean {
 	if (SHELL_ENV_NAMES.test(command.replace(SHELL_ENV_READS, ""))) return true;
 	const parsed = parseShell(command);
-	return !parsed.ok || parsed.commands.some(commandTouchesShell);
+	// A function definition persists and can shadow any later verb.
+	return !parsed.ok || parsed.commands.some(commandTouchesShell) || shellDefinesFunction(command);
 }
 
 /** Sessions where an earlier bash command may have changed the persistent
@@ -1051,6 +1052,10 @@ export interface DecisionRecord {
 	 *  critical or environment line of the same tool call (spec step 0). An ask
 	 *  joins to what a human did next by id, not by session, command and time. */
 	followsDecisionId?: string;
+	/** Script bodies in JavaScript or Python that a built-in critical pattern
+	 *  matched, as `<verb> runs <operand>`. The hit went to the judge instead
+	 *  of the critical layer (critical-scan.ts). */
+	criticalBodies?: string[];
 	/** Session that produced the decision, when the host exposed one. */
 	sessionId?: string;
 	/** Policy identity that produced this line; lets status/eval distinguish
@@ -6504,9 +6509,12 @@ export default function (pi: ExtensionAPI) {
 		// One object for the fields every line of this tool call shares. A
 		// function, not a constant, because the floor is computed per call and
 		// the ids are not: both are fixed by the time any line is written.
-		const auditFields = (): Pick<DecisionRecord, "userMessageIds" | "floor"> => ({
+		/** Set by the bash path's critical scan: non-shell bodies a pattern matched. */
+		let criticalBodies: string[] | undefined;
+		const auditFields = (): Pick<DecisionRecord, "userMessageIds" | "floor" | "criticalBodies"> => ({
 			...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}),
 			...(floorShadow ? { floor: floorShadow } : {}),
+			...(criticalBodies ? { criticalBodies } : {}),
 		});
 		/** Whether a command's directory can move before or while it runs.
 		 *
@@ -7081,13 +7089,37 @@ export default function (pi: ExtensionAPI) {
 			// approval mode: the mode cannot be trusted to imply a human, because
 			// a per-session `autoApprove` (wrapper.ts:189-192) forces `yolo`
 			// without appearing in settings at all.
-			if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(judgedCommand))) {
+			// The scan reads the raw command with its message operands blanked
+			// and each spliced body on its own (critical-scan.ts). A hit in a
+			// JavaScript or Python body refuses here, unrecorded, when the body
+			// names a process API or no judge will run. Otherwise it goes to the
+			// judge with the hit in its state.
+			// Message blanking trusts that `git` is git: not once an earlier call in
+			// this session (or this one) may have redefined the shell, and not for
+			// a call with no session to track.
+			const scanSession = sessionIdOf(ctx);
+			const criticalScan = scanCriticalPatterns(command, script.bodies, scanSession !== undefined && !shellEnvTouched.has(scanSession));
+			if (criticalScan.judgedBodies.length > 0) {
+				recordExtras.criticalPatternInScriptBody = { bodies: criticalScan.judgedBodies, note: CRITICAL_BODY_NOTE };
+				criticalBodies = criticalScan.judgedBodies;
+			}
+			// Every path below that returns before `classify` is judge-off: a
+			// static prompt rule, `tools.approval.bash: prompt` with no rule,
+			// classification disabled, or the session paused. (Dry-run runs
+			// nothing and mirrors the live path, so it is not one.)
+			const judgeOff =
+				!config.enabled ||
+				sessionOff.has(ctx.sessionManager.getSessionId()) ||
+				rule?.approval === "prompt" ||
+				(!rule && policy.bashPolicy === "prompt");
+			if (criticalScan.critical || criticalScan.unrecorded || (criticalBodies !== undefined && judgeOff)) {
 				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, riskFlags: ["critical"], maxCommandLength: config.maxCommandLength });
 				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, ...lead, why: "critical pattern: matches a built-in dangerous-command pattern", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				// A critical hit is a refusal (issue #30): the pattern itself is the
 				// memory, so a rewording that dodges the pattern meets it at the
-				// classifier.
-				addRefusal(ctx, judgedCommand, "matches a built-in dangerous-command pattern", { source: "critical", cwd, userMessageId: newestUserId });
+				// classifier. A non-shell body hit is not: the same file refuses on
+				// every call anyway, and a record would outlive a fixed file.
+				if (criticalScan.critical) addRefusal(ctx, judgedCommand, "matches a built-in dangerous-command pattern", { source: "critical", cwd, userMessageId: newestUserId });
 				return refuse(ctx, target, "critical", "matches a built-in dangerous-command pattern", "bash", "", { ...auditFields(), ...follows });
 			}
 
@@ -7254,6 +7286,10 @@ export default function (pi: ExtensionAPI) {
 				for (const body of script.bodies) {
 					if (hasInterpreterCodeRisk(body.body)) flags.push(`${body.verb} runs ${body.operand}`);
 				}
+				// A critical pattern in a JavaScript or Python body: no process
+				// API was found by name, which is not proof none is reached, so a
+				// SAFE alone does not release it.
+				for (const body of criticalBodies ?? []) flags.push(`critical pattern in ${body}`);
 				const lifts =
 					prior !== undefined &&
 					(priorRefusalLifts(prior, judgement, judgedCommand, cwd, userMessagesSince(ctx, prior.userMessageId).map(message => message.text)) ||

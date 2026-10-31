@@ -359,6 +359,29 @@ export function shellRunsInSourceOrder(text: string): boolean {
 	return ordered;
 }
 
+/**
+ * Whether `text` defines a shell function (`f() { … }`, `function f { … }`)
+ * anywhere, including inside a substitution or a block. A definition outlives
+ * the command in the host's persistent shell and can shadow any later verb,
+ * `git` included. A command the parser cannot read answers true.
+ */
+export function shellDefinesFunction(text: string): boolean {
+	let tree: unknown;
+	try {
+		tree = parse(text);
+	} catch {
+		return true;
+	}
+	let found = false;
+	walk(tree, node => {
+		if (found) return false;
+		if (!node) return true;
+		if (nodeType(node) === "FuncDecl") found = true;
+		return !found;
+	});
+	return found;
+}
+
 /** The parser's own message. Its error is a Go value whose `toString` is
  *  `[object Object]`, so the text comes from `Text` or `Error()`. */
 function parserMessage(err: unknown): string {

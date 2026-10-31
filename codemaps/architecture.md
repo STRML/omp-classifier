@@ -28,7 +28,7 @@ Runtime dep: `mvdan-sh` (shell parser, loaded lazily by `shell-ast.ts`). Dev dep
 | L3 memory | verdict cache, refusal memory, audit log | index.ts (module state, `logDecision`) |
 | L2 judgment | state + battery, transport, derivation | jev.ts, jev-judge.ts, decision-order.ts, authorization.ts |
 | L2b stage 2 | reviewer on a live jev-v2 UNSURE or UNSAFE: prompt, strict reply, quote check (reviewer.ts); script discovery and reads (shapes A, B and C), re-hash, block memory (stage-two.ts); Python interpreter identity and code hand-offs (stage-two-python.ts); eligibility and wiring (`stageTwo`, `reviewerTranscript` in index.ts); bake-off `eval/reviewer.ts` | reviewer.ts, stage-two.ts, stage-two-python.ts |
-| L1 recognition | critical/structural/overlay scans, floor, literal match | index.ts (overlay scanners), floor.ts, literal-match.ts, recognizer.ts |
+| L1 recognition | critical/structural/overlay scans, floor, literal match | critical-scan.ts, index.ts (overlay scanners), floor.ts, literal-match.ts, recognizer.ts |
 | L0 evidence | command, cwd, user msgs, pinned policy, measured provenance | index.ts (evidence), jev.ts (`measure*`), trust-policy.ts, shell-cwd.ts |
 | shared infra | parser, cwd walk, redaction, CLI grammars | shell-ast.ts, shell-cwd.ts, redact.ts, arity.ts (+arity.generated.ts) |
 
@@ -58,6 +58,7 @@ recognizer.ts ─► floor.ts, shell-ast.ts      (not imported by index.ts)
 | literal-match.ts | floor, shell-ast | index |
 | recognizer.ts | floor, shell-ast | eval/recognizer-measure only |
 | shell-cwd.ts | shell-ast | index, jev, floor |
+| critical-scan.ts | shell-ast; host `CRITICAL_BASH_PATTERNS` | index, eval/run |
 | shell-ast.ts | mvdan-sh | index, jev, floor, authorization, literal-match, recognizer, shell-cwd |
 | trust-policy.ts | host pi-utils | index (+ types elsewhere) |
 | redact.ts | (none) | index, jev, floor, authorization, eval/recognizer-measure |
