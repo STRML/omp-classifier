@@ -51,7 +51,7 @@ function write(rel: string, content: string | Buffer, mode = 0o644): string {
 /** An install under `base/`: the interpreter, its standard library, its site-packages. */
 function fakeInstall(base = "base", interpreter: string | Buffer = MACHO): string {
 	const python = write(`${base}/bin/python3.12`, interpreter, 0o755);
-	for (const module of ["json/__init__.py", "pathlib.py", "platform.py", "re/__init__.py", "os.py", "shutil.py", "subprocess.py", "importlib/__init__.py", "xml/etree/ElementTree.py", "collections/__init__.py"]) write(`${base}/lib/python3.12/${module}`, "");
+	for (const module of ["json/__init__.py", "pathlib.py", "platform.py", "tarfile.py", "sys.py", "pickle.py", "importlib/__init__.py", "_posixsubprocess.py", "re/__init__.py", "os.py", "shutil.py", "subprocess.py", "importlib/__init__.py", "xml/etree/ElementTree.py", "collections/__init__.py"]) write(`${base}/lib/python3.12/${module}`, "");
 	write(`${base}/lib/python3.12/lib-dynload/_json.cpython-312-darwin.so`, "");
 	write(`${base}/lib/python3.12/site-packages/requests/__init__.py`, "");
 	return python;
@@ -139,9 +139,9 @@ describe("a venv interpreter the gate can identify", () => {
 		expect(reviewerCalls[0].input.scriptBodies).toEqual([]);
 	});
 
-	test("an import from the venv's site-packages counts as installed", async () => {
+	test("an import from the venv's site-packages is refused: the reviewer cannot read it", async () => {
 		const python = fakeVenv(fakeInstall());
-		await expectReviewed(`${python} -c "import pytest"`);
+		await expectRefused(`${python} -c "import pytest"`, "imports pytest, which is not in the standard library");
 	});
 
 	test("a venv over an ELF interpreter", async () => {
@@ -224,15 +224,29 @@ describe("a program the gate cannot tell is Python stays refused", () => {
 	});
 });
 
+describe("a spawn the body spells out is the reviewer's to judge", () => {
+	// The reviewer reads the body and treats what it hands off to as unknown;
+	// the gate does not recognize spawns by name. Stage 1's INTERPRETER_CODE_RISK
+	// overlay still flags them after an allow, so only the review is checked.
+	test.each([
+		["subprocess", "import subprocess; subprocess.run(['./x.sh'])"],
+		["os.system", "import os; os.system('./x.sh')"],
+		["a spawn imported by name", "from os import execv; execv('/bin/sh', ['sh'])"],
+	])("python -c with %s reaches the reviewer", async (_name, code) => {
+		const python = fakeVenv(fakeInstall());
+		scriptReviewer(reviewerReply("block"));
+		await fire("tool_call", makeEvent(`${python} -c "${code}"`), uiCtx(nextSession(), words));
+		expect(reviewerCalls).toHaveLength(1);
+		expect(reviewerCalls[0].input.command).toContain(code);
+	});
+});
+
 describe("Python the gate cannot read all of stays refused", () => {
 	test.each([
 		["a local module next to the code", "import helpers", "imports the local module helpers"],
 		["a local module shadowing the standard library", "import json", "imports the local module json"],
 		["a relative import", "from . import helpers", "relative import"],
 		["a module the interpreter does not have", "import notinstalled", "imports notinstalled"],
-		["subprocess", "import subprocess; subprocess.run(['./x.sh'])", "subprocess"],
-		["os.system", "import os; os.system('./x.sh')", "system"],
-		["a spawn imported by name", "from os import execv", "execv"],
 		["exec", "exec(open('payload.txt').read())", "uses exec"],
 		["eval", "eval(input())", "uses eval"],
 		["__import__", "__import__('subprocess')", "__import__"],
@@ -357,10 +371,10 @@ describe("a Python script run by its shebang reads under the same rules", () => 
 		}
 	});
 
-	test("one that spawns a process is refused", async () => {
+	test("one that writes to a computed path is refused", async () => {
 		const python = fakeVenv(fakeInstall());
-		write("probe.py", `#!${python}\nimport subprocess\nsubprocess.run(['./other.sh'])\n`, 0o755);
-		await expectRefused("./probe.py", "subprocess");
+		write("probe.py", `#!${python}\nimport pathlib, sys\npathlib.Path(sys.argv[1]).write_text('x')\n`, 0o755);
+		await expectRefused("./probe.py", "path built at run time");
 	});
 
 	test("one that imports a module next to it is refused", async () => {
@@ -408,34 +422,63 @@ describe("Python's own parse decides, so prose about imports is not an import", 
 	});
 });
 
-describe("text Python reads differently from the gate stays refused", () => {
+describe("the gate's four guarantees hold however the code is spelled", () => {
 	test.each([
-		["a backslash-newline joining an import", "import \\\nsubprocess\n", "imports subprocess"],
-		["a backslash-newline joining a from-import", "from \\\nos import system\nsystem('id')\n", "imports system from os"],
-		["a form feed before an import", "\fimport subprocess\n", "imports subprocess"],
+		// Every import is of the standard library and not shadowed locally.
+		["a backslash-newline joining an import of a local module", "import \\\nhelpers\n", "imports the local module helpers"],
+		["a form feed before an import of a missing module", "\fimport notinstalled\n", "imports notinstalled"],
+		["a ) inside a comment in a parenthesized from-import", "from helpers import (  # )\n    run as r\n)\n", "imports the local module helpers"],
+		["a # comment inside a parenthesized from-import", "from json import (loads,  # x\n    dumps)\nimport notinstalled\n", "imports notinstalled"],
+		["an import inside a function", "def main():\n    import notinstalled\n", "imports notinstalled"],
+		["an import inside try/except", "try:\n    import notinstalled\nexcept ImportError:\n    pass\n", "imports notinstalled"],
+		["a private C module", "import _posixsubprocess\n", "private module _posixsubprocess"],
+		["a site-packages module", "import requests\n", "imports requests, which is not in the standard library"],
 		["a utf-7 coding declaration", "# -*- coding: utf-7 -*-\n+AGkAbQBwAG8AcgB0ACAAcwB1AGIAcAByAG8AYwBlAHMAcw-\n", "declares the encoding utf-7"],
 		["a coding declaration on line 2", "#!/usr/bin/env python3\n# vim: set fileencoding=utf-7 :\nprint(1)\n", "declares the encoding utf-7"],
-		["a multi-line parenthesized from-import with an alias", "from os import (\n    system as s\n)\ns('id')\n", "imports system from os"],
-		["a star import from os", "from os import *\n", "imports * from os"],
-		["a module file written and then imported", "import json\nopen('json.py', 'w').write('import os')\nimport json\n", "after other code runs"],
-		["a file moved onto a module name and then imported", "import json, pathlib\npathlib.Path('payload.txt').replace('json.py')\nimport json\n", "after other code runs"],
-		["a computed write target, then an import", "import json, pathlib\npathlib.Path('js' + 'on.py').write_text('x')\nimport json\n", "after other code runs"],
-		["a ) inside a comment in a parenthesized from-import", "from os import (  # )\n    system as s\n)\ns('id')\n", "imports system from os"],
-		["a # comment hiding a name in a parenthesized from-import", "from os import (path,  # spawn below\n    execv as run)\nrun('/bin/sh', ['sh'])\n", "imports execv from os"],
-		["an import inside a function", "def main():\n    import helpers_missing\nmain()\n", "inside a block"],
-		["an import inside try/except", "try:\n    import json\nexcept ImportError:\n    json = None\n", "inside a block"],
-		["sys.path imported by name", "from sys import path\npath.insert(0, 'scripts')\n", "imports sys.path"],
-		["sys.path through an alias", "import sys as s\ns.path.insert(0, 'scripts')\n", "changes where imports come from"],
-		["a spawn through a module alias", "import os as o\no.system('id')\n", "o.system"],
-		["reflection through __dict__", "import os\nos.__dict__['sys' + 'tem']('id')\n", "__dict__"],
-		["a keyword that unpickles", "import json\njson.loads('{}', allow_pickle=True)\n", "allow_pickle"],
 		["code that does not parse", "def broken(:\n", "could not parse"],
-		["a private C module that spawns", "import _posixsubprocess\n", "imports _posixsubprocess"],
-		["a hand-off submodule of an allowed package", "from concurrent import interpreters\n", "imports interpreters from concurrent"],
-		["a hand-off submodule by its dotted name", "import concurrent.interpreters\n", "imports interpreters from concurrent.interpreters"],
+		// No code runs from a string, a computed name or bytes on disk.
+		["reflection through __dict__", "import os\nos.__dict__['sys' + 'tem']('id')\n", "__dict__"],
+		["getattr", "import os\ngetattr(os, 'sys' + 'tem')('id')\n", "getattr"],
+		["unpickling", "import pickle\n", "imports pickle"],
+		["importlib by an imported name", "from importlib import import_module\n", "imports importlib"],
+		// Nothing touches where imports come from.
+		["sys.path", "import sys\nsys.path.insert(0, 'scripts')\n", "sys.path"],
+		["sys.path through a rebinding", "import sys\ns = sys\ns.path.insert(0, 'scripts')\n", "passes the sys module around"],
+		["sys.path through an import alias", "import sys as s\ns.path.insert(0, 'scripts')\n", "imports sys as s"],
+		["sys.path imported by name", "from sys import path\npath.insert(0, 'scripts')\n", "imports sys.path"],
+		["sys.path through a function argument", "import sys\ndef f(m):\n    m.path.insert(0, 'x')\nf(sys)\n", "passes the sys module around"],
+		["os rebound to sys, so os.path is sys.path", "import os, sys\nos = sys\nos.path.insert(0, 'x')\n", "rebinds os"],
+		["sys bound to the name os by import", "import sys as os\nos.path.insert(0, 'x')\n", "binds os by import"],
+		["platform rebound to os", "import os\nplatform = os\nplatform.system('id')\n", "passes the os module around"],
+		["sys.modules", "import sys, json\nsys.modules['json'] = None\n", "sys.modules"],
+		// No write lands on a computed path or a module file name.
+		["a module file written and then imported", "import json\nopen('json.py', 'w').write('import os')\n", "writes json.py"],
+		["a file moved onto a module name", "import pathlib\npathlib.Path('payload.txt').replace('json.py')\n", "writes json.py"],
+		["a computed write target", "import pathlib\npathlib.Path('js' + 'on.py').write_text('x')\n", "path built at run time"],
+		["a write with a computed mode to a module file", "import sys\nopen('json.py', sys.argv[1])\n", "writes json.py"],
+		["a package __init__ written", "import os\nos.makedirs('json', exist_ok=True)\nopen('json/__init__.py', 'w')\n", "writes json/__init__.py"],
+		["a shutil copy onto a module name", "import shutil\nshutil.copy('payload.txt', 'json.py')\n", "writes json.py"],
+		["a shutil copy to a computed path", "import shutil, sys\nshutil.copytree('a', sys.argv[1])\n", "path built at run time"],
+		["an archive extracted", "import tarfile\ntarfile.open('x.tar').extractall()\n", "path built at run time"],
 	])("%s", async (_name, code, why) => {
 		const python = fakeVenv(fakeInstall());
+		write("helpers.py", "import os\nos.system('id')\n");
 		write("probe.py", code);
 		await expectRefused(`${python} probe.py`, why);
+	});
+
+	test.each([
+		["os.path", "import os\nprint(os.path.join('a', 'b'))\n"],
+		["from os import path", "from os import path\nprint(path.join('a', 'b'))\n"],
+		["a write to a literal path", "import json, pathlib\npathlib.Path('out.json').write_text(json.dumps(1))\n"],
+		["a write through open with a literal path", "with open('out.txt', 'w') as f:\n    f.write('x')\n"],
+		["a read through open with a computed path", "import sys\nprint(open(sys.argv[1]).read())\n"],
+		["str.replace with computed arguments", "import sys\nprint(sys.argv[0].replace(sys.argv[1], 'x'))\n"],
+		["platform.system", "import platform\nprint(platform.system())\n"],
+		["an import inside a function, of the standard library", "def main():\n    import json\n    print(json.dumps(1))\nmain()\n"],
+	])("%s is reviewed", async (_name, code) => {
+		const python = fakeVenv(fakeInstall());
+		write("probe.py", code);
+		await expectReviewed(`${python} probe.py`);
 	});
 });
