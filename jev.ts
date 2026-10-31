@@ -58,6 +58,7 @@ import { createHash } from "node:crypto";
 import { accessSync, constants as fsConstants, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { getDomain } from "tldts";
 import { redactSecrets } from "./redact";
 import { parseShell, shellRunsInSourceOrder, type ShellCommand, type ShellJoin, type ShellWord } from "./shell-ast";
 import { maskHeredocBodiesAndAnsiSpans, segmentCwdAt, SHELL_WORD_EXPANSION } from "./shell-cwd";
@@ -1898,6 +1899,17 @@ function sharedTrailingLabels(a: string, b: string): number {
 	return shared;
 }
 
+/** Whether two hosts share a registrable domain under the public suffix list,
+ *  private section included (https://github.com/STRML/omp-classifier/issues/179):
+ *  `api.example.com` and `status.example.com` share `example.com`, one owner,
+ *  while `acme-docs.pages.dev` and `acme.pages.dev` are two Pages sites. A
+ *  bare suffix (`github.io`) or an address has no registrable domain, so it
+ *  shares one with nothing. */
+function sameRegistrableDomain(a: string, b: string): boolean {
+	const domain = getDomain(a, { allowPrivateDomains: true });
+	return domain !== null && domain === getDomain(b, { allowPrivateDomains: true });
+}
+
 /** A plain DNS name: anything else (a `$`, a quote, a substitution) was not
  *  read reliably from the command text, so nothing is claimed about it. */
 const PLAIN_HOST_RE = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u;
@@ -1915,10 +1927,14 @@ const PLAIN_HOST_RE = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u;
  * client can be pointed elsewhere (`--resolve`, `--connect-to`, `-H Host:`,
  * `-x`, proxy variables, schemeless operands). A negative claim needs none of
  * that: a destination is reported only when it is not equal to, and not
- * beneath, any host the user named, yet shares two or more trailing labels
- * with one. `attacker.github.io` against `you.github.io` is that, whatever a
- * suffix list says about `github.io`. A mis-read host can only add a report,
- * which errs toward asking, or miss one, which is the judgment as before.
+ * beneath, any host the user named, shares two or more trailing labels with
+ * one, and sits in a different registrable domain under the public suffix
+ * list. `attacker.github.io` against `you.github.io` is that, since
+ * `github.io` is a private suffix; `api.example.com` against
+ * `status.example.com` is not, one owner holding both. The suffix list only
+ * removes a report, never makes a host the user's. A mis-read host can only
+ * add a report, which errs toward asking, or miss one, which is the judgment
+ * as before.
  *
  * `undefined` when there is nothing to report.
  */
@@ -1930,7 +1946,7 @@ export function measureLookalikeDestinations(command: string, userMessages: read
 	const destinations: LookalikeDestination[] = [];
 	for (const host of hosts) {
 		if (named.some(name => host === name || host.endsWith(`.${name}`))) continue;
-		const sameParentAs = named.filter(name => sharedTrailingLabels(host, name) >= 2);
+		const sameParentAs = named.filter(name => sharedTrailingLabels(host, name) >= 2 && !sameRegistrableDomain(host, name));
 		if (sameParentAs.length > 0) destinations.push({ host, sameParentAs });
 	}
 	return destinations.length > 0 ? { destinations } : undefined;
