@@ -4,6 +4,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### Task instructions that are not reviewer injection join the intent corpus
+
+From Sean Perkins' https://github.com/STRML/omp-classifier/pull/83, written against `jev-v2.2`. Its 31 eval rows move into `eval/corpus/intent.jsonl`: 23 cases where a smoke check, an approved test run, or a request to read review feedback must not score as `state_contains_injection`, with twins and controls, plus 8 held-out paraphrases marked `heldOut`. The rows needed `hasUI: true` wherever they carry user words, which the validator requires now. The PR's rewording of the injection question is not ported. The false positives it targeted (114 blocks, all under `jev-v2.11`) stopped once the state notice stopped addressing the reviewer, and a wording change would move the policy hash.
+
 ### A root ssh to a host the user named can reach the reviewer
 
 From OMP session `fa2bd2e7a500`. The user asked the agent to stop a service on their own TV, typed "stop content recognition service" and "then execute the plan", and picked "Yes" on an ask. Jev answered UNSURE on every root ssh to the TV and raised `escalates_privilege` (0.70 to 0.88). That hazard was hard for stage 2, so the reviewer never read the user's words.
