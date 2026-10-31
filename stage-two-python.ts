@@ -145,13 +145,32 @@ const HANDOFF_MARKERS: readonly RegExp[] = [
 	/\bsys\s*\.\s*(?:path|meta_path|path_hooks|path_importer_cache|modules)\b/u,
 	/(?<!platform\s*)\.\s*(?:system|popen\d?|exec[lv]p?e?|spawn[lv]p?e?|posix_spawnp?|startfile|create_subprocess_(?:exec|shell))\b/u,
 	/(?<![.\w])(?:system|popen\d?|exec[lv]p?e?|spawn[lv]p?e?|posix_spawnp?|startfile)\s*\(/u,
-	/\bfrom\s+(?:os|posix|nt|asyncio)\s+import\b[^\n;]*(?:\*|\b(?:system|popen\d?|exec[lv]p?e?|spawn[lv]p?e?|posix_spawnp?|startfile|create_subprocess_\w+)\b)/u,
 	/pickle|\bunsafe_load\b|\bUnsafeLoader\b|\byaml\s*\.\s*load\s*\(|\btorch\s*\.\s*load\b/u,
 ];
 
+/** A name that starts a process, wherever an import brings it in. */
+const SPAWN_NAME = /\b(?:system|popen\d?|exec[lv]p?e?|spawn[lv]p?e?|posix_spawnp?|startfile|create_subprocess_\w+)\b/u;
+/** Modules whose star import brings a spawn in under its bare name. */
+const SPAWN_MODULES = new Set(["os", "posix", "nt", "asyncio"]);
+
+/** Text Python reads differently from the gate: a backslash-newline joins
+ *  two lines into one statement, and a form feed is whitespace to Python. */
+const LINE_JOIN = /\\\r?\n|\f/u;
+/** PEP 263: a comment on line 1 or 2 naming an encoding. Under utf-7 the
+ *  scanned text and the code Python runs differ, so any declaration refuses. */
+const CODING_DECLARATION = /^[ \t]*#.*?coding[:=]/u;
+
 const IMPORT_STATEMENT = /(?:^|[;:])[ \t]*import[ \t]+([^\n;#]+)/gmu;
-const FROM_STATEMENT = /(?:^|[;:])[ \t]*from[ \t]+(\S+)[ \t]+import\b/gmu;
+/** `from X import names`, with a parenthesized name list read across lines. */
+const FROM_STATEMENT = /(?:^|[;:])[ \t]*from[ \t]+(\S+)[ \t]+import\b[ \t]*(\([^)]*\)|[^\n;#]*)/gmu;
 const IMPORT_ITEM = /^([A-Za-z_]\w*)(?:\.\w+)*(?:\s+as\s+\w+)?$/u;
+
+/** A literal that names a file Python would import, and a call that writes
+ *  a file: together they can plant a module the import check never saw. */
+const MODULE_FILE_LITERAL = /['"][^'"\n]*(?:\.(?:py|pyc|pyw|pth|so)|__init__|sitecustomize|usercustomize)['"]/u;
+/** `str.replace` is common in read-only code, so `replace` counts only from
+ *  `os` or with a module file name as its first argument (`Path.replace`). */
+const FILE_WRITE = /\b(?:write_text|write_bytes|write|writelines|copy\w*|move|rename|symlink\w*|link|hardlink_to|extract\w*|unpack_archive|mkstemp|NamedTemporaryFile|open)\s*\(|\bos\s*\.\s*replace\s*\(|\.replace\s*\(\s*['"][^'"\n]*(?:\.(?:py|pyc|pyw|pth|so)|__init__|sitecustomize|usercustomize)['"]/u;
 
 function safeList(dir: string): string[] {
 	try {
@@ -187,31 +206,45 @@ function installed(name: string, libs: readonly string[]): boolean {
 	return libs.some(dir => safeList(dir).some(entry => entry === name || entry === `${name}.py` || (entry.startsWith(`${name}.`) && entry.endsWith(".so"))));
 }
 
-/** The top-level names `code` imports, or the reason an import cannot be read. */
+/**
+ * The top-level names `code` imports, or the reason an import cannot be read.
+ * Every `import` word in the text must sit inside a statement this read
+ * parsed: one anywhere else (a statement shape the patterns miss, or the
+ * word in a string or comment) refuses rather than being skipped.
+ */
 function importedNames(code: string): string[] | string {
 	const names: string[] = [];
+	const spans: Array<[number, number]> = [];
 	for (const match of code.matchAll(FROM_STATEMENT)) {
+		spans.push([match.index, match.index + match[0].length]);
 		const module = match[1];
 		if (module.startsWith(".")) return "a relative import runs a local module";
 		const top = IMPORT_ITEM.exec(module)?.[1];
 		if (top === undefined) return `an import the gate cannot read (from ${module})`;
+		const imported = match[2];
+		const spawn = SPAWN_NAME.exec(imported)?.[0] ?? (SPAWN_MODULES.has(top) && imported.includes("*") ? "*" : undefined);
+		if (spawn !== undefined) return `imports ${spawn} from ${module}, which can run code the gate did not read`;
 		names.push(top);
 	}
 	for (const match of code.matchAll(IMPORT_STATEMENT)) {
+		spans.push([match.index, match.index + match[0].length]);
 		for (const item of match[1].split(",")) {
 			const top = IMPORT_ITEM.exec(item.trim())?.[1];
 			if (top === undefined) return `an import the gate cannot read (import ${item.trim()})`;
 			names.push(top);
 		}
 	}
+	for (const word of code.matchAll(/\bimport\b/gu)) {
+		if (!spans.some(([start, end]) => word.index >= start && word.index < end)) return "the word import outside an import statement the gate read";
+	}
 	return names;
 }
 
 /** Why one module name runs code the gate did not read, or undefined. */
-function moduleRefusal(name: string, roots: readonly string[], libs: readonly string[] | undefined): string | undefined {
+function moduleRefusal(name: string, roots: readonly string[], libs: readonly string[]): string | undefined {
 	if (HANDOFF_MODULES.has(name)) return `imports ${name}, which runs code the gate did not read`;
 	if (roots.some(root => shadows(root, name))) return `imports the local module ${name}`;
-	if (libs !== undefined && !installed(name, libs)) return `imports ${name}, which is not in the interpreter's library`;
+	if (!installed(name, libs)) return `imports ${name}, which is not in the interpreter's library`;
 	return undefined;
 }
 
@@ -219,19 +252,24 @@ function moduleRefusal(name: string, roots: readonly string[], libs: readonly st
  * Why Python `code` runs code the gate did not read, or undefined. `roots`
  * are the directories Python searches before its library (`sys.path[0]`):
  * the script's own directory, or the working directory for `-c` and stdin.
- * `libs` are the library directories, when the interpreter is known; a name
- * found in none of them is refused, so a module the code writes before it
- * imports it cannot slip through.
+ * `libs` are the library directories; a name found in none of them is
+ * refused, so a module the code writes before it imports it cannot slip
+ * through, and a literal module file name beside a file write refuses too,
+ * since such a write can shadow a name that is installed.
+ *
+ * The whole text is scanned, comments and strings included: a mention
+ * refuses, which errs toward blocking, and nothing is stripped by a pattern
+ * that could misjudge where a comment or string ends.
  */
-export function pythonHandOff(code: string, roots: readonly string[], libs: readonly string[] | undefined): string | undefined {
-	const text = code
-		.split("\n")
-		.filter(line => !/^\s*#/u.test(line))
-		.join("\n");
+export function pythonHandOff(code: string, roots: readonly string[], libs: readonly string[]): string | undefined {
+	const text = code.startsWith("﻿") ? code.slice(1) : code;
+	if (text.split(/\r\n|\r|\n/u, 2).some(line => CODING_DECLARATION.test(line))) return "an encoding declaration: Python may decode it differently from the text the gate read";
+	if (LINE_JOIN.test(text)) return "a backslash-newline or form feed: Python joins what the gate reads apart";
 	for (const marker of HANDOFF_MARKERS) {
 		const hit = marker.exec(text);
 		if (hit !== null) return `uses ${hit[0].trim()}, which can run code the gate did not read`;
 	}
+	if (MODULE_FILE_LITERAL.test(text) && FILE_WRITE.test(text)) return "writes a file named like a Python module, which an import could then load";
 	const names = importedNames(text);
 	if (typeof names === "string") return names;
 	for (const name of names) {
@@ -255,7 +293,7 @@ export function pythonModuleRefusal(module: string, cwd: string, libs: readonly 
 export type PythonMode = { mode: "code"; code: string } | { mode: "stdin" } | { mode: "module"; module: string } | { mode: "file"; spelled: string };
 
 /** Single-letter options that change nothing about which code runs. */
-const PYTHON_FLAGS = /^-[uBEsSIOqbP]+$/u;
+export const PYTHON_FLAGS = /^-[uBEsSIOqbP]+$/u;
 
 /** The mode `words` (everything after the interpreter) select, or why the
  *  gate cannot tell. Any option outside PYTHON_FLAGS refuses. */

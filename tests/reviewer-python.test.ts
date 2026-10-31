@@ -114,6 +114,11 @@ describe("a venv interpreter the gate can identify", () => {
 		expect(reviewerCalls[0].input.command).toContain('print(re.sub("a", "b", "abc"))');
 	});
 
+	test("a here-document that reads a .py file and edits its text with str.replace", async () => {
+		const python = fakeVenv(fakeInstall());
+		await expectReviewed(`${python} - <<'PY'\nimport pathlib\nt = pathlib.Path("tests/test_page.py").read_text()\nprint(t.replace("a", "b"))\nPY`);
+	});
+
 	test("python x.py under a timeout, into an output filter: the body is read", async () => {
 		const python = fakeVenv(fakeInstall());
 		write(".scratch/build_page.py", "import json\nfrom pathlib import Path\nprint('from-build')\n");
@@ -333,20 +338,77 @@ describe("Python the gate cannot read all of stays refused", () => {
 });
 
 describe("a Python script run by its shebang reads under the same rules", () => {
-	test("one that only uses the standard library is reviewed", async () => {
-		write("probe.py", "#!/usr/bin/env python3\nimport json\nprint('from-shebang')\n", 0o755);
+	test("one naming a venv interpreter that only uses the standard library is reviewed", async () => {
+		const python = fakeVenv(fakeInstall());
+		write("probe.py", `#!${python} -u\nimport json\nprint('from-shebang')\n`, 0o755);
 		await expectReviewed("./probe.py");
 		expect(JSON.stringify(reviewerCalls[0].input.scriptBodies)).toContain("from-shebang");
 	});
 
+	test("one reaching a venv interpreter through env and PATH is reviewed", async () => {
+		fakeVenv(fakeInstall());
+		write("probe.py", "#!/usr/bin/env python3\nimport json\n", 0o755);
+		const previous = process.env.PATH;
+		process.env.PATH = `${path.join(dir, "venv", "bin")}${path.delimiter}${previous ?? ""}`;
+		try {
+			await expectReviewed("./probe.py");
+		} finally {
+			process.env.PATH = previous;
+		}
+	});
+
 	test("one that spawns a process is refused", async () => {
-		write("probe.py", "#!/usr/bin/env python3\nimport subprocess\nsubprocess.run(['./other.sh'])\n", 0o755);
+		const python = fakeVenv(fakeInstall());
+		write("probe.py", `#!${python}\nimport subprocess\nsubprocess.run(['./other.sh'])\n`, 0o755);
 		await expectRefused("./probe.py", "subprocess");
 	});
 
 	test("one that imports a module next to it is refused", async () => {
-		write("probe.py", "#!/usr/bin/env python3\nimport helpers\n", 0o755);
+		const python = fakeVenv(fakeInstall());
+		write("probe.py", `#!${python}\nimport helpers\n`, 0o755);
 		write("helpers.py", "import os\nos.system('id')\n");
 		await expectRefused("./probe.py", "imports the local module helpers");
+	});
+
+	test("one that imports a module its interpreter does not have is refused", async () => {
+		const python = fakeVenv(fakeInstall());
+		write("probe.py", `#!${python}\nimport notinstalled\n`, 0o755);
+		await expectRefused("./probe.py", "imports notinstalled");
+	});
+
+	test.each([
+		["env -S splitting more arguments", "#!/usr/bin/env -S python3 -c 'import os'"],
+		["env with an assignment", "#!/usr/bin/env PYTHONPATH=. python3"],
+		["-m", "#!__PY__ -m runpy"],
+		["-c", "#!__PY__ -c 'import os'"],
+		["-W", "#!__PY__ -W ignore"],
+		["-X", "#!__PY__ -X dev"],
+		["a python outside any venv", "#!__BASE__"],
+		["a relative interpreter", "#!venv/bin/python"],
+	])("one whose shebang the gate cannot read is refused: %s", async (_name, shebang) => {
+		const base = fakeInstall();
+		const python = fakeVenv(base);
+		write("probe.py", `${shebang.replace("__PY__", python).replace("__BASE__", base)}\nimport json\n`, 0o755);
+		await expectRefused("./probe.py", "shebang");
+	});
+});
+
+describe("text Python reads differently from the gate stays refused", () => {
+	test.each([
+		["a backslash-newline joining an import", "import \\\nsubprocess\n", "backslash-newline"],
+		["a backslash-newline joining a from-import", "from \\\nos import system\nsystem('id')\n", "backslash-newline"],
+		["a form feed before an import", "\fimport subprocess\n", "form feed"],
+		["a utf-7 coding declaration", "# -*- coding: utf-7 -*-\n+AGkAbQBwAG8AcgB0ACAAcwB1AGIAcAByAG8AYwBlAHMAcw-\n", "encoding declaration"],
+		["a coding declaration on line 2", "#!/usr/bin/env python3\n# vim: set fileencoding=utf-7 :\nprint(1)\n", "encoding declaration"],
+		["a multi-line parenthesized from-import with an alias", "from os import (\n    system as s\n)\ns('id')\n", "imports system from os"],
+		["a star import from os", "from os import *\n", "imports * from os"],
+		["the word import where no import statement parses", "x = 1 if True else 0; y = [__name__ for _ in ()] or import_me\nprint('import subprocess')\n", "the word import"],
+		["an import mentioned only in a comment", "# import subprocess\nprint(1)\n", "the word import"],
+		["a module file written and then imported", "import json\nopen('json.py', 'w').write('import os')\nimport json\n", "writes a file named like a Python module"],
+		["a file moved onto a module name and then imported", "import json, pathlib\npathlib.Path('payload.txt').replace('json.py')\nimport json\n", "writes a file named like a Python module"],
+	])("%s", async (_name, code, why) => {
+		const python = fakeVenv(fakeInstall());
+		write("probe.py", code);
+		await expectRefused(`${python} probe.py`, why);
 	});
 });

@@ -27,8 +27,13 @@ The gate still refuses code it can see running something it did not read:
 - the import machinery, an edit to `sys.path`, or reflection by name (`getattr`, `__import__`)
 - a module whose job is running a string or file (`runpy`, `timeit`, `pdb`, `code`)
 - unpickling
+- a literal module file name (`json.py`, `__init__`, a `.pth`) beside a file write, which could plant a module that shadows an installed one
+- text Python reads differently from the gate: a backslash-newline, a form feed, or an encoding declaration on line 1 or 2 (a utf-7 body hides code from a UTF-8 read)
+- the word `import` anywhere outside an import statement the gate parsed, comments and strings included
 
-It also refuses an unquoted here-document, a here-string, stdin from a file, an option outside `-uBEsSIOqbP`, words built at run time, an assignment, and a set `PYTHONPATH` or `PYTHONHOME`. A script run by a Python shebang now gets the same import and hand-off checks. Before this, any such body was shown with no checks at all. No reviewer run in the log had a `.py` program, so this changes no past decision.
+The scan reads the whole text and strips nothing, so a mention in a comment or string refuses. It also refuses an unquoted here-document, a here-string, stdin from a file, an option outside `-uBEsSIOqbP`, words built at run time, an assignment, and a set `PYTHONPATH` or `PYTHONHOME`.
+
+A script run by a Python shebang now gets the same checks against the interpreter its shebang names. Only `#!<absolute python>` and `#!/usr/bin/env <python name>` are read, followed by nothing but those flags. That interpreter must pass the same identity check, and its library is what the import check reads. Before this, any such body was shown with no checks at all. No reviewer run in the log had a `.py` program, so this changes no past decision.
 
 | Command (from the log, anonymized) | Before | After |
 |---|---|---|
@@ -39,7 +44,7 @@ It also refuses an unquoted here-document, a here-string, stdin from a file, an 
 | `timeout 2400 ~/.venv/bin/python -m scripts.flow "name" \| tail -40` | refused, "a binary" | refused, "imports the local module scripts" |
 | `python3 -c ...`, `python3` from Homebrew, no venv | refused | refused |
 
-Not covered: a module that the code's imports pull in transitively, shadowed by a file someone planted in `sys.path[0]` (the same class as a planted binary, judged when it is written), a `.pth` file in site-packages, the local code an installed `-m` runner loads (pytest's `conftest.py`), and a copy of another binary saved as `python3.12` in a venv.
+Not covered: a module that the code's imports pull in transitively, shadowed by a file someone planted in `sys.path[0]` (the same class as a planted binary, judged when it is written), a planting write whose file name is built at run time, a `.pth` file or a modified package in site-packages (a venv's site-packages is user-writable; it is trusted the way the user-owned Homebrew prefix every shape-A binary resolves into is trusted, and no further), the local code an installed `-m` runner loads (pytest's `conftest.py`), and a copy of another binary saved as `python3.12` in a venv.
 
 ### `command -v` and a Python variable named `rm` no longer block
 

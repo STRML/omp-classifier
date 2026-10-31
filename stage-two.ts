@@ -37,7 +37,7 @@ import * as path from "node:path";
 import { isSecretPath } from "./floor";
 import { REVIEWER_SCRIPT_MAX_BYTES, type ReviewerScriptBody } from "./reviewer";
 import { parseShell, type ShellCommand, type ShellWord } from "./shell-ast";
-import { isNativeExecutable, libraryDirs, PYTHON_ENVIRONMENT, PYTHON_NAME, pythonHandOff, pythonMode, pythonModuleRefusal, venvOf } from "./stage-two-python";
+import { isNativeExecutable, libraryDirs, PYTHON_ENVIRONMENT, PYTHON_FLAGS, PYTHON_NAME, pythonHandOff, pythonMode, pythonModuleRefusal, venvOf } from "./stage-two-python";
 
 export interface ReadScript extends ReviewerScriptBody {
 	/** The path the command names, resolved but not through links. */
@@ -210,9 +210,9 @@ export function readScriptForReview(spelled: string, file: string, handOff: (bod
  */
 function bodyHandOff(body: string, real: string): string | undefined {
 	const shebang = body.startsWith("#!") ? body.split("\n", 1)[0] : "";
-	// A Python body gets Python's checks: its imports search the script's own
-	// directory first. Which interpreter the shebang finds is not checked.
-	if (/\bpython[\d.]*\b/u.test(shebang) && !/\b(?:ba|z|da|k)?sh\b/u.test(shebang)) return pythonHandOff(body, [path.dirname(real)], undefined);
+	// A shebang that mentions Python gets Python's checks, against the
+	// interpreter it names: its imports search the script's own directory first.
+	if (/python/u.test(shebang)) return shebangPythonHandOff(shebang, body, real);
 	const code = body
 		.split("\n")
 		.filter(line => !/^\s*#/u.test(line))
@@ -466,7 +466,12 @@ function pythonInterpreter(run: ShellCommand, dir: string): PythonInterpreter | 
 	if (word === undefined || !word.fixed) return undefined;
 	const spelled = word.value;
 	const located = isPathWord(spelled) ? path.resolve(dir, expandHome(spelled)) : pathHasRelativeEntry() ? undefined : onPath(spelled);
-	if (located === undefined) return undefined;
+	return located === undefined ? undefined : pythonAt(located);
+}
+
+/** The interpreter at `located` (the program as the shell or kernel finds
+ *  it, before links), under the rules `pythonInterpreter` states. */
+function pythonAt(located: string): PythonInterpreter | undefined {
 	let real: string;
 	try {
 		real = fs.realpathSync(located);
@@ -477,6 +482,34 @@ function pythonInterpreter(run: ShellCommand, dir: string): PythonInterpreter | 
 	if (isSystemProgram(located)) return { real };
 	const venv = venvOf(located, real);
 	return venv === undefined ? undefined : { real, venv };
+}
+
+/**
+ * Python's checks for a script whose shebang mentions Python. Only two
+ * spellings are read: `#!<absolute path to python>` and `#!/usr/bin/env
+ * <python name>`, each followed by nothing but PYTHON_FLAGS. An env option
+ * (`-S` splits the rest into more arguments), an assignment, `-m`, `-c`, `-W`
+ * or `-X` refuses. The interpreter the shebang reaches must pass the same
+ * identity check as a command's (`pythonAt`), and its library is what the
+ * import check reads.
+ */
+function shebangPythonHandOff(shebang: string, body: string, real: string): string | undefined {
+	const [program = "", ...args] = shebang.slice(2).trim().split(/[ \t]+/u);
+	if (!path.isAbsolute(program)) return "its shebang names no absolute interpreter";
+	let located: string | undefined = program;
+	let flags = args;
+	if (path.basename(program) === "env") {
+		const [name = "", ...rest] = args;
+		if (!PYTHON_NAME.test(name)) return "its shebang hands env something other than a python name";
+		located = pathHasRelativeEntry() ? undefined : onPath(name);
+		flags = rest;
+	} else if (!PYTHON_NAME.test(path.basename(program))) return "its shebang names an interpreter the gate does not read";
+	if (!flags.every(flag => PYTHON_FLAGS.test(flag))) return "its shebang passes the interpreter an option the gate does not know";
+	const python = located === undefined ? undefined : pythonAt(located);
+	if (python === undefined) return "its shebang names a python the gate cannot identify";
+	const libs = libraryDirs(python.real, python.venv);
+	if (libs === undefined) return "the gate cannot find its interpreter's standard library";
+	return pythonHandOff(body, [path.dirname(real)], libs);
 }
 
 /** Whether a redirect is a here-document on stdin whose delimiter is quoted,
