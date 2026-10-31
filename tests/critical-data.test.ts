@@ -116,6 +116,7 @@ describe("anything that executes the same text stays critical", () => {
 		["a cat heredoc that runs a substitution", `git commit -m "$(cat <<EOF\n$(rm -rf /)\nEOF\n)"`],
 		["cat with an argument inside -m", `git commit -m "$(cat notes.txt <<'EOF'\nreboot\nEOF\n)"`],
 		["a git -c value", `git -c core.editor='rm -rf /' commit -m x`],
+		["a git -c hooksPath whose commit-msg hook reads the message", `git -c core.hooksPath=.hooks commit -m 'rm -rf /'`],
 		["a git -c editor that runs the message file", `git -c core.editor='sh .git/COMMIT_EDITMSG' commit -e -m 'rm -rf /'`],
 		["a sequence after the commit", `git commit -m x; reboot`],
 		["the last argument handed to eval", `git commit -m 'rm -rf /'; eval "$_"`],
