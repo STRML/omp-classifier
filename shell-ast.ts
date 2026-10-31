@@ -1285,7 +1285,9 @@ function trustedNames(tree: any): Map<string, number> {
 	// biome-ignore lint/suspicious/noExplicitAny: untyped AST
 	for (const stmt of (tree as any)?.Stmts ?? []) {
 		const cmd = stmt?.Cmd;
-		if (!cmd || stmt.Background || stmt.Coprocess || stmt.Negated) continue;
+		// A redirect on the statement (a heredoc above all) is expanded before
+		// the statement's own assignments take effect.
+		if (!cmd || stmt.Background || stmt.Coprocess || stmt.Negated || (stmt.Redirs ?? []).length > 0) continue;
 		const type = nodeType(cmd);
 		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
 		if (type === "CallExpr" && (cmd.Args ?? []).length === 0) for (const assign of cmd.Assigns ?? []) if (assign.Name?.Value && !assign.Array && !assign.Index && !assign.Append && assign.Value && integerValue(assign.Value)) define(assign.Name.Value, assign.End().Offset());
