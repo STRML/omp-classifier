@@ -4,6 +4,19 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### Stage 2 reads hidden arithmetic from the parse, not the text
+
+https://github.com/STRML/omp-classifier/pull/225 refused script bodies whose arithmetic reads a name, because bash evaluates the variable's value as an expression and a value of `PATH=/x` assigns PATH. It found those spots with regexes over the body text, and every review round found another spelling: a substring offset on `${1:w}`, `${@:w}` or `${a[0]:w}`, a compound array `( [w]=1 )`, a `[[ ]]` comparison split over lines, `declare -i` (later plain assignments become arithmetic), `declare -n` (a name becomes an alias of another), and a verb rewritten by brace expansion (`{ex,}port`). `hiddenArithmetic` in `shell-ast.ts` now reads the parse. It checks `ArithmCmd`, `let`, `$(( ))`, `$[ ]`, every subscript and substring offset (read off the node, since the walker does not descend into them), and `[[ ]]` comparisons whose operator the runtime derives from a parse of `-eq` through `-ge`. Any one of them that reads a name, an expansion or a substitution refuses. `declare`, `typeset` and `local` with `-i` or `-n`, or with a flag word built at run time, refuse outright, as does a verb that brace expansion or a glob rewrites. The text scans are removed.
+
+| Body | Before | After |
+|---|---|---|
+| `echo ${1:w}`, `${@:w}`, `${a[0]:w}` | reviewed | refused |
+| `a=( [w]=1 )` | reviewed | refused |
+| `[[ $w` newline `-eq 1 ]]` | reviewed | refused |
+| `declare -i x; x=w`, `declare -n r="$n"` | reviewed | refused |
+| `{ex,}port X=1` | reviewed | refused |
+| `$((1 + (2)))`, `${x:-d}`, `${x:0:1}`, `[[ 1 -eq 1 ]]`, `x[0]=1`, `declare -x FOO=1`, `[ "$1" = start ]` | reviewed | reviewed |
+
 ### A Python run refuses when a local file shadows any stdlib module, and a shebang's env must be a system program
 
 Two gaps the security review found after https://github.com/STRML/omp-classifier/pull/218 merged.
