@@ -587,6 +587,8 @@ function shebangPythonHandOff(shebang: string, body: string, real: string): stri
 	let located: string | undefined = program;
 	let flags = args;
 	if (path.basename(program) === "env") {
+		// A user-owned file named env is whatever it says it is.
+		if (!isSystemProgram(program)) return "its shebang names an env that is not a system program";
 		const [name = "", ...rest] = args;
 		if (!PYTHON_NAME.test(name)) return "its shebang hands env something other than a python name";
 		located = pathHasRelativeEntry() ? undefined : onPath(name);

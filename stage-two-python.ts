@@ -309,6 +309,33 @@ function shadows(dir: string, name: string): boolean {
 	return entries.some(entry => entry === name || entry.startsWith(`${name}.`));
 }
 
+/** The module name an import of a directory entry would bind: `re.py`,
+ *  `re.pyc`, `re/`, `_json.cpython-312-darwin.so` all name a module. */
+const moduleNameOf = (entry: string): string => entry.replace(/\.(?:py|pyc|pyo|pyw|so|pyd)$/u, "").replace(/\.(?:cpython|abi\d|pypy)[^.]*$/u, "");
+
+/**
+ * A stdlib module name that a file in one of `roots` would shadow, or
+ * undefined. The script's directory (or the working directory for `-c`, `-m`
+ * and stdin) comes first on sys.path, so a local `re.py` replaces `re` for
+ * every import of it, including the imports the standard library makes among
+ * its own modules. Checking only the body's own imports misses those.
+ */
+export function stdlibShadow(roots: readonly string[], stdlib: readonly string[]): string | undefined {
+	const names = new Set<string>();
+	for (const dir of stdlib) {
+		for (const entry of safeList(dir)) names.add(moduleNameOf(entry));
+		for (const entry of safeList(path.join(dir, "lib-dynload"))) names.add(moduleNameOf(entry));
+	}
+	names.delete("site-packages");
+	names.delete("lib-dynload");
+	names.delete("__pycache__");
+	for (const root of roots) {
+		const found = safeList(root).map(moduleNameOf).find(name => names.has(name));
+		if (found !== undefined) return found;
+	}
+	return undefined;
+}
+
 function installed(name: string, libs: readonly string[]): boolean {
 	if (BUILTIN_MODULES.has(name)) return true;
 	return libs.some(dir => safeList(dir).some(entry => entry === name || entry === `${name}.py` || (entry.startsWith(`${name}.`) && entry.endsWith(".so"))));
@@ -384,6 +411,8 @@ export function pythonHandOff(code: string, roots: readonly string[], libs: read
 	// The reviewer reads the text: code in another encoding is not what it sees.
 	if (!/^utf-8(?:-sig)?$/u.test(facts.encoding)) return `declares the encoding ${facts.encoding}, so the code that runs is not the text the reviewer reads`;
 	const stdlib = standardLibrary(libs);
+	const shadowed = stdlibShadow(roots, stdlib);
+	if (shadowed !== undefined) return `a local ${shadowed} shadows the standard library for every import of it`;
 	for (const item of facts.imports) {
 		const why = importRefusal(item, roots, stdlib);
 		if (why !== undefined) return why;
@@ -495,6 +524,8 @@ export function pythonModuleRefusal(module: string, cwd: string, libs: readonly 
 	if (top === undefined) return `python -m ${module} names no module`;
 	if (RUNNER_MODULES.has(top) || DYNAMIC_MODULES.has(top) || (top.startsWith("_") && top !== "__future__")) return `python -m ${top} runs a file or string the reviewer cannot read`;
 	if (shadows(cwd, top)) return `runs the local module ${top}`;
+	const shadowed = stdlibShadow([cwd], standardLibrary(libs));
+	if (shadowed !== undefined) return `a local ${shadowed} shadows the standard library for every import of it`;
 	if (!installed(top, libs)) return `python -m ${top}, which is not installed`;
 	return undefined;
 }
