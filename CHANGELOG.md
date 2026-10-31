@@ -4,6 +4,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### `$_` and `BASH*` names are never trusted in arithmetic
+
+After https://github.com/STRML/omp-classifier/pull/232, a name the body sets to an integer is trusted in arithmetic. Bash overwrites `$_` after every command (with the last argument of the one before), so `_=0; echo 'a[$(cmd)]'; (( _ ))` evaluates text the reviewer did not see as a value. `_` and every name starting with `BASH`, plus `HISTCMD`, `COLUMNS`, `LINES` and the readline names, join the never-trusted list.
+
 ### Arithmetic over names the body sets to integers reads again, and `[[ ]]` is not a glob
 
 Two over-refusals from today's hardening, plus one more gap.

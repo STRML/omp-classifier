@@ -989,7 +989,10 @@ const PLAIN_ARITHMETIC = new Set(["Word", "Lit", "BinaryArithm", "UnaryArithm", 
 const INTEGER_SPECIALS = new Set(["SECONDS", "RANDOM", "SRANDOM", "EPOCHSECONDS", "LINENO", "BASHPID", "PPID", "UID", "EUID", "#", "?", "$", "!"]);
 /** Names bash fills on its own (`read` with no name sets REPLY, `=~` sets
  *  BASH_REMATCH): never trusted, whatever the body assigns. */
-const BASH_MANAGED = new Set(["REPLY", "MAPFILE", "OPTARG", "OPTIND", "OPTERR", "BASH_REMATCH", "COPROC", "PIPESTATUS", "BASH_ARGV", "BASH_ARGC", "FUNCNAME", "BASH_SOURCE", "BASH_LINENO", "DIRSTACK", "GROUPS", "COMP_WORDS", "COMPREPLY", "READLINE_LINE", "PWD", "OLDPWD", "IFS", "PATH"]);
+const BASH_MANAGED = new Set(["_", "REPLY", "MAPFILE", "OPTARG", "OPTIND", "OPTERR", "COPROC", "PIPESTATUS", "FUNCNAME", "DIRSTACK", "GROUPS", "COMP_WORDS", "COMPREPLY", "READLINE_LINE", "READLINE_POINT", "READLINE_MARK", "HISTCMD", "COLUMNS", "LINES", "PWD", "OLDPWD", "IFS", "PATH"]);
+/** `$_` is overwritten after every command, and every `BASH*` variable is
+ *  bash's own: neither is trusted, whatever the body assigns. */
+const bashManaged = (name: string): boolean => BASH_MANAGED.has(name) || name.startsWith("BASH");
 /** Builtins that write the names they are handed from input the text does not show. */
 const INPUT_WRITERS = new Set(["read", "mapfile", "readarray", "getopts"]);
 
@@ -1065,7 +1068,7 @@ function trustedNames(tree: any): Set<string> {
 	// A writer whose target is built at run time (`read "$n"`) can write any
 	// name, so nothing the body assigns can be trusted.
 	if (written.has("\0")) return trusted;
-	for (const name of integerAssigned) if (!written.has(name) && !INTEGER_SPECIALS.has(name) && !BASH_MANAGED.has(name)) trusted.add(name);
+	for (const name of integerAssigned) if (!written.has(name) && !INTEGER_SPECIALS.has(name) && !bashManaged(name)) trusted.add(name);
 	for (const name of INTEGER_SPECIALS) if (!written.has(name) && !integerAssigned.has(name)) trusted.add(name);
 	return trusted;
 }

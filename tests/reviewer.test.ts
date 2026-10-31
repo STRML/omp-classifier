@@ -605,6 +605,8 @@ describe("what never reaches the reviewer", () => {
 		["a script whose arithmetic reads a name it never assigns", () => script("wrap.sh", "#!/bin/bash\n(( i++ ))\ngit status\n"), "./wrap.sh"],
 		["a script whose arithmetic assigns a name from its own old value", () => script("wrap.sh", "#!/bin/bash\n(( x = x + 1 ))\ngit status\n"), "./wrap.sh"],
 		["a script that reads into a name built at run time before its arithmetic", () => script("wrap.sh", "#!/bin/bash\nx=0; n=x\nread \"$n\" < /dev/null\n(( x ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads $_, which every command overwrites", () => script("wrap.sh", "#!/bin/bash\n_=0\necho x\n(( _ ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a BASH variable it assigned", () => script("wrap.sh", "#!/bin/bash\nBASH_COMMAND=0\n(( BASH_COMMAND ))\ngit status\n"), "./wrap.sh"],
 		["a script whose arithmetic reads REPLY after assigning it", () => script("wrap.sh", "#!/bin/bash\nREPLY=0\nread < /dev/null\n(( REPLY ))\ngit status\n"), "./wrap.sh"],
 		["a script whose arithmetic reads a name declared with no value", () => script("wrap.sh", "#!/bin/bash\nlocal x\n(( x ))\ngit status\n"), "./wrap.sh"],
 		["a script whose arithmetic reads a name it appended to", () => script("wrap.sh", "#!/bin/bash\nx=0\nx+=1\n(( x ))\ngit status\n"), "./wrap.sh"],
