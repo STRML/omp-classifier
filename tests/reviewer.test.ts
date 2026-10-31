@@ -258,7 +258,7 @@ describe("a session whose shell an earlier call may have changed", () => {
 	});
 
 	test("a body that prints variables and does integer arithmetic still reaches the reviewer", async () => {
-		script("update.sh", "#!/bin/bash\nx=hi\nprintf '%s\\n' \"$x\"\necho $((1 + (2)))\necho ${x:-default} ${x:0:1}\n[ \"$1\" = start ] && git fetch origin\nexport FOO=bar\n");
+		script("update.sh", "#!/bin/bash\nx=hi\nprintf '%s\\n' \"$x\"\necho $((1 + (2)))\necho ${x:-default} ${x:0:1}\n[ \"$1\" = start ] && git fetch origin\n[ -n \"$x\" ] && [ \"$#\" -eq 1 ] && [ \"$x\" ]\nexport FOO=bar\n");
 		scriptReviewer(reviewerReply("allow", "update fork main"));
 		expect(resultText(await fire("tool_call", makeEvent("./update.sh start"), uiCtx(nextSession(), [user("u1", "update fork main")])))).toBe("ALLOWED");
 	});
@@ -596,6 +596,10 @@ describe("what never reaches the reviewer", () => {
 		["a script whose [ ] builds its -v flag at run time", () => script("wrap.sh", "#!/bin/bash\nf=-v; n='a[w]'\n[ \"$f\" \"$n\" ]\ngit status\n"), "./wrap.sh"],
 		["a script whose test builds its -R flag after !", () => script("wrap.sh", "#!/bin/bash\nf=-R; n='a[w]'\ntest ! \"$f\" \"$n\"\ngit status\n"), "./wrap.sh"],
 		["a script whose wait is handed a built flag", () => script("wrap.sh", "#!/bin/bash\nf=-p; n='a[w]'\nwait \"$f\" \"$n\"\ngit status\n"), "./wrap.sh"],
+		["a script whose unquoted [ ] word splits into -v and a name", () => script("wrap.sh", "#!/bin/bash\ns='-v a[w]'\n[ $s ]\ngit status\n"), "./wrap.sh"],
+		["a script whose [ ] builds its connective too", () => script("wrap.sh", "#!/bin/bash\ng='!'; f=-v; n='a[w]'\n[ \"$g\" \"$f\" \"$n\" ]\ngit status\n"), "./wrap.sh"],
+		["a script whose expanded verb reads a script on stdin", () => script("wrap.sh", "#!/bin/bash\nX=bash\n$X < payload.txt\ngit status\n"), "./wrap.sh"],
+		["a script whose wait bundles -p", () => script("wrap.sh", "#!/bin/bash\nwait -fp 'a[w]'\ngit status\n"), "./wrap.sh"],
 		["a script that unsets a subscripted name", () => script("wrap.sh", "#!/bin/bash\nunset 'a[$(id)]'\ngit status\n"), "./wrap.sh"],
 		["a script that reads into a subscripted name", () => script("wrap.sh", "#!/bin/bash\nread -r 'a[w]' < /dev/null\ngit status\n"), "./wrap.sh"],
 		["a script whose expanded verb is handed a name to write", () => script("wrap.sh", "#!/bin/bash\nv=export\n$v X=1\ngit status\n"), "./wrap.sh"],

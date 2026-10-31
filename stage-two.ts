@@ -252,11 +252,36 @@ function bodyHandOff(body: string, real: string): string | undefined {
 
 /** Builtins whose words are variable names, where a subscript is evaluated. */
 const NAME_TAKERS = new Set(["unset", "read", "declare", "typeset", "local", "export", "readonly", "mapfile", "readarray", "getopts", "printf", "wait", "let", "test", "["]);
-/** `test` binary operators: a built word right before one is its left operand. */
-const BINARY_TEST_OPERATORS = new Set(["=", "==", "!=", "<", ">", "-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-nt", "-ot", "-ef", "-a", "-o"]);
+/** `test` binary operators. The numeric ones are safe here, unlike in
+ *  `[[ ]]`: `[` rejects a non-integer operand instead of evaluating it. */
+const BINARY_TEST_OPERATORS = new Set(["=", "==", "!=", "<", ">", "-nt", "-ot", "-ef", "-eq", "-ne", "-lt", "-le", "-gt", "-ge"]);
+/** `test` unary operators on a string or file. `-v` and `-R` take a variable
+ *  name and are left out on purpose. */
+const UNARY_TEST_OPERATORS = new Set(["-n", "-z", "-e", "-f", "-d", "-r", "-w", "-x", "-s", "-L", "-h", "-p", "-S", "-b", "-c", "-g", "-k", "-u", "-O", "-G", "-N", "-t"]);
+const NAME_TEST = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+
+/** A built word that stays one word: one double-quoted span. */
+const quotedOperand = (word: ShellWord): boolean => /^"[^"]*"$/u.test(word.source);
+
+/** Why a `test` argument list can evaluate a name, or undefined. With every
+ *  word fixed, `-v`/`-R` must be followed by a plain name. With any word
+ *  built at run time, only `[ "$x" ]`, `[ -op "$x" ]` and `[ A op B ]` read,
+ *  each built word one double-quoted span and every operator fixed. */
+function testShapeRefusal(args: readonly ShellWord[]): string | undefined {
+	if (args.every(word => word.fixed)) {
+		const bad = args.findIndex((word, index) => (word.value === "-v" || word.value === "-R") && !NAME_TEST.test(args[index + 1]?.value ?? ""));
+		return bad === -1 ? undefined : "evaluates the subscript in a name it is given";
+	}
+	if (!args.every(word => word.fixed || quotedOperand(word))) return "is handed a word that can split into an operator";
+	const fixedOp = (word: ShellWord | undefined, ops: ReadonlySet<string>): boolean => word !== undefined && word.fixed && ops.has(word.value);
+	const shape =
+		args.length === 1 ||
+		(args.length === 2 && fixedOp(args[0], UNARY_TEST_OPERATORS) && !args[1].fixed) ||
+		(args.length === 3 && fixedOp(args[1], BINARY_TEST_OPERATORS) && !UNARY_TEST_OPERATORS.has(args[0].value) && args[0].value !== "!");
+	return shape ? undefined : "is handed a built word where an operator can go";
+}
 /** `name[expr]` with anything but an integer between the brackets. */
 const SUBSCRIPTED_NAME = /^[A-Za-z_][A-Za-z0-9_]*\[[^\]]*[^0-9\s\]][^\]]*\]/u;
-const ASSIGNMENT_SHAPED = /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/u;
 
 /** Builtins that write a variable named by one of their words. */
 const VARIABLE_WRITERS = new Set(["export", "declare", "typeset", "local", "readonly", "read", "mapfile", "readarray", "unset", "getopts"]);
@@ -288,26 +313,22 @@ function writesHiddenName(command: ShellCommand): string | undefined {
 	if (verb !== undefined && NAME_TAKERS.has(verb.value) && command.words.slice(1).some(word => SUBSCRIPTED_NAME.test(word.value))) {
 		return `${verb.value} evaluates the subscript in a name it is given`;
 	}
-	// `test -v NAME`, `[ -R NAME ]` and `wait -p NAME` take a variable name
-	// as the word after the flag, and a value built at run time can carry a
-	// subscript (`n='a[$(cmd)]'; [ -v "$n" ]`).
-	// The flag itself can be built at run time (`f=-v; [ "$f" "$n" ]`): a built
-	// word where a unary operator goes (first, or after `!`, `-a`, `-o`, `(`)
-	// with an operand after it fails closed. `[ "$x" = y ]` puts the built
-	// word where an operand goes and still reads.
-	const builtUnaryOperator = (): boolean => {
-		const args = command.words.slice(1).filter((word, index, all) => !(verb?.value === "[" && index === all.length - 1 && word.value === "]"));
-		return args.some((word, index) => !word.fixed && index + 1 < args.length && (index === 0 || ["!", "-a", "-o", "("].includes(args[index - 1]?.value ?? "")) && !BINARY_TEST_OPERATORS.has(args[index + 1]?.value ?? ""));
-	};
-	const takesName = (flags: readonly string[]): boolean =>
-		command.words.some((word, index) => index > 0 && flags.includes(word.value) && !(command.words[index + 1]?.fixed && /^[A-Za-z_][A-Za-z0-9_]*$/u.test(command.words[index + 1]?.value ?? "")));
-	if (verb !== undefined && (((verb.value === "test" || verb.value === "[") && (takesName(["-v", "-R"]) || builtUnaryOperator())) || (verb.value === "wait" && (takesName(["-p"]) || command.words.slice(1).some(word => !word.fixed))))) {
-		return `${verb.value} evaluates the subscript in a name it is given`;
+	// `test -v NAME`, `[ -R NAME ]` and `wait -p NAME` take a variable name,
+	// and a subscript in it is evaluated. A word built at run time can be that
+	// name, or the flag itself (`f=-v; [ "$f" "$n" ]`), and an unquoted one can
+	// split into several words, so its position cannot be trusted. `test` with
+	// a built word reads only in three fixed shapes; anything else refuses.
+	if (verb !== undefined && (verb.value === "test" || verb.value === "[")) {
+		const args = command.words.slice(1).filter((word, index, all) => !(verb.value === "[" && index === all.length - 1 && word.value === "]"));
+		const why = testShapeRefusal(args);
+		if (why !== undefined) return `${verb.value} ${why}`;
 	}
-	// A verb spelled by an expansion can be any of those builtins: refuse it
-	// with an argument shaped like a name to write or one built at run time.
-	if (verb !== undefined && !verb.literal && command.words.slice(1).some(word => !word.fixed || ASSIGNMENT_SHAPED.test(word.value) || SUBSCRIPTED_NAME.test(word.value))) {
-		return "a program named by an expansion is handed an argument it could write to";
+	if (verb?.value === "wait" && command.words.slice(1).some(word => !word.fixed || /^-[A-Za-z]*p/u.test(word.value))) return "wait -p writes a variable whose name may carry a subscript";
+	// A verb spelled by an expansion can be any builtin, an interpreter
+	// reading stdin included: it reads only bare, with no argument and no
+	// input redirect.
+	if (verb !== undefined && !verb.literal && (command.words.length > 1 || command.redirects.some(redirect => redirect.direction !== "out"))) {
+		return "a program named by an expansion is handed arguments or input";
 	}
 	// `[` alone reads as a glob character but names the test builtin.
 	if (verb !== undefined && verb.literal && !verb.fixed && verb.value !== "[") return "the program word is rewritten by brace expansion or a glob";
