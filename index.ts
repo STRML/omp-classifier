@@ -546,15 +546,21 @@ function normalizeUserPolicy(value: unknown): "allow" | "deny" | "prompt" | unde
  * (`filterChildShellEnv` drops values a project dotenv file supplied), and the
  * session's shell snapshot never exports `TMPDIR`. The other writers are a
  * repo's direnv, which loads the nearest `.envrc` above the start directory,
- * so any `.envrc` there leaves the value unknown, and an earlier command in
- * the same persistent shell (`shellEnvTouched`). A caller-supplied `env`
+ * so any `.envrc` there leaves the value unknown, an earlier command in the
+ * same persistent shell (`shellEnvTouched`), and a shell prefix the host
+ * prepends to the command. A caller-supplied `env`
  * blocks the call before judgment, so it never reaches this.
  */
 export function shellTmpdirFor(cwds: readonly string[], env: Record<string, string | undefined> = process.env, shellTouched = false): string | null {
-	if (shellTouched || cwds.some(hasEnvrcAbove)) return null;
+	if (shellTouched || shellPrefixSet(env) || cwds.some(hasEnvrcAbove)) return null;
 	const value = filterChildShellEnv(env).TMPDIR;
 	return value === undefined || value === "" ? null : value;
 }
+
+/** The host prepends this text to every command line it runs
+ *  (`PI_SHELL_PREFIX`, else `CLAUDE_CODE_SHELL_PREFIX`), after the gate has
+ *  read the command, so a prefix such as `TMPDIR=/x;` is unmeasured text. */
+const shellPrefixSet = (env: Record<string, string | undefined>): boolean => Boolean(env.PI_SHELL_PREFIX || env.CLAUDE_CODE_SHELL_PREFIX);
 
 /** Whether `cwd` or any directory above it holds an `.envrc`, the file the
  *  host's direnv preflight walks up to. */
@@ -569,21 +575,55 @@ function hasEnvrcAbove(cwd: string): boolean {
 	}
 }
 
-/** Reads of the two variables that change nothing, taken out before the check. */
+/** Reads of the two variables that change nothing, taken out before the name check. */
 const SHELL_ENV_READS = /\$\{TMPDIR\}|\$TMPDIR(?![A-Za-z0-9_])|\$IFS(?![A-Za-z0-9_])/gu;
-/** A command that can leave `TMPDIR` or `IFS` changed in a persistent shell:
- *  it names either as anything but a plain read, or runs `eval`, `source`,
- *  `.` or `shopt`, which can set them from a string or a file. */
-const SHELL_ENV_WRITES = /(?<![A-Za-z0-9_])(?:TMPDIR|IFS)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_-])(?:eval|source|shopt)(?![A-Za-z0-9_-])|(?:^|[;&|(\n])\s*\.\s+\S/u;
+/** Either name as anything but a plain read (an assignment, `unset`, a `for`
+ *  variable, `${TMPDIR:=x}`), or a `${...:=...}` / `$((...))` that can assign
+ *  to a name built some other way. */
+const SHELL_ENV_NAMES = /(?<![A-Za-z0-9_])(?:TMPDIR|IFS)(?![A-Za-z0-9_])|:=|\$\(\(/u;
+/** Builtins and keywords that write a shell variable, run text or a file in
+ *  the current shell, or change how later commands are looked up. */
+const SHELL_STATE_VERBS = new Set([
+	"export", "declare", "typeset", "local", "readonly", "read", "mapfile", "readarray", "unset", "set", "getopts", "wait",
+	"eval", "source", ".", "shopt", "enable", "alias", "unalias", "trap", "builtin", "command", "exec", "let", "coproc", "function",
+]);
 
-/** Whether `command` may change the persistent shell's `TMPDIR` or `IFS` for
- *  the commands after it. Over-matching only costs an ask. */
-export const touchesShellEnv = (command: string): boolean => SHELL_ENV_WRITES.test(command.replace(SHELL_ENV_READS, ""));
+/** Whether one parsed command can leave the persistent shell changed. */
+function commandTouchesShell(command: ShellCommand): boolean {
+	if (command.unreadShape !== undefined || command.expression === "arithmetic") return true;
+	const verb = command.words[0];
+	// A bare assignment persists; a prefix one lasts for its command only.
+	if (verb === undefined) return command.assigns.length > 0 || command.redirects.length > 0;
+	// A verb built from an expansion could be any builtin.
+	if (!verb.literal) return true;
+	if (SHELL_STATE_VERBS.has(verb.value)) return true;
+	// `printf -v name` writes a variable.
+	if (verb.value === "printf" && command.words.some(word => /^-[A-Za-z]*v/u.test(word.value))) return true;
+	return false;
+}
+
+/**
+ * Whether `command` may change the persistent shell's `TMPDIR` or `IFS` for
+ * the commands after it. Fails closed: a command that does not parse, one
+ * that parses to a shape the gate does not read, a builtin that writes a
+ * variable or runs text in the current shell, a verb built from an expansion,
+ * a bare assignment, and any mention of either name beyond a plain read all
+ * count. Over-matching only costs an ask.
+ */
+export function touchesShellEnv(command: string): boolean {
+	if (SHELL_ENV_NAMES.test(command.replace(SHELL_ENV_READS, ""))) return true;
+	const parsed = parseShell(command);
+	return !parsed.ok || parsed.commands.some(commandTouchesShell);
+}
 
 /** Sessions where an earlier bash command may have changed the persistent
  *  shell's `TMPDIR` or `IFS` (the host reuses one shell per session), so a
  *  later `$TMPDIR` cannot be read from this process's environment. */
 const shellEnvTouched = new Set<string>();
+// Never cleared at a session boundary: the host keys the persistent shell by
+// session id and keeps it until that session is disposed, so a switch away and
+// back finds the same changed shell. The set grows by one id per touched
+// session for the life of the process.
 
 /** The shell's `TMPDIR` only when the command names it: the walk and the env
  *  filter read files, and most commands have no use for either. Both the
@@ -7275,7 +7315,6 @@ export default function (pi: ExtensionAPI) {
 		// starts unpaused.
 		sessionOff.delete(sessionId);
 		floorTaint.delete(sessionId);
-		shellEnvTouched.delete(sessionId);
 		forgetReviewerBlocks(sessionId);
 	};
 	pi.on("session_start", dropCurrent);
@@ -7303,6 +7342,5 @@ export default function (pi: ExtensionAPI) {
 		// Same boundary rule for the session-scoped pause.
 		sessionOff.delete(sessionId);
 		floorTaint.delete(sessionId);
-		shellEnvTouched.delete(sessionId);
 	});
 }

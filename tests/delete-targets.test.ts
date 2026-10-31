@@ -410,6 +410,33 @@ describe("delete targets through the gate", () => {
 		}
 	});
 
+	test("the latch survives a session boundary and a builtin that writes a variable trips it", async () => {
+		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-bound-")));
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = real;
+		try {
+			mkdirSync(join(real, "x"));
+			writeFileSync(join(real, "x", "probe.md"), "x");
+			const command = 'trash "$TMPDIR/x/probe.md"';
+			const flagFor = async (ctx: ReturnType<typeof makeCtx>, line: string): Promise<unknown> => {
+				const before = modelCalls.length;
+				await fire("tool_call", makeEvent(line), ctx);
+				return (stateOf(before).deleteTargets as Array<Record<string, unknown>> | undefined)?.[0]?.underTempRoot;
+			};
+			const ctx = makeCtx({ sessionId: session(), cwd: home });
+			await flagFor(ctx, 'declare "TMP""DIR=/Users"');
+			expect(await flagFor(ctx, command)).toBeNull();
+			for (const event of ["session_start", "session_before_switch", "session_switch", "session_shutdown"]) {
+				await fire(event, {}, ctx);
+				expect(await flagFor(ctx, command)).toBeNull();
+			}
+		} finally {
+			if (saved === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = saved;
+			rmSync(real, { recursive: true, force: true });
+		}
+	});
+
 	test("a $TMPDIR operand stays unmeasured when an .envrc sits in the working directory", async () => {
 		const real = realpathSync(mkdtempSync(join(tmpdir(), "gate-tmpdir-envrc-")));
 		try {
@@ -488,6 +515,12 @@ describe("shellTmpdirFor", () => {
 		expect(shellTmpdirFor([cwd], { TMPDIR: "/var/folders/zz/T" }, true)).toBeNull();
 	});
 
+	test("is null when the host prepends a shell prefix to every command", () => {
+		expect(shellTmpdirFor([cwd], { TMPDIR: "/var/folders/zz/T", PI_SHELL_PREFIX: "TMPDIR=/Users;" })).toBeNull();
+		expect(shellTmpdirFor([cwd], { TMPDIR: "/var/folders/zz/T", CLAUDE_CODE_SHELL_PREFIX: "TMPDIR=/Users;" })).toBeNull();
+		expect(shellTmpdirFor([cwd], { TMPDIR: "/var/folders/zz/T", PI_SHELL_PREFIX: "" })).toBe("/var/folders/zz/T");
+	});
+
 	test("reads process.env by default", () => {
 		const saved = process.env.TMPDIR;
 		process.env.TMPDIR = "/var/folders/yy/T";
@@ -501,15 +534,29 @@ describe("shellTmpdirFor", () => {
 });
 
 describe("touchesShellEnv", () => {
-	test("names that can change TMPDIR or IFS in the persistent shell", () => {
-		for (const command of ["export TMPDIR=/Users", "TMPDIR=/x", "unset TMPDIR", "IFS=/", "export IFS=:", "echo ${TMPDIR:=/x}", "eval \"$setup\"", "source ./env.sh", ". ./env.sh", "ls && . ./env.sh", "shopt -s extglob", "declare -x TMPDIR=/y"]) {
-			expect([command, touchesShellEnv(command)]).toEqual([command, true]);
-		}
-	});
+	const touching = [
+		// the names, spelled out
+		"export TMPDIR=/Users", "TMPDIR=/x", "unset TMPDIR", "IFS=/", "export IFS=:", "echo ${TMPDIR:=/x}", "for TMPDIR in /a /b; do ls; done",
+		// text or a file run in the current shell
+		'eval "$setup"', "source ./env.sh", ". ./env.sh", "ls && . ./env.sh", "shopt -s extglob",
+		// builtins that write a variable, whatever the name looks like
+		"declare -x TMPDIR=/y", 'declare "TMP""DIR=/x"', 'typeset "T"MPDIR=/x', "export ${v}=/x", 'export "$v=/x"', "local x=1", "readonly X=1",
+		"read -r TMPDIR", "read name", "printf -v name %s /x", "printf -vname %s /x", "mapfile -t lines < f", "readarray lines < f", "unset v", "set -a", "getopts ab opt",
+		// wrappers, lookups and traps
+		"command export X=1", "builtin export X=1", "enable -n test", "alias trash=ls", "unalias -a", "trap 'IFS=/' DEBUG", "exec 3>&1", "exec bash",
+		// shapes the gate cannot read
+		"FOO=1", 'v=1; ls', "$cmd x", '"$cmd" x', "f() { export A=1; }", "(( X=1 ))", "echo $(( X=1 ))", "let x=1", "echo (",
+	];
+	for (const command of touching) {
+		test(`trips on ${command}`, () => {
+			expect(touchesShellEnv(command)).toBe(true);
+		});
+	}
 
-	test("plain reads and unrelated commands leave it alone", () => {
-		for (const command of ['trash "$TMPDIR/x"', "ls $TMPDIR", "echo ${TMPDIR}/a", "echo $IFS", "ls . src", "cat file.txt", "git status", "bun run evaluate", "export PATH=$PATH:/x", "echo sourcemap"]) {
-			expect([command, touchesShellEnv(command)]).toEqual([command, false]);
-		}
-	});
+	const quiet = ['trash "$TMPDIR/x"', "ls $TMPDIR", "echo ${TMPDIR}/a", "echo $IFS", "ls . src", "cat file.txt", "git status", "bun run evaluate", "echo sourcemap", "FOO=1 ls", 'printf "%s\\n" x', "ls | head -3", "cd /tmp && ls", "echo $(date)"];
+	for (const command of quiet) {
+		test(`stays quiet on ${command}`, () => {
+			expect(touchesShellEnv(command)).toBe(false);
+		});
+	}
 });
