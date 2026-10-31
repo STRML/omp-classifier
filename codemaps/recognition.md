@@ -92,16 +92,27 @@ secret-path, floor. `ROUTINE_VERBS`, `SEARCH_VERBS` (find/grep = `search` varian
 `taintedVars: "unknown"` drops the `echo` exemption. Not imported by index.ts; the only caller is
 eval/recognizer-measure.ts.
 
-## redact.ts (165 lines)
+## redact.ts (553 lines)
 
 | Export | Line | Called by |
 |---|---|---|
-| `redactSecrets(text)` | 161 | jev `buildJevState` (evidence only), index audit `cmd` + logger, authorization, eval/recognizer-measure |
-| `redactValue(value)` | 154 | index `collectToolEvidence` |
-| `isSecretName(name)` | 81 | floor (single definition of a secret name) |
+| `redactSecrets(text)` | 540 | prose: jev `buildJevState` (evidence only), authorization, reviewer transcript/script bodies/stage1, index evidence + judged-states, eval/recognizer-measure. A secret runs to the end of its line |
+| `redactCommand(text)` | 551 | shell commands: index audit `cmd` + OMP log line, reviewer `command`. A secret ends at its shell word |
+| `redactValue(value)` | 519 | index `collectToolEvidence`: object keys, argv arrays, `{name, value}` and `[header, value]` pairs |
+| `isSecretName(name)` | 91 | floor, authorization (single definition of a secret name; trailing digits and `PASS` count) |
 | `REDACTED` = `[redacted]` | 15 | authorization |
 
-The judged command is never redacted. The copy written to the audit log is.
+Per line, `lineSpans(line, shell)` finds the value spans and `applySpans` replaces them. In shell
+mode a shell assignment (`NAME=value`) or a flag's value ends at its shell word (`wordEnd`:
+quotes, `$(...)`, backticks, `;`, `|`, `&&`), so the command around it survives; a secret flag
+followed by flags redacts the first non-flag word (`afterFlags`). A header, JSON field or
+`name = value` line has no word grammar: it ends at the closing quote of its enclosing argument,
+else the line. Prose mode extends every span to the end of the line. `TOOL_FLAGS` ties `-u`, `-p`,
+`-a`, `-pass` to curl, sshpass, docker login, mysql, redis-cli, openssl, ssh-keygen. Linear time:
+each `sweep` skips a match inside the value it already took.
+
+The judged command is never redacted. The copy written to the audit log, and the copy the stage 2
+reviewer reads, are.
 
 ## arity.ts (85 lines) + arity.generated.ts (1558 lines)
 
