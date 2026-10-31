@@ -430,6 +430,14 @@ describe("what never reaches the reviewer", () => {
 		expect(reviewerCalls).toHaveLength(0);
 	});
 
+	test("an UNSURE carrying escalates_privilege on a local command whose operand the user named", async () => {
+		setJevAnswer(jevUnsureAnswer({ escalates_privilege: jevNoul(0.88) }));
+		const result = await fire("tool_call", makeEvent("sudo systemctl stop nginx"), uiCtx(nextSession(), [user("u1", "stop nginx")]));
+		expect(refusalOf(result).layer).toBe("unsure");
+		expect(reviewerCalls).toHaveLength(0);
+		expect(reviewerAudit()).toMatchObject({ skipped: "hazard escalates_privilege" });
+	});
+
 	test("a headless session", async () => {
 		await fire("tool_call", makeEvent("git fetch upstream"), makeCtx({ sessionId: nextSession(), hasUI: false, cwd: dir }));
 		expect(reviewerCalls).toHaveLength(0);
@@ -494,6 +502,71 @@ describe("what never reaches the reviewer", () => {
 		expect(refusalOf(result).layer).toBe("unsure");
 		expect(reviewerCalls).toHaveLength(0);
 		expect(reviewerAudit()).toMatchObject({ skipped: expect.stringContaining("unread") });
+	});
+});
+
+describe("escalates_privilege on a remote host the user named", () => {
+	// OMP session fa2bd2e7a500: the user asked to stop a service on their own
+	// TV, and every root ssh to it was refused on escalates_privilege without
+	// the reviewer ever reading the user's words. On an UNSURE that hazard no
+	// longer bars review when the user's words or an ask name the host.
+	const stop = "ssh root@192.168.86.53 'systemctl stop contents-recognition-service'";
+	const privileged = () => jevUnsureAnswer({ escalates_privilege: jevNoul(0.88) });
+
+	test("user words naming the host reach the reviewer, and its allow runs the command", async () => {
+		setJevAnswer(privileged());
+		scriptReviewer(reviewerReply("allow", "stop content recognition service on 192.168.86.53"));
+		const result = await fire("tool_call", makeEvent(stop), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
+		expect(reviewerCalls).toHaveLength(1);
+		expect(resultText(result)).toBe("ALLOWED");
+	});
+
+	test("an ask question naming the host reaches the reviewer", async () => {
+		setJevAnswer(privileged());
+		scriptReviewer(reviewerReply("allow", "Yes"));
+		const branch = [user("u1", "stop content recognition service"), askAnswer("a1", "SSH to root@192.168.86.53 and stop contents-recognition-service?", "Yes")];
+		const result = await fire("tool_call", makeEvent(`${stop} 2>&1 | tail -3`), uiCtx(nextSession(), branch));
+		expect(reviewerCalls).toHaveLength(1);
+		expect(resultText(result)).toBe("ALLOWED");
+	});
+
+	test("a host named at the end of a sentence counts", async () => {
+		setJevAnswer(privileged());
+		scriptReviewer(reviewerReply("block"));
+		await fire("tool_call", makeEvent(stop), uiCtx(nextSession(), [user("u1", "the TV is 192.168.86.53.")]));
+		expect(reviewerCalls).toHaveLength(1);
+	});
+
+	test("user words that never name the host stay barred", async () => {
+		setJevAnswer(privileged());
+		const branch = [user("u1", "stop content recognition service"), askAnswer("a1", "May I run that one SSH command on the TV?", "Yes"), user("u2", "then execute the plan")];
+		const result = await fire("tool_call", makeEvent(stop), uiCtx(nextSession(), branch));
+		expect(refusalOf(result).layer).toBe("unsure");
+		expect(reviewerCalls).toHaveLength(0);
+		expect(reviewerAudit()).toMatchObject({ skipped: "hazard escalates_privilege" });
+	});
+
+	test("an UNSAFE stays barred even when the user named the host", async () => {
+		setJevAnswer(jevUnsafeAnswer({ escalates_privilege: jevNoul(0.88) }));
+		const result = await fire("tool_call", makeEvent(stop), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
+		expect(refusalOf(result).layer).toBe("unsafe");
+		expect(reviewerCalls).toHaveLength(0);
+		expect(reviewerAudit()).toMatchObject({ skipped: "hazard escalates_privilege" });
+	});
+
+	test("exposes_secrets alongside it stays hard", async () => {
+		setJevAnswer(jevUnsureAnswer({ escalates_privilege: jevNoul(0.88), exposes_secrets: jevNoul(0.64) }));
+		await fire("tool_call", makeEvent(stop), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
+		expect(reviewerCalls).toHaveLength(0);
+		expect(reviewerAudit()).toMatchObject({ skipped: "hazard exposes_secrets" });
+	});
+
+	test("an ssh run through a variable has no host to name, so it stays barred", async () => {
+		setJevAnswer(privileged());
+		const indirect = `SSH="ssh root@192.168.86.53"; $SSH 'systemctl stop contents-recognition-service'`;
+		await fire("tool_call", makeEvent(indirect), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
+		expect(reviewerCalls).toHaveLength(0);
+		expect(reviewerAudit()).toMatchObject({ skipped: "hazard escalates_privilege" });
 	});
 });
 

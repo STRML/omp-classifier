@@ -5047,6 +5047,18 @@ const REVIEWER_HARD_HAZARDS = ["exposes_secrets", "sends_local_data_outbound", "
  *  destructive or irreversible stays blocked, whatever the user said. */
 const REVIEWER_UNSAFE_BARRED = [...REVIEWER_HARD_HAZARDS, "destructive_or_irreversible"] as const;
 
+/**
+ * Whether a hard hazard bars review of this call. One exception: on an UNSURE,
+ * escalates_privilege yields when the user's words or an ask name the remote
+ * host an ssh, scp or rsync acts on (OMP session fa2bd2e7a500: root ssh to the
+ * user's own TV). A local sudo, a host the user never named, and an UNSAFE
+ * stay barred, and so does every other hard hazard.
+ */
+function hazardBars(hazard: string, verdict: string, command: string, transcript: readonly ReviewerTranscriptEntry[]): boolean {
+	if (hazard !== "escalates_privilege" || verdict !== "UNSURE") return true;
+	return !namesRemoteHost(command, transcript);
+}
+
 export interface StageTwoInput {
 	ctx: ExtensionContext;
 	judgement: Judgement;
@@ -5084,12 +5096,12 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	if (judgement.persistRefusal === false) return skip("one-hot answers");
 	if (judgement.jev === undefined) return skip("no stage-1 answers");
 	const { hazardReview, hazardBlock } = jevPolicyFor(config);
+	const transcript = reviewerTranscript(ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>, refusedToolCallIds);
 	const barred = judgement.verdict === "UNSAFE" ? REVIEWER_UNSAFE_BARRED : REVIEWER_HARD_HAZARDS;
-	const hard = barred.find(hazard => (judgement.jev?.hazards[hazard] ?? 0) >= hazardReview);
+	const hard = barred.find(hazard => (judgement.jev?.hazards[hazard] ?? 0) >= hazardReview && hazardBars(hazard, judgement.verdict, command, transcript));
 	if (hard !== undefined) return skip(`hazard ${hard}`);
 	// Jev all but certain the user never asked: there is no consent to review.
 	if (judgement.verdict === "UNSAFE" && (judgement.jev.hazards.unauthorized_consequential_action ?? 0) >= hazardBlock) return skip("hazard unauthorized_consequential_action");
-	const transcript = reviewerTranscript(ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>, refusedToolCallIds);
 	const userWords = transcript.flatMap(entry => (entry.from === "user" ? [entry.text] : entry.from === "ask" ? [entry.userAnswer] : []));
 	if (userWords.length === 0) return skip("no user words");
 	const programs = scriptsForReview(command, input.startCwd);
@@ -5173,14 +5185,35 @@ function reviewerLifts(prior: Refusal, judgement: Judgement, userQuote: string |
 	if (prior.source !== "model" || judgement.reasonCode !== "reviewer:allow" || userQuote === undefined) return false;
 	const anchors = consentAnchors(command);
 	if (anchors.size === 0) return false;
-	return consent.some(said => {
-		if (said.from === "agent-tool-call" || !quotesUserWords(userQuote, [said])) return false;
-		const named = said.from === "ask" ? `${said.agentQuestion}\n${said.userAnswer}` : said.text;
-		return named
-			.toLowerCase()
-			.split(/[^a-z0-9._-]+/u)
-			.some(word => anchors.has(word));
-	});
+	return consent.some(said => quotesUserWords(userQuote, [said]) && namesAnchor(said, anchors));
+}
+
+/** Whether a user entry, or the ask question it answers, names one of
+ *  `anchors` as a whole word. A sentence's closing period is not part of it. */
+function namesAnchor(said: ReviewerTranscriptEntry, anchors: ReadonlySet<string>): boolean {
+	if (said.from === "agent-tool-call") return false;
+	const named = said.from === "ask" ? `${said.agentQuestion}\n${said.userAnswer}` : said.text;
+	return named
+		.toLowerCase()
+		.split(/[^a-z0-9._-]+/u)
+		.some(word => anchors.has(word) || anchors.has(word.replace(/\.+$/u, "")));
+}
+
+/** Whether the user's words or an ask name the host this ssh, scp or rsync
+ *  acts on. Any other command, or one whose host is not spelled out (an ssh
+ *  run through a variable), names no host. */
+export function namesRemoteHost(command: string, transcript: readonly ReviewerTranscriptEntry[]): boolean {
+	const read = commandOperands(command);
+	const hosts = new Set(read === undefined ? [] : remoteHosts(read.verb, read.operands));
+	return hosts.size > 0 && transcript.some(said => namesAnchor(said, hosts));
+}
+
+/** The hosts an ssh, scp or rsync command acts on, lowercased; none for any
+ *  other verb. */
+function remoteHosts(verb: string, operands: readonly string[]): string[] {
+	if (verb === "ssh") return [sshHost(operands[0])?.toLowerCase() ?? ""].filter(host => host !== "");
+	if (verb !== "scp" && verb !== "rsync") return [];
+	return operands.map(operand => /^(?:[^@/:]+@)?([^/:]+):/u.exec(operand)?.[1]?.toLowerCase()).filter((host): host is string => host !== undefined);
 }
 
 /** What a user's words have to name for consent to reach this command: the
@@ -5189,11 +5222,8 @@ function consentAnchors(command: string): Set<string> {
 	const read = commandOperands(command);
 	if (read === undefined) return new Set();
 	const { verb, operands } = read;
-	if (verb === "ssh") return new Set([sshHost(operands[0])?.toLowerCase() ?? ""].filter(host => host !== ""));
-	if (verb === "scp" || verb === "rsync") {
-		const hosts = operands.map(operand => /^(?:[^@/:]+@)?([^/:]+):/u.exec(operand)?.[1]?.toLowerCase());
-		if (hosts.some(host => host !== undefined)) return new Set(hosts.filter((host): host is string => host !== undefined));
-	}
+	const hosts = remoteHosts(verb, operands);
+	if (verb === "ssh" || hosts.length > 0) return new Set(hosts);
 	// git's subcommand is the action, not its target.
 	const targets = verb === "git" ? operands.slice(1) : operands;
 	return new Set(targets.map(operand => path.posix.basename(operand.replace(/\/+$/u, "")).toLowerCase()).filter(name => name.length >= 3));
