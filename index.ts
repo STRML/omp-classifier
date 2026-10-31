@@ -108,7 +108,7 @@ import { buildAuthorizationState, DEFAULT_AUTHORIZATION_POLICY, deriveAuthorizat
 import { CRITICAL_BODY_NOTE, scanCriticalPatterns } from "./critical-scan";
 import { deriveDecisionOrder, type DecisionBranch } from "./decision-order";
 import { literalMatch } from "./literal-match";
-import { redactSecrets, redactValue } from "./redact";
+import { redactCommand, redactSecrets, redactValue } from "./redact";
 import { quotesUserWords, reviewerModelCall, runReviewer, type ReviewerOutcome, type ReviewerTranscriptEntry } from "./reviewer";
 import { forgetReviewerBlocks, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged, withoutFilterForKey, withoutOutputFilter } from "./stage-two";
 import { formatTrustPolicyPin, normalizeTrustPolicyPin, pinUserInstructionFiles, resolvePinnedUserPolicy, type TrustPolicyPin, type TrustedPolicyDocument } from "./trust-policy";
@@ -6215,7 +6215,7 @@ export default function (pi: ExtensionAPI) {
 				// (same rule and regex as matchModerateRiskTokens), so joining
 				// makes the redactor see the logical argument, then the newline
 				// flatten below cannot re-expose it.
-				cmd: truncated(redactSecrets(line.cmd.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120),
+				cmd: truncated(redactCommand(line.cmd.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120),
 			};
 			fs.appendFileSync(decisionsLogPath(), `${JSON.stringify(record)}\n`, { mode: 0o600 });
 			fs.chmodSync(decisionsLogPath(), 0o600);
@@ -7262,7 +7262,7 @@ export default function (pi: ExtensionAPI) {
 			// line: a `--password` value on the continued line is otherwise on a
 			// marker-less line of its own, and flattening it back onto the flag
 			// would strand the real value after the REDACTED marker.
-			const logCommand = truncated(redactSecrets(judgedCommand.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120);
+			const logCommand = truncated(redactCommand(judgedCommand.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120);
 			if (!dryRun) pi.logger.info(
 				`classifier: verdict=${judgement.verdict}` +
 					` cached=${cached ? 1 : 0} reason="${judgement.reason}" cmd="${logCommand}"`,

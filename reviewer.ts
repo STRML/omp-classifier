@@ -24,7 +24,7 @@
  */
 import { completeSimple, type Model } from "@oh-my-pi/pi-ai";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { redactSecrets } from "./redact";
+import { redactCommand, redactSecrets } from "./redact";
 
 /** How many draws a malformed reply may cost before the review fails. */
 const REVIEWER_ATTEMPTS = 2;
@@ -144,7 +144,7 @@ export function renderReviewerInput(input: ReviewerInput): string {
 		return { from: "agent-tool-call", text: truncatedText(redactSecrets(entry.text), TOOL_CALL_MAX_CHARS) };
 	});
 	const document: Record<string, unknown> = {
-		command: redactSecrets(input.command),
+		command: redactCommand(input.command),
 		workingDirectory: redactSecrets(input.workingDirectory),
 		transcript,
 		scriptBodies: input.scriptBodies.map(script => ({

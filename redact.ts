@@ -277,85 +277,103 @@ function closingQuoteAt(line: string, from: number, quote: number): number {
 	return line.length;
 }
 
-/** The spans of one line that hold a secret value. */
-function lineSpans(line: string): Span[] {
+/** The spans of one line that hold a secret value. `shell` says the line is a
+ *  shell command: only then does a value end at its shell word. Prose (tool
+ *  output, a user's message, a policy file) has no word grammar, so a secret
+ *  there runs to the end of the line, however many spaces or terminators it
+ *  holds. */
+function lineSpans(line: string, shell: boolean): Span[] {
 	const spans: Span[] = [];
 	let quotes: Uint8Array | undefined;
+	const quoteAt = (index: number): number => (quotes ??= enclosingQuotes(line))[index];
 	const wordSpan = (from: number): Span | undefined => {
-		quotes ??= enclosingQuotes(line);
-		const end = wordEnd(line, from, quotes[from]);
+		const end = wordEnd(line, from, quoteAt(from));
 		return end > from ? { start: from, end } : undefined;
 	};
-	// How far the last value reached: a name inside it (the `TOKEN:` of
-	// `TOKEN=${TOKEN:-x}`) is part of that value, not a second secret.
-	let covered = 0;
-	const addWord = (from: number): void => {
-		const span = wordSpan(from);
-		if (span === undefined) return;
-		spans.push(span);
-		covered = Math.max(covered, span.end);
+	// The flags a secret flag's value could sit behind: `psql --password -h db`
+	// has no value (the flag is a boolean), and an action key sorts its flags
+	// ahead of its arguments (`mysql --password -e hunter2`). Either way the
+	// first word that is not a flag is the one to redact, and the flags and
+	// commands around it stay. One scan per run of flags.
+	let run = { start: 1, end: 0, span: undefined as Span | undefined };
+	const afterFlags = (from: number): Span | undefined => {
+		if (from >= run.start && from <= run.end) return run.span;
+		let at = from;
+		for (;;) {
+			const end = wordEnd(line, at, quoteAt(at));
+			let next = end;
+			while (line[next] === " " || line[next] === "\t") next++;
+			// The line, or an operator, ends the command with no value in it.
+			if (next === end || next >= line.length) {
+				run = { start: from, end: next, span: undefined };
+				return undefined;
+			}
+			if (line[next] !== "-") {
+				run = { start: from, end: next, span: wordSpan(next) };
+				return run.span;
+			}
+			at = next;
+		}
 	};
-	// The value of a flag is the word after it. When that word is another flag
-	// the value is not adjacent (a boolean such as `--password-stdin`, or an
-	// action key that sorts its flags ahead of the arguments), so it could be
-	// anywhere after: the rest of the line goes.
 	const flagValue = (from: number, flag: string): Span | undefined => {
-		if (line[from] !== "-") return wordSpan(from);
-		return /stdin$/iu.test(flag) ? undefined : { start: from, end: line.length };
+		if (!shell || line[from] !== "-") return wordSpan(from);
+		// A flag that says the password comes on stdin takes no value.
+		return /stdin$/iu.test(flag) ? undefined : afterFlags(from);
+	};
+	// Each loop skips a match that starts inside the value it already took, so
+	// a long unclosed `$(` is scanned once and a name inside a value (the
+	// `TOKEN:` of `TOKEN=${TOKEN:-x}`) is part of that value, not a second
+	// secret. Linear time on any input.
+	const sweep = (pattern: RegExp, each: (match: RegExpMatchArray & { index: number }, cover: (end: number) => void) => Span | undefined): void => {
+		let covered = 0;
+		for (const match of line.matchAll(pattern) as IterableIterator<RegExpMatchArray & { index: number }>) {
+			if (match.index < covered) continue;
+			const span = each(match, end => { covered = Math.max(covered, end); });
+			if (span === undefined) continue;
+			spans.push(span);
+			covered = Math.max(covered, span.end);
+			if (covered === line.length) return;
+		}
 	};
 
-	for (const match of line.matchAll(NAME_THEN_SEPARATOR)) {
+	sweep(NAME_THEN_SEPARATOR, match => {
 		const [text, name, closingQuote, gap, separator, after] = match;
-		if (match.index < covered || !isSecretMarker(name)) continue;
+		if (!isSecretMarker(name)) return undefined;
 		const start = match.index + text.length;
 		// `NAME=value` with nothing around the `=` is a shell assignment, whose
 		// value ends with its word. Anything looser (`password = x`,
 		// `"password": "x"`, `Authorization: …`) is a config line, a JSON field
-		// or a header with no word grammar, and takes the rest of the line.
+		// or a header with no word grammar. Inside a quoted argument it ends
+		// where that argument does; otherwise nothing bounds it.
 		const assignment = separator === "=" && closingQuote === undefined && gap === "" && after === "" && !HEADER_MARKER.test(name);
-		if (assignment) {
-			addWord(start);
-			continue;
-		}
-		// A header or field inside a quoted argument, `-H "Authorization: …"`,
-		// ends where that argument does; otherwise nothing bounds it.
-		quotes ??= enclosingQuotes(line);
-		const end = closingQuoteAt(line, start, quotes[start]);
-		spans.push({ start, end });
-		if (end === line.length) break;
-		covered = Math.max(covered, end);
-	}
-	for (const match of line.matchAll(FLAG_THEN_VALUE)) {
-		const span = isSecretMarker(match[1]) ? flagValue(match.index + match[0].length, match[1]) : undefined;
-		if (span !== undefined) spans.push(span);
-	}
-	for (const match of line.matchAll(CONFIG_SET)) {
-		if (isSecretMarker(match[1])) addWord(match.index + match[0].length);
-	}
+		if (assignment) return wordSpan(start);
+		return { start, end: closingQuoteAt(line, start, quoteAt(start)) };
+	});
+	sweep(FLAG_THEN_VALUE, match => (isSecretMarker(match[1]) ? flagValue(match.index + match[0].length, match[1]) : undefined));
+	sweep(CONFIG_SET, match => (isSecretMarker(match[1]) ? wordSpan(match.index + match[0].length) : undefined));
 	for (const tool of TOOL_FLAGS) {
 		const after = tool.needs.map(need => line.search(need));
 		if (after.some(index => index < 0)) continue;
 		const floor = Math.max(...after);
-		for (const match of line.matchAll(tool.flag)) {
-			if (match.index <= floor) continue;
-			const start = match.index + match[0].length;
-			const span = flagValue(start, "");
-			if (span === undefined) continue;
-			if (tool.kind === "word" || line[start] === "-") spans.push(span);
-			else spans.push(...passwordOfPair(line, span));
-		}
+		sweep(tool.flag, (match, cover) => {
+			if (match.index <= floor) return undefined;
+			const span = flagValue(match.index + match[0].length, "");
+			if (span === undefined) return undefined;
+			cover(span.end);
+			return tool.kind === "word" ? span : passwordOfPair(line, span);
+		});
 	}
-	return spans;
+	return shell ? spans : spans.map(span => ({ start: span.start, end: line.length }));
 }
 
 /** `user:password` in a word: the password. A quoted pair goes whole, since
  *  its closing quote would otherwise be left dangling. */
-function passwordOfPair(line: string, word: Span): Span[] {
-	if (line[word.start] === '"' || line[word.start] === "'") return [word];
+function passwordOfPair(line: string, word: Span): Span | undefined {
+	if (line[word.start] === '"' || line[word.start] === "'") return word;
 	// Searched inside the word only: an indexOf to the end of the line is
 	// quadratic when a line holds many words and no colon.
 	const colon = line.slice(word.start, word.end).indexOf(":");
-	return colon >= 0 && word.start + colon + 1 < word.end ? [{ start: word.start + colon + 1, end: word.end }] : [];
+	return colon >= 0 && word.start + colon + 1 < word.end ? { start: word.start + colon + 1, end: word.end } : undefined;
 }
 
 /** Replace each span with REDACTED. Spans that overlap or touch become one. */
@@ -390,25 +408,26 @@ function applySpans(text: string, spans: Span[]): string {
  * `{"password":"x","user":"bob"}` loses `bob`. Every name on the line is asked,
  * so a harmless `https:` before a `token=` doesn't hide it.
  */
-function redactLine(line: string): string {
-	return applySpans(line, lineSpans(line));
+function redactLine(line: string, shell: boolean): string {
+	return applySpans(line, lineSpans(line, shell));
 }
 
 /** Every span of a multi-line text, in the text's own offsets. */
 function textSpans(text: string): Span[] {
 	const spans: Span[] = [];
 	for (const match of text.matchAll(/[^\r\n]+/gu)) {
-		for (const span of lineSpans(match[0])) spans.push({ start: match.index + span.start, end: match.index + span.end });
+		for (const span of lineSpans(match[0], true)) spans.push({ start: match.index + span.start, end: match.index + span.end });
 	}
 	return spans;
 }
 
+/** A private key block, whole. An unterminated block runs to the end.
+ *  PEM and PGP armor both: `PRIVATE KEY` and `PRIVATE KEY BLOCK`. */
+const KEY_BLOCK = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)/gu;
+const LINES = /[^\r\n]+/gu;
+
+/** The shapes that need no line context, run after the per-line pass. */
 const RULES: readonly Rule[] = [
-	// A private key block, whole. An unterminated block runs to the end.
-	// PEM and PGP armor both: `PRIVATE KEY` and `PRIVATE KEY BLOCK`.
-	{ pattern: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)/gu, replace: whole },
-	// The value of every secret on each line (see redactLine).
-	{ pattern: /[^\r\n]+/gu, replace: line => redactLine(line) },
 	{ pattern: /\b(bearer\s+)[^\s"'\\,;]{8,}/giu, replace: (_m, keep) => `${keep}${REDACTED}` },
 	// Token formats with a published prefix.
 	{ pattern: /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}/gu, replace: whole },
@@ -427,9 +446,9 @@ const RULES: readonly Rule[] = [
 	// A Slack incoming webhook: the path after the host is the credential.
 	{ pattern: /(\bhooks\.slack\.com\/services\/)[A-Za-z0-9_/-]+/gu, replace: (_m, head) => `${head}${REDACTED}` },
 	// The password in a URL's userinfo. The user and host stay. The password
-	// runs to the last `@` before the path, query or fragment, so one that
-	// contains `@` does not leak its tail.
-	{ pattern: /((?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s/?#]+(@)/giu, replace: (_m, head, at) => `${head}${REDACTED}${at}` },
+	// runs to the last `@` before the path or a space, so one that contains
+	// `@`, `?` or `#` does not leak its tail.
+	{ pattern: /((?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s/]+(@)/giu, replace: (_m, head, at) => `${head}${REDACTED}${at}` },
 ];
 
 const ARGV_QUOTE_FREE = /^[A-Za-z0-9_@%+=:,./-]+$/u;
@@ -477,7 +496,7 @@ function redactArray(items: readonly unknown[]): unknown[] {
 	// An argv array: the element a secret flag or `-u user:pass` points at.
 	if (items.length >= 2 && items.every(item => typeof item === "string")) {
 		const secret = argvSecrets(items as string[]);
-		for (let i = 0; i < out.length; i++) if (secret[i] && out[i] === items[i]) out[i] = REDACTED;
+		for (let i = 0; i < out.length; i++) if (secret[i]) out[i] = REDACTED;
 	}
 	return out;
 }
@@ -506,8 +525,29 @@ export function redactValue(value: unknown): unknown {
 	return Object.fromEntries(entries.map(([key, inner]) => [key, isSecretMarker(key) || key === pairValue ? REDACTED : redactValue(inner)]));
 }
 
-export function redactSecrets(text: string): string {
-	let out = text;
+function redactText(text: string, shell: boolean): string {
+	let out = text.replace(KEY_BLOCK, REDACTED).replace(LINES, line => redactLine(line, shell));
 	for (const rule of RULES) out = out.replace(rule.pattern, rule.replace);
 	return out;
+}
+
+/**
+ * Redact free text: tool output, a user's message, a policy file, a log line.
+ * Prose has no word grammar, so from a secret's name or flag to the end of the
+ * line goes, whatever spaces or terminators the value holds. Use
+ * {@link redactCommand} for text known to be a shell command.
+ */
+export function redactSecrets(text: string): string {
+	return redactText(text, false);
+}
+
+/**
+ * Redact a shell command: only the value goes, up to the end of its shell
+ * word, so the rest of the command stays readable to a reader that judges it
+ * (the audit log, the stage 2 reviewer). `export TOKEN=x && rm -rf build` keeps
+ * the `rm`. A form with no word grammar (a JSON field, a header, `password = x`)
+ * still takes the rest of its line or quoted argument.
+ */
+export function redactCommand(text: string): string {
+	return redactText(text, true);
 }

@@ -165,9 +165,8 @@ describe("redactSecrets", () => {
 	});
 
 	test("a secret flag with its value after a space is redacted; --password-stdin is not a value", () => {
-		// The value ends with its shell word: the command around it stays.
-		expect(redactSecrets("mysql -u root --password hunter2 -e 'select 1'")).toBe(`mysql -u root --password ${REDACTED} -e 'select 1'`);
-		expect(redactSecrets("curl --api-key $KEY https://x.test")).toBe(`curl --api-key ${REDACTED} https://x.test`);
+		expect(redactSecrets("mysql -u root --password hunter2 -e 'select 1'")).toBe(`mysql -u root --password ${REDACTED}`);
+		expect(redactSecrets("curl --api-key $KEY https://x.test")).toBe(`curl --api-key ${REDACTED}`);
 		// At the start of the text or of a line too (key 102 round 2).
 		expect(redactSecrets("--password hunter2")).toBe(`--password ${REDACTED}`);
 		expect(redactSecrets("--api-key opaque-value-1")).toBe(`--api-key ${REDACTED}`);

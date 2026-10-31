@@ -12,16 +12,16 @@
  */
 import { describe, expect, test } from "bun:test";
 import { renderReviewerInput, type ReviewerInput } from "../reviewer";
-import { isSecretName, REDACTED, redactSecrets, redactValue } from "../redact";
+import { isSecretName, REDACTED, redactCommand, redactSecrets, redactValue } from "../redact";
 
 const fake = (prefix: string, length: number, alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"): string =>
 	prefix + Array.from({ length }, (_, i) => alphabet[(i * 7 + 3) % alphabet.length]).join("");
 
 /** Redaction leaves a second pass nothing to change. */
 const redacts = (text: string, expected: string): void => {
-	const out = redactSecrets(text);
+	const out = redactCommand(text);
 	expect(out).toBe(expected);
-	expect(redactSecrets(out)).toBe(out);
+	expect(redactCommand(out)).toBe(out);
 };
 
 /** The text comes back as it went in. */
@@ -166,12 +166,17 @@ describe("redaction replaces the value and leaves the command", () => {
 		for (const [text, expected] of cases) redacts(text, expected);
 	});
 
-	test("a secret flag followed by another flag could have its value anywhere after, so the line goes", () => {
+	test("a secret flag followed by flags redacts the first word that is not a flag, and the command stays", () => {
 		// Action keys sort their flags ahead of the arguments: `mysql --password
 		// -e hunter2` is what a refusal key for `mysql --password hunter2 -e x` reads.
-		redacts("mysql --password -e hunter2", `mysql --password ${REDACTED}`);
-		redacts("sshpass -p -v hunter2", `sshpass -p ${REDACTED}`);
-		redacts("curl -u -s bob:hunter2", `curl -u ${REDACTED}`);
+		redacts("mysql --password -e hunter2", `mysql --password -e ${REDACTED}`);
+		redacts("sshpass -p -v hunter2", `sshpass -p -v ${REDACTED}`);
+		redacts("curl -u -s bob:hunter2", `curl -u -s bob:${REDACTED}`);
+		// `--password` and `-W` are booleans for these clients, so the command
+		// around them is what a reviewer must still read.
+		redacts('psql --password -h db -c "run the cleanup"', `psql --password -h ${REDACTED} -c "run the cleanup"`);
+		redacts("mysql --password -h db -e 'run the cleanup'", `mysql --password -h ${REDACTED} -e 'run the cleanup'`);
+		redacts("mysql --password -v && rm -rf build", "mysql --password -v && rm -rf build");
 		// A flag that only says the password comes on stdin takes nothing.
 		untouched("docker login --password-stdin -u bob registry.example.com");
 		redacts("docker login --password-stdin registry.example.com && make", `docker login --password-stdin ${REDACTED} && make`);
@@ -189,7 +194,7 @@ describe("redaction replaces the value and leaves the command", () => {
 		redacts('{"password":"x","user":"bob"}', `{"password":${REDACTED}`);
 		// Many markers inside one quoted argument are one redaction, not a rescan each.
 		const started = performance.now();
-		redactSecrets(`"${"password: ".repeat(100_000)}" tail`);
+		redactCommand(`"${"password: ".repeat(100_000)}" tail`);
 		expect(performance.now() - started).toBeLessThan(1_000);
 	});
 
@@ -219,6 +224,63 @@ describe("redaction replaces the value and leaves the command", () => {
 		const input: ReviewerInput = { command, workingDirectory: "/work", transcript: [], scriptBodies: [], stage1: { verdict: "UNSURE", reason: "needs review" } };
 		const rendered = JSON.parse(renderReviewerInput(input)) as { command: string };
 		expect(rendered.command).toBe(`export X=1 AWS_SECRET_ACCESS_KEY=${REDACTED} && rm -rf build`);
+	});
+});
+
+describe("prose is cut at the end of the line, only a command is bounded at its word", () => {
+	test("evidence text keeps end-of-line redaction, so a secret with spaces or terminators leaks no tail", () => {
+		const cases: Array<[string, string]> = [
+			["the tool printed DB_PASSWORD=correct horse battery staple; done", `the tool printed DB_PASSWORD=${REDACTED}`],
+			["API_KEY=abc;def|ghi>jkl", `API_KEY=${REDACTED}`],
+			["PASS=two words here", `PASS=${REDACTED}`],
+			["my password is in --password two words", `my password is in --password ${REDACTED}`],
+			["curl -u bob:hunter2 and then the rest of the sentence", `curl -u bob:${REDACTED}`],
+			["sshpass -p two words ssh host", `sshpass -p ${REDACTED}`],
+			[`curl -H "Authorization: Bearer abc def" https://x.test`, `curl -H "Authorization: ${REDACTED}`],
+			["aws configure set aws_secret_access_key some value --profile dev", `aws configure set aws_secret_access_key ${REDACTED}`],
+		];
+		for (const [text, expected] of cases) {
+			expect(redactSecrets(text)).toBe(expected);
+			expect(redactSecrets(redactSecrets(text))).toBe(expected);
+		}
+	});
+
+	test("the same text as a command keeps what follows the value", () => {
+		expect(redactCommand("API_KEY=abc;rm -rf build")).toBe(`API_KEY=${REDACTED};rm -rf build`);
+		expect(redactSecrets("API_KEY=abc;rm -rf build")).toBe(`API_KEY=${REDACTED}`);
+	});
+
+	test("judge and reviewer evidence is prose, and the reviewer's command is a command", () => {
+		const input: ReviewerInput = {
+			command: "export A_TOKEN=x && rm -rf build",
+			workingDirectory: "/work",
+			transcript: [{ from: "user", text: "the log said DB_PASSWORD=hunter two; then I ran the build" }],
+			scriptBodies: [{ path: "run.sh", body: "export A_TOKEN=x && rm -rf build", unread: undefined }],
+			stage1: { verdict: "UNSURE", reason: "A_TOKEN=x y z" },
+		} as ReviewerInput;
+		const rendered = renderReviewerInput(input);
+		expect(rendered).toContain(`export A_TOKEN=${REDACTED} && rm -rf build`);
+		expect(rendered).not.toContain("hunter two");
+		expect(rendered).not.toContain("then I ran the build");
+		expect(rendered).not.toContain("y z");
+	});
+});
+
+describe("URL passwords and argv elements", () => {
+	test("a URL password that contains ? or # loses all of it", () => {
+		redacts("git clone https://u:pa?ss@host/repo.git", `git clone https://u:${REDACTED}@host/repo.git`);
+		redacts("git clone https://u:pa#ss@host/repo.git", `git clone https://u:${REDACTED}@host/repo.git`);
+		redacts("psql postgres://u:a?b#c@d@host", `psql postgres://u:${REDACTED}@host`);
+		redacts("https://host:8080/path?a=b@c", "https://host:8080/path?a=b@c");
+	});
+
+	test("an argv element another pass already changed is redacted whole", () => {
+		expect(redactValue(["curl", "--user=bob:hunter2 tail", "https://x.test"])).not.toContain("hunter2 tail");
+		const out = redactValue(["mysql", "--password=hunter2 and more"]) as string[];
+		expect(out[1]).toBe(REDACTED);
+		const flagged = redactValue(["sshpass", "-p", "hunter2 extra", "ssh"]) as string[];
+		expect(flagged).toEqual(["sshpass", "-p", REDACTED, "ssh"]);
+		expect(redactValue(["mysql", "--password", "-e", "x"])).toEqual(["mysql", "--password", "-e", REDACTED]);
 	});
 });
 
@@ -277,13 +339,24 @@ describe("redaction stays linear on hostile input", () => {
 		["many backticks", `A_TOKEN=${"`".repeat(2 * MB)}`],
 		["many token prefixes", "hf_ ya29. shpat_ sk_live_ ".repeat(MB / 26)],
 		["a long slack path", `hooks.slack.com/services/${"a/".repeat(MB)}`],
+		// A value that never closes ran to the end of the line once per flag.
+		["secret flags with an unclosed $(", "--password $( ".repeat(MB / 14)],
+		["sshpass -p with an unclosed $(", `sshpass ${"-p $( ".repeat(MB / 6)}`],
+		["curl -u with an unclosed $(", `curl ${"-u $( ".repeat(MB / 6)}`],
+		["config set with an unclosed $(", "config set token $( ".repeat(MB / 20)],
+		["nested $( flags that close at the end", `${"--password $(".repeat(MB / 14)}${")".repeat(MB / 14)}`],
+		["secret flags before a run of flags", "--password -a ".repeat(MB / 14)],
+		["a secret flag, a long run of flags, a value", `--password ${"-a ".repeat(MB / 3)} value`],
+		["many headers in one quoted argument", `curl -H "${"password: ".repeat(MB / 10)}" tail`],
 	];
-	test("each shape finishes in well under a second per megabyte", () => {
+	test("each shape finishes in well under a second per megabyte, as a command and as prose", () => {
 		for (const [label, text] of hostile) {
-			const started = performance.now();
-			redactSecrets(text);
-			const elapsed = performance.now() - started;
-			expect(elapsed, label).toBeLessThan(1_000);
+			for (const redact of [redactCommand, redactSecrets]) {
+				const started = performance.now();
+				redact(text);
+				const elapsed = performance.now() - started;
+				expect(elapsed, `${redact.name} ${label}`).toBeLessThan(1_000);
+			}
 		}
 	});
 
