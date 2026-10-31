@@ -195,6 +195,101 @@ describe("the body decides, wherever the file lives", () => {
 	});
 });
 
+describe("second-execution markers read code, not prose", () => {
+	// OMP session 01a18e06: generate_landmine_index.py was flagged on a SAFE
+	// verdict for `re.compile(` and a docstring that says "the subprocess".
+	test.each([
+		["a regex compile", 'import re\nHEADING = re.compile(r"^### (\\d+)")\n'],
+		["a docstring that names subprocess", '"""One heading came from the subprocess\nrewrite."""\nprint("ok")\n'],
+		["a comment that names subprocess", "# no subprocess here\nprint('ok')\n"],
+		["eval() with no argument", "model.eval()\nprint('ok')\n"],
+		["re aliased as regex inside an import list", "import os, re as regex\nPAT = regex.compile(r'a+')\n"],
+		["re aliased as regex", "import re as regex\nPAT = regex.compile(r'a+')\n"],
+		["regex aliased as re", "import regex as re\nPAT = re.compile(r'a+')\n"],
+	])("%s runs on a SAFE", async (_name, body) => {
+		writeScript(root, "probe.py", body);
+		expect(await gate("python3 probe.py")).toBe("ALLOWED");
+	});
+
+	test.each([
+		["import subprocess", "import subprocess\n"],
+		["subprocess in an import list", "import os, subprocess\n"],
+		["from subprocess", "from subprocess import run\n"],
+		["a subprocess call", "subprocess.run(['ls'])\n"],
+		["an asyncio subprocess", "asyncio.create_subprocess_shell('ls')\n"],
+		["the module named as a string", "importlib.import_module('subprocess')\n"],
+		["builtin compile", "code = compile(src, 'x', 'exec')\n"],
+		["eval with an argument", "eval(payload)\n"],
+		["exec", "exec(payload)\n"],
+		["an import after a colon", "try: import subprocess\nexcept ImportError: pass\n"],
+		["an import continued with a backslash", "import os, \\\n    subprocess\n"],
+		["a parenthesized import list", "from pkg import (\n    os,\n    subprocess,\n)\n"],
+		["subprocess imported from a package", "from pkg import subprocess\n"],
+		["compile borrowed through an alias of re", "import builtins as re\nre.compile(src, 'x', 'exec')\n"],
+		["compile through a name assigned to re", "re = builtins\nre.compile(src, 'x', 'exec')\n"],
+		["compile through another module imported as regex", "from builtins import compile as c\nfrom evil import re as regex\nregex.compile(src)\n"],
+		["a JS private field that runs exec", "class A {\n#run = require('child_process').exec('ls');\n}\n"],
+		["code after a comment line", "# setup\nimport subprocess\n"],
+		["an import after a comment that closes a multi-line string", 's = """\nend # """; import subprocess\n'],
+		["an import behind a comment under a utf-7 coding", "# -*- coding: utf-7 -*-\nx = 1 # +AAo-import subprocess\n"],
+		["an import under a #-prefixed name", "x = 1;#import subprocess\n"],
+		["a dotted module aliased as regex", "import evil.re as regex\nregex.compile(src)\n"],
+		["an import after a comment ending in a backslash", "# note \\\nimport subprocess as sp\n"],
+		["a JS private field named import", "class A {\n  #import = subprocess;\n}\n"],
+		["a from-import alias after an earlier import", "import os; from evil import re as regex\nregex.compile(src)\n"],
+		["an import after a carriage return in a comment", "x = 1 # note\rimport subprocess\n"],
+	])("%s is still flagged", async (_name, body) => {
+		writeScript(root, "probe.py", body);
+		expect(refusalOf(await gate("python3 probe.py")).layer).toBe("flagged");
+	});
+
+	test.each([
+		["an import after a semicolon", `python3 -c "x = 1; import subprocess"`],
+		["a from-import after a semicolon", `python3 -c "x = 1; from subprocess import run"`],
+		["an import on the line after a comment", `python3 -c "# note\nimport subprocess"`],
+	])("inline code with %s is still flagged", async (_name, command) => {
+		expect(refusalOf(await gate(command)).layer).toBe("flagged");
+	});
+
+	// Comments read as code: each language ends a `#` comment somewhere else,
+	// and every attempt to cut them hid code in some language (rounds 2-8 of
+	// https://github.com/STRML/omp-classifier/pull/211).
+	test.each([
+		["a JS regex literal holding # before exec", "probe.js", "node", "const exec = require('child_process').exec;\nconst r = / # /; exec(payload);\n"],
+		["a PHP comment that closes the tag", "probe.php", "php", "<?php\n# note ?> <?php exec($cmd);\n"],
+		["a shell heredoc handing a PHP comment to php", "probe.sh", "bash", "php <<'EOF'\n<?php\n# note ?> <?php exec($cmd);\nEOF\n"],
+		["a shell comment after an escaped space", "probe.sh", "bash", "echo a\\ # b; python3 -c 'exec(x)'\n"],
+		["JS code in a shell string that spans lines", "probe.sh", "bash", "node -e \"\nconst r = / # /; require(String.fromCharCode(99)).exec(x)\n\"\n"],
+		["a # inside a multi-line shell string", "probe.sh", "bash", "x=\"\n # ; eval(y)\n\"\n"],
+		["a # inside a multi-line Python f-string", "probe.py", "python3", "payload = input()\nprint(f\"\"\"\n# {exec(payload)}\n\"\"\")\n"],
+		["a # inside a multi-line shell string holding a substitution", "probe.sh", "bash", "x=\"\n# $(base64 -d /dev/null)\n\"\n"],
+		["a # after an escaped quote in a Python string", "probe.py", "python3", "s = \"a \\\" # \"; exec(p)\n"],
+	])("%s is still refused", async (_name, file, verb, body) => {
+		writeScript(root, file, body);
+		// A heredoc handed to an interpreter is refused before the marker scan
+		// (layer script-body); every other row reaches the flag.
+		expect(["flagged", "script-body"]).toContain(refusalOf(await gate(`${verb} ${file}`)).layer);
+	});
+
+	// The cost of reading comments as code: a comment that names a marker
+	// flags, as it did before the markers were narrowed. It fails closed.
+	test.each([
+		["a trailing comment that names an import", "print(1) # do not import subprocess\n"],
+		["a comment that names a marker", "# decode base64 input\nprint(1)\n"],
+		["a Python comment with punctuation that names a marker", "# base64 encoding (RFC 4648)\nprint(1)\n"],
+		["a Python comment with an apostrophe that names a marker", "# don't use base64\nprint(1)\n"],
+		["a Python comment that holds quotes and names an import", "x = 1 # it's fine'; import subprocess\n"],
+		["a comment line that names an import", "# do not import subprocess\nprint(1)\n"],
+	])("%s flags: comments read as code", async (_name, body) => {
+		writeScript(root, "probe.py", body);
+		expect(refusalOf(await gate("python3 probe.py")).layer).toBe("flagged");
+	});
+
+	test("inline code that only builds a regex runs on a SAFE", async () => {
+		expect(await gate(`python3 -c "import re; print(re.compile('a+').pattern)"`)).toBe("ALLOWED");
+	});
+});
+
 describe("a benign body still runs", () => {
 	test("from the session's directory", async () => {
 		writeScript(root, "probe.py", BENIGN);

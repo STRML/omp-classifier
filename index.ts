@@ -2169,8 +2169,34 @@ const SCRIPT_FILE_EXTENSION = /\.(?:py|pyw|rb|js|mjs|cjs|ts|mts|cts|tsx|jsx|sh|b
 // shows every character it will run — so a SAFE verdict on plain code may
 // release it. A payload that decodes or re-execs is NOT the code the model
 // read, so the wrapper's SAFE says nothing about what actually runs.
+// Each marker matches code, not prose: `model.eval()` takes no code, a
+// docstring that says "subprocess" imports nothing, and `re.compile(` builds a
+// regex. Any line that imports and names subprocess still matches, wherever
+// the statement starts (`try: import subprocess`) and across a `\` line
+// continuation or a parenthesized import list.
 const INTERPRETER_CODE_RISK =
-	/exec\(|eval\(|os\.system|subprocess|base64|b64decode|compile\(|__import__|marshal|\\x[0-9a-f]{2}/;
+	/exec\(|eval\((?!\s*\))|os\.system|\bsubprocess\s*\.|\bimport\b[^\n]*\bsubprocess\b|\bimport\s*\([^)]*\bsubprocess\b|\bfrom\s+subprocess\b|["']subprocess["']|create_subprocess_|base64|b64decode|__import__|marshal|\\x[0-9a-f]{2}/;
+/** `compile(` as a builtin. `re.compile(` and `regex.compile(` are exempt only
+ *  while the text never rebinds those names, so `import builtins as re` cannot
+ *  borrow the exemption. */
+const COMPILE_CALL = /compile\(/;
+const REGEX_COMPILE_ONLY = /(?<!\b(?:re|regex)\.)compile\(/;
+/** A plain `import a, b as c, re as regex` statement that aliases one regex
+ *  module to the other is not a rebind: every module in it is a bare name, so
+ *  no `;`, `from` or dotted module can sit in front. Any other `as re` is. */
+const REBINDS_REGEX_NAME =
+	/(?<!^[ \t]*import[ \t]+(?:\w+(?:[ \t]+as[ \t]+\w+)?[ \t]*,[ \t]*)*(?:re|regex)[ \t]+)\bas\s+(?:re|regex)\b|(?<![\w.])(?:re|regex)\s*=(?!=)|\b(?:def|class|for)\s+(?:re|regex)\b/m;
+
+/** Whether inline code or a script body carries a second-execution marker.
+ *  Comments read as code: where a `#` comment ends depends on the language (a
+ *  JS regex `/ # /`, PHP's `?>`, a Python f-string spanning lines), so a
+ *  comment that names a marker flags. */
+function hasInterpreterCodeRisk(text: string): boolean {
+	const joined = text.replace(/\\\r?\n/gu, " ");
+	if (INTERPRETER_CODE_RISK.test(joined)) return true;
+	if (!COMPILE_CALL.test(joined)) return false;
+	return REBINDS_REGEX_NAME.test(joined) || REGEX_COMPILE_ONLY.test(joined);
+}
 
 // Same token set as a word-boundary regex, for matching inside joined
 // interpreter-code text where a quoted payload arrives as one token
@@ -4472,7 +4498,7 @@ export function matchModerateRiskTokens(
 	const pipeStages = splitPipeStages(unmaskedNormalized);
 	for (let i = 1; i < pipeStages.length; i++) {
 		for (const { verb, codeText } of stdinExecutingInterpreters(pipeStages[i])) {
-			if (codeText !== null && !INTERPRETER_CODE_RISK.test(codeText) && !INTERPRETER_RISK_TOKEN_RE.test(codeText)) continue;
+			if (codeText !== null && !hasInterpreterCodeRisk(codeText) && !INTERPRETER_RISK_TOKEN_RE.test(codeText)) continue;
 			flags.add(`| ${verb}`);
 		}
 	}
@@ -4539,7 +4565,7 @@ export function matchModerateRiskTokens(
 				// bare command would have flagged (`bash -c 'rm -rf x'`
 				// keeps the backstop `rm -rf x` has).
 				const codeText = words.slice(2).join(" ");
-				if (INTERPRETER_CODE_RISK.test(codeText) || INTERPRETER_RISK_TOKEN_RE.test(codeText)) {
+				if (hasInterpreterCodeRisk(codeText) || INTERPRETER_RISK_TOKEN_RE.test(codeText)) {
 					flags.add(`${verb} ${next}`);
 				}
 			}
@@ -7065,7 +7091,7 @@ export default function (pi: ExtensionAPI) {
 				// script that re-execs or decodes its real work, and that must not
 				// depend on the judge noticing which file it is reading.
 				for (const body of script.bodies) {
-					if (INTERPRETER_CODE_RISK.test(body.body)) flags.push(`${body.verb} runs ${body.operand}`);
+					if (hasInterpreterCodeRisk(body.body)) flags.push(`${body.verb} runs ${body.operand}`);
 				}
 				const lifts =
 					prior !== undefined &&
