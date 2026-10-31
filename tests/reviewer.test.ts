@@ -258,7 +258,7 @@ describe("a session whose shell an earlier call may have changed", () => {
 	});
 
 	test("a body that prints variables and does integer arithmetic still reaches the reviewer", async () => {
-		script("update.sh", "#!/bin/bash\nx=hi\nprintf '%s\\n' \"$x\"\necho $((1 + 2))\n[ \"$1\" = start ] && git fetch origin\nexport FOO=bar\n");
+		script("update.sh", "#!/bin/bash\nx=hi\nprintf '%s\\n' \"$x\"\necho $((1 + (2)))\necho ${x:-default} ${x:0:1}\n[ \"$1\" = start ] && git fetch origin\nexport FOO=bar\n");
 		scriptReviewer(reviewerReply("allow", "update fork main"));
 		expect(resultText(await fire("tool_call", makeEvent("./update.sh start"), uiCtx(nextSession(), [user("u1", "update fork main")])))).toBe("ALLOWED");
 	});
@@ -572,8 +572,13 @@ describe("what never reaches the reviewer", () => {
 		["a script whose [[ ]] compares a variable as a number", () => script("wrap.sh", "#!/bin/bash\nw=x\n[[ $w -eq 1 ]]\ngit status\n"), "./wrap.sh"],
 		["a script whose [[ ]] numeric comparison spans a line continuation", () => script("wrap.sh", "#!/bin/bash\nw=x\n[[ $w \\\n-eq 1 ]]\ngit status\n"), "./wrap.sh"],
 		["a script whose $(( )) evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\necho $((w))\ngit status\n"), "./wrap.sh"],
+		["a script whose $(( )) evaluates a parenthesised variable", () => script("wrap.sh", "#!/bin/bash\nw=x\necho $(( 1 + (w) ))\ngit status\n"), "./wrap.sh"],
+		["a script whose legacy $[ ] evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\necho $[ w ]\ngit status\n"), "./wrap.sh"],
+		["a script whose substring offset evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x; s=abc\necho ${s:w:1}\ngit status\n"), "./wrap.sh"],
 		["a script whose array subscript evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\necho ${a[w]}\ngit status\n"), "./wrap.sh"],
 		["a script whose subscripted assignment evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\nx[w]=1\ngit status\n"), "./wrap.sh"],
+		["a script that exports a brace-expanded name", () => script("wrap.sh", "#!/bin/bash\nexport {A,PATH}=/tmp/evil\ngit status\n"), "./wrap.sh"],
+		["a script whose printf -v hides in a brace expansion", () => script("wrap.sh", "#!/bin/bash\nprintf {-v,X} y\ngit status\n"), "./wrap.sh"],
 		["a script whose printf -v format is built at run time", () => script("wrap.sh", "#!/bin/bash\nprintf \"${O:--v}\" X y\ngit status\n"), "./wrap.sh"],
 		[
 			"a symlink to a secret file",

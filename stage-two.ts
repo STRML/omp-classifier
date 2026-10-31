@@ -263,16 +263,42 @@ const NUMERIC_TEST = /\[\[[^\n]*?\s-(?:eq|ne|lt|le|gt|ge)\s[^\n]*?\]\]/gu;
 const PLAIN_NUMERIC_TEST = /^\[\[\s*-?\d+\s+-(?:eq|ne|lt|le|gt|ge)\s+-?\d+\s*\]\]$/u;
 const comparesNamesAsNumbers = (code: string): boolean => [...code.matchAll(NUMERIC_TEST)].some(match => !PLAIN_NUMERIC_TEST.test(match[0]));
 
-/** Arithmetic outside a command: `$(( w ))` evaluates `w`, and so does an
- *  array subscript, in an expansion (`${a[w]}`) or an assignment
- *  (`x[w]=1`). Any of them that reads a name or an expansion fails closed;
- *  a plain-integer subscript or `$(( 1 + 2 ))` does not. */
-const ARITHMETIC_EXPANSION = /\$\(\(([^)]*)\)\)/gu;
 const SUBSCRIPT = /(?:\$\{[A-Za-z_][A-Za-z0-9_]*|\b[A-Za-z_][A-Za-z0-9_]*)\[([^\]]*)\]/gu;
+/** A substring offset or length, `${s:w:1}`: also arithmetic. `${x:-d}`,
+ *  `${x:=d}`, `${x:?m}` and `${x:+a}` are defaults, not offsets. */
+const SUBSTRING = /\$\{[A-Za-z_][A-Za-z0-9_]*:(?![-=?+])([^}]*)\}/gu;
 const readsAName = (text: string): boolean => /[A-Za-z_$`]/u.test(text);
+
+/** The text of each `$(( ... ))` and `$[ ... ]`, matched by depth so nested
+ *  parentheses (`$(( (w) ))`) stay inside. An unclosed one runs to the end. */
+function arithmeticExpansions(code: string): string[] {
+	const found: string[] = [];
+	for (let at = code.indexOf("$"); at !== -1; at = code.indexOf("$", at + 1)) {
+		const open = code.startsWith("$((", at) ? "(" : code.startsWith("$[", at) ? "[" : undefined;
+		if (open === undefined) continue;
+		const close = open === "(" ? ")" : "]";
+		let depth = 0;
+		let end = code.length;
+		for (let index = at + 1; index < code.length; index++) {
+			if (code[index] === open) depth++;
+			else if (code[index] === close && --depth === 0) {
+				end = index;
+				break;
+			}
+		}
+		found.push(code.slice(at + (open === "(" ? 3 : 2), end));
+	}
+	return found;
+}
+
+/** Arithmetic outside a command: `$(( w ))` and `$[ w ]` evaluate `w`, and
+ *  so does an array subscript, in an expansion (`${a[w]}`) or an assignment
+ *  (`x[w]=1`), and a substring offset (`${s:w:1}`). Any of them that reads a
+ *  name or an expansion fails closed; plain integers do not. */
 const evaluatesNamesInText = (code: string): boolean =>
-	[...code.matchAll(ARITHMETIC_EXPANSION)].some(match => readsAName(match[1] ?? "")) ||
-	[...code.matchAll(SUBSCRIPT)].some(match => readsAName(match[1] ?? ""));
+	arithmeticExpansions(code).some(readsAName) ||
+	[...code.matchAll(SUBSCRIPT)].some(match => readsAName(match[1] ?? "")) ||
+	[...code.matchAll(SUBSTRING)].some(match => readsAName(match[1] ?? ""));
 
 /**
  * Why a body command may assign a variable whose name its text never spells,
@@ -285,13 +311,15 @@ const evaluatesNamesInText = (code: string): boolean =>
  */
 function writesHiddenName(command: ShellCommand): string | undefined {
 	const verb = command.words[0];
-	if (verb !== undefined && VARIABLE_WRITERS.has(verb.value) && command.words.slice(1).some(word => !word.literal)) {
+	// `fixed`, not `literal`: brace expansion rewrites a literal word, and
+	// `export {A,PATH}=/x` exports PATH.
+	if (verb !== undefined && VARIABLE_WRITERS.has(verb.value) && command.words.slice(1).some(word => !word.fixed)) {
 		return `${verb.value} writes a variable whose name is built at run time`;
 	}
 	// `printf -v NAME` writes a variable; an expanded format word can spell
 	// `-v` (`"${O:--v}"`). `printf '%s' "$x"` only prints.
 	const printfArgs = command.words.slice(1);
-	if (verb?.value === "printf" && printfArgs.length > 0 && (!printfArgs[0].literal || printfArgs.some(word => /^-[A-Za-z]*v/u.test(word.value)))) {
+	if (verb?.value === "printf" && printfArgs.length > 0 && (!printfArgs[0].fixed || printfArgs[0].value.startsWith("-"))) {
 		return "printf -v writes a variable whose name may be built at run time";
 	}
 	const operands = command.words.slice(1);
