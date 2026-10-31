@@ -987,6 +987,9 @@ const PLAIN_ARITHMETIC = new Set(["Word", "Lit", "BinaryArithm", "UnaryArithm", 
 
 /** Specials whose value bash itself sets to an integer. */
 const INTEGER_SPECIALS = new Set(["SECONDS", "RANDOM", "SRANDOM", "EPOCHSECONDS", "LINENO", "BASHPID", "PPID", "UID", "EUID", "#", "?", "$", "!"]);
+/** Names bash fills on its own (`read` with no name sets REPLY, `=~` sets
+ *  BASH_REMATCH): never trusted, whatever the body assigns. */
+const BASH_MANAGED = new Set(["REPLY", "MAPFILE", "OPTARG", "OPTIND", "OPTERR", "BASH_REMATCH", "COPROC", "PIPESTATUS", "BASH_ARGV", "BASH_ARGC", "FUNCNAME", "BASH_SOURCE", "BASH_LINENO", "DIRSTACK", "GROUPS", "COMP_WORDS", "COMPREPLY", "READLINE_LINE", "PWD", "OLDPWD", "IFS", "PATH"]);
 /** Builtins that write the names they are handed from input the text does not show. */
 const INPUT_WRITERS = new Set(["read", "mapfile", "readarray", "getopts"]);
 
@@ -1042,7 +1045,9 @@ function trustedNames(tree: any): Set<string> {
 		const type = nodeType(node);
 		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
 		const n = node as any;
-		if (type === "Assign" && n.Name?.Value) (n.Array || n.Index || !integerValue(n.Value) ? written : integerAssigned).add(n.Name.Value);
+		// No value (`local x`, `declare x`) keeps whatever the name held, and
+		// `x+=…` appends text: neither sets an integer the body vouches for.
+		if (type === "Assign" && n.Name?.Value) (n.Array || n.Index || n.Append || !n.Value || !integerValue(n.Value) ? written : integerAssigned).add(n.Name.Value);
 		if ((type === "WordIter" || type === "SelectClause") && n.Name?.Value) written.add(n.Name.Value);
 		if (type === "ParamExp" && n.Exp && n.Param?.Value) written.add(n.Param.Value);
 		// `(( x = x + 1 ))` reads x before it sets it, so only a right side of
@@ -1060,7 +1065,7 @@ function trustedNames(tree: any): Set<string> {
 	// A writer whose target is built at run time (`read "$n"`) can write any
 	// name, so nothing the body assigns can be trusted.
 	if (written.has("\0")) return trusted;
-	for (const name of integerAssigned) if (!written.has(name) && !INTEGER_SPECIALS.has(name)) trusted.add(name);
+	for (const name of integerAssigned) if (!written.has(name) && !INTEGER_SPECIALS.has(name) && !BASH_MANAGED.has(name)) trusted.add(name);
 	for (const name of INTEGER_SPECIALS) if (!written.has(name) && !integerAssigned.has(name)) trusted.add(name);
 	return trusted;
 }
