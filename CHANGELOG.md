@@ -14,7 +14,7 @@ From OMP session `01a18e06`. Jev answered SAFE on `python scripts/generate_landm
 | `eval(` | any call | needs an argument (`model.eval()` runs no code) |
 | `subprocess` | the word anywhere | a line with `import` that names it (wherever the statement starts, across `\` continuations and parenthesized lists), `from subprocess`, `subprocess.`, the module named in quotes, `create_subprocess_` |
 
-A body that uses subprocess still flags. A body that only mentions it in prose no longer does.
+A body that uses subprocess still flags. A body that only mentions it in prose no longer does. A trailing `#` comment is cut only for the import check, and only when the cut cannot hide code: the comment holds no quote and no `?>`, and the file declares no encoding other than UTF-8 or ASCII. Every other marker reads comments as code. `import os, re as regex` keeps the `regex.compile(` exemption; `from x import re as regex` and `import evil.re as regex` do not.
 
 ### A root ssh to a host the user named can reach the reviewer
 

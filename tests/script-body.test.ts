@@ -203,6 +203,9 @@ describe("second-execution markers read code, not prose", () => {
 		["a docstring that names subprocess", '"""One heading came from the subprocess\nrewrite."""\nprint("ok")\n'],
 		["a comment that names subprocess", "# no subprocess here\nprint('ok')\n"],
 		["eval() with no argument", "model.eval()\nprint('ok')\n"],
+		["a trailing comment that names an import", "print(1) # do not import subprocess\n"],
+		["a comment line that names an import", "# do not import subprocess\nprint(1)\n"],
+		["re aliased as regex inside an import list", "import os, re as regex\nPAT = regex.compile(r'a+')\n"],
 		["re aliased as regex", "import re as regex\nPAT = regex.compile(r'a+')\n"],
 		["regex aliased as re", "import regex as re\nPAT = re.compile(r'a+')\n"],
 	])("%s runs on a SAFE", async (_name, body) => {
@@ -231,6 +234,11 @@ describe("second-execution markers read code, not prose", () => {
 		["code after a comment line", "# setup\nimport subprocess\n"],
 		// Comments scan as code: PHP ends a `#` comment at `?>`.
 		["a PHP comment that closes the tag", "<?php\n# note ?> <?php exec($cmd);\n"],
+		["an import after a comment that closes a multi-line string", 's = """\nend # """; import subprocess\n'],
+		["an import after a quote inside a comment", "x = 1 # it's fine'; import subprocess\n"],
+		["an import behind a comment under a utf-7 coding", "# -*- coding: utf-7 -*-\nx = 1 # +AAo-import subprocess\n"],
+		["an import under a #-prefixed name", "x = 1;#import subprocess\n"],
+		["a dotted module aliased as regex", "import evil.re as regex\nregex.compile(src)\n"],
 	])("%s is still flagged", async (_name, body) => {
 		writeScript(root, "probe.py", body);
 		expect(refusalOf(await gate("python3 probe.py")).layer).toBe("flagged");
@@ -239,6 +247,7 @@ describe("second-execution markers read code, not prose", () => {
 	test.each([
 		["an import after a semicolon", `python3 -c "x = 1; import subprocess"`],
 		["a from-import after a semicolon", `python3 -c "x = 1; from subprocess import run"`],
+		["an import on the line after a comment", `python3 -c "# note\nimport subprocess"`],
 	])("inline code with %s is still flagged", async (_name, command) => {
 		expect(refusalOf(await gate(command)).layer).toBe("flagged");
 	});
