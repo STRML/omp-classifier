@@ -4,6 +4,17 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### `command -v` and a Python variable named `rm` no longer block
+
+Two false blocks from the decision log, both on words that run nothing.
+
+| Command | Before | After |
+|---|---|---|
+| `command -v git` | `script-body`: "command option -v cannot be resolved" | reaches the judge |
+| eval payload with `("mxm", rm)` and one `subprocess.run(["grep", ...])` | `flagged: rm` on a SAFE | runs on a SAFE |
+
+`command -v` and `-V` describe how each name resolves and run none of them, but the wrapper grammar marked both options `opaque`, so the script-body reader refused the whole line. A lookup (`-v` or `-V` among the leading options, alone or bundled with `-p`) now ends the scan with no program to read. Any other option still goes through the grammar and fails closed. In eval payloads, the moderate-risk token scan already skipped a token being assigned or dereferenced. It now also skips one that closes a tuple, list, call or object as a value (`rm,` `rm)` `rm]` `rm}`). A command a spawn runs sits inside a string or backtick and is followed by a space, an argument or the closing quote, so `["rm", "-rf", x]`, `"rm -rf x"` and `` `rm x` `` still flag.
+
 ### A `$TMPDIR` delete operand is measured with the shell's own TMPDIR
 
 https://github.com/STRML/omp-classifier/issues/176. Once the gate measured delete targets (https://github.com/STRML/omp-classifier/issues/166), every operand with an expansion measured `null`, because the gate could not promise which directory the shell would expand `$TMPDIR` to. `trash "$TMPDIR/omp-run-2/report.json"` therefore reached the judge with no proof it was temp cleanup and asked. The gate now expands a leading `$TMPDIR` or `${TMPDIR}` (bare or double-quoted as a whole word, followed by a plain `/path`) with the value the bash tool's shell will hold, then measures it like any other path: the real path must sit strictly inside a temp root.

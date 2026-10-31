@@ -167,6 +167,33 @@ describe("eval gate routing", () => {
 		expect(modelCalls.length).toBe(1);
 	});
 
+	// OMP session 01a18e06: a tuple element named `rm` flagged the payload as
+	// running `rm`, though the only process it starts is a grep.
+	test("a token read as a value (closing a tuple, call or list) is a variable, not a command", async () => {
+		setJevAnswer(jevSafeAnswer());
+		const result = await gateEval(
+			[
+				'for name, root in (("mxs", rx), ("mxm", rm)):',
+				"    print(name, len(list(root.iter())))",
+				"import subprocess",
+				'print(subprocess.run(["grep", "-rl", "PAGE_IDX", str(cfg)], capture_output=True, text=True).stdout)',
+			].join("\n"),
+			{},
+			"py",
+		);
+		expect(result).toBe("ALLOWED");
+	});
+
+	test.each([
+		['import subprocess\nsubprocess.run(["rm", "-rf", "build"])', "py"],
+		['import subprocess\nsubprocess.run("rm -rf build", shell=True)', "py"],
+		["import subprocess\nsubprocess.run(f\"cd x; rm\")\nsubprocess.run('rm build')", "py"],
+		["Bun.$`rm -rf ./build`", "js"],
+	])("a token a spawn runs still blocks on a SAFE: %s", async (code, language) => {
+		setJevAnswer(jevSafeAnswer());
+		expect(refusalOf(await gateEval(code, {}, language)).why).toContain("flags: rm");
+	});
+
 	test("verdict is cached per payload", async () => {
 		setJevAnswer(jevSafeAnswer());
 		const code = `import subprocess\nsubprocess.run(["echo", "cache-probe-${seq}"])`;
