@@ -26,16 +26,18 @@ What the reviewer judges and what the gate guarantees are split. The reviewer re
 | nothing touches where imports come from | an attribute named `path`, `meta_path`, `path_hooks`, `path_importer_cache` or `modules` on any base but an `os` the code never rebinds; `from sys import path`; rebinding `os`, `sys`, `shutil`, `pathlib`, `Path` or `open`, importing one under another name, or passing one of those modules anywhere but as an attribute base |
 | no write can plant a module | an allowlist, not a list of writers: a call that may write (opened with a write or computed mode, or named with write, copy, move, rename, replace, link, extract, retrieve, dump, save, touch or unpack, or taking a `target`, `dst` or `path` keyword) must take only literal paths, none a module file name (`.py`, `.pyc`, `.pth`, `.so`, `__init__`), none a directory on `sys.path` itself, and none under a module name inside one (`json/`); a write-like function named without a call refuses too |
 
-It also refuses an unquoted here-document, a here-string, stdin from a file, an option outside `-uBEsSIOqbP`, words built at run time, an assignment, and a set `PYTHONPATH` or `PYTHONHOME`.
+It also refuses an unquoted here-document, a here-string, stdin from a file, an option outside `-uBEsSIOqbP`, words built at run time, an assignment, and a set `PYTHONPATH` or `PYTHONHOME`. It refuses any import alias (`import json as j`, `from shutil import copy as c`), since the name checks cannot follow one, and any archive extraction (`extractall`, `extract`, `unpack_archive`), since the reviewer cannot read what an archive holds.
+
+Startup code counts too. Unless `-S` is given, `site` runs every `.pth` line that starts with `import` and imports `sitecustomize` and `usercustomize`, all before the body. The gate reads the site-packages directories the interpreter will process (and the user site, outside a venv or without `-s` or `-I`) and refuses when it finds any of them. A venv with setuptools' `distutils-precedence.pth` or a coverage `.pth` installed therefore stays refused unless the command passes `-S`.
 
 A script run by a Python shebang now gets the same checks against the interpreter its shebang names. Only `#!<absolute python>` and `#!/usr/bin/env <python name>` are read, followed by nothing but those flags. That interpreter must pass the same identity check, and its library is what the import check reads. Before this, any such body was shown with no checks at all. No reviewer run in the log had a `.py` program, so this changes no past decision.
 
 | Command (from the log, anonymized) | Before | After |
 |---|---|---|
-| `cd /Users/you/repo && ~/.venv/bin/python - <<'PY'` (re, pathlib, xml.etree, read-only) | refused, "reads a redirect" | reviewed |
+| `cd /Users/you/repo && ~/.venv/bin/python - <<'PY'` (re, pathlib, xml.etree, read-only) | refused, "reads a redirect" | reviewed in a venv with no startup hooks, or under `-S`; the measured venv has two `.pth` import lines, so refused there |
 | same, with `sys.path.insert(0, "scripts")` | refused | refused, "sys.path" |
 | `cd /Users/you/repo && ~/.venv/bin/python -c "import shutil, pathlib; ...copytree(src, dst)"` | refused, "a binary" | refused, a write to a computed path |
-| `~/.venv/bin/python -m pytest tests/x.py -q \| tail -25` | refused, "a binary" | reviewed |
+| `~/.venv/bin/python -m pytest tests/x.py -q \| tail -25` | refused, "a binary" | same |
 | `timeout 2400 ~/.venv/bin/python -m scripts.flow "name" \| tail -40` | refused, "a binary" | refused, "runs the local module scripts" |
 | `python3 -c ...`, `python3` from Homebrew, no venv | refused | refused |
 

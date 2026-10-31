@@ -99,7 +99,7 @@ const BUILTIN_MODULES = new Set(["atexit", "errno", "faulthandler", "gc", "itert
 const DYNAMIC_MODULES = new Set(["importlib", "imp", "runpy", "zipimport", "pkgutil", "site", "sitecustomize", "usercustomize", "builtins", "code", "codeop", "ctypes", "pickle", "cPickle", "marshal", "shelve"]);
 
 /** `python -m` modules that run a file or string they are handed. */
-const RUNNER_MODULES = new Set(["runpy", "pdb", "bdb", "cProfile", "profile", "trace", "timeit", "code", "doctest", "idlelib", "pickle", "pickletools", "zipapp"]);
+const RUNNER_MODULES = new Set(["runpy", "pdb", "bdb", "cProfile", "profile", "trace", "timeit", "code", "doctest", "idlelib", "pickle", "pickletools", "zipapp", "pydoc", "unittest", "multiprocessing"]);
 
 /** Names that run a string as code, or reach code or a namespace by a
  *  computed name, so the reviewer cannot read what runs. */
@@ -184,13 +184,13 @@ def write_targets(node):
     return targets
 call_functions = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
 attribute_bases = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
-imports, names, bare, bound, attrs, writes, refs = [], set(), set(), set(), [], [], set()
+imports, names, bare, bound, attrs, writes, refs, calls = [], set(), set(), set(), [], [], set(), set()
 for node in ast.walk(tree):
     if isinstance(node, ast.Import):
         for alias in node.names:
             imports.append({"module": alias.name, "level": 0, "names": [], "asname": alias.asname})
     elif isinstance(node, ast.ImportFrom):
-        imports.append({"module": node.module or "", "level": node.level, "names": [n for a in node.names for n in (a.name, a.asname) if n], "asname": None})
+        imports.append({"module": node.module or "", "level": node.level, "names": [n for a in node.names for n in (a.name, a.asname) if n], "asname": next((a.asname for a in node.names if a.asname), None)})
     elif isinstance(node, ast.Name):
         if isinstance(node.ctx, ast.Load):
             names.add(node.id)
@@ -212,11 +212,19 @@ for node in ast.walk(tree):
         attrs.append([base_name(node.value), node.attr])
         if writes_like(node.attr) and id(node) not in call_functions:
             refs.add(node.attr)
+    # Names bound by node types newer than the parser's Python: match patterns
+    # (MatchAs, MatchStar, MatchMapping's rest) and type parameters.
+    kind = type(node).__name__
+    if kind in ("MatchAs", "MatchStar", "TypeVar", "ParamSpec", "TypeVarTuple") and getattr(node, "name", None):
+        bound.add(node.name)
+    if kind == "MatchMapping" and getattr(node, "rest", None):
+        bound.add(node.rest)
     if isinstance(node, ast.Call):
+        calls.add(callee(node) or "")
         targets = write_targets(node)
         if targets is not None:
             writes.extend({"call": callee(node) or "a computed callee", "target": t} for t in targets)
-print(json.dumps({"encoding": encoding, "imports": imports, "names": sorted(names), "bare": sorted(bare), "bound": sorted(bound), "attrs": attrs, "writes": writes, "refs": sorted(refs)}))
+print(json.dumps({"encoding": encoding, "imports": imports, "names": sorted(names), "bare": sorted(bare), "bound": sorted(bound), "attrs": attrs, "writes": writes, "refs": sorted(refs), "calls": sorted(calls)}))
 `;
 
 interface ParsedImport {
@@ -244,7 +252,13 @@ interface PythonFacts {
 	writes: Array<{ call: string; target: string | null }>;
 	/** Write-like functions named without being called (`w = Path.write_text`). */
 	refs: string[];
+	/** The name of every function or method called. */
+	calls: string[];
 }
+
+/** Archive extraction: the reviewer cannot read what an archive holds, so
+ *  extracting one runs invisible code wherever it lands. */
+const ARCHIVE_CALLS = new Set(["extractall", "extract", "unpack_archive", "extractfile_to"]);
 
 const PARSER_TIMEOUT_MS = 3000;
 const PARSER_MAX_OUTPUT = 8 * 1024 * 1024;
@@ -258,7 +272,7 @@ function parsePython(code: string, parser: string): PythonFacts | string {
 	}
 	try {
 		const facts = JSON.parse(result.stdout.toString("utf8")) as PythonFacts;
-		const lists = [facts.imports, facts.names, facts.bare, facts.bound, facts.attrs, facts.writes, facts.refs];
+		const lists = [facts.imports, facts.names, facts.bare, facts.bound, facts.attrs, facts.writes, facts.refs, facts.calls];
 		if (typeof facts.encoding !== "string" || !lists.every(Array.isArray)) return "the gate's Python returned a shape it does not read";
 		return facts;
 	} catch {
@@ -312,7 +326,7 @@ function importRefusal(item: ParsedImport, roots: readonly string[], stdlib: rea
 	if (item.names.includes("*")) return `a star import from ${item.module} binds names the gate cannot list`;
 	const top = IMPORT_ITEM.exec(item.module)?.[1];
 	if (top === undefined) return `an import the gate cannot read (${item.module})`;
-	const dynamic = [...item.module.split("."), ...item.names].find(name => DYNAMIC_MODULES.has(name) || DYNAMIC_NAMES.has(name));
+	const dynamic = [...item.module.split("."), ...item.names].find(name => DYNAMIC_MODULES.has(name) || RUNNER_MODULES.has(name) || DYNAMIC_NAMES.has(name)) ?? (item.module === "logging.config" || (item.module === "logging" && item.names.includes("config")) ? "logging.config" : undefined);
 	if (dynamic !== undefined) return `imports ${dynamic}, which loads or runs code the reviewer cannot read`;
 	if (top.startsWith("_") && top !== "__future__") return `imports the private module ${top}`;
 	if (roots.some(root => shadows(root, top))) return `imports the local module ${top}`;
@@ -324,6 +338,8 @@ function importRefusal(item: ParsedImport, roots: readonly string[], stdlib: rea
 	const guarded = [item.asname, ...item.names].find(name => name !== null && GUARDED_NAMES.has(name) && !(name === "Path" && top === "pathlib") && !(name === "path" && top === "os"));
 	if (guarded !== undefined && guarded !== top) return `binds ${guarded} by import, which the gate's checks rely on`;
 	if (item.asname !== null && GUARDED_NAMES.has(top)) return `imports ${top} as ${item.asname}, a name the gate does not follow`;
+	// An alias hides what a name is from the name checks: `from shutil import copy as c`.
+	if (item.asname !== null) return `imports ${item.module} as ${item.asname}, so the gate cannot track what the name does`;
 	return undefined;
 }
 
@@ -381,12 +397,62 @@ export function pythonHandOff(code: string, roots: readonly string[], libs: read
 		if (DYNAMIC_ATTRIBUTES.has(attr)) return `uses .${attr}, which reaches code the reviewer cannot read`;
 		if (IMPORT_STATE.has(attr) && !(attr === "path" && base === "os")) return `uses ${base ?? "…"}.${attr}, which can change where imports come from`;
 	}
+	const archive = facts.calls.find(name => ARCHIVE_CALLS.has(name));
+	if (archive !== undefined) return `calls ${archive}, which unpacks an archive the reviewer cannot read`;
 	if (facts.refs.length > 0) return `names ${facts.refs[0]} without calling it, so the gate cannot check what it writes`;
 	for (const { call, target } of facts.writes) {
 		const why = writeRefusal(call, target, roots, stdlib);
 		if (why !== undefined) return why;
 	}
 	return undefined;
+}
+
+const PTH_MAX_BYTES = 64 * 1024;
+const CUSTOMIZE = /^(?:sitecustomize|usercustomize)(?:\.|$)/u;
+
+/**
+ * Why the interpreter's own startup runs code the reviewer cannot read, or
+ * undefined. Unless `-S` skips it, `site` runs every line of a `.pth` file in
+ * a site-packages directory that starts with `import`, and imports
+ * `sitecustomize` and `usercustomize`. `flags` are the interpreter's own
+ * options: `-S` skips all of it, and `-s` or `-I` skip the user site.
+ */
+export function startupRefusal(libs: readonly string[], venv: { systemSite: boolean } | undefined, flags: readonly string[]): string | undefined {
+	const letters = flags.join("");
+	if (letters.includes("S")) return undefined;
+	const version = libs.map(dir => /^python(\d+\.\d+)$/u.exec(path.basename(dir))?.[1]).find(found => found !== undefined);
+	// A venv turns the user site off unless it includes the system site.
+	const userSite = (venv === undefined || venv.systemSite) && !letters.includes("s") && !letters.includes("I") && version !== undefined;
+	const sites = [...libs.filter(dir => path.basename(dir) === "site-packages"), ...(userSite ? [path.join(os.homedir(), ".local", "lib", `python${version}`, "site-packages"), path.join(os.homedir(), "Library", "Python", version, "lib", "python", "site-packages")] : [])];
+	for (const dir of [...libs, ...sites]) {
+		const custom = safeList(dir).find(entry => CUSTOMIZE.test(entry));
+		if (custom !== undefined) return `${path.join(dir, custom)} runs at interpreter startup, unread`;
+	}
+	for (const dir of sites) {
+		for (const entry of safeList(dir).filter(name => name.endsWith(".pth"))) {
+			const file = path.join(dir, entry);
+			let text: string;
+			try {
+				const stat = fs.statSync(file);
+				if (!stat.isFile() || stat.size > PTH_MAX_BYTES) return `${file} could not be checked for startup code`;
+				text = fs.readFileSync(file, "utf8");
+			} catch {
+				return `${file} could not be checked for startup code`;
+			}
+			if (text.split(/\r?\n/u).some(line => /^import[ \t]/u.test(line))) return `${file} runs an import line at interpreter startup, unread`;
+		}
+	}
+	return undefined;
+}
+
+/** The interpreter's own options before its mode: every leading flag cluster. */
+export function leadingFlags(words: readonly string[]): string[] {
+	const flags: string[] = [];
+	for (const word of words) {
+		if (!PYTHON_FLAGS.test(word)) break;
+		flags.push(word);
+	}
+	return flags;
 }
 
 /** A Python on a root-owned chain to parse with, or undefined. Not the

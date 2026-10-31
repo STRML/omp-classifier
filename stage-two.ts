@@ -37,7 +37,7 @@ import * as path from "node:path";
 import { isSecretPath } from "./floor";
 import { REVIEWER_SCRIPT_MAX_BYTES, type ReviewerScriptBody } from "./reviewer";
 import { parseShell, type ShellCommand, type ShellWord } from "./shell-ast";
-import { isNativeExecutable, libraryDirs, PYTHON_ENVIRONMENT, PYTHON_FLAGS, PYTHON_NAME, parserPython, pythonHandOff, pythonMode, pythonModuleRefusal, venvOf } from "./stage-two-python";
+import { isNativeExecutable, leadingFlags, libraryDirs, PYTHON_ENVIRONMENT, PYTHON_FLAGS, PYTHON_NAME, parserPython, pythonHandOff, startupRefusal, pythonMode, pythonModuleRefusal, venvOf } from "./stage-two-python";
 
 export interface ReadScript extends ReviewerScriptBody {
 	/** The path the command names, resolved but not through links. */
@@ -513,6 +513,8 @@ function shebangPythonHandOff(shebang: string, body: string, real: string): stri
 	const libs = libraryDirs(python.real, python.venv);
 	const parser = parserPython(isSystemProgram);
 	if (libs === undefined) return "the gate cannot find its interpreter's standard library";
+	const startup = startupRefusal(libs, python.venv, flags);
+	if (startup !== undefined) return startup;
 	return parser === undefined ? NO_PARSER : pythonHandOff(body, [path.dirname(real)], libs, parser);
 }
 
@@ -543,6 +545,8 @@ function pythonScripts(run: ShellCommand, dir: string, python: PythonInterpreter
 	if (inputs.length > 0 && heredoc === undefined) return refuse("the script reads a redirect");
 	const libs = libraryDirs(python.real, python.venv);
 	if (libs === undefined) return refuse(`${programWord(run)}: the gate cannot find its standard library`);
+	const startup = startupRefusal(libs, python.venv, leadingFlags(run.words.slice(timeoutWords(run) + 1).map(word => word.value)));
+	if (startup !== undefined) return refuse(startup);
 	const refused = (reason: string | undefined): CommandScripts => (reason === undefined ? { kind: "scripts", scripts: [] } : refuse(reason));
 	// A module run hands the reviewer no code of its own, so nothing to parse.
 	if (mode.mode === "module") return refused(pythonModuleRefusal(mode.module, dir, libs));

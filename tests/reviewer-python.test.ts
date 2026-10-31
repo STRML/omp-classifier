@@ -109,7 +109,7 @@ describe("a venv interpreter the gate can identify", () => {
 	test("python - with a quoted here-document, after a cd: the body is in the command", async () => {
 		const python = fakeVenv(fakeInstall());
 		fs.mkdirSync(path.join(dir, "work"));
-		await expectReviewed(`cd work && ${python} - <<'PY'\nimport re, pathlib\nimport xml.etree.ElementTree as ET\nprint(re.sub("a", "b", "abc"))\nPY`);
+		await expectReviewed(`cd work && ${python} - <<'PY'\nimport re, pathlib\nimport xml.etree.ElementTree\nprint(re.sub("a", "b", "abc"))\nPY`);
 		expect(reviewerCalls[0].input.scriptBodies).toEqual([]);
 		expect(reviewerCalls[0].input.command).toContain('print(re.sub("a", "b", "abc"))');
 	});
@@ -459,7 +459,7 @@ describe("the gate's four guarantees hold however the code is spelled", () => {
 		["a package __init__ written", "import os\nos.makedirs('json', exist_ok=True)\nopen('json/__init__.py', 'w')\n", "writes json/__init__.py"],
 		["a shutil copy onto a module name", "import shutil\nshutil.copy('payload.txt', 'json.py')\n", "writes json.py"],
 		["a shutil copy to a computed path", "import shutil, sys\nshutil.copytree('a', sys.argv[1])\n", "path built at run time"],
-		["an archive extracted", "import tarfile\ntarfile.open('x.tar').extractall()\n", "path built at run time"],
+		["an archive extracted", "import tarfile\ntarfile.open('x.tar').extractall()\n", "unpacks an archive"],
 		// The fourth security round: each is a write the allowlist must catch.
 		["str.replace with computed arguments (a possible Path.replace)", "import sys\nprint(sys.argv[0].replace(sys.argv[1], 'x'))\n", "path built at run time"],
 		["io.FileIO opened for writing", "import io\nio.FileIO('json.py', 'w')\n", "writes json.py"],
@@ -473,6 +473,13 @@ describe("the gate's four guarantees hold however the code is spelled", () => {
 		["a star import", "from sys import *\npath.insert(0, 'x')\n", "star import"],
 		["operator.attrgetter", "import operator\noperator.attrgetter('system')\n", "attrgetter"],
 		["attrgetter imported by name", "from operator import attrgetter\n", "attrgetter"],
+		// The fifth security round.
+		["an archive unpacked to a literal directory", "import shutil\nshutil.unpack_archive('x.tar', 'out')\n", "unpacks an archive"],
+		["an archive member extracted", "import tarfile\ntarfile.open('x.tar').extract('m', path='out')\n", "unpacks an archive"],
+		["logging.config", "import logging.config\n", "logging.config"],
+		["logging.config imported by name", "from logging import config\n", "logging.config"],
+		["pydoc", "import pydoc\n", "imports pydoc"],
+		["os rebound by a match pattern", "import os, sys\nmatch sys:\n    case os:\n        os.path.insert(0, 'x')\n", "unread script"],
 	])("%s", async (_name, code, why) => {
 		const python = fakeVenv(fakeInstall());
 		write("helpers.py", "import os\nos.system('id')\n");
@@ -494,5 +501,54 @@ describe("the gate's four guarantees hold however the code is spelled", () => {
 		const python = fakeVenv(fakeInstall());
 		write("probe.py", code);
 		await expectReviewed(`${python} probe.py`);
+	});
+});
+
+describe("startup code the interpreter runs before the body stays refused", () => {
+	test.each([
+		["a .pth file with an import line", "venv/lib/python3.12/site-packages/hook.pth", "import os; os.system('id')\n", "runs an import line at interpreter startup"],
+		["a sitecustomize in site-packages", "venv/lib/python3.12/site-packages/sitecustomize.py", "import os\n", "sitecustomize.py runs at interpreter startup"],
+		["a usercustomize in the standard library", "base/lib/python3.12/usercustomize.py", "import os\n", "usercustomize.py runs at interpreter startup"],
+	])("%s", async (_name, rel, content, why) => {
+		const python = fakeVenv(fakeInstall());
+		write(rel, content);
+		await expectRefused(`${python} -c "import json"`, why);
+	});
+
+	test("a .pth file that only adds a path is fine", async () => {
+		const python = fakeVenv(fakeInstall());
+		write("venv/lib/python3.12/site-packages/paths.pth", "/opt/extra\n");
+		await expectReviewed(`${python} -c "import json"`);
+	});
+
+	test("-S skips site, so a .pth import line does not run", async () => {
+		const python = fakeVenv(fakeInstall());
+		write("venv/lib/python3.12/site-packages/hook.pth", "import os; os.system('id')\n");
+		await expectReviewed(`${python} -S -c "import json"`);
+	});
+
+	test("-I still runs site, so a .pth import line refuses", async () => {
+		const python = fakeVenv(fakeInstall());
+		write("venv/lib/python3.12/site-packages/hook.pth", "import os; os.system('id')\n");
+		await expectRefused(`${python} -I -c "import json"`, "runs an import line at interpreter startup");
+	});
+
+	test("a shebang script whose interpreter's site-packages has a .pth import line", async () => {
+		const python = fakeVenv(fakeInstall());
+		write("venv/lib/python3.12/site-packages/hook.pth", "import os; os.system('id')\n");
+		write("probe.py", `#!${python}\nimport json\n`, 0o755);
+		await expectRefused("./probe.py", "runs an import line at interpreter startup");
+	});
+});
+
+describe("an import alias refuses, since the name checks cannot follow it", () => {
+	test.each([
+		["a write function under another name", "from shutil import copy as c\nc('payload.txt', 'json.py')\n"],
+		["Path under another name", "from pathlib import Path as P\nP('json.py').write_text('x')\n"],
+		["a module under another name", "import json as j\nprint(j.dumps(1))\n"],
+	])("%s", async (_name, code) => {
+		const python = fakeVenv(fakeInstall());
+		write("probe.py", code);
+		await expectRefused(`${python} probe.py`, " as ");
 	});
 });
