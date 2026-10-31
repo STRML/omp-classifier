@@ -24,7 +24,7 @@ and the plugin still loads. `ShellCommand.unreadShape` marks a construct the ada
 flatten. The module's `walk` also enters `ParamExp.Slice` (mvdan-sh's own Walk does not); an extglob
 pattern holding a substitution fails the parse. `ShellRedirect.duplicate` is true for `>&word`
 only when `word` is digits or `-`. Exported readers that walk outside `parseShell` catch a stack
-overflow and answer fail-closed. flatten. `shellLayout` uses a second parser that keeps comments; null means the text could not be
+overflow and answer fail-closed. `shellLayout` uses a second parser that keeps comments; null means the text could not be
 laid out (syntax error, a tree too deep to walk, an empty heredoc whose closer is not where expected).
 
 ## critical-scan.ts (247 lines): what the critical patterns read

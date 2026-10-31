@@ -4,6 +4,15 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### Arithmetic trust follows source order, and the reader sees through alias and path-verb spellings
+
+Security review findings on https://github.com/STRML/omp-classifier/pull/232, https://github.com/STRML/omp-classifier/pull/233 and https://github.com/STRML/omp-classifier/pull/224:
+
+- **Trust was flow-insensitive.** A name counted as integer-assigned wherever the assignment sat, so `(( n )); n=0`, `f() { n=0; }; (( n ))`, `if …; then n=0; fi; (( n ))`, `n=0 true; (( n ))` (a prefix lasts for one command) and `(n=0); (( n ))` all trusted `n` at a read that sees whatever it held before. A name is now trusted only after its first top-level, unconditional integer assignment in the text: a plain assignment statement, a top-level `(( n = 1 ))`, or the init of a top-level `for (( i = 0; … ))`, not backgrounded or negated. A plain `=` over integers inside arithmetic writes its target without reading it.
+- **Bash 5 specials.** macOS still ships bash 3.2, which does not set `SRANDOM`, `EPOCHSECONDS` or `BASHPID`, so there those are ordinary names the environment can fill. They are no longer trusted specials.
+- **Alias spellings.** `builtin alias`, `command alias` and `\alias` define an alias as surely as `alias` does, and the reader now sees all four. An alias definition refuses when any later command has an operand, not only one shaped like a script path.
+- **Path verbs.** A verb such as `"$VENV/bin/python"` names its program by its last component. That component is now read off the source text and must be a plain filename, so `"$D/py"$V` or `$D/$((1))` refuses.
+
 ### The script-body reader follows the shell parse, and refuses where it cannot
 
 The script-body reader (issue 67) found interpreter calls by reading the command as text: a masker blanked heredoc bodies and quote spans, the host tokenizer split segments, and a text walk followed `cd`. None of the three knew about comments, and the masker treated every `<<` as a heredoc. When one of them lost its place it blanked the rest of the command or moved the shell somewhere bash does not, and the reader read nothing, or the wrong file, and refused nothing. The parse already knew better, so the reader now uses it.
