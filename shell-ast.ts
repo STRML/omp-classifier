@@ -69,6 +69,8 @@ interface ShellRuntime {
 	redirect: Record<RedirectOpName, number>;
 	binary: Record<BinaryOpName, number>;
 	redirectDirection: Record<number, ShellRedirect["direction"] | undefined>;
+	/** `[[ ]]` operators that evaluate both operands as arithmetic. */
+	arithmeticTests: ReadonlySet<number>;
 }
 
 let runtime: ShellRuntime | undefined;
@@ -94,7 +96,7 @@ const deriveRuntime = (mod: unknown): ShellRuntime => {
 	 * renumbers them silently wrong in a security boundary, so each one is
 	 * read back from a parse of the spelling it belongs to.
 	 */
-	const operatorOf = (source: string, type: "Redirect" | "BinaryCmd"): number => {
+	const operatorOf = (source: string, type: "Redirect" | "BinaryCmd" | "BinaryTest"): number => {
 		// Local walk, not the module-level one: walk() calls getShell(), and
 		// the runtime is not assigned until this function returns, so touching
 		// it here would re-enter this derivation forever.
@@ -146,7 +148,9 @@ const deriveRuntime = (mod: unknown): ShellRuntime => {
 		[redirect.readWrite]: "both",
 	};
 
-	return { syntax, parser, redirect, binary, redirectDirection };
+	const arithmeticTests = new Set(["-eq", "-ne", "-lt", "-le", "-gt", "-ge"].map(op => operatorOf(`[[ 1 ${op} 1 ]]`, "BinaryTest")));
+
+	return { syntax, parser, redirect, binary, redirectDirection, arithmeticTests };
 };
 
 /** The live runtime, loading and deriving the parser on first use. */
@@ -955,6 +959,71 @@ function arithmeticNames(node: any): string[] {
 		return true;
 	});
 	return names;
+}
+
+/** A word's text when every part is a plain literal; otherwise a marker no
+ *  flag pattern accepts, so a built word fails closed. */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+const literalWordText = (word: any): string => {
+	const parts = word?.Parts ?? [];
+	// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+	return parts.every((part: any) => nodeType(part) === "Lit") ? parts.map((part: any) => part.Value ?? "").join("") : "\0";
+};
+
+/** Whether an arithmetic expression (or any node under it) reads something
+ *  other than a plain integer: a name, an expansion or a substitution. */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function arithmeticReadsAnything(node: any): boolean {
+	if (!node) return false;
+	if (Array.isArray(node)) return node.some(arithmeticReadsAnything);
+	let reads = false;
+	walk(node, (inner: unknown) => {
+		if (reads || !inner) return !reads;
+		const type = nodeType(inner);
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		if (type === "ParamExp" || type === "CmdSubst" || type === "ProcSubst" || type === "ArithmExp" || (type === "Lit" && /[^0-9\s]/u.test((inner as any).Value ?? ""))) reads = true;
+		return !reads;
+	});
+	return reads;
+}
+
+/**
+ * Why a shell text evaluates arithmetic that reads a name, or undefined.
+ * bash evaluates a variable's VALUE as an expression wherever it does
+ * arithmetic, so with `w='PATH=/x'` each of these assigns PATH though no
+ * text spells it: `(( w ))`, `let w`, `$(( w ))`, a subscript (`${a[w]}`,
+ * `x[w]=1`, `( [w]=1 )`), a substring offset or length (`${s:w:1}`), and a
+ * `[[ ]]` numeric comparison. `declare -i` makes every later assignment to
+ * the name arithmetic, and `declare -n` makes the name an alias of another,
+ * so both refuse outright. Read from the parse: the walker does not descend
+ * into slices and subscripts, so those are read off the node itself.
+ */
+export function hiddenArithmetic(text: string): string | undefined {
+	let tree: unknown;
+	try {
+		tree = parse(text);
+	} catch {
+		return "its shell body could not be parsed";
+	}
+	const { arithmeticTests } = getShell();
+	let why: string | undefined;
+	walk(tree, (node: unknown) => {
+		if (why !== undefined || !node) return why === undefined;
+		const type = nodeType(node);
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		const n = node as any;
+		if ((type === "ArithmCmd" || type === "LetClause" || type === "ArithmExp") && arithmeticReadsAnything(n.X ?? n.Exprs ?? n)) why = "arithmetic evaluates a variable, which can assign any name";
+		else if (type === "ParamExp" && (arithmeticReadsAnything(n.Index) || arithmeticReadsAnything(n.Slice?.Offset) || arithmeticReadsAnything(n.Slice?.Length))) why = "a subscript or substring offset evaluates a variable, which can assign any name";
+		else if ((type === "Assign" || type === "ArrayElem") && arithmeticReadsAnything(n.Index)) why = "a subscript evaluates a variable, which can assign any name";
+		else if (type === "BinaryTest" && arithmeticTests.has(n.Op) && (arithmeticReadsAnything(n.X) || arithmeticReadsAnything(n.Y))) why = "a numeric comparison evaluates a variable, which can assign any name";
+		else if (type === "DeclClause") {
+			// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+			const flags = (n.Args ?? []).filter((arg: any) => arg.Naked && arg.Value).map((arg: any) => literalWordText(arg.Value));
+			if (flags.some((flag: string) => /^[-+][A-Za-z]*[in]/u.test(flag) || !/^[-+A-Za-z0-9_]*$/u.test(flag))) why = "declare -i or -n changes what a later assignment does";
+		}
+		return why === undefined;
+	});
+	return why;
 }
 
 /** A code point bash would emit, or the escape as written when it is out of
