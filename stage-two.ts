@@ -121,7 +121,15 @@ const isLiteral = (word: ShellWord): boolean => word.fixed;
 /** Whether a word names a file by path rather than by a bare name. */
 const isPathWord = (value: string): boolean => value.includes("/") || value.startsWith("~");
 
-/** A bare name as the gate's PATH resolves it. */
+/** Whether PATH holds an empty or relative entry. The shell resolves one from
+ *  the command's own directory, after any `cd`, so the gate cannot tell which
+ *  file a bare name runs (https://github.com/STRML/omp-classifier/issues/206). */
+function pathHasRelativeEntry(): boolean {
+	return (process.env.PATH ?? "").split(path.delimiter).some(dir => !path.isAbsolute(dir));
+}
+
+/** A bare name as the gate's PATH resolves it. Callers that vouch for a bare
+ *  name check `pathHasRelativeEntry` first: this lookup skips those entries. */
 function onPath(name: string): string | undefined {
 	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
 		if (dir === "") continue;
@@ -209,6 +217,7 @@ function bodyHandOff(body: string): string | undefined {
 		const name = verbName(command);
 		const names = programNames(command);
 		if (isPathWord(program) && !isSystemProgram(program)) return `runs ${program}`;
+		if (program !== "" && !isPathWord(program) && pathHasRelativeEntry()) return "PATH has an empty or relative entry";
 		// An interpreter or `source` in a body runs code this read did not cover,
 		// whatever carries it: a file, a bare name, stdin, a pipe, a here-document
 		// or `-c` text. Each of those was a bypass in turn, so none is allowed.
@@ -251,6 +260,7 @@ function shapeARefusal(commands: readonly ShellCommand[]): string | undefined {
 		if (command.words.length === 0) continue;
 		const program = command.words[0];
 		if (!isLiteral(program)) return "the program is built at run time";
+		if (!isPathWord(program.value) && pathHasRelativeEntry()) return "PATH has an empty or relative entry";
 		const resolved = isPathWord(program.value) ? undefined : onPath(program.value);
 		const names = programNames(command);
 		if (names.some(n => WRAPPERS.has(n))) return `${name} runs another program`;
@@ -276,7 +286,7 @@ const DURATION = /^\d+(?:\.\d+)?[smhd]?$/u;
 function timeoutWords(command: ShellCommand): number {
 	const [wrapper, duration] = command.words;
 	if (command.words.length < 3 || !wrapper.fixed || !duration.fixed || !DURATION.test(duration.value)) return 0;
-	if ((process.env.PATH ?? "").split(path.delimiter).some(dir => !path.isAbsolute(dir))) return 0;
+	if (pathHasRelativeEntry()) return 0;
 	const resolved = TIMEOUTS.has(wrapper.value) ? onPath(wrapper.value) : undefined;
 	if (resolved === undefined || isScriptFile(resolved)) return 0;
 	return programNames(command).every(name => TIMEOUTS.has(name)) ? 2 : 0;
@@ -350,26 +360,50 @@ const OUTPUT_FILTERS: Record<string, (args: readonly string[]) => boolean> = {
 	cat: args => args.every(arg => /^-[benstuv]+$/u.test(arg)),
 };
 
-/** Whether `command` is a system output filter reading the pipe it is on:
- *  `./x.sh | tail -60` runs what x.sh runs and prints part of it. */
-function isOutputFilter(command: ShellCommand): boolean {
+/** Whether `command` is shaped like an output filter on the pipe it is on: a
+ *  filter name, literal words, no redirect or assignment, and arguments that
+ *  name no file. The refusal key drops a filter of this shape, which can only
+ *  widen what a refusal covers. */
+function hasFilterShape(command: ShellCommand): boolean {
 	if (command.join !== "pipe" || command.nested || command.negated || command.unreadShape !== undefined) return false;
 	if (command.assigns.length > 0 || command.redirects.length > 0 || !command.words.every(isLiteral)) return false;
 	const name = command.words[0]?.value ?? "";
 	const filter = Object.hasOwn(OUTPUT_FILTERS, name) ? OUTPUT_FILTERS[name] : undefined;
-	if (filter === undefined) return false;
-	const resolved = onPath(name);
-	return resolved !== undefined && isSystemProgram(resolved) && filter(command.words.slice(1).map(word => word.value));
+	return filter !== undefined && filter(command.words.slice(1).map(word => word.value));
 }
 
-/** `command` with a trailing output filter cut off, so `./x.sh | tail -60`
- *  and `./x.sh` name one action. Any other command comes back unchanged. */
-export function withoutOutputFilter(command: string): string {
+/** Whether `command` is a system output filter reading the pipe it is on:
+ *  `./x.sh | tail -60` runs what x.sh runs and prints part of it. Stage 2
+ *  vouches for it only when the name resolves to a system binary through a
+ *  PATH of absolute entries. */
+function isOutputFilter(command: ShellCommand): boolean {
+	if (!hasFilterShape(command) || pathHasRelativeEntry()) return false;
+	const resolved = onPath(command.words[0].value);
+	return resolved !== undefined && isSystemProgram(resolved);
+}
+
+/** `command` with its last command cut off when `drops` accepts it. */
+function withoutTrailing(command: string, drops: (last: ShellCommand) => boolean): string {
 	const parsed = parseShell(command);
 	if (!parsed.ok || parsed.commands.length < 2) return command;
 	const last = parsed.commands[parsed.commands.length - 1];
-	if (last.sourceOffset === undefined || !isOutputFilter(last)) return command;
+	if (last.sourceOffset === undefined || !drops(last)) return command;
 	return command.slice(0, last.sourceOffset).replace(/\|&?\s*$/u, "").trimEnd();
+}
+
+/** `command` without a trailing system output filter, for checks that vouch
+ *  for what runs: the filter must resolve to a system binary. Any other
+ *  command comes back unchanged. */
+export function withoutOutputFilter(command: string): string {
+	return withoutTrailing(command, isOutputFilter);
+}
+
+/** `command` without a trailing filter-shaped command, for refusal and
+ *  reviewer-block keys: `./x.sh | tail -60` and `./x.sh` name one action under
+ *  any PATH. Dropping more than a vouched filter only widens what a key
+ *  covers, so it errs toward blocking. */
+export function withoutFilterForKey(command: string): string {
+	return withoutTrailing(command, hasFilterShape);
 }
 
 /**

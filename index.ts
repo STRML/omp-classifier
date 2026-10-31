@@ -110,7 +110,7 @@ import { deriveDecisionOrder, type DecisionBranch } from "./decision-order";
 import { literalMatch } from "./literal-match";
 import { redactSecrets, redactValue } from "./redact";
 import { quotesUserWords, reviewerModelCall, runReviewer, type ReviewerOutcome, type ReviewerTranscriptEntry } from "./reviewer";
-import { forgetReviewerBlocks, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged, withoutOutputFilter } from "./stage-two";
+import { forgetReviewerBlocks, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged, withoutFilterForKey, withoutOutputFilter } from "./stage-two";
 import { formatTrustPolicyPin, normalizeTrustPolicyPin, pinUserInstructionFiles, resolvePinnedUserPolicy, type TrustPolicyPin, type TrustedPolicyDocument } from "./trust-policy";
 import {
 	buildJevState,
@@ -4835,7 +4835,7 @@ function refusalKeyForCommand(command: string): string {
 	// A trailing output filter prints part of what ran and changes nothing, so
 	// key the command it reads: `x | tail -5` meets the refusal on
 	// `x | tail -60` and on `x` (https://github.com/STRML/omp-classifier/issues/203).
-	const unfiltered = withoutOutputFilter(command);
+	const unfiltered = withoutFilterForKey(command);
 	if (unfiltered !== command) return refusalKeyForCommand(unfiltered);
 	// The old identity first, because it is what the session's refusals are
 	// already keyed under: an ordinary command keeps exactly the key it had,
@@ -5144,7 +5144,7 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	// Read past a leading cd and an assignment prefix the way the refusal key
 	// does, so `FOO=1 cmd` meets the block on `cmd`. A trailing output filter
 	// is dropped too, so `x.sh | tail -5` meets the block on `x.sh | tail -60`.
-	const unfiltered = withoutOutputFilter(command);
+	const unfiltered = withoutFilterForKey(command);
 	const bare = extractLeadingCdTarget(unfiltered.replace(/\s+/gu, " ").trim())?.rest || unfiltered;
 	const blockKey = reviewerBlockKey(normalizeActionTarget(unwrappedCommand(bare) ?? bare), cwd, model, userWords);
 	if (reviewerBlocked(sessionId, blockKey)) {

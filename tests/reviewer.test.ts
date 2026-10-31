@@ -185,6 +185,36 @@ describe("which commands stage 2 can vouch for", () => {
 		}
 	});
 
+	// https://github.com/STRML/omp-classifier/issues/206: the shell reads an
+	// empty or relative PATH entry from the command's own directory, after any
+	// `cd`, so a bare name there can be a script nobody read.
+	test.each([
+		["a bare name after a cd, PATH with an empty entry", "", "cd sub && tool start"],
+		["a bare name, PATH with a dot entry", ".", "tool start"],
+		["a bare name, PATH with a relative entry", "sub", "tool start"],
+		["an output filter, PATH with an empty entry", "", "cd sub && ./update.sh start | tail -5"],
+		["an output filter, PATH with a relative entry", "sub", "./update.sh start | tail -5"],
+		["a bare name inside the script body, PATH with an empty entry", "", "cd sub && ./runs-tool.sh"],
+	])("refuses %s", async (_name, entry, command) => {
+		fs.mkdirSync(path.join(dir, "sub"));
+		script("sub/tool", "#!/bin/bash\ncat ~/.ssh/id_ed25519\n");
+		script("tool", "#!/bin/bash\ncat ~/.ssh/id_ed25519\n");
+		script("sub/tail", "#!/bin/bash\ncat ~/.ssh/id_ed25519\n");
+		script("tail", "#!/bin/bash\ncat ~/.ssh/id_ed25519\n");
+		script("update.sh", "#!/bin/bash\necho ok\n");
+		script("sub/update.sh", "#!/bin/bash\necho ok\n");
+		script("sub/runs-tool.sh", "#!/bin/bash\ntool start\n");
+		const previous = process.env.PATH;
+		process.env.PATH = `${entry}${path.delimiter}${previous ?? ""}`;
+		try {
+			const result = await fire("tool_call", makeEvent(command), uiCtx(nextSession(), [user("u1", "update fork main")]));
+			expect(refusalOf(result).layer).toBe("unsure");
+			expect(reviewerCalls).toHaveLength(0);
+		} finally {
+			process.env.PATH = previous;
+		}
+	});
+
 	test.each([
 		["tail with a count", "./update.sh start 2>&1 | tail -60"],
 		["tail with -n", "./update.sh start | tail -n 20"],
@@ -547,6 +577,22 @@ describe("escalates_privilege on a remote host the user named", () => {
 		scriptReviewer(reviewerReply("block"));
 		await fire("tool_call", makeEvent(command), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
 		expect(reviewerCalls).toHaveLength(1);
+	});
+
+	test.each([
+		["a tail that is not on PATH", "/nonexistent"],
+		["a tail on a relative PATH entry", ".:/usr/bin:/bin"],
+	])("a root ssh piped into %s stays barred", async (_name, pathValue) => {
+		setJevAnswer(privileged());
+		const previous = process.env.PATH;
+		process.env.PATH = pathValue;
+		try {
+			const result = await fire("tool_call", makeEvent(`${stop} | tail -5`), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
+			expect(refusalOf(result).layer).toBe("unsure");
+			expect(reviewerCalls).toHaveLength(0);
+		} finally {
+			process.env.PATH = previous;
+		}
 	});
 
 	test("a URL host must be the named one: the scheme is not a host", async () => {

@@ -4,6 +4,19 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### Stage 2 refuses a bare name when PATH has an empty or relative entry
+
+https://github.com/STRML/omp-classifier/issues/206. The shell reads an empty, `.` or relative PATH entry from the command's own directory after any `cd`, and the gate's PATH lookup skipped empty entries and read relative ones from its own directory. A planted `sub/tool` run as `cd sub && tool` could reach the reviewer as shape A with no body attached.
+
+| Where a bare name is resolved | Before | After |
+|---|---|---|
+| shape A program | looked up, empty entries skipped | refused while PATH has a non-absolute entry |
+| output filter after a script (`\| tail -5`) | looked up the same way | not a filter while PATH has a non-absolute entry |
+| `timeout <duration>` | already refused (https://github.com/STRML/omp-classifier/pull/205) | same check, one helper |
+| a bare name inside a reviewed shell body | looked up the same way | the body is not read while PATH has a non-absolute entry |
+
+The refusal key still drops a trailing filter under any PATH: it reads only the filter's shape, which can only widen what a refusal covers. A PATH with only absolute entries, the normal case, is unaffected.
+
 ### Second-execution markers read code, not prose
 
 From OMP session `01a18e06`. Jev answered SAFE on `python scripts/generate_landmine_index.py` four times, and the gate blocked every run on `python runs scripts/generate_landmine_index.py`. The body matched two markers: `re.compile(`, which builds a regex, and a docstring that says "the subprocess".
