@@ -60,7 +60,7 @@ command ─▶ Jev ─▶ SAFE ────────────────�
 ```
 
 - **What it reads:** your messages and ask answers, the agent's tool calls, and the body of every script the command runs, read by the gate. It never sees tool results, skill text or the agent's prose.
-- **When it can allow:** when Jev's verdict is UNSURE or UNSAFE and no secrets, exfiltration, privilege or injection hazard is raised. An UNSAFE also needs Jev's destructive-or-irreversible score under the review level, and one the reviewer blocks still records its refusal.
+- **When it can allow:** when Jev's verdict is UNSURE or UNSAFE and no secrets, exfiltration, privilege or injection hazard is raised. One exception: on an UNSURE, a privilege hazard does not stop the review when the command is one plain ssh, scp or rsync (no second command, no substitution, only connection options) and your messages or an ask name every host it acts on. An UNSAFE also needs Jev's destructive-or-irreversible score under the review level, and one the reviewer blocks still records its refusal.
 - **Which commands it reviews:** two shapes, and no others.
   - Commands that run no local program: system tools such as `git` and `curl`, or the repository's own build tooling such as `bun test`.
   - One local script on its own, optionally after `cd <dir> &&`, with literal words. Its body must be readable: not binary, under 64 KB, not behind a secret path, and not handing off to another program (an interpreter, a wrapper, a change to PATH or what a shell loads, or a program named by a path outside the root-owned system directories).

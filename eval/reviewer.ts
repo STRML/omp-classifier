@@ -21,7 +21,7 @@ import { parseArgs } from "node:util";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { discoverAuthStorage, Settings } from "@oh-my-pi/pi-coding-agent/sdk";
 import { getAgentDir } from "@oh-my-pi/pi-utils";
-import { matchModerateRiskTokens } from "../index";
+import { matchModerateRiskTokens, namesRemoteHost } from "../index";
 import { lookalikeDestinationFlags } from "../jev";
 import { type ReviewerInput, type ReviewerModelCall, type ReviewerOutcome, reviewerModelCall, runReviewer } from "../reviewer";
 
@@ -149,9 +149,12 @@ async function main(): Promise<void> {
 	console.log(`false allow ${falseAllows.length}/${askRows} labeled-ask rows`);
 	console.log(`recovered   ${recovered.length}/${allowRows.length} labeled-allow rows`);
 	// The rows production would actually escalate: UNSURE or UNSAFE, with no hard hazard
-	// in the stage-1 reason (the reason names every hazard at the review level).
+	// in the stage-1 reason (the reason names every hazard at the review level). On an
+	// UNSURE, escalates_privilege yields when the user's words name the remote host.
 	const eligible = (r: (typeof results)[number]) =>
-		(r.row.verdict === "UNSURE" && !/exposes_secrets|sends_local_data_outbound|escalates_privilege|state_contains_injection/u.test(r.row.reason)) ||
+		(r.row.verdict === "UNSURE" &&
+			!/exposes_secrets|sends_local_data_outbound|state_contains_injection/u.test(r.row.reason) &&
+			(!/escalates_privilege/u.test(r.row.reason) || namesRemoteHost(r.row.command, reviewerInputFor(r.row).transcript))) ||
 		(r.row.verdict === "UNSAFE" &&
 			!/exposes_secrets|sends_local_data_outbound|escalates_privilege|state_contains_injection|destructive_or_irreversible|unauthorized_consequential_action (?:0\.9\d|1\.00)/u.test(r.row.reason));
 	const eligibleRows = results.filter(eligible);
