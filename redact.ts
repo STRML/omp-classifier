@@ -158,7 +158,11 @@ function enclosingQuotes(line: string): Uint8Array {
 			i++;
 			states[i] = state;
 		} else if (c === '"') state = state === IN_DOUBLE ? OUTSIDE : IN_DOUBLE;
-		else if (c === "$" && line[i + 1] === "'" && state === OUTSIDE) {
+		// `$$` is the shell's PID: the quote after it opens a plain single quote.
+		else if (c === "$" && line[i + 1] === "$") {
+			i++;
+			states[i] = state;
+		} else if (c === "$" && line[i + 1] === "'" && state === OUTSIDE) {
 			i++;
 			states[i] = state;
 			state = IN_ANSI;
@@ -231,7 +235,13 @@ function wordEnd(line: string, from: number, outer: number): number {
 			inner = WITHIN_SINGLE;
 			continue;
 		}
-		if (c === "$" && line[i + 1] === "'") {
+		// `$$` is the PID, so `$$'…'` is a plain single quote; inside double
+		// quotes `$'` is literal text.
+		if (c === "$" && line[i + 1] === "$") {
+			i++;
+			continue;
+		}
+		if (c === "$" && line[i + 1] === "'" && outer !== IN_DOUBLE) {
 			inner = WITHIN_ANSI;
 			i++;
 			continue;

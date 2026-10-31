@@ -6,7 +6,7 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ### Redaction reads ANSI-C `$'…'` quoting
 
-https://github.com/STRML/omp-classifier/pull/223 bounds a secret at its shell word in commands. Its quote scanner treated `$'…'` as an ordinary single quote, but in ANSI-C quoting a backslash escapes the next character, a quote included. So `export TOKEN=$'hunter2\' rest'` ended the value at the escaped quote, and ` rest'` reached the audit log and the reviewer. The same happened inside a quoted header. Both scanners (the enclosing-quote pass and the word bound) now treat `$'` as its own state in which `\'` does not close.
+https://github.com/STRML/omp-classifier/pull/223 bounds a secret at its shell word in commands. Its quote scanner treated `$'…'` as an ordinary single quote, but in ANSI-C quoting a backslash escapes the next character, a quote included. So `export TOKEN=$'hunter2\' rest'` ended the value at the escaped quote, and ` rest'` reached the audit log and the reviewer. The same happened inside a quoted header. Both scanners (the enclosing-quote pass and the word bound) now treat `$'` as its own state in which `\'` does not close. `$$` is read as one token (the PID), so `$$'…'` stays a plain single quote, and `$'` inside double quotes is literal: misreading either could stretch a redaction over the command after it and hide that command from the reviewer.
 
 | Command | Before | After |
 |---|---|---|

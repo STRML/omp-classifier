@@ -255,6 +255,18 @@ describe("ANSI-C $'…' quoting, where a backslash escapes the quote", () => {
 		expect(out).toContain(tail);
 	});
 
+	test("$$ before a quote is the PID, not ANSI-C quoting, so the command after it stays", () => {
+		const out = redactCommand("echo $$'\\' && export TOKEN=hunter2 && rm -rf ~/build");
+		expect(out).not.toContain("hunter2");
+		expect(out).toContain("rm -rf ~/build");
+	});
+
+	test("$' inside double quotes is literal and opens nothing", () => {
+		const out = redactCommand("echo \"cost: $'\" && export TOKEN=hunter2 && rm -rf ~/build");
+		expect(out).not.toContain("hunter2");
+		expect(out).toContain("rm -rf ~/build");
+	});
+
 	test("an ANSI-C string that holds no secret is left as written", () => {
 		expect(redactCommand("echo $'it\\'s' && ls")).toBe("echo $'it\\'s' && ls");
 	});
