@@ -245,6 +245,8 @@ describe("second-execution markers read code, not prose", () => {
 		["a from-import alias after an earlier import", "import os; from evil import re as regex\nregex.compile(src)\n"],
 		["an import after a carriage return in a comment", "x = 1 # note\rimport subprocess\n"],
 		["base64 after a comment cut is refused", "x = 1 # note ?>\nimport base64\n"],
+		["exec after a JS regex literal holding #", "const exec = require('child_process').exec;\nconst r = / # /; exec(payload);\n"],
+		["code after an escaped space before #", "echo a\\ # b; exec(x)\n"],
 	])("%s is still flagged", async (_name, body) => {
 		writeScript(root, "probe.py", body);
 		expect(refusalOf(await gate("python3 probe.py")).layer).toBe("flagged");

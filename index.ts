@@ -2186,8 +2186,12 @@ const NO_COMMENT_CUT = /[\r\f\v\u0085\u2028\u2029]|coding[:=][ \t]*(?!(?:utf-?8|
  *  `#` sits outside quotes at the start or after whitespace and is followed by
  *  whitespace or the line end (a JS private field `#run` is code), the line
  *  does not end in `\` (that would join the next line before the cut), and the
- *  comment holds no quote (it could close a multi-line string) and no `?>`
- *  (PHP ends a comment there). Any doubt keeps the line whole: it can only flag. */
+ *  comment is prose: letters, digits, spaces and `.,:!?-`. A `#` some language
+ *  does not read as a comment (a JS regex `/ # /`, PHP's `?>`, the end of a
+ *  multi-line string) needs punctuation to close what it opened and to run
+ *  anything after it, so the line stays whole. Any doubt keeps the line whole:
+ *  it can only flag. */
+const PROSE_COMMENT = /^#[\w\s.,:!?-]*$/u;
 function trailingCommentCut(line: string): string {
 	if (line.endsWith("\\")) return line;
 	let quote = "";
@@ -2199,9 +2203,9 @@ function trailingCommentCut(line: string): string {
 			continue;
 		}
 		if (ch === "'" || ch === '"' || ch === "`") quote = ch;
-		else if (ch === "#" && (at === 0 || /\s/u.test(line[at - 1])) && /^#(?:\s|$)/u.test(line.slice(at))) {
+		else if (ch === "#" && (at === 0 || (/\s/u.test(line[at - 1]) && line[at - 2] !== "\\")) && /^#(?:\s|$)/u.test(line.slice(at))) {
 			const comment = line.slice(at);
-			return /['"`]|\?>/u.test(comment) ? line : line.slice(0, at);
+			return PROSE_COMMENT.test(comment) ? line.slice(0, at) : line;
 		}
 	}
 	return line;
