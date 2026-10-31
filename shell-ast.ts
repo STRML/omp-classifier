@@ -1057,6 +1057,9 @@ function trustedNames(tree: any): Set<string> {
 		return true;
 	});
 	const trusted = new Set<string>();
+	// A writer whose target is built at run time (`read "$n"`) can write any
+	// name, so nothing the body assigns can be trusted.
+	if (written.has("\0")) return trusted;
 	for (const name of integerAssigned) if (!written.has(name) && !INTEGER_SPECIALS.has(name)) trusted.add(name);
 	for (const name of INTEGER_SPECIALS) if (!written.has(name) && !integerAssigned.has(name)) trusted.add(name);
 	return trusted;

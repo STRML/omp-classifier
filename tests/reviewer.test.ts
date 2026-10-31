@@ -604,6 +604,7 @@ describe("what never reaches the reviewer", () => {
 		["a script whose arithmetic reads a special it redefined", () => script("wrap.sh", "#!/bin/bash\nSECONDS=x\n(( SECONDS ))\ngit status\n"), "./wrap.sh"],
 		["a script whose arithmetic reads a name it never assigns", () => script("wrap.sh", "#!/bin/bash\n(( i++ ))\ngit status\n"), "./wrap.sh"],
 		["a script whose arithmetic assigns a name from its own old value", () => script("wrap.sh", "#!/bin/bash\n(( x = x + 1 ))\ngit status\n"), "./wrap.sh"],
+		["a script that reads into a name built at run time before its arithmetic", () => script("wrap.sh", "#!/bin/bash\nx=0; n=x\nread \"$n\" < /dev/null\n(( x ))\ngit status\n"), "./wrap.sh"],
 		["a script whose arithmetic reads a positional parameter", () => script("wrap.sh", "#!/bin/bash\n(( $1 ))\ngit status\n"), "./wrap.sh"],
 		["a script whose indirect expansion names a variable at run time", () => script("wrap.sh", "#!/bin/bash\nw=x\necho ${!w}\ngit status\n"), "./wrap.sh"],
 		["a script whose [[ -v ]] tests a subscripted name", () => script("wrap.sh", "#!/bin/bash\nw=x\n[[ -v 'a[w]' ]]\ngit status\n"), "./wrap.sh"],
