@@ -89,11 +89,19 @@ describe("a tree too deep to walk fails closed", () => {
 	const deep = `${Array(2800).fill("a").join("|")}|echo $(x)`;
 
 	test("the exported readers answer instead of throwing", () => {
+		// Whether Walk overflows depends on the stack the engine has left, so
+		// each reader must answer either the true answer or the fail-closed one,
+		// and never throw.
 		expect(parseShell(deep).ok).toBe(true);
-		expect(shellRunsInSourceOrder(deep)).toBe(false);
-		expect(shellDefinesFunction(deep)).toBe(true);
+		expect(shellRunsInSourceOrder(deep)).toBeOneOf([true, false]);
+		expect(shellDefinesFunction(deep)).toBeOneOf([false, true]);
 		expect(substitutionSpans(deep)).toEqual(["x"]);
-		expect(hiddenArithmetic(deep)).toBe("its shell body is too deep to read");
+		expect(hiddenArithmetic(deep)).toBeOneOf([undefined, "its shell body is too deep to read"]);
+		// A pipeline deep enough to overflow every time still answers.
+		const deeper = `${Array(20_000).fill("a").join("|")}|echo $(x)`;
+		expect(shellRunsInSourceOrder(deeper)).toBe(false);
+		expect(shellDefinesFunction(deeper)).toBe(true);
+		expect(hiddenArithmetic(deeper)).toBe("its shell body is too deep to read");
 	}, 60_000);
 
 	describe("through the gate", () => {
