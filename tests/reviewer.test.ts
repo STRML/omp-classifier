@@ -611,6 +611,11 @@ describe("escalates_privilege on a remote host the user named", () => {
 		["an scp URL", "scp -r ./d scp://root@10.0.0.9/tmp"],
 		["an sftp URL", "scp ./d sftp://root@10.0.0.9/tmp"],
 		["a local program named ssh", "./ssh root@192.168.86.53 id"],
+		["options in a variable", "ssh 192.168.86.53 $OPTS id"],
+		["options in a variable before the host", "ssh $OPTS 192.168.86.53 id"],
+		["a brace expansion naming two hosts", "ssh root@{192.168.86.53,10.0.0.9} id"],
+		["an scp to an IPv6 host nobody named", 'scp root@192.168.86.53:/a "root@[2001:db8::1]:/b"'],
+		["an scp operand whose host does not parse", "scp root@192.168.86.53:/a 'root@!bad:/b'"],
 		["a program named ssh by path", "/tmp/ssh root@192.168.86.53 id"],
 		["an assignment before the ssh", "LD_PRELOAD=./x.so ssh root@192.168.86.53 id"],
 	])("%s stays barred", async (_name, command) => {

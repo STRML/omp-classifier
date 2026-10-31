@@ -5216,7 +5216,8 @@ export function namesRemoteHost(command: string, transcript: readonly ReviewerTr
 	// Every command counts, a substitution's too: `$(ssh other id)` runs first.
 	const commands = parsed.commands[0] !== undefined && verbName(parsed.commands[0]) === "cd" ? parsed.commands.slice(1) : parsed.commands;
 	const [remote] = commands;
-	if (commands.length !== 1 || remote.assigns.length > 0) return false;
+	// Every word as written: `$OPTS` can expand into `-oProxyCommand=sh`, and `{a,b}` into two hosts.
+	if (commands.length !== 1 || remote.assigns.length > 0 || !remote.words.every(word => word.fixed)) return false;
 	const words = remote.words.map(word => word.value);
 	// The program by its bare name only: `./ssh` or `/tmp/ssh` is whatever local file carries that name.
 	if (!remoteOptionsInert(words[0] ?? "", words.slice(1))) return false;
@@ -5275,9 +5276,18 @@ function remoteOptionsInert(verb: string, args: readonly string[]): boolean {
 /** The hosts an ssh, scp or rsync command acts on, lowercased; none for any
  *  other verb. */
 function remoteHosts(verb: string, operands: readonly string[]): string[] {
-	const hosts = verb === "ssh" ? [sshHost(operands[0])] : verb === "scp" || verb === "rsync" ? operands.map(transferHost) : [];
+	const hosts = verb === "ssh" ? [sshHost(operands[0])] : verb === "scp" || verb === "rsync" ? operands.filter(looksRemote).map(transferHost) : [];
 	// A host is a name or an address, never punctuation such as `.` or `_`.
-	return hosts.map(host => host?.toLowerCase()).filter((host): host is string => host !== undefined && /^[a-z0-9][a-z0-9._-]*$/u.test(host));
+	// One that does not read that way (`[2001:db8::1]`) voids them all rather
+	// than drop out of the list: an scp to an unread host is not consent.
+	const read = hosts.map(host => host?.toLowerCase());
+	return read.every(host => host !== undefined && /^[a-z0-9][a-z0-9._-]*$/u.test(host)) ? (read as string[]) : [];
+}
+
+/** Whether an scp or rsync operand points at another machine: a URL, or a
+ *  user, host or bracket before the first slash. */
+function looksRemote(operand: string): boolean {
+	return /^[a-z][a-z0-9+.-]*:\/\//iu.test(operand) || /^[^/]*[:@[]/u.test(operand);
 }
 
 /** The host an scp or rsync operand names: `user@host:path`, `host::module`,
@@ -5295,8 +5305,8 @@ function consentAnchors(command: string): Set<string> {
 	const read = commandOperands(command);
 	if (read === undefined) return new Set();
 	const { verb, operands } = read;
-	const hosts = remoteHosts(verb, operands);
-	if (verb === "ssh" || hosts.length > 0) return new Set(hosts);
+	// A remote end anchors on its host alone; one whose host does not read anchors nothing.
+	if (verb === "ssh" || ((verb === "scp" || verb === "rsync") && operands.some(looksRemote))) return new Set(remoteHosts(verb, operands));
 	// git's subcommand is the action, not its target.
 	const targets = verb === "git" ? operands.slice(1) : operands;
 	return new Set(targets.map(operand => path.posix.basename(operand.replace(/\/+$/u, "")).toLowerCase()).filter(name => name.length >= 3));
