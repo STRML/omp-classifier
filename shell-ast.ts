@@ -1288,7 +1288,7 @@ function trustedNames(tree: any): Map<string, number> {
 		if (!cmd || stmt.Background || stmt.Coprocess || stmt.Negated) continue;
 		const type = nodeType(cmd);
 		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
-		if (type === "CallExpr" && (cmd.Args ?? []).length === 0) for (const assign of cmd.Assigns ?? []) if (assign.Name?.Value && !assign.Array && !assign.Index && !assign.Append && assign.Value && integerValue(assign.Value)) define(assign.Name.Value, assign.Pos().Offset());
+		if (type === "CallExpr" && (cmd.Args ?? []).length === 0) for (const assign of cmd.Assigns ?? []) if (assign.Name?.Value && !assign.Array && !assign.Index && !assign.Append && assign.Value && integerValue(assign.Value)) define(assign.Name.Value, assign.End().Offset());
 		if (type === "ArithmCmd") arithmeticDefines(cmd.X);
 		if (type === "ForClause" && nodeType(cmd.Loop) === "CStyleLoop") arithmeticDefines(cmd.Loop.Init);
 	}
@@ -1308,8 +1308,18 @@ function trustedNames(tree: any): Map<string, number> {
 // biome-ignore lint/suspicious/noExplicitAny: untyped AST
 const trustedAt = (trusted: ReadonlyMap<string, number>, name: string, node: any): boolean => {
 	const at = trusted.get(name);
-	return at !== undefined && (at < 0 || at < (node?.Pos?.().Offset?.() ?? -1));
+	if (at === undefined) return false;
+	if (at < 0) return true;
+	const offset: number = node?.Pos?.().Offset?.() ?? -1;
+	// A heredoc body is expanded when its command runs, before the commands
+	// after it on the same line, though its text comes later: inside one, the
+	// assignment must come before the `<<` that owns the body.
+	const heredoc = (HEREDOC_RANGES.get(trusted) ?? []).find(([from, to]) => offset >= from && offset <= to);
+	return at < (heredoc === undefined ? offset : heredoc[2]);
 };
+
+/** The heredoc body spans of the text a trusted-name map was built from. */
+const HEREDOC_RANGES = new WeakMap<ReadonlyMap<string, number>, Array<[number, number, number]>>();
 
 /** Whether an arithmetic expression (or any node under it) reads something
  *  that is not an integer the body can vouch for: an untrusted name, a quoted
@@ -1381,6 +1391,15 @@ export function hiddenArithmetic(text: string): string | undefined {
 function walkArithmetic(tree: unknown, report: (why: string) => void): void {
 	const { arithmeticTests, nameTests } = getShell();
 	const trusted = trustedNames(tree);
+	const heredocs: Array<[number, number, number]> = [];
+	walk(tree, (node: unknown) => {
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		const hdoc = node && nodeType(node) === "Redirect" ? (node as any).Hdoc : undefined;
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		if (hdoc) heredocs.push([hdoc.Pos().Offset(), hdoc.End().Offset(), (node as any).Pos().Offset()]);
+		return true;
+	});
+	HEREDOC_RANGES.set(trusted, heredocs);
 	const reads = (node: unknown): boolean => arithmeticReadsAnything(node, trusted);
 	let why: string | undefined;
 	walk(tree, (node: unknown) => {

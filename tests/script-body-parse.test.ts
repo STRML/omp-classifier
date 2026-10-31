@@ -199,6 +199,9 @@ describe("a verb the shell expands is not an interpreter the reader can name", (
 		["command alias", "command alias run=python3; run p.py"],
 		["a backslashed alias", "\\alias run=python3; run p.py"],
 		["an alias and a later command with any operand", "alias run=python3; run payload"],
+		["builtin -- alias", "builtin -- alias run=python3; run p.py"],
+		["command -p alias", "command -p alias run=python3; run p.py"],
+		["an alias and a later command fed by a redirect", "alias run=python3; run < p.py"],
 	])("an alias definition spelled as %s refuses", async (_name, command) => {
 		write(path.join(start, "p.py"), HARMFUL);
 		write(path.join(start, "payload"), HARMFUL);

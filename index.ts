@@ -4211,7 +4211,7 @@ function expandedVerb(command: ShellCommand): ShellWord | null {
  *  `command alias` and `\alias` all reach the same builtin. */
 const ALIAS_DEFINITION = (command: ShellCommand): boolean => {
 	let index = 0;
-	while (command.words[index]?.value === "builtin" || command.words[index]?.value === "command") index++;
+	while (command.words[index]?.value === "builtin" || command.words[index]?.value === "command" || (index > 0 && command.words[index]?.value.startsWith("-"))) index++;
 	return command.words[index]?.value === "alias" && command.words.slice(index + 1).some(word => word.value.includes("="));
 };
 
@@ -4234,8 +4234,9 @@ function expandedVerbRefusal(commands: readonly ShellCommand[], programAt: reado
 	for (const command of commands) {
 		const offset = command.sourceOffset ?? 0;
 		if (ALIAS_DEFINITION(command)) {
-			// Any later command with an operand could be the alias handed code.
-			if (programAnywhere || commands.some(other => (other.sourceOffset ?? 0) > offset && other.words.length > 1)) {
+			// Any later command at all could be the alias, handed code by an
+			// operand, a redirect or a pipe.
+			if (programAnywhere || commands.some(other => (other.sourceOffset ?? 0) > offset)) {
 				return "script body blocked: the command defines an alias, so the words after it are not the programs that run";
 			}
 			continue;
