@@ -43,6 +43,18 @@ A script run by a Python shebang now gets the same checks against the interprete
 
 Not covered: a module planted in `sys.path[0]` by an earlier command (the same class as a planted binary, judged when it is written), a `.pth` file or a modified package in site-packages (a venv's site-packages is user-writable and is trusted the way the user-owned Homebrew prefix every shape-A binary resolves into is trusted, and no further), the local code an installed `-m` runner loads (pytest's `conftest.py`), and a copy of another binary saved as `python3.12` in a venv. With no root-owned Python to parse with, every Python run stays refused.
 
+### A quoted redirect onto a system file is critical too
+
+`echo x > /etc/passwd` matched the built-in critical pattern, but `echo x > "/etc/passwd"` did not: the raw text puts a quote between `>` and the path, and the shell removes it before opening the file. On a SAFE that write ran. No moderate-risk token covers a plain `echo`, so nothing else stopped it. The critical scan now also renders each file redirect as `> <target as the shell reads it>` and scans that. Only redirect targets are dequoted. `echo "rm -rf /"` prints data, and dequoting arguments would turn every quoted mention into a refusal that never yields. A target with an expansion is left to the raw scan and the judge, as before.
+
+| Command | Before | After |
+|---|---|---|
+| `echo x > "/etc/passwd"` | runs on a SAFE | `critical` |
+| `echo x > /etc/"shadow"` | runs on a SAFE | `critical` |
+| `cat img > "/dev/sda"` | runs on a SAFE | `critical` |
+| `echo x >& "/etc/passwd"` (bash reads `>&file` as `&>file`) | runs on a SAFE | `critical` |
+| `echo "rm -rf /"` | `critical` | `critical` (raw text, unchanged) |
+
 ### The critical patterns read what a command runs, not the data it carries
 
 The gate ran the host's `CRITICAL_BASH_PATTERNS` over the judged text: the raw command plus every spliced script body. The patterns are regexes, so they matched data as well as commands. A critical refusal never yields, so one false hit locked the target for the rest of the session. Two production cases: a commit whose message said "reboot" matched the host-control pattern, and `bun test tests/reviewer.test.ts` matched the recursive-delete pattern on a fixture string inside the test file.
