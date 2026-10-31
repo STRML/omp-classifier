@@ -87,7 +87,7 @@ Outside the transcript it also gets:
 
 It gets a compact rule list modelled on Claude Code's defaults:
 
-- **Allow by default:** ordinary development work, the user's own tooling and the scripts of a skill the task loaded, and pushes to the session repository's branches without force.
+- **Allow by default:** ordinary development work, the user's own tooling and the scripts of a skill the task loaded, and pushes to the session repository's branches without force. Tidying up inside the working directory with a step the user can undo (`trash`, `git rm --cached`) is on this list too, because the reviewer had read both as "irreversible deletion" and blocked them 6 times between 2026-10-29 and 2026-10-31.
 - **Block unless the user's words name both the action and its target:**
   - force push or history rewrite of a branch others use
   - irreversible deletion of pre-existing files

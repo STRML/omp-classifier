@@ -91,10 +91,17 @@ const input = {
 	stage1: { verdict: values.verdict!, reason: values.reason! },
 };
 const tally: Record<string, number> = {};
+// Each distinct rule and reason, counted: a tally says how often the reviewer
+// blocks, the reasons say which rule it reached for and why.
+const reasons: Record<string, number> = {};
 for (let i = 0; i < draws; i++) {
 	const outcome = await runReviewer(input, call, timeoutMs);
 	const key = outcome.kind === "decided" ? outcome.decision.decision : `failed: ${outcome.why.slice(0, 60)}`;
 	tally[key] = (tally[key] ?? 0) + 1;
+	if (outcome.kind === "decided") {
+		const why = `${outcome.decision.decision} [${outcome.decision.rule}] ${outcome.decision.reason}`;
+		reasons[why] = (reasons[why] ?? 0) + 1;
+	}
 }
-console.log(JSON.stringify({ command, cut: values.upto ?? values.at, verdict: values.verdict, model: values.model, tally }));
+console.log(JSON.stringify({ command, cut: values.upto ?? values.at, verdict: values.verdict, model: values.model, tally, reasons }));
 store.close();
