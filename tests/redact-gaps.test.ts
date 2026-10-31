@@ -377,14 +377,16 @@ describe("redaction stays linear on hostile input", () => {
 	};
 
 	test("each shape takes about 8 times as long at 8 times the size, as a command and as prose", () => {
+		const slow: string[] = [];
 		for (const [label, build] of hostile) {
 			for (const redact of [redactCommand, redactSecrets]) {
 				const small = Math.max(timeOf(redact, build(SMALL)), timeOf(redact, build(SMALL)));
 				const large = timeOf(redact, build(LARGE));
 				// Twice the linear ratio, plus a floor for timer noise.
-				expect(large, `${redact.name} ${label}: ${small.toFixed(1)} ms then ${large.toFixed(1)} ms`).toBeLessThan(16 * small + 100);
+				if (large >= 16 * small + 100) slow.push(`${redact.name} ${label}: ${small.toFixed(1)} ms then ${large.toFixed(1)} ms`);
 			}
 		}
+		expect(slow).toEqual([]);
 	});
 
 	test("a large argv array is linear too", () => {
