@@ -20,7 +20,10 @@ every caller reads as "not read" (fail closed).
 
 The parser loads lazily through `createRequire`. If the load fails, every parse returns `ok:false`
 and the plugin still loads. `ShellCommand.unreadShape` marks a construct the adapter cannot
-flatten.
+flatten. The module's `walk` also enters `ParamExp.Slice` (mvdan-sh's own Walk does not); an extglob
+pattern holding a substitution fails the parse. `ShellRedirect.duplicate` is true for `>&word`
+only when `word` is digits or `-`. Exported readers that walk outside `parseShell` catch a stack
+overflow and answer fail-closed.
 
 ## critical-scan.ts (247 lines): what the critical patterns read
 
