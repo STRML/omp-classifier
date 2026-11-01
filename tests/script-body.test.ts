@@ -206,6 +206,8 @@ describe("second-execution markers read code, not prose", () => {
 		["re aliased as regex inside an import list", "import os, re as regex\nPAT = regex.compile(r'a+')\n"],
 		["re aliased as regex", "import re as regex\nPAT = regex.compile(r'a+')\n"],
 		["regex aliased as re", "import regex as re\nPAT = re.compile(r'a+')\n"],
+		// From the decision log: a py_compile check of a file refused on a SAFE.
+		["a py_compile check", "import py_compile, sys\npy_compile.compile('/tmp/x/a.py', doraise=True)\nprint('compiled ok')\n"],
 	])("%s runs on a SAFE", async (_name, body) => {
 		writeScript(root, "probe.py", body);
 		expect(await gate("python3 probe.py")).toBe("ALLOWED");
@@ -227,6 +229,8 @@ describe("second-execution markers read code, not prose", () => {
 		["subprocess imported from a package", "from pkg import subprocess\n"],
 		["compile borrowed through an alias of re", "import builtins as re\nre.compile(src, 'x', 'exec')\n"],
 		["compile through a name assigned to re", "re = builtins\nre.compile(src, 'x', 'exec')\n"],
+		["compile borrowed through an alias of py_compile", "import builtins as py_compile\npy_compile.compile(src, 'x', 'exec')\n"],
+		["compile through a name assigned to py_compile", "py_compile = builtins\npy_compile.compile(src, 'x', 'exec')\n"],
 		["compile through another module imported as regex", "from builtins import compile as c\nfrom evil import re as regex\nregex.compile(src)\n"],
 		["a JS private field that runs exec", "class A {\n#run = require('child_process').exec('ls');\n}\n"],
 		["code after a comment line", "# setup\nimport subprocess\n"],

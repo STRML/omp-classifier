@@ -2318,16 +2318,17 @@ const SCRIPT_FILE_EXTENSION = /\.(?:py|pyw|rb|js|mjs|cjs|ts|mts|cts|tsx|jsx|sh|b
 // continuation or a parenthesized import list.
 const INTERPRETER_CODE_RISK =
 	/exec\(|eval\((?!\s*\))|os\.system|\bsubprocess\s*\.|\bimport\b[^\n]*\bsubprocess\b|\bimport\s*\([^)]*\bsubprocess\b|\bfrom\s+subprocess\b|["']subprocess["']|create_subprocess_|base64|b64decode|__import__|marshal|\\x[0-9a-f]{2}/;
-/** `compile(` as a builtin. `re.compile(` and `regex.compile(` are exempt only
- *  while the text never rebinds those names, so `import builtins as re` cannot
- *  borrow the exemption. */
+/** `compile(` as a builtin. `re.compile(` and `regex.compile(` build a regex
+ *  and `py_compile.compile(` writes a `.pyc` without running it; they are
+ *  exempt only while the text never rebinds those names, so
+ *  `import builtins as re` cannot borrow the exemption. */
 const COMPILE_CALL = /compile\(/;
-const REGEX_COMPILE_ONLY = /(?<!\b(?:re|regex)\.)compile\(/;
+const REGEX_COMPILE_ONLY = /(?<!\b(?:re|regex|py_compile)\.)compile\(/;
 /** A plain `import a, b as c, re as regex` statement that aliases one regex
  *  module to the other is not a rebind: every module in it is a bare name, so
  *  no `;`, `from` or dotted module can sit in front. Any other `as re` is. */
 const REBINDS_REGEX_NAME =
-	/(?<!^[ \t]*import[ \t]+(?:\w+(?:[ \t]+as[ \t]+\w+)?[ \t]*,[ \t]*)*(?:re|regex)[ \t]+)\bas\s+(?:re|regex)\b|(?<![\w.])(?:re|regex)\s*=(?!=)|\b(?:def|class|for)\s+(?:re|regex)\b/m;
+	/(?<!^[ \t]*import[ \t]+(?:\w+(?:[ \t]+as[ \t]+\w+)?[ \t]*,[ \t]*)*(?:re|regex)[ \t]+)\bas\s+(?:re|regex|py_compile)\b|(?<![\w.])(?:re|regex|py_compile)\s*=(?!=)|\b(?:def|class|for)\s+(?:re|regex|py_compile)\b/m;
 
 /** Whether inline code or a script body carries a second-execution marker.
  *  Comments read as code: where a `#` comment ends depends on the language (a
