@@ -4,6 +4,12 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### `py_compile.compile(` is not a second execution
+
+`python3 -c "import py_compile; py_compile.compile('/tmp/x/a.py', doraise=True)"` got a SAFE and still blocked with "classifier-safe but flags: python3 -c". The second-execution scan reads `compile(` as the builtin that turns source into runnable code, and exempts only `re.compile(` and `regex.compile(`. `py_compile.compile(` writes a `.pyc` file and runs none of it, so it now gets the same exemption, under the same rebinding guard: `import builtins as py_compile` or `py_compile = builtins` still flags.
+
+The guard itself missed five rebinding spellings, for `re` and `regex` too: a walrus (`(re := builtins)`), a parameter (`def f(re)`, `lambda re:`), a loop target (`for x, re in`), and the name written as a string, which is how `setattr` or `globals()` rebinds it. Each now voids the exemption. A type annotation such as `-> re.Pattern` does not.
+
 ### A substitution holding `${…}` keeps the plain word match
 
 https://github.com/STRML/omp-classifier/pull/239 stopped the substitution scan from reading `eval` inside `eval-file` by treating `-` and `.` as part of a shell word. A parameter expansion breaks that rule: `$(${x:-rm} -rf y)` and `$(${x-rm} y)` run `rm`, and the `rm` follows a `-`. A span that holds `${` now uses the plain `\b` match it used before #239, so both flag `rm` again. Spans without one keep the shell-word reading.
