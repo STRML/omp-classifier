@@ -2342,10 +2342,73 @@ const REBINDS_REGEX_NAME =
  *  JS regex `/ # /`, PHP's `?>`, a Python f-string spanning lines), so a
  *  comment that names a marker flags. */
 function hasInterpreterCodeRisk(text: string): boolean {
-	const joined = text.replace(/\\\r?\n/gu, " ");
+	// Python folds identifiers with NFKC (`ｒｅ = builtins` binds `re`) but reads
+	// punctuation as written, so both spellings are checked and either flags:
+	// folding can add a flag, never remove one.
+	return codeRiskIn(text) || codeRiskIn(text.normalize("NFKC"));
+}
+
+function codeRiskIn(text: string): boolean {
+	const joined = text.replace(/\\(?:\r\n?|\n)/gu, " ");
 	if (INTERPRETER_CODE_RISK.test(joined)) return true;
 	if (!COMPILE_CALL.test(joined)) return false;
-	return REBINDS_REGEX_NAME.test(joined) || REGEX_COMPILE_ONLY.test(joined);
+	if (COMPILE_CODE_MODE.test(joined) || RUNTIME_REBINDERS.test(joined) || REGEX_ATTRIBUTE_WRITE.test(joined)) return true;
+	if (!compileOnlyCalledOnRegexModules(joined)) return true;
+	return REBINDS_REGEX_NAME.test(joined) || !regexNamesOnlyRead(joined) || REGEX_COMPILE_ONLY.test(joined);
+}
+
+/** Whether every `compile` and `_compile` token is a call on a regex module:
+ *  `re.compile(`, `regex.compile(`, `py_compile.compile(`. Any other spelling
+ *  (`re.compile, x = builtins.compile, 1`, `re._compile = …`, a string
+ *  `'compile'` for `setattr`) can swap the function the exemption trusts. */
+function compileOnlyCalledOnRegexModules(text: string): boolean {
+	for (const match of text.matchAll(/\b_?compile\b/gu)) {
+		const at = match.index ?? 0;
+		if (match[0] !== "compile" || !/(?<![\w.])(?:re|regex|py_compile)[ \t]*\.[ \t]*$/u.test(text.slice(Math.max(0, at - 20), at))) return false;
+		if (!/^[ \t]*\(/u.test(text.slice(at + match[0].length))) return false;
+	}
+	return true;
+}
+
+/** A compile that builds code: `re.compile` never takes an `exec`, `eval` or
+ *  `single` mode, whatever name the call goes through. */
+const COMPILE_CODE_MODE = /compile\([^)]*["'](?:exec|eval|single)["']/u;
+
+/** Ways to rebind `re` without spelling it (`globals().update({"r"+"e": …})`,
+ *  `sys.modules[...]`, `setattr`), and ways to run a code object without
+ *  `exec` (`types.FunctionType(code, {})()`, `f.__code__ = code`): any of them
+ *  voids the compile exemption. */
+const RUNTIME_REBINDERS = /(?<![\w.])(?:globals|locals|vars|setattr|delattr)\s*\(|__dict__|__builtins__|__code__|(?<![\w.])builtins\b|\bsys\s*\.\s*modules\b|\bimportlib\b|\b(?:FunctionType|CodeType)\b/u;
+
+/** A write to an attribute of the module itself: `re.compile = builtins.compile`,
+ *  `re.__dict__["compile"] = …`, `del re.compile`. */
+const REGEX_ATTRIBUTE_WRITE =
+	/(?<![\w.])(?:re|regex|py_compile)[ \t]*\.[\w \t.[\]'"]*?(?:\*\*|\/\/|<<|>>|[-+*/%&|^@])?=(?!=)|\bdel\s+(?:re|regex|py_compile)\s*\./u;
+
+/** A plain import statement: `import os, re as regex`, `from re import
+ *  compile`. Read per statement, between `;` and line breaks. */
+const PLAIN_IMPORT_STATEMENT =
+	/^[ \t]*(?:import[ \t]+[\w.]+(?:[ \t]+as[ \t]+\w+)?(?:[ \t]*,[ \t]*[\w.]+(?:[ \t]+as[ \t]+\w+)?)*|from[ \t]+(?:re|regex|py_compile)[ \t]+import[ \t]+[^;\r\n#]+)[ \t]*(?:#[^\r\n]*)?$/u;
+
+/**
+ * Whether every bare `re`, `regex` or `py_compile` in the text is an attribute
+ * access (`re.compile`) or sits in a plain import statement. Deny-by-default: any
+ * other use (a parameter however its header is spelled, a loop target, a
+ * walrus, a string key for `setattr`, a mention in a comment) voids the
+ * compile exemption. REBINDS_REGEX_NAME still reads `import builtins as re`,
+ * which is an import statement.
+ */
+function regexNamesOnlyRead(text: string): boolean {
+	for (const match of text.matchAll(/(?<![\w.])(?:re|regex|py_compile)\b/gu)) {
+		const at = match.index ?? 0;
+		if (/^\s*\./u.test(text.slice(at + match[0].length))) continue;
+		// Python ends a line at \n, \r or \r\n; a statement also ends at `;`.
+		const start = Math.max(text.lastIndexOf("\n", at - 1), text.lastIndexOf("\r", at - 1), text.lastIndexOf(";", at - 1)) + 1;
+		const ends = [text.indexOf("\n", at), text.indexOf("\r", at), text.indexOf(";", at)].filter(end => end !== -1);
+		if (PLAIN_IMPORT_STATEMENT.test(text.slice(start, ends.length > 0 ? Math.min(...ends) : text.length))) continue;
+		return false;
+	}
+	return true;
 }
 
 // Same token set as a word-boundary regex, for matching inside joined
