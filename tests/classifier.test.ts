@@ -178,6 +178,19 @@ describe("matcher unit spec", () => {
 			["mkfs.ext4 /dev/sda1", ["mkfs"]],
 			["chmod +x script.sh", []],
 			["sudo apt update", ["sudo"]],
+			// The other ways to run as another user flag like sudo, as a verb only.
+			["doas pkg_add vim", ["doas"]],
+			["run0 systemctl restart x", ["run0"]],
+			["pkexec env", ["pkexec"]],
+			["su -c 'id' root", ["su"]],
+			["sudo-rs ls", ["sudo-rs"]],
+			["sudoedit /etc/hosts", ["sudoedit"]],
+			["timeout 5 doas ls", ["doas"]],
+			["/usr/bin/doas ls", ["doas"]],
+			["grep su notes.txt", []],
+			["echo su", []],
+			// A wrapper's arguments are read whole, as for sudo: the safe direction.
+			["timeout 5 grep su notes.txt", ["su"]],
 			["curl -O https://x/y", []],
 			["git push origin main", []],
 			["git push --force origin main", ["git push --force"]],
@@ -595,7 +608,8 @@ describe("heredoc bodies are data, not commands", () => {
 
 	test("an unlisted wrapper does not hide the interpreter", async () => {
 		expect(await flags("time bash <<'EOF'\nrm -rf /tmp/build/*\nEOF")).toEqual(["rm"]);
-		expect(await flags("doas bash <<'EOF'\nrm -rf /tmp/build/*\nEOF")).toEqual(["rm"]);
+		// `doas` is a privilege verb of its own now, and still hides nothing.
+		expect(await flags("doas bash <<'EOF'\nrm -rf /tmp/build/*\nEOF")).toEqual(["doas", "rm"]);
 	});
 
 	test("an opener inside quotes is text, and a delimiter keeps its whole word", async () => {

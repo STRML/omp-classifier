@@ -4,6 +4,12 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### `doas`, `run0`, `pkexec`, `su` and `sudoedit` hold like `sudo`
+
+A SAFE verdict does not release `sudo`: the judge can be steered by text in the command, and privilege escalation is one of the forced-flag classes. The other ways to run a command as another user were not in that class, so `doas rm -rf /srv/x` or `run0 systemctl stop x` ran on a SAFE. `doas`, `run0`, `pkexec`, `su`, `sudo-rs` and `sudoedit` now flag when they are the command a segment runs, directly, by path, or through a wrapper such as `timeout`. Like `sudo`, they are also matched as words where the segment scan reads a whole segment (a wrapper's or `find`'s arguments), so `timeout 5 grep su notes.txt` flags; over-flagging there is the safe direction. Plain `grep su notes.txt`, code text and substitution spans are not scanned for them, since `su` is also a word in prose and a variable name.
+
+Replayed against the decision log: of the 9 distinct bash commands that mention one of these words, none gains a flag. Each mention is prose or code, not a command.
+
 ### The compile exemption is deny-by-default on the module name
 
 https://github.com/STRML/omp-classifier/pull/243 and https://github.com/STRML/omp-classifier/pull/245 widened the regex that spots a rebound `re`, `regex` or `py_compile`. Every round of review then found another header shape it missed: a `):` inside a string default, a header past the 2000-character cap, an annotation containing `=`. The exemption now holds only when every bare use of those names is an attribute access (`re.compile`) or sits in a plain import statement (`import os, re as regex`, `from re import compile`), read per statement between `;` and line breaks. Any other use voids it, however the code is spelled: a parameter, a loop target, a walrus, a string key for `setattr`, a mention in a comment. `import builtins as re` is an import, so the existing alias check still catches it.
