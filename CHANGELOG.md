@@ -4,6 +4,17 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### A substitution flags whole shell words
+
+`php tools/rebuild-claim-parts.php self-test` got a SAFE and still blocked with "classifier-safe but flags: eval". The judged text holds the PHP body, whose comment reads `` `wp eval-file <this file>` ``. The substitution scan reads backtick spans for risk verbs and matched each one with `\b`, which stops at `-` and `.`. So it found `eval` inside `eval-file`. A shell word runs on through those characters, and the top-level verb scan already reads it that way.
+
+| Span | Before | After |
+|---|---|---|
+| `` `wp eval-file x.php` `` | `eval` | nothing |
+| `$(docker run --rm img)` | `rm` | nothing |
+| `$(./rm.sh)` | `rm` | nothing |
+| `$(/bin/rm -rf x)`, `$(x;rm y)`, `$(\rm y)` | `rm` | `rm` |
+
 ### A spawn cwd named by a constant reads as that constant
 
 An eval payload that set `repo = "<worktree path>"` and then ran `subprocess.run([...], cwd=repo)` refused with "unreadable spawn cwd: the cwd is not a literal (repo)". The scan read only a string written at the spawn itself. A bare name in `cwd=`, `chdir=` or `.chdir(...)` now resolves to the string it holds, under deny-by-default rules:
