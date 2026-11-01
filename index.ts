@@ -3092,7 +3092,7 @@ function evalChdirScope(masked: string, site: EvalCwdSiteMatch): EvalChdirScope 
  *  `with` block that puts an object's keys in scope. Every dunder counts but a
  *  few that only name a module or file. Tested against the RAW text, since an
  *  f-string, `${}` or `#{}` interpolation runs code the mask hides. */
-const EVAL_NAME_REBINDERS = /(?<![\w$])(?:globals|locals|vars|exec|eval|setattr|__setattr__|__dict__|__builtins__|builtins|f_globals|f_locals|binding|local_variable_set|globalThis|window|global|Reflect|getattr|__getattribute__|__import__|importlib|inspect|ctypes|Function|setTimeout|setInterval|vm|this|send|public_send|__send__|instance_eval|class_eval|module_eval|instance_exec|const_set|define_method|gc|pickle|cPickle|marshal|dill|cloudpickle|shelve|jsonpickle|runpy|constructor|runInThisContext|runInNewContext|runInContext|TOPLEVEL_BINDING|ObjectSpace)(?![\w$])|(?<![\w$.])compile\s*\(|__(?!(?:name|main|file|init|future|doc|version)__)\w+__|\bimport\s*\*|\bwith\s*\(/u;
+const EVAL_NAME_REBINDERS = /(?<![\w$])(?:globals|locals|vars|exec|eval|setattr|__setattr__|__dict__|__builtins__|builtins|f_globals|f_locals|binding|local_variable_set|globalThis|window|global|Reflect|getattr|__getattribute__|__import__|importlib|inspect|ctypes|Function|setTimeout|setInterval|vm|this|send|public_send|__send__|instance_eval|class_eval|module_eval|instance_exec|const_set|define_method|gc|pickle|cPickle|marshal|dill|cloudpickle|shelve|jsonpickle|runpy|constructor|runInThisContext|runInNewContext|runInContext|TOPLEVEL_BINDING|ObjectSpace|modules|_getframe|currentframe|tb_frame|gi_frame|cr_frame|ag_frame|f_back|methodcaller|pdb|bdb|profile|cProfile|trace|doctest|timeit)(?![\w$])|\bimport\s+__main__|\bfrom\s+__main__\b|(?<![\w$.])compile\s*\(|__(?!(?:name|main|file|init|future|doc|version)__)\w+__|\bimport\s*\*|\bwith\s*\(/u;
 
 /** A Ruby heredoc opener, `=begin` block or percent literal: text maskCodeText
  *  leaves visible although Ruby never runs it as code. */
@@ -3120,7 +3120,7 @@ function hiddenUsesAreReads(masked: string, code: string, name: string): boolean
  *  identifier character once decoded or NFKC-folded (`\u0065`, `ｅ`, `ﬁ`). */
 function spellsAsciiIdentifier(code: string): boolean {
 	const identifier = /[A-Za-z0-9_$]/u;
-	for (const escape of code.matchAll(/\\u\{([0-9a-fA-F]{1,6})\}|\\u([0-9a-fA-F]{4})/gu)) {
+	for (const escape of code.matchAll(/\\u\{([0-9a-fA-F]+)\}|\\u([0-9a-fA-F]{4})/gu)) {
 		const point = Number.parseInt(escape[1] ?? escape[2] ?? "", 16);
 		if (point <= 0x10ffff && identifier.test(String.fromCodePoint(point))) return true;
 	}
@@ -3175,6 +3175,7 @@ function constantCwdText(masked: string, code: string, name: string, siteAt: num
 	// count writes in the raw text too: the one binding must be the only one.
 	const writes = new RegExp(`(?<![\\w$])${name}\\s*(?:\\*\\*|//|<<|>>|[-+*/%&|^:])?=(?!=)|(?<![\\w$])${name}\\s*(?:\\+\\+|--)|(?:\\+\\+|--)\\s*${name}(?![\\w$])`, "gu");
 	if ((code.match(writes) ?? []).length !== 1) return null;
+	const sites = evalCwdSites(masked);
 	let binding: string | null = null;
 	let span: [number, number] = [0, 0];
 	for (const match of masked.matchAll(new RegExp(`(?<![\\w$])[.:]?${name}(?![\\w$])`, "gu"))) {
@@ -3194,7 +3195,11 @@ function constantCwdText(masked: string, code: string, name: string, siteAt: num
 			if (binding === null) return null;
 			continue;
 		}
-		const read = /(?:(?<![\w$.])(?:cwd|chdir)\s*=|\.chdir\(\s*)$/u.test(masked.slice(Math.max(0, at - 40), at)) && /^\s*[,)\n]/u.test(`${after}\n`);
+		// A read counts only inside a spawn or chdir call's own arguments: a
+		// top-level `cwd = repo` in Ruby aliases the same mutable string, and
+		// `cwd.replace("/")` would then change what `repo` holds.
+		const shaped = /(?:(?<![\w$.])(?:cwd|chdir)\s*=|\.chdir\(\s*)$/u.test(masked.slice(Math.max(0, at - 40), at)) && /^\s*[,)\n]/u.test(`${after}\n`);
+		const read = shaped && sites.some(site => site.argEnd !== -1 && at >= site.argStart && at < site.argEnd);
 		if (!read) return null;
 	}
 	if (binding === null) return null;
