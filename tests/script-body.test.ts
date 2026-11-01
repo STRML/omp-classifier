@@ -1380,6 +1380,27 @@ describe("syntax-only interpreter modes do not execute file contents", () => {
 		expect({ refusal: read.refusal, bodies: read.bodies }).toEqual({ refusal: null, bodies: [] });
 	});
 
+	// Each of these runs the file on bash 5, zsh, dash and node 22: a later
+	// option undoes the check, so the body is read.
+	test.each([
+		"bash -n +n payload.sh",
+		"bash -n +o noexec payload.sh",
+		"zsh -n -i payload.sh",
+		"zsh -n -o exec payload.sh",
+		"dash -n +o noexec payload.sh",
+		"ksh -n -e payload.sh",
+		"node -c --no-check payload.sh",
+	])("an option after the check makes it a run: %s", command => {
+		writeScript(root, "payload.sh", "echo ran\n");
+		const read = readInterpretedScriptBodies(command, root, 8000);
+		expect(read.bodies.length).toBe(1);
+	});
+
+	test.each(["bash -vn payload.sh", "bash -n -x payload.sh", "ruby -cw payload.sh"])("a check with output-only companions reads nothing: %s", command => {
+		writeScript(root, "payload.sh", "echo ran\n");
+		expect(readInterpretedScriptBodies(command, root, 8000).bodies).toEqual([]);
+	});
+
 	test("a syntax check beside a real run still reads the run's body", () => {
 		writeScript(root, "payload.php", "<?php system('id');\n");
 		const read = readInterpretedScriptBodies("php -l payload.php && php payload.php", root, 8000);

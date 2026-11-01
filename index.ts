@@ -3948,29 +3948,62 @@ function hasBundledSyntaxOnlyFlag(word: string, grammar: InterpreterFlagGrammar 
 	return false;
 }
 
-/** True when the interpreter's main file is only parsed, not executed. */
+/** Short options that change only what a syntax check prints (verbose, warnings,
+ *  xtrace), alone or bundled with the check itself (`ruby -cw`, `bash -vn`). */
+const SYNTAX_CHECK_COMPANION = /^-[vwWx]+$/u;
+
+/** Whether a bundle (`-vn`, `-cw`) holds the syntax-only letter and nothing but
+ *  companion letters. A bundle that mixes in any other letter is not a check. */
+function isSyntaxOnlyBundle(word: string, grammar: InterpreterFlagGrammar | undefined): boolean {
+	if (!hasBundledSyntaxOnlyFlag(word, grammar)) return false;
+	return [...word.slice(1)].every(letter => grammar?.syntaxOnly?.test(`-${letter}`) || /[vwWx]/u.test(letter));
+}
+
+/**
+ * True when the interpreter's main file is only parsed, not executed.
+ *
+ * Every option before the program counts, not only the first syntax-only one:
+ * a later option can undo the check (`bash -n +n x.sh`, `zsh -n -i x.sh`,
+ * `zsh -n -o exec x.sh`, `bash -n +o noexec x.sh` and `node -c --no-check x.js`
+ * all run x on this machine). So the check holds only when every other option
+ * is a companion that changes the output alone. Any other option, a `+`
+ * option, or a value-taking one reads the bodies, which is the safe direction.
+ */
 function interpreterSyntaxOnly(segment: string[]): boolean {
 	const invocation = interpreterInvocation(segment);
 	if (!invocation || "opaque" in invocation) return false;
 	const { verb, rest } = invocation;
 	const grammar = INTERPRETER_FLAG_GRAMMAR[verb] ?? INTERPRETER_FLAG_GRAMMAR[verb.replace(/[\d.]+$/u, "")];
+	let checks = false;
+	let other = false;
 	for (let i = 0; i < rest.length; i++) {
 		const word = rest[i];
-		if (word === "--") return false;
-		if (!word.startsWith("-") || word === "-") return false;
+		if (word.startsWith("+")) return false;
+		if (word === "--" || !word.startsWith("-") || word === "-") break;
 		const flag = splitAttachedFlagValue(word);
-		if (hasBundledSyntaxOnlyFlag(word, grammar)) return true;
-		if (grammar?.syntaxOnly?.test(flag.name)) return true;
 		if (verb.startsWith("python") && (flag.name === "-m" || flag.name === "--module")) {
 			return rest[i + 1] === "py_compile";
 		}
-		if (grammar?.value?.test(flag.name) || grammar?.file?.test(flag.name)) {
+		if (SHARED_INLINE_FLAG.test(flag.name) || grammar?.inline.test(flag.name)) return false;
+		if (flag.attached === undefined && grammar?.syntaxOnly?.test(flag.name)) {
+			checks = true;
+			continue;
+		}
+		if (isSyntaxOnlyBundle(word, grammar)) {
+			checks = true;
+			continue;
+		}
+		if (SYNTAX_CHECK_COMPANION.test(word)) continue;
+		// A preload (`node --check -r x.js`) runs, and interpreterProgramRefs
+		// reads it as a loader whatever this returns; it does not undo the check.
+		if (grammar?.file?.test(flag.name)) {
 			if (flag.attached === undefined) i++;
 			continue;
 		}
-		if (SHARED_INLINE_FLAG.test(flag.name) || grammar?.inline.test(flag.name)) return false;
+		other = true;
+		if (grammar?.value?.test(flag.name) && flag.attached === undefined) i++;
 	}
-	return false;
+	return checks && !other;
 }
 
 /** Whether an interpreter has no separate program and will execute stdin. */
