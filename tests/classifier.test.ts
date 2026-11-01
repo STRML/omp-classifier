@@ -189,6 +189,8 @@ describe("matcher unit spec", () => {
 			["/usr/bin/doas ls", ["doas"]],
 			["grep su notes.txt", []],
 			["echo su", []],
+			// A wrapper's arguments are read whole, as for sudo: the safe direction.
+			["timeout 5 grep su notes.txt", ["su"]],
 			["curl -O https://x/y", []],
 			["git push origin main", []],
 			["git push --force origin main", ["git push --force"]],

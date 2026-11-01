@@ -2169,9 +2169,11 @@ const MODERATE_RISK_TOKENS = new Set([
 ]);
 
 // The other ways to run a command as another user. Like `sudo`, a SAFE does
-// not release them, but only as the command a segment runs (directly or
-// through a wrapper): `su` is also a word in prose and a variable name, so it
-// is not scanned for in code text or substitution spans.
+// not release them. They are matched as shell words, the way the segment scan
+// matches `sudo`: as the verb, and anywhere in a segment the scan reads whole
+// (a wrapper's arguments, `find`'s arguments), where over-flagging is the safe
+// direction. `su` is also a word in prose and a variable name, so unlike the
+// moderate-risk tokens they are not looked for in code text or substitutions.
 const PRIVILEGE_VERBS = new Set(["doas", "run0", "pkexec", "su", "sudo-rs", "sudoedit"]);
 
 // Interpreters that only matter when they execute inline code (-c/-e);

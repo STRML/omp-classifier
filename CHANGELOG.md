@@ -6,7 +6,7 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ### `doas`, `run0`, `pkexec`, `su` and `sudoedit` hold like `sudo`
 
-A SAFE verdict does not release `sudo`: the judge can be steered by text in the command, and privilege escalation is one of the forced-flag classes. The other ways to run a command as another user were not in that class, so `doas rm -rf /srv/x` or `run0 systemctl stop x` ran on a SAFE. `doas`, `run0`, `pkexec`, `su`, `sudo-rs` and `sudoedit` now flag when they are the command a segment runs, directly, by path, or through a wrapper such as `timeout`. Only the verb position counts: `su` is also a word in prose and a variable name, so `grep su notes.txt` and code text are not scanned for it.
+A SAFE verdict does not release `sudo`: the judge can be steered by text in the command, and privilege escalation is one of the forced-flag classes. The other ways to run a command as another user were not in that class, so `doas rm -rf /srv/x` or `run0 systemctl stop x` ran on a SAFE. `doas`, `run0`, `pkexec`, `su`, `sudo-rs` and `sudoedit` now flag when they are the command a segment runs, directly, by path, or through a wrapper such as `timeout`. Like `sudo`, they are also matched as words where the segment scan reads a whole segment (a wrapper's or `find`'s arguments), so `timeout 5 grep su notes.txt` flags; over-flagging there is the safe direction. Plain `grep su notes.txt`, code text and substitution spans are not scanned for them, since `su` is also a word in prose and a variable name.
 
 Replayed against the decision log: of the 9 distinct bash commands that mention one of these words, none gains a flag. Each mention is prose or code, not a command.
 
