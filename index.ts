@@ -3096,23 +3096,19 @@ const EVAL_NAME_REBINDERS = /(?<![\w$])(?:globals|locals|vars|exec|eval|setattr|
  *  leaves visible although Ruby never runs it as code. */
 const EVAL_UNMASKED_RUBY_TEXT = /<<[~-]?(?:["'`]?[A-Za-z_])|^=begin\b|%[qQwWiIrsx]?[^\w\s(\[{<]/mu;
 
-/** Whether every use of `name` the mask hides is harmless: inside a string
- *  with no `{` at all (plain text), or a bare interpolation read (`f"{wt}/a"`,
- *  `${wt}`, `#{wt}`). Anything else inside an interpolation can change it out of
- *  sight: Ruby strings are mutable (`"#{repo << '/x'}"`) and JS can destructure
- *  into a name (`${[repo] = ["/"]}`). A use in a region masked as a comment
- *  refuses outright: `//` is a comment to JS and floor division to Python, so
- *  `n = 1 // 2; [repo] = ["/"]` is code the mask blanked. */
+/** Whether every use of `name` the mask hides is a bare interpolation read
+ *  (`f"{wt}/a"`, `${wt}`, `#{wt}`). Anything else can change it out of sight:
+ *  Ruby strings are mutable (`"#{repo << '/x'}"`), JS can destructure into a
+ *  name (`${[repo] = ["/"]}`), and the mask can take code for a string (a
+ *  regex literal `/"/` opens one) or for a comment (`//` is floor division
+ *  to Python, so `n = 1 // 2; [repo] = ["/"]` is code it blanked). Even a
+ *  plain mention refuses, since the scan cannot tell plain text from code it
+ *  misread as text. */
 function hiddenUsesAreReads(masked: string, code: string, name: string): boolean {
 	for (const match of code.matchAll(new RegExp(`(?<![\\w$])${name}(?![\\w$])`, "gu"))) {
 		const at = match.index ?? 0;
 		if (masked[at] === code[at]) continue;
 		if (masked[at] !== MASK_FILL) return false;
-		let start = at;
-		while (start > 0 && masked[start - 1] === MASK_FILL) start -= 1;
-		let end = at;
-		while (end < masked.length && masked[end] === MASK_FILL) end += 1;
-		if (!code.slice(start, end).includes("{")) continue;
 		if (code[at - 1] !== "{" || code[at + name.length] !== "}") return false;
 	}
 	return true;
@@ -3147,19 +3143,16 @@ function atPayloadTopLevel(masked: string, at: number): boolean {
  */
 function constantCwdText(masked: string, code: string, name: string, siteAt: number): string | null {
 	if (!/^[A-Za-z_][\w]*$/u.test(name) || EVAL_NAME_REBINDERS.test(code)) return null;
-	// An attribute or symbol spelling anywhere, interpolations included
-	// (`f"{importlib.import_module('__main__').repo}"`, `:repo`), can be a write.
-	if (new RegExp(`(?<![\\w$])[.:]${name}(?![\\w$])`, "u").test(code)) return null;
 	// Ruby text the mask does not hide (a heredoc body, `=begin` block or `%q|…|`
 	// literal) could hold a line that reads as the binding but never runs.
 	if (EVAL_UNMASKED_RUBY_TEXT.test(code)) return null;
-	if (!hiddenUsesAreReads(masked, code, name)) return null;
 	// The mask hides string bodies, and an interpolation inside one can write
 	// the name (`f"{(repo := '/')}"`, `${repo = "/"}`, `"#{repo = '/'}"`). So
 	// count writes in the raw text too: the one binding must be the only one.
 	const writes = new RegExp(`(?<![\\w$])${name}\\s*(?:\\*\\*|//|<<|>>|[-+*/%&|^:])?=(?!=)|(?<![\\w$])${name}\\s*(?:\\+\\+|--)|(?:\\+\\+|--)\\s*${name}(?![\\w$])`, "gu");
 	if ((code.match(writes) ?? []).length !== 1) return null;
 	let binding: string | null = null;
+	let span: [number, number] = [0, 0];
 	for (const match of masked.matchAll(new RegExp(`(?<![\\w$])[.:]?${name}(?![\\w$])`, "gu"))) {
 		const at = match.index ?? 0;
 		if (match[0] !== name) return null;
@@ -3172,14 +3165,22 @@ function constantCwdText(masked: string, code: string, name: string, siteAt: num
 			const valueStart = at + name.length + assignment[0].length;
 			const lineEnd = masked.indexOf("\n", valueStart);
 			const tail = masked.slice(valueStart, lineEnd === -1 ? masked.length : lineEnd).replace(/[\s;]+$/u, "");
-			binding = cwdLiteralText(code.slice(valueStart, valueStart + tail.length));
+			span = [valueStart, valueStart + tail.length];
+			binding = cwdLiteralText(code.slice(...span));
 			if (binding === null) return null;
 			continue;
 		}
 		const read = /(?:(?<![\w$.])(?:cwd|chdir)\s*=|\.chdir\(\s*)$/u.test(masked.slice(Math.max(0, at - 40), at)) && /^\s*[,)\n]/u.test(`${after}\n`);
 		if (!read) return null;
 	}
-	return binding;
+	if (binding === null) return null;
+	// The binding's own literal may spell the name (`wt = "/tmp/wt"`); every
+	// other raw spelling counts. An attribute or symbol spelling anywhere,
+	// interpolations included (`f"{importlib.import_module('__main__').repo}"`,
+	// `:repo`), can be a write.
+	const rest = code.slice(0, span[0]) + " ".repeat(span[1] - span[0]) + code.slice(span[1]);
+	if (new RegExp(`(?<![\\w$])[.:]${name}(?![\\w$])`, "u").test(rest)) return null;
+	return hiddenUsesAreReads(masked, rest, name) ? binding : null;
 }
 
 export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {

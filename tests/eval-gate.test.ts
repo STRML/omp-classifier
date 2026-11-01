@@ -300,6 +300,8 @@ describe("eval spawn cwd (issue #14)", () => {
 		const forms: Array<[string, string]> = [
 			['import subprocess\nrepo="/tmp/r"\nphp = r"""\necho 1;\n"""\nsubprocess.run(["php", "-r", php], cwd=repo, capture_output=True)', "/tmp/r"],
 			['wt = "/tmp/wt"\nx = f"{wt}/a"\nsubprocess.run(["ls"], cwd=wt)\nsubprocess.run(["ls"], cwd=wt)', "/tmp/wt"],
+			// The binding's own literal may spell the name.
+			['wt = "/tmp/.wt"\nsubprocess.run(["ls"], cwd=wt)', "/tmp/.wt"],
 			['repo = "/tmp/rb"\nDir.chdir(repo) do\n  system("ls")\nend', "/tmp/rb"],
 		];
 		for (const [code, expected] of forms) {
@@ -332,6 +334,8 @@ describe("eval spawn cwd (issue #14)", () => {
 		["an interpolation after a closing brace", "repo = \"/tmp/r\"\nputs \"} #{repo << 'x'}\"\nsystem(\"ls\", chdir: repo)"],
 		["a getattr with a split dunder", 'repo="/tmp/r"\ngetattr(sys.modules[__name__], "__di"+"ct__")["re"+"po"] = "/"\nsubprocess.run(["ls"], cwd=repo)'],
 		["a write after Python floor division", 'repo="/tmp/r"\nn = 1 // 2; [repo] = ["/"]\nsubprocess.run(["ls"], cwd=repo)'],
+		["a write the mask took for a string (a regex literal opens one)", 'repo = "/tmp/r"\nx = /"/; repo, = "/"; y = /"/\nDir.chdir(repo)'],
+		["mentioned in plain text", 'repo="/tmp/r"\nprint("repo")\nsubprocess.run(["ls"], cwd=repo)'],
 	])("a name stays unreadable when it is %s", (_why, code) => {
 		expect(evalSpawnCwd(code, SESSION).kind).toBe("opaque");
 	});
