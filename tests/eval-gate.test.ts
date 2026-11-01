@@ -293,6 +293,55 @@ describe("eval spawn cwd (issue #14)", () => {
 		}
 	});
 
+	// From the decision log: `repo = "<worktree>"` then `cwd=repo` refused as
+	// "the cwd is not a literal (repo)". 526 of 2845 such refusals in past
+	// sessions named a constant like this.
+	test("a name bound once to a plain literal reads as that literal", () => {
+		const forms: Array<[string, string]> = [
+			['import subprocess\nrepo="/tmp/r"\nphp = r"""\necho 1;\n"""\nsubprocess.run(["php", "-r", php], cwd=repo, capture_output=True)', "/tmp/r"],
+			['wt = "/tmp/wt"\nx = f"{wt}/a"\nsubprocess.run(["ls"], cwd=wt)\nsubprocess.run(["ls"], cwd=wt)', "/tmp/wt"],
+			// The binding's own literal may spell the name.
+			['wt = "/tmp/.wt"\nsubprocess.run(["ls"], cwd=wt)', "/tmp/.wt"],
+			['repo = "/tmp/rb"\nDir.chdir(repo) do\n  system("ls")\nend', "/tmp/rb"],
+		];
+		for (const [code, expected] of forms) {
+			expect(evalSpawnCwd(code, SESSION)).toEqual({ kind: "literal", cwd: expected });
+		}
+	});
+
+	test.each([
+		["bound twice", 'repo="/tmp/r"\nrepo="/"\nsubprocess.run(["rm", "-rf", "."], cwd=repo)'],
+		["bound after the spawn", 'subprocess.run(["ls"], cwd=repo)\nrepo="/tmp/r"'],
+		["bound inside a branch", 'if x:\n    repo="/tmp/r"\nsubprocess.run(["ls"], cwd=repo)'],
+		["a loop target", 'repo="/tmp/r"\nfor repo in ["/"]:\n    subprocess.run(["ls"], cwd=repo)'],
+		["a parameter", 'repo="/tmp/r"\ndef f(repo):\n    subprocess.run(["ls"], cwd=repo)\nf("/")'],
+		["written through globals()", 'repo="/tmp/r"\nglobals()["repo"]="/"\nsubprocess.run(["ls"], cwd=repo)'],
+		["written as a module attribute", 'repo="/tmp/r"\nsys.modules[__name__].repo="/"\nsubprocess.run(["ls"], cwd=repo)'],
+		["a star import after it", 'repo="/tmp/r"\nfrom elsewhere import *\nsubprocess.run(["ls"], cwd=repo)'],
+		["a walrus", 'repo="/tmp/r"\nif (repo := "/"):\n    subprocess.run(["ls"], cwd=repo)'],
+		["a walrus inside an f-string", "repo=\"/tmp/r\"\nprint(f\"{(repo := '/')}\")\nsubprocess.run([\"rm\", \"-rf\", \".\"], cwd=repo)"],
+		["an f-string value", 'repo=f"/tmp/{x}"\nsubprocess.run(["ls"], cwd=repo)'],
+		["a concatenation", 'repo="/tmp" + x\nsubprocess.run(["ls"], cwd=repo)'],
+		["a Ruby binding write", 'repo = "/tmp/r"\nbinding.local_variable_set(:repo, "/")\nsystem("ls", chdir: repo)'],
+		["inside an open bracket", 'x = (1,\nrepo = "/tmp/r")\nsubprocess.run(["ls"], cwd=repo)'],
+		// Code inside an interpolation runs where the mask hides it (review round 1).
+		["globals() inside an f-string", "repo=\"/tmp/r\"\nprint(f\"{globals().update({'repo': '/'})}\")\nsubprocess.run([\"rm\", \"-rf\", \".\"], cwd=repo)"],
+		["setattr with a split name inside an f-string", "repo=\"/tmp/r\"\nprint(f\"{setattr(sys.modules[__name__], 'r'+'epo', '/')}\")\nsubprocess.run([\"ls\"], cwd=repo)"],
+		["a module attribute inside an f-string", "repo=\"/tmp/r\"\nprint(f\"{__import__('importlib').import_module('__main__').repo}\")\nsubprocess.run([\"ls\"], cwd=repo)"],
+		["a Ruby in-place append inside an interpolation", "repo = \"/tmp/r\"\nputs \"#{repo << '/x'}\"\nsystem(\"ls\", chdir: repo)"],
+		["a fake binding in a Ruby heredoc", 'x = <<~EOS\nrepo = "/tmp/r"\nEOS\nsystem("ls", chdir: repo)'],
+		["a fake binding in a =begin block", '=begin\nrepo = "/tmp/r"\n=end\nsystem("ls", chdir: repo)'],
+		["an interpolation after a closing brace", "repo = \"/tmp/r\"\nputs \"} #{repo << 'x'}\"\nsystem(\"ls\", chdir: repo)"],
+		["a getattr with a split dunder", 'repo="/tmp/r"\ngetattr(sys.modules[__name__], "__di"+"ct__")["re"+"po"] = "/"\nsubprocess.run(["ls"], cwd=repo)'],
+		["a write after Python floor division", 'repo="/tmp/r"\nn = 1 // 2; [repo] = ["/"]\nsubprocess.run(["ls"], cwd=repo)'],
+		["a write the mask took for a string (a regex literal opens one)", 'repo = "/tmp/r"\nx = /"/; repo, = "/"; y = /"/\nDir.chdir(repo)'],
+		["mentioned in plain text", 'repo="/tmp/r"\nprint("repo")\nsubprocess.run(["ls"], cwd=repo)'],
+		["written through a function's __globals__", 'repo="/tmp/r"\ndef f(): pass\nf.__globals__["re"+"po"]="/"\nsubprocess.run(["ls"], cwd=repo)'],
+		["written by code a constructor builds", 'repo = "/tmp/r"\n(() => {}).constructor("re" + "po = 1")()\nsubprocess.run(["ls"], cwd=repo)'],
+	])("a name stays unreadable when it is %s", (_why, code) => {
+		expect(evalSpawnCwd(code, SESSION).kind).toBe("opaque");
+	});
+
 	test("the payload's language label does not decide which forms are read", () => {
 		// The label is model-written and shared across tool schemas, so it is not
 		// consulted: `exec(cmd, { cwd })` labeled `py` is still a spawn that named
