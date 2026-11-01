@@ -2345,7 +2345,32 @@ function hasInterpreterCodeRisk(text: string): boolean {
 	const joined = text.replace(/\\\r?\n/gu, " ");
 	if (INTERPRETER_CODE_RISK.test(joined)) return true;
 	if (!COMPILE_CALL.test(joined)) return false;
-	return REBINDS_REGEX_NAME.test(joined) || REGEX_COMPILE_ONLY.test(joined);
+	return REBINDS_REGEX_NAME.test(joined) || !regexNamesOnlyRead(joined) || REGEX_COMPILE_ONLY.test(joined);
+}
+
+/** A plain import statement: `import os, re as regex`, `from re import
+ *  compile`. Read per statement, between `;` and line breaks. */
+const PLAIN_IMPORT_STATEMENT =
+	/^[ \t]*(?:import[ \t]+[\w.]+(?:[ \t]+as[ \t]+\w+)?(?:[ \t]*,[ \t]*[\w.]+(?:[ \t]+as[ \t]+\w+)?)*|from[ \t]+(?:re|regex|py_compile)[ \t]+import[ \t]+[^;\n#]+)[ \t]*(?:#[^\n]*)?$/u;
+
+/**
+ * Whether every bare `re`, `regex` or `py_compile` in the text is an attribute
+ * access (`re.compile`) or sits in a plain import statement. Deny-by-default: any
+ * other use (a parameter however its header is spelled, a loop target, a
+ * walrus, a string key for `setattr`, a mention in a comment) voids the
+ * compile exemption. REBINDS_REGEX_NAME still reads `import builtins as re`,
+ * which is an import statement.
+ */
+function regexNamesOnlyRead(text: string): boolean {
+	for (const match of text.matchAll(/(?<![\w.])(?:re|regex|py_compile)\b/gu)) {
+		const at = match.index ?? 0;
+		if (/^\s*\./u.test(text.slice(at + match[0].length))) continue;
+		const start = Math.max(text.lastIndexOf("\n", at - 1), text.lastIndexOf(";", at - 1)) + 1;
+		const ends = [text.indexOf("\n", at), text.indexOf(";", at)].filter(end => end !== -1);
+		if (PLAIN_IMPORT_STATEMENT.test(text.slice(start, ends.length > 0 ? Math.min(...ends) : text.length))) continue;
+		return false;
+	}
+	return true;
 }
 
 // Same token set as a word-boundary regex, for matching inside joined
