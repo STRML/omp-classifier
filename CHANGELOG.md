@@ -4,6 +4,22 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### A spawn cwd named by a constant reads as that constant
+
+An eval payload that set `repo = "<worktree path>"` and then ran `subprocess.run([...], cwd=repo)` refused with "unreadable spawn cwd: the cwd is not a literal (repo)". The scan read only a string written at the spawn itself. A bare name in `cwd=`, `chdir=` or `.chdir(...)` now resolves to the string it holds, under deny-by-default rules:
+
+| Rule | Example that stays unreadable |
+|---|---|
+| bound exactly once, counting writes inside f-strings and templates | `repo="/a"` then `repo="/"`; `f"{(repo := '/')}"` |
+| any use the mask hides (string, comment) is a bare `{repo}` read; the mask can misread code (`//` is floor division in Python, `/"/` opens a string) | `"#{repo << '/x'}"`, `n = 1 // 2; [repo] = ["/"]`, `print("repo")` |
+| the binding is a top-level, unconditional `name = "<plain literal>"` (optionally `const`/`let`/`var`) | inside an `if`, a bracket, or after a braceless `if (…)` |
+| written before the spawn | `cwd=repo` above `repo = …` |
+| every other bare use is a cwd read | a parameter, a loop target, `obj.repo`, `:repo` |
+| no word that can rebind it unseen, anywhere in the raw text | `globals()`, `setattr`, `getattr`, `exec`, `pickle`, any dunder but `__name__`-style ones, `Function`, `constructor`, `instance_eval`, `globalThis`, `from x import *`, `binding`, `.repo`, `:repo` |
+| no Ruby text the mask leaves visible | a heredoc, `=begin` block or `%q\|…\|` literal anywhere in the payload |
+
+Replayed against 3962 past eval payloads that name a cwd: 449 that refused now resolve, and no payload that resolved before changed kind or directory.
+
 ### A syntax check reads no script body
 
 A `php -l` lint of a PHP tool refused with "body exceeds the review limit": the reader sent the 313 KB file to review, though a lint runs none of it. Ruby (`-c`), bash (`-n`) and Python's `py_compile` already counted as syntax-only. The interpreter grammar now marks these too:

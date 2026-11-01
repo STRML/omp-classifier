@@ -3085,6 +3085,106 @@ function evalChdirScope(masked: string, site: EvalCwdSiteMatch): EvalChdirScope 
  * one spawn in the session directory, another in `/` — there is no single
  * directory this payload runs in, and the answer is "ask", not one of the two.
  */
+/** Words that can rebind a name without writing `name =`: a namespace written
+ *  through as a dict or an object (`globals()`, `setattr`, `globalThis`,
+ *  `f.__globals__`, `gc.get_referrers`), code built or loaded at run time
+ *  (`exec`, `pickle`, `constructor`, node's `vm`), a star import, and a JS
+ *  `with` block that puts an object's keys in scope. Every dunder counts but a
+ *  few that only name a module or file. Tested against the RAW text, since an
+ *  f-string, `${}` or `#{}` interpolation runs code the mask hides. */
+const EVAL_NAME_REBINDERS = /(?<![\w$])(?:globals|locals|vars|exec|eval|setattr|__setattr__|__dict__|__builtins__|builtins|f_globals|f_locals|binding|local_variable_set|globalThis|window|global|Reflect|getattr|__getattribute__|__import__|importlib|inspect|ctypes|Function|setTimeout|setInterval|vm|this|send|public_send|__send__|instance_eval|class_eval|module_eval|instance_exec|const_set|define_method|gc|pickle|cPickle|marshal|dill|cloudpickle|shelve|jsonpickle|runpy|constructor|runInThisContext|runInNewContext|runInContext|TOPLEVEL_BINDING|ObjectSpace)(?![\w$])|(?<![\w$.])compile\s*\(|__(?!(?:name|main|file|init|future|doc|version)__)\w+__|\bimport\s*\*|\bwith\s*\(/u;
+
+/** A Ruby heredoc opener, `=begin` block or percent literal: text maskCodeText
+ *  leaves visible although Ruby never runs it as code. */
+const EVAL_UNMASKED_RUBY_TEXT = /<<[~-]?(?:["'`]?[A-Za-z_])|^=begin\b|%[qQwWiIrsx]?[^\w\s(\[{<]/mu;
+
+/** Whether every use of `name` the mask hides is a bare interpolation read
+ *  (`f"{wt}/a"`, `${wt}`, `#{wt}`). Anything else can change it out of sight:
+ *  Ruby strings are mutable (`"#{repo << '/x'}"`), JS can destructure into a
+ *  name (`${[repo] = ["/"]}`), and the mask can take code for a string (a
+ *  regex literal `/"/` opens one) or for a comment (`//` is floor division
+ *  to Python, so `n = 1 // 2; [repo] = ["/"]` is code it blanked). Even a
+ *  plain mention refuses, since the scan cannot tell plain text from code it
+ *  misread as text. */
+function hiddenUsesAreReads(masked: string, code: string, name: string): boolean {
+	for (const match of code.matchAll(new RegExp(`(?<![\\w$])${name}(?![\\w$])`, "gu"))) {
+		const at = match.index ?? 0;
+		if (masked[at] === code[at]) continue;
+		if (masked[at] !== MASK_FILL) return false;
+		if (code[at - 1] !== "{" || code[at + name.length] !== "}") return false;
+	}
+	return true;
+}
+
+/** Whether the masked text before `at` puts it at the top level of the
+ *  payload: no bracket left open, and not the body of a braceless `if (…)`,
+ *  `else` or `do` on the line before. */
+function atPayloadTopLevel(masked: string, at: number): boolean {
+	let depth = 0;
+	for (let i = 0; i < at; i += 1) {
+		const char = masked[i];
+		if (char === "(" || char === "[" || char === "{") depth += 1;
+		else if (char === ")" || char === "]" || char === "}") depth -= 1;
+	}
+	if (depth !== 0) return false;
+	const previous = masked.slice(0, at).trimEnd();
+	return previous === "" || !(/[)\\:,=+\-*/%&|^!<>?]$/u.test(previous) || /\b(?:else|do)$/u.test(previous));
+}
+
+/**
+ * The directory text a bare name in a cwd argument stands for, or null.
+ *
+ * `repo = "/x"` then `subprocess.run([...], cwd=repo)` names /x as plainly as
+ * the literal does, but only when nothing else can change what `repo` holds.
+ * Deny-by-default: the name must be bound exactly once, by a top-level,
+ * unconditional `name = "<plain literal>"` line (`const`/`let`/`var` allowed)
+ * written before the site, and every other use of it must be a cwd read
+ * (`cwd=name`, `chdir=name`, `.chdir(name)`). Any other use (a parameter, a
+ * loop target, `global name`, `obj.name`, a second assignment) and any word
+ * that could rebind it unseen leaves the cwd unreadable, as before.
+ */
+function constantCwdText(masked: string, code: string, name: string, siteAt: number): string | null {
+	if (!/^[A-Za-z_][\w]*$/u.test(name) || EVAL_NAME_REBINDERS.test(code)) return null;
+	// Ruby text the mask does not hide (a heredoc body, `=begin` block or `%q|…|`
+	// literal) could hold a line that reads as the binding but never runs.
+	if (EVAL_UNMASKED_RUBY_TEXT.test(code)) return null;
+	// The mask hides string bodies, and an interpolation inside one can write
+	// the name (`f"{(repo := '/')}"`, `${repo = "/"}`, `"#{repo = '/'}"`). So
+	// count writes in the raw text too: the one binding must be the only one.
+	const writes = new RegExp(`(?<![\\w$])${name}\\s*(?:\\*\\*|//|<<|>>|[-+*/%&|^:])?=(?!=)|(?<![\\w$])${name}\\s*(?:\\+\\+|--)|(?:\\+\\+|--)\\s*${name}(?![\\w$])`, "gu");
+	if ((code.match(writes) ?? []).length !== 1) return null;
+	let binding: string | null = null;
+	let span: [number, number] = [0, 0];
+	for (const match of masked.matchAll(new RegExp(`(?<![\\w$])[.:]?${name}(?![\\w$])`, "gu"))) {
+		const at = match.index ?? 0;
+		if (match[0] !== name) return null;
+		const lineStart = masked.lastIndexOf("\n", at - 1) + 1;
+		const head = masked.slice(lineStart, at);
+		const after = masked.slice(at + name.length);
+		const assignment = /^\s*=(?!=)\s*/u.exec(after);
+		if (assignment && /^(?:(?:const|let|var)\s+)?$/u.test(head)) {
+			if (binding !== null || at > siteAt || !atPayloadTopLevel(masked, lineStart)) return null;
+			const valueStart = at + name.length + assignment[0].length;
+			const lineEnd = masked.indexOf("\n", valueStart);
+			const tail = masked.slice(valueStart, lineEnd === -1 ? masked.length : lineEnd).replace(/[\s;]+$/u, "");
+			span = [valueStart, valueStart + tail.length];
+			binding = cwdLiteralText(code.slice(...span));
+			if (binding === null) return null;
+			continue;
+		}
+		const read = /(?:(?<![\w$.])(?:cwd|chdir)\s*=|\.chdir\(\s*)$/u.test(masked.slice(Math.max(0, at - 40), at)) && /^\s*[,)\n]/u.test(`${after}\n`);
+		if (!read) return null;
+	}
+	if (binding === null) return null;
+	// The binding's own literal may spell the name (`wt = "/tmp/wt"`); every
+	// other raw spelling counts. An attribute or symbol spelling anywhere,
+	// interpolations included (`f"{importlib.import_module('__main__').repo}"`,
+	// `:repo`), can be a write.
+	const rest = code.slice(0, span[0]) + " ".repeat(span[1] - span[0]) + code.slice(span[1]);
+	if (new RegExp(`(?<![\\w$])[.:]${name}(?![\\w$])`, "u").test(rest)) return null;
+	return hiddenUsesAreReads(masked, rest, name) ? binding : null;
+}
+
 export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
 	const masked = maskCodeText(code);
 	const sites = evalCwdSites(masked);
@@ -3119,18 +3219,15 @@ export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
 			perSite.push(current);
 			continue;
 		}
-		if (argument.kind === "dynamic") {
-			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${argument.detail})`;
-			continue;
-		}
-		const literal = cwdLiteralText(argument.value);
+		const source = argument.kind === "dynamic" ? argument.detail : argument.value;
+		const literal = (argument.kind === "value" ? cwdLiteralText(argument.value) : null) ?? constantCwdText(masked, code, source.trim(), site.at);
 		if (literal === null) {
-			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${truncated(argument.value, 60)})`;
+			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${truncated(source, 60)})`;
 			continue;
 		}
 		const resolved = resolveSpawnCwdLiteral(literal, current);
 		if (resolved === null) {
-			if (opaque === "") opaque = `${site.name}: ${truncated(argument.value, 60)} does not name a directory`;
+			if (opaque === "") opaque = `${site.name}: ${truncated(source, 60)} does not name a directory`;
 			continue;
 		}
 		if (site.kind === "chdir") {
