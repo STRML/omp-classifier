@@ -454,7 +454,7 @@ const CUSTOMIZE = /^(?:sitecustomize|usercustomize)(?:\.|$)/u;
  * `sitecustomize` and `usercustomize`. `flags` are the interpreter's own
  * options: `-S` skips all of it, and `-s` or `-I` skip the user site.
  */
-export function startupRefusal(libs: readonly string[], venv: { systemSite: boolean } | undefined, flags: readonly string[], real: string, isSystemProgram: (file: string) => boolean): string | undefined {
+export function startupRefusal(libs: readonly string[], venv: { root: string; systemSite: boolean } | undefined, flags: readonly string[], real: string, isSystemProgram: (file: string) => boolean): string | undefined {
 	const version = libs.map(dir => /^python(\d+\.\d+)$/u.exec(path.basename(dir))?.[1]).find(found => found !== undefined);
 	// The standard-library zip sits first on sys.path, -S or not, so a writable one shadows every stdlib module.
 	if (version !== undefined) {
@@ -466,11 +466,38 @@ export function startupRefusal(libs: readonly string[], venv: { systemSite: bool
 	// A venv turns the user site off unless it includes the system site.
 	const userSite = (venv === undefined || venv.systemSite) && !letters.includes("s") && !letters.includes("I") && version !== undefined;
 	const sites = [...libs.filter(dir => path.basename(dir) === "site-packages"), ...(userSite ? [path.join(os.homedir(), ".local", "lib", `python${version}`, "site-packages"), path.join(os.homedir(), "Library", "Python", version, "lib", "python", "site-packages")] : [])];
-	for (const dir of [...libs, ...sites]) {
+	// The venv's own site-packages is trusted like the standard library (Sam,
+	// 2026-10-31: "Trust user site-packages"): its .pth files and
+	// sitecustomize are the user's installed tooling. The base install's and
+	// the user site's directories outside the venv are still read.
+	// Only the venv's exact site-packages, and only for a venv whose root is
+	// neither the home directory nor an ancestor of the base install: a
+	// pyvenv.cfg in either would otherwise exempt the user site or the stdlib.
+	const resolved = (dir: string): string | undefined => {
+		try {
+			return fs.realpathSync(dir);
+		} catch {
+			return undefined;
+		}
+	};
+	// Every comparison is by real path: a guard that compared the path as
+	// spelled would miss a venv root that is a symlink to the base install.
+	const realRoot = venv === undefined ? undefined : resolved(venv.root);
+	const realBase = resolved(path.dirname(path.dirname(real)));
+	const realHome = resolved(os.homedir());
+	const rootAllowed = realRoot !== undefined && realBase !== undefined && realRoot !== realHome && realBase !== realRoot && !realBase.startsWith(`${realRoot}${path.sep}`) && !realRoot.startsWith(`${realBase}${path.sep}`);
+	const realSite = rootAllowed && venv !== undefined && version !== undefined ? resolved(path.join(venv.root, "lib", `python${version}`, "site-packages")) : undefined;
+	// Never the user site or the base install's site-packages, however the
+	// venv reaches them.
+	const sharedSites = version === undefined ? [] : [path.join(os.homedir(), ".local", "lib", `python${version}`, "site-packages"), path.join(os.homedir(), "Library", "Python", version, "lib", "python", "site-packages"), path.join(path.dirname(path.dirname(real)), "lib", `python${version}`, "site-packages")].map(resolved);
+	// No symlinked component below the root: the real path is the plain one.
+	const ownSite = realRoot !== undefined && version !== undefined && realSite === path.join(realRoot, "lib", `python${version}`, "site-packages") && !sharedSites.includes(realSite) ? realSite : undefined;
+	const inVenv = (dir: string): boolean => ownSite !== undefined && resolved(dir) === ownSite;
+	for (const dir of [...libs, ...sites].filter(dir => !inVenv(dir))) {
 		const custom = safeList(dir).find(entry => CUSTOMIZE.test(entry));
 		if (custom !== undefined) return `${path.join(dir, custom)} runs at interpreter startup, unread`;
 	}
-	for (const dir of sites) {
+	for (const dir of sites.filter(dir => !inVenv(dir))) {
 		for (const entry of safeList(dir).filter(name => name.endsWith(".pth"))) {
 			const why = pthRefusal(path.join(dir, entry));
 			if (why !== undefined) return why;
