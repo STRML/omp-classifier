@@ -3145,6 +3145,12 @@ function atPayloadTopLevel(masked: string, at: number): boolean {
  */
 function constantCwdText(masked: string, code: string, name: string, siteAt: number): string | null {
 	if (!/^[A-Za-z_][\w]*$/u.test(name) || EVAL_NAME_REBINDERS.test(code)) return null;
+	// The scans match the name's ASCII spelling, and code can spell it other
+	// ways: a JS identifier escape (`r\u0065po = "/"`) and Python's NFKC
+	// folding (`ｒｅｐｏ = "/"` binds `repo`). Code outside strings that holds
+	// either is refused; the mask hides strings, so an escape or accent inside
+	// one costs nothing.
+	if (/[^\x00-\x7f]|\\u/u.test(masked)) return null;
 	// Ruby text the mask does not hide (a heredoc body, `=begin` block or `%q|…|`
 	// literal) could hold a line that reads as the binding but never runs.
 	if (EVAL_UNMASKED_RUBY_TEXT.test(code)) return null;

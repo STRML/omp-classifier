@@ -337,6 +337,8 @@ describe("eval spawn cwd (issue #14)", () => {
 		["a write the mask took for a string (a regex literal opens one)", 'repo = "/tmp/r"\nx = /"/; repo, = "/"; y = /"/\nDir.chdir(repo)'],
 		["mentioned in plain text", 'repo="/tmp/r"\nprint("repo")\nsubprocess.run(["ls"], cwd=repo)'],
 		["written through a function's __globals__", 'repo="/tmp/r"\ndef f(): pass\nf.__globals__["re"+"po"]="/"\nsubprocess.run(["ls"], cwd=repo)'],
+		["rebound through a JS identifier escape", 'let repo = "/tmp/r";\nr\\u0065po = "/";\nsubprocess.run(["ls"], cwd=repo)'],
+		["rebound through an NFKC-folded Python name", 'repo="/tmp/r"\n\uff52\uff45\uff50\uff4f="/"\nsubprocess.run(["ls"], cwd=repo)'],
 		["written by code a constructor builds", 'repo = "/tmp/r"\n(() => {}).constructor("re" + "po = 1")()\nsubprocess.run(["ls"], cwd=repo)'],
 	])("a name stays unreadable when it is %s", (_why, code) => {
 		expect(evalSpawnCwd(code, SESSION).kind).toBe("opaque");
