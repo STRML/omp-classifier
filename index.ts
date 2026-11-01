@@ -5193,7 +5193,11 @@ export function matchModerateRiskTokens(
 function addSubstitutionFlags(text: string, flags: Set<string>): void {
 	for (const span of substitutionSpans(text)) {
 		for (const token of MODERATE_RISK_TOKENS) {
-			if (new RegExp(`\\b${token}\\b`, "iu").test(span)) flags.add(token);
+			// A shell word runs on through `-` and `.`: `wp eval-file`, `--rm` and
+			// `rm.sh` name other words, and the top-level verb scan reads them
+			// the same way. `\b` matched `eval` inside a PHP comment's
+			// `` `wp eval-file` `` and blocked the run on a SAFE.
+			if (new RegExp(`(?<![\\w.-])${token}(?![\\w.-])`, "iu").test(span)) flags.add(token);
 		}
 		if (/^mkfs\b|^mkfs\./iu.test(span.trim())) flags.add("mkfs");
 	}
