@@ -4,6 +4,17 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### A commit message is blanked after a leading `cd`
+
+`cd <repo> && git add -A && git commit -q -m "Refuse ota and reboot ..."` refused with "critical pattern: matches a built-in dangerous-command pattern", and a critical refusal never yields for the session. The critical scan already blanks `git commit` message words in a plain chain of `git add`, `git commit`, `git log` and `git status`, but any other command in the chain turned blanking off, and agents start most chains with `cd`. One leading `cd <literal dir>` is now allowed in front of the chain. `git -C <dir>` already did the same thing.
+
+| Command | Message scanned |
+|---|---|
+| `cd /repo && git add -A && git commit -m "…reboot…"` | no |
+| `cd "$DIR" && …`, `cd -P /repo && …`, `CDPATH=x cd …`, `cd /a > log && …`, two `cd`s, a `cd` after git | yes, as before |
+
+Six such refusals are in the decision log since 2026-09-19.
+
 ### A substitution flags whole shell words
 
 `php tools/rebuild-claim-parts.php self-test` got a SAFE and still blocked with "classifier-safe but flags: eval". The judged text holds the PHP body, whose comment reads `` `wp eval-file <this file>` ``. The substitution scan reads backtick spans for risk verbs and matched each one with `\b`, which stops at `-` and `.`. So it found `eval` inside `eval-file`. A shell word runs on through those characters, and the top-level verb scan already reads it that way.
