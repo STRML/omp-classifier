@@ -3090,26 +3090,29 @@ function evalChdirScope(masked: string, site: EvalCwdSiteMatch): EvalChdirScope 
  *  built at run time, a star import, and a JS `with` block that puts an
  *  object's keys in scope. Tested against the RAW text, since an f-string,
  *  `${}` or `#{}` interpolation runs code the mask hides. */
-const EVAL_NAME_REBINDERS = /(?<![\w$])(?:globals|locals|vars|exec|eval|setattr|__setattr__|__dict__|__builtins__|builtins|f_globals|f_locals|binding|local_variable_set|globalThis|window|global|Reflect)(?![\w$])|\bimport\s*\*|\bwith\s*\(/u;
+const EVAL_NAME_REBINDERS = /(?<![\w$])(?:globals|locals|vars|exec|eval|setattr|__setattr__|__dict__|__builtins__|builtins|f_globals|f_locals|binding|local_variable_set|globalThis|window|global|Reflect|getattr|__getattribute__|__import__|importlib|inspect|ctypes|Function|setTimeout|setInterval|vm|this|send|public_send|__send__|instance_eval|class_eval|module_eval|instance_exec|const_set|define_method)(?![\w$])|\bimport\s*\*|\bwith\s*\(/u;
 
 /** A Ruby heredoc opener, `=begin` block or percent literal: text maskCodeText
  *  leaves visible although Ruby never runs it as code. */
 const EVAL_UNMASKED_RUBY_TEXT = /<<[~-]?(?:["'`]?[A-Za-z_])|^=begin\b|%[qQwWiIrsx]?[^\w\s(\[{<]/mu;
 
-/** Whether every use of `name` inside a string is plain text or a bare
- *  interpolation read (`f"{wt}/a"`, `${wt}`, `#{wt}`). Anything else inside an
- *  interpolation can change it where the mask hides the code: Ruby strings are
- *  mutable (`"#{repo << '/x'}"`) and JS can destructure into a name
- *  (`${[repo] = ["/"]}`). */
-function stringUsesAreReads(masked: string, code: string, name: string): boolean {
+/** Whether every use of `name` the mask hides is harmless: inside a string
+ *  with no `{` at all (plain text), or a bare interpolation read (`f"{wt}/a"`,
+ *  `${wt}`, `#{wt}`). Anything else inside an interpolation can change it out of
+ *  sight: Ruby strings are mutable (`"#{repo << '/x'}"`) and JS can destructure
+ *  into a name (`${[repo] = ["/"]}`). A use in a region masked as a comment
+ *  refuses outright: `//` is a comment to JS and floor division to Python, so
+ *  `n = 1 // 2; [repo] = ["/"]` is code the mask blanked. */
+function hiddenUsesAreReads(masked: string, code: string, name: string): boolean {
 	for (const match of code.matchAll(new RegExp(`(?<![\\w$])${name}(?![\\w$])`, "gu"))) {
 		const at = match.index ?? 0;
-		if (masked[at] !== MASK_FILL) continue;
+		if (masked[at] === code[at]) continue;
+		if (masked[at] !== MASK_FILL) return false;
 		let start = at;
 		while (start > 0 && masked[start - 1] === MASK_FILL) start -= 1;
-		const before = code.slice(start, at);
-		const open = (before.match(/\{/gu) ?? []).length - (before.match(/\}/gu) ?? []).length;
-		if (open <= 0) continue;
+		let end = at;
+		while (end < masked.length && masked[end] === MASK_FILL) end += 1;
+		if (!code.slice(start, end).includes("{")) continue;
 		if (code[at - 1] !== "{" || code[at + name.length] !== "}") return false;
 	}
 	return true;
@@ -3150,7 +3153,7 @@ function constantCwdText(masked: string, code: string, name: string, siteAt: num
 	// Ruby text the mask does not hide (a heredoc body, `=begin` block or `%q|…|`
 	// literal) could hold a line that reads as the binding but never runs.
 	if (EVAL_UNMASKED_RUBY_TEXT.test(code)) return null;
-	if (!stringUsesAreReads(masked, code, name)) return null;
+	if (!hiddenUsesAreReads(masked, code, name)) return null;
 	// The mask hides string bodies, and an interpolation inside one can write
 	// the name (`f"{(repo := '/')}"`, `${repo = "/"}`, `"#{repo = '/'}"`). So
 	// count writes in the raw text too: the one binding must be the only one.

@@ -329,6 +329,9 @@ describe("eval spawn cwd (issue #14)", () => {
 		["a Ruby in-place append inside an interpolation", "repo = \"/tmp/r\"\nputs \"#{repo << '/x'}\"\nsystem(\"ls\", chdir: repo)"],
 		["a fake binding in a Ruby heredoc", 'x = <<~EOS\nrepo = "/tmp/r"\nEOS\nsystem("ls", chdir: repo)'],
 		["a fake binding in a =begin block", '=begin\nrepo = "/tmp/r"\n=end\nsystem("ls", chdir: repo)'],
+		["an interpolation after a closing brace", "repo = \"/tmp/r\"\nputs \"} #{repo << 'x'}\"\nsystem(\"ls\", chdir: repo)"],
+		["a getattr with a split dunder", 'repo="/tmp/r"\ngetattr(sys.modules[__name__], "__di"+"ct__")["re"+"po"] = "/"\nsubprocess.run(["ls"], cwd=repo)'],
+		["a write after Python floor division", 'repo="/tmp/r"\nn = 1 // 2; [repo] = ["/"]\nsubprocess.run(["ls"], cwd=repo)'],
 	])("a name stays unreadable when it is %s", (_why, code) => {
 		expect(evalSpawnCwd(code, SESSION).kind).toBe("opaque");
 	});

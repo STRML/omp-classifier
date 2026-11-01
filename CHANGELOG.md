@@ -11,14 +11,15 @@ An eval payload that set `repo = "<worktree path>"` and then ran `subprocess.run
 | Rule | Example that stays unreadable |
 |---|---|
 | bound exactly once, counting writes inside f-strings and templates | `repo="/a"` then `repo="/"`; `f"{(repo := '/')}"` |
-| inside a string, only a bare `{repo}` read | `"#{repo << '/x'}"`, `f"{repo!r}"` |
+| inside a string, only a bare `{repo}` read, or a string with no `{` | `"} #{repo << '/x'}"`, `f"{repo!r}"` |
+| no use in a region masked as a comment (`//` is floor division in Python) | `n = 1 // 2; [repo] = ["/"]`, `# the repo` |
 | the binding is a top-level, unconditional `name = "<plain literal>"` (optionally `const`/`let`/`var`) | inside an `if`, a bracket, or after a braceless `if (…)` |
 | written before the spawn | `cwd=repo` above `repo = …` |
 | every other bare use is a cwd read | a parameter, a loop target, `obj.repo`, `:repo` |
-| no word that can rebind it unseen, anywhere in the raw text | `globals()`, `setattr`, `exec`, `globalThis`, `from x import *`, `binding`, `.repo`, `:repo` |
+| no word that can rebind it unseen, anywhere in the raw text | `globals()`, `setattr`, `getattr`, `exec`, `__import__`, `Function`, `instance_eval`, `globalThis`, `from x import *`, `binding`, `.repo`, `:repo` |
 | no Ruby text the mask leaves visible | a heredoc, `=begin` block or `%q\|…\|` literal anywhere in the payload |
 
-Replayed against 3962 past eval payloads that name a cwd: 482 that refused now resolve, and no payload that resolved before changed kind or directory.
+Replayed against 3962 past eval payloads that name a cwd: 454 that refused now resolve, and no payload that resolved before changed kind or directory.
 
 ### A syntax check reads no script body
 
