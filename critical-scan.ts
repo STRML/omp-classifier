@@ -11,7 +11,8 @@
  * narrows what they read in two ways, and neither strips text with a regex.
  *
  * 1. The raw command. When the whole command is a plain chain of `git add`,
- *    `git commit`, `git log` and `git status`, the parser names the
+ *    `git commit`, `git log` and `git status` (after at most one leading
+ *    `cd <literal dir>`), the parser names the
  *    `git commit` message words and those spans are blanked in place. Every
  *    other byte is scanned exactly as before. Every word must reach git as
  *    written, every flag must be on a short allowlist, and the session's shell
@@ -119,6 +120,17 @@ function isPlainGit(command: ShellCommand): boolean {
 	return sub !== -1 && flagsAllowed(command.words, sub + 1, GIT_FLAGS[command.words[sub].value]);
 }
 
+/** A leading `cd <literal dir>`: agents start most chains this way, and `cd`
+ *  only moves where the git commands after it run (`git -C` does the same).
+ *  One fixed operand that is not an option, no env prefix, no file redirect. */
+function isPlainCd(command: ShellCommand): boolean {
+	if (command.nested || command.unreadShape !== undefined || command.expression !== undefined) return false;
+	if (command.assigns.length > 0 || command.words.length !== 2) return false;
+	if (!command.words.every(word => word.fixed)) return false;
+	if (!command.redirects.every(isInertRedirect)) return false;
+	return command.words[0].value === "cd" && !command.words[1].value.startsWith("-");
+}
+
 /** The message words of a `git commit`, in a command `isPlainGit` accepted. */
 function commitMessageWords(command: ShellCommand): ShellWord[] {
 	const { words } = command;
@@ -162,8 +174,8 @@ export function criticalScanText(command: string, shellTrusted = true): string {
 	const parsed = parseShell(command);
 	if (!parsed.ok || parsed.commands.length === 0) return command;
 	if (!shellRunsInSourceOrder(command)) return command;
-	if (!parsed.commands.every(isPlainGit)) return command;
-	const spans = parsed.commands.flatMap(commitMessageWords);
+	if (!parsed.commands.every((each, index) => isPlainGit(each) || (index === 0 && parsed.commands.length > 1 && isPlainCd(each)))) return command;
+	const spans = parsed.commands.filter(isPlainGit).flatMap(commitMessageWords);
 	// Word offsets are UTF-16 string indexes (shell-ast converts the parser's
 	// byte offsets), and split("") indexes by UTF-16 unit too.
 	const out = command.split("");
