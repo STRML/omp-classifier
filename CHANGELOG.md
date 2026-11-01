@@ -8,7 +8,7 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 `python3 -c "import py_compile; py_compile.compile('/tmp/x/a.py', doraise=True)"` got a SAFE and still blocked with "classifier-safe but flags: python3 -c". The second-execution scan reads `compile(` as the builtin that turns source into runnable code, and exempts only `re.compile(` and `regex.compile(`. `py_compile.compile(` writes a `.pyc` file and runs none of it, so it now gets the same exemption, under the same rebinding guard: `import builtins as py_compile` or `py_compile = builtins` still flags.
 
-The guard itself missed five rebinding spellings, for `re` and `regex` too: a walrus (`(re := builtins)`), a parameter (`def f(re)`, `lambda re:`), a loop target (`for x, re in`), and the name written as a string, which is how `setattr` or `globals()` rebinds it. Each now voids the exemption. A type annotation such as `-> re.Pattern` does not.
+The guard itself missed five rebinding spellings, for `re` and `regex` too: a walrus (`(re := builtins)`), a parameter (`def f(re)`, `lambda re:`), a loop target (`for x, re in`), and the name written as a string, which is how `setattr` or `globals()` rebinds it. Each now voids the exemption. A type annotation such as `-> re.Pattern` does not. A parameter list is read to its closing paren, through annotations, slices and nested calls (`def f(x: int, re)`, `lambda a=d[1:2], re:`), and an annotated assignment (`re: object = builtins`) rebinds too.
 
 ### A substitution holding `${…}` keeps the plain word match
 

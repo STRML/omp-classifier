@@ -207,6 +207,7 @@ describe("second-execution markers read code, not prose", () => {
 		["re aliased as regex", "import re as regex\nPAT = regex.compile(r'a+')\n"],
 		["regex aliased as re", "import regex as re\nPAT = re.compile(r'a+')\n"],
 		// From the decision log: a py_compile check of a file refused on a SAFE.
+		["a parameter annotated with a regex type", "import re\ndef f(p: re.Pattern, s: str) -> bool:\n    return bool(p.match(s))\nprint(f(re.compile('a'), 'a'))\n"],
 		["a function annotated with a regex type", "import re\ndef f(x) -> re.Pattern:\n    return re.compile(x)\nfor m in re.finditer('a', 'aa'):\n    print(m)\n"],
 		["a py_compile check", "import py_compile, sys\npy_compile.compile('/tmp/x/a.py', doraise=True)\nprint('compiled ok')\n"],
 	])("%s runs on a SAFE", async (_name, body) => {
@@ -232,8 +233,13 @@ describe("second-execution markers read code, not prose", () => {
 		["compile through a name assigned to re", "re = builtins\nre.compile(src, 'x', 'exec')\n"],
 		["compile borrowed through an alias of py_compile", "import builtins as py_compile\npy_compile.compile(src, 'x', 'exec')\n"],
 		["compile through a name assigned to py_compile", "py_compile = builtins\npy_compile.compile(src, 'x', 'exec')\n"],
+		["compile through re bound by an annotated assignment", "re: object = builtins\nre.compile(src, 'x', 'exec')\n"],
 		["compile through re bound by a walrus", "if (re := builtins):\n    re.compile(src, 'x', 'exec')\n"],
 		["compile through re as a parameter", "def f(x, re):\n    return re.compile(src, 'x', 'exec')\nf(1, builtins)\n"],
+		["compile through re after an annotated parameter", "def f(x: int, re):\n    return re.compile(src, 'x', 'exec')\n"],
+		["compile through re after a default with a call", "def f(x=g(1), re=None):\n    return re.compile(src, 'x', 'exec')\n"],
+		["compile through re after a doubly nested default", "def f(x=g(h(1)), re=None):\n    return re.compile(src, 'x', 'exec')\n"],
+		["compile through re after a lambda default slice", "f = lambda a=d[1:2], re=None: re.compile(src)\n"],
 		["compile through re as a lambda parameter", "f = lambda re: re.compile(src, 'x', 'exec')\nf(builtins)\n"],
 		["compile through re as a loop target", "for x, re in [(1, builtins)]:\n    re.compile(src, 'x', 'exec')\n"],
 		["compile through re rebound with setattr", "import sys, re\nsetattr(sys.modules[__name__], 're', builtins)\nre.compile(src, 'x', 'exec')\n"],

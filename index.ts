@@ -2327,11 +2327,11 @@ const REGEX_COMPILE_ONLY = /(?<!\b(?:re|regex|py_compile)\.)compile\(/;
 /** A plain `import a, b as c, re as regex` statement that aliases one regex
  *  module to the other is not a rebind: every module in it is a bare name, so
  *  no `;`, `from` or dotted module can sit in front. Any other `as re` is, and
- *  so is an assignment or walrus, a parameter (`def f(re)`, `lambda re:`), a
+ *  so is an assignment (annotated too: `re: Any = builtins`) or walrus, a parameter (`def f(re)`, `lambda re:`), a
  *  loop target (`for x, re in`), and the name written as a string, which is
  *  how `setattr` or `globals()` would rebind it. */
 const REBINDS_REGEX_NAME =
-	/(?<!^[ \t]*import[ \t]+(?:\w+(?:[ \t]+as[ \t]+\w+)?[ \t]*,[ \t]*)*(?:re|regex)[ \t]+)\bas\s+(?:re|regex|py_compile)\b|(?<![\w.])(?:re|regex|py_compile)\s*:?=(?!=)|\b(?:def|class|for)\s+(?:re|regex|py_compile)\b|\b(?:def\s+\w+\s*\(|lambda\b)[^:]*?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)|\bfor\s[^:\n]*?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)[^:\n]*?\bin\b|["'](?:re|regex|py_compile)["']/m;
+	/(?<!^[ \t]*import[ \t]+(?:\w+(?:[ \t]+as[ \t]+\w+)?[ \t]*,[ \t]*)*(?:re|regex)[ \t]+)\bas\s+(?:re|regex|py_compile)\b|(?<![\w.])(?:re|regex|py_compile)\s*(?::[^=\n]*)?:?=(?!=)|\b(?:def|class|for)\s+(?:re|regex|py_compile)\b|\bdef\s+\w+\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)|\blambda\b(?:[^:()[\]{}]|\((?:[^()]|\([^()]*\))*\)|\[(?:[^[\]]|\[[^\]]*\])*\]|\{[^}]*\})*?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)|\bfor\s[^:\n]*?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)[^:\n]*?\bin\b|["'](?:re|regex|py_compile)["']/m;
 
 /** Whether inline code or a script body carries a second-execution marker.
  *  Comments read as code: where a `#` comment ends depends on the language (a
