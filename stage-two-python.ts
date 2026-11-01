@@ -485,12 +485,13 @@ export function startupRefusal(libs: readonly string[], venv: { root: string; sy
 	const realRoot = venv === undefined ? undefined : resolved(venv.root);
 	const realBase = resolved(path.dirname(path.dirname(real)));
 	const realHome = resolved(os.homedir());
-	const rootAllowed = realRoot !== undefined && realBase !== undefined && realRoot !== realHome && realBase !== realRoot && !realBase.startsWith(`${realRoot}${path.sep}`);
+	const rootAllowed = realRoot !== undefined && realBase !== undefined && realRoot !== realHome && realBase !== realRoot && !realBase.startsWith(`${realRoot}${path.sep}`) && !realRoot.startsWith(`${realBase}${path.sep}`);
 	const realSite = rootAllowed && venv !== undefined && version !== undefined ? resolved(path.join(venv.root, "lib", `python${version}`, "site-packages")) : undefined;
 	// Never the user site or the base install's site-packages, however the
 	// venv reaches them.
 	const sharedSites = version === undefined ? [] : [path.join(os.homedir(), ".local", "lib", `python${version}`, "site-packages"), path.join(os.homedir(), "Library", "Python", version, "lib", "python", "site-packages"), path.join(path.dirname(path.dirname(real)), "lib", `python${version}`, "site-packages")].map(resolved);
-	const ownSite = realRoot !== undefined && realSite !== undefined && realSite.startsWith(`${realRoot}${path.sep}`) && !sharedSites.includes(realSite) ? realSite : undefined;
+	// No symlinked component below the root: the real path is the plain one.
+	const ownSite = realRoot !== undefined && version !== undefined && realSite === path.join(realRoot, "lib", `python${version}`, "site-packages") && !sharedSites.includes(realSite) ? realSite : undefined;
 	const inVenv = (dir: string): boolean => ownSite !== undefined && resolved(dir) === ownSite;
 	for (const dir of [...libs, ...sites].filter(dir => !inVenv(dir))) {
 		const custom = safeList(dir).find(entry => CUSTOMIZE.test(entry));
