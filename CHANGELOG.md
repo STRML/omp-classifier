@@ -10,6 +10,14 @@ A SAFE verdict does not release `sudo`: the judge can be steered by text in the 
 
 Replayed against the decision log: of the 9 distinct bash commands that mention one of these words, none gains a flag. Each mention is prose or code, not a command.
 
+### The compile exemption is deny-by-default on the module name
+
+https://github.com/STRML/omp-classifier/pull/243 and https://github.com/STRML/omp-classifier/pull/245 widened the regex that spots a rebound `re`, `regex` or `py_compile`. Every round of review then found another header shape it missed: a `):` inside a string default, a header past the 2000-character cap, an annotation containing `=`. The exemption now holds only when every bare use of those names is an attribute access (`re.compile`) or sits in a plain import statement (`import os, re as regex`, `from re import compile`), read per statement between `;` and line breaks. Any other use voids it, however the code is spelled: a parameter, a loop target, a walrus, a string key for `setattr`, a mention in a comment. `import builtins as re` is an import, so the existing alias check still catches it.
+
+The exemption also never covers a `compile(` with an `exec`, `eval` or `single` mode, a write to the module's own attributes (`re.compile = …`, `re.__dict__[…] = …`, `del re.x`), or text that can rebind the name at run time without spelling it (`globals(`, `vars(`, `setattr(`, `__dict__`, `builtins`, `sys.modules`, `importlib`). Every `compile` or `_compile` token must be a call on a regex module (`re.compile(`): a tuple target, a string `'compile'` or `re._compile = …` voids it. Running a code object without `exec` (`types.FunctionType`, `CodeType`, `__code__`) voids it too. The raw and the NFKC-folded text are both checked and either flags (`ｒｅ = b` binds `re`; a fullwidth `＼` is not a continuation), and `\r` ends a statement as Python reads it.
+
+Measured on 86 past eval payloads that compile only regexes: none lose the exemption.
+
 ### `py_compile.compile(` is not a second execution
 
 `python3 -c "import py_compile; py_compile.compile('/tmp/x/a.py', doraise=True)"` got a SAFE and still blocked with "classifier-safe but flags: python3 -c". The second-execution scan reads `compile(` as the builtin that turns source into runnable code, and exempts only `re.compile(` and `regex.compile(`. `py_compile.compile(` writes a `.pyc` file and runs none of it, so it now gets the same exemption, under the same rebinding guard: `import builtins as py_compile` or `py_compile = builtins` still flags.
