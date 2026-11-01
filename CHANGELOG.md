@@ -15,7 +15,7 @@ An eval payload that set `repo = "<worktree path>"` and then ran `subprocess.run
 | the binding is a top-level, unconditional `name = "<plain literal>"` (optionally `const`/`let`/`var`) | inside an `if`, a bracket, or after a braceless `if (…)` |
 | written before the spawn | `cwd=repo` above `repo = …` |
 | every other bare use is a cwd read | a parameter, a loop target, `obj.repo`, `:repo` |
-| no word that can rebind it unseen, anywhere in the raw text | `globals()`, `setattr`, `getattr`, `exec`, `__import__`, `Function`, `instance_eval`, `globalThis`, `from x import *`, `binding`, `.repo`, `:repo` |
+| no word that can rebind it unseen, anywhere in the raw text | `globals()`, `setattr`, `getattr`, `exec`, `pickle`, any dunder but `__name__`-style ones, `Function`, `constructor`, `instance_eval`, `globalThis`, `from x import *`, `binding`, `.repo`, `:repo` |
 | no Ruby text the mask leaves visible | a heredoc, `=begin` block or `%q\|…\|` literal anywhere in the payload |
 
 Replayed against 3962 past eval payloads that name a cwd: 449 that refused now resolve, and no payload that resolved before changed kind or directory.

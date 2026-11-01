@@ -3086,11 +3086,13 @@ function evalChdirScope(masked: string, site: EvalCwdSiteMatch): EvalChdirScope 
  * directory this payload runs in, and the answer is "ask", not one of the two.
  */
 /** Words that can rebind a name without writing `name =`: a namespace written
- *  through as a dict or an object (`globals()`, `setattr`, `globalThis`), code
- *  built at run time, a star import, and a JS `with` block that puts an
- *  object's keys in scope. Tested against the RAW text, since an f-string,
- *  `${}` or `#{}` interpolation runs code the mask hides. */
-const EVAL_NAME_REBINDERS = /(?<![\w$])(?:globals|locals|vars|exec|eval|setattr|__setattr__|__dict__|__builtins__|builtins|f_globals|f_locals|binding|local_variable_set|globalThis|window|global|Reflect|getattr|__getattribute__|__import__|importlib|inspect|ctypes|Function|setTimeout|setInterval|vm|this|send|public_send|__send__|instance_eval|class_eval|module_eval|instance_exec|const_set|define_method)(?![\w$])|\bimport\s*\*|\bwith\s*\(/u;
+ *  through as a dict or an object (`globals()`, `setattr`, `globalThis`,
+ *  `f.__globals__`, `gc.get_referrers`), code built or loaded at run time
+ *  (`exec`, `pickle`, `constructor`, node's `vm`), a star import, and a JS
+ *  `with` block that puts an object's keys in scope. Every dunder counts but a
+ *  few that only name a module or file. Tested against the RAW text, since an
+ *  f-string, `${}` or `#{}` interpolation runs code the mask hides. */
+const EVAL_NAME_REBINDERS = /(?<![\w$])(?:globals|locals|vars|exec|eval|setattr|__setattr__|__dict__|__builtins__|builtins|f_globals|f_locals|binding|local_variable_set|globalThis|window|global|Reflect|getattr|__getattribute__|__import__|importlib|inspect|ctypes|Function|setTimeout|setInterval|vm|this|send|public_send|__send__|instance_eval|class_eval|module_eval|instance_exec|const_set|define_method|gc|pickle|cPickle|marshal|dill|cloudpickle|shelve|jsonpickle|runpy|constructor|runInThisContext|runInNewContext|runInContext|TOPLEVEL_BINDING|ObjectSpace)(?![\w$])|(?<![\w$.])compile\s*\(|__(?!(?:name|main|file|init|future|doc|version)__)\w+__|\bimport\s*\*|\bwith\s*\(/u;
 
 /** A Ruby heredoc opener, `=begin` block or percent literal: text maskCodeText
  *  leaves visible although Ruby never runs it as code. */
