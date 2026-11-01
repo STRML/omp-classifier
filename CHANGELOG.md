@@ -8,6 +8,21 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 `python3 -c "import py_compile; py_compile.compile('/tmp/x/a.py', doraise=True)"` got a SAFE and still blocked with "classifier-safe but flags: python3 -c". The second-execution scan reads `compile(` as the builtin that turns source into runnable code, and exempts only `re.compile(` and `regex.compile(`. `py_compile.compile(` writes a `.pyc` file and runs none of it, so it now gets the same exemption, under the same rebinding guard: `import builtins as py_compile` or `py_compile = builtins` still flags.
 
+### A substitution holding `${…}` keeps the plain word match
+
+https://github.com/STRML/omp-classifier/pull/239 stopped the substitution scan from reading `eval` inside `eval-file` by treating `-` and `.` as part of a shell word. A parameter expansion breaks that rule: `$(${x:-rm} -rf y)` and `$(${x-rm} y)` run `rm`, and the `rm` follows a `-`. A span that holds `${` now uses the plain `\b` match it used before #239, so both flag `rm` again. Spans without one keep the shell-word reading.
+
+### A commit message is blanked after a leading `cd`
+
+`cd <repo> && git add -A && git commit -q -m "Refuse ota and reboot ..."` refused with "critical pattern: matches a built-in dangerous-command pattern", and a critical refusal never yields for the session. The critical scan already blanks `git commit` message words in a plain chain of `git add`, `git commit`, `git log` and `git status`, but any other command in the chain turned blanking off, and agents start most chains with `cd`. One leading `cd <literal dir>` is now allowed in front of the chain. `git -C <dir>` already did the same thing.
+
+| Command | Message scanned |
+|---|---|
+| `cd /repo && git add -A && git commit -m "…reboot…"` | no |
+| `cd "$DIR" && …`, `cd -P /repo && …`, `CDPATH=x cd …`, `cd /a > log && …`, two `cd`s, a `cd` after git | yes, as before |
+
+Six such refusals are in the decision log since 2026-09-19.
+
 ### A substitution flags whole shell words
 
 `php tools/rebuild-claim-parts.php self-test` got a SAFE and still blocked with "classifier-safe but flags: eval". The judged text holds the PHP body, whose comment reads `` `wp eval-file <this file>` ``. The substitution scan reads backtick spans for risk verbs and matched each one with `\b`, which stops at `-` and `.`. So it found `eval` inside `eval-file`. A shell word runs on through those characters, and the top-level verb scan already reads it that way.

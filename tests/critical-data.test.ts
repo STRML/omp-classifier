@@ -191,6 +191,28 @@ describe("criticalScanText", () => {
 		expect(scanned.endsWith(" && git log")).toBe(true);
 	});
 
+	// From the decision log: `cd <repo> && git add -A && git commit -m "...reboot..."`
+	// refused for good on its message, though `git -C <repo>` would have passed.
+	test("a leading cd to a literal directory still blanks the message", () => {
+		const command = `cd /work/repo && git add -A && git commit -q -m "refuse ota and reboot"`;
+		const scanned = criticalScanText(command);
+		expect(scanned.length).toBe(command.length);
+		expect(scanned).not.toContain("reboot");
+		expect(scanned.startsWith("cd /work/repo && git add -A && git commit -q -m ")).toBe(true);
+	});
+
+	test.each([
+		["a cd alone", `cd "reboot"`],
+		["a cd after the git command", `git commit -m "reboot" && cd /work`],
+		["a cd with an option", `cd -P /work && git commit -m "reboot"`],
+		["a cd to an expansion", `cd "$DIR" && git commit -m "reboot"`],
+		["a cd with an env prefix", `CDPATH=/x cd work && git commit -m "reboot"`],
+		["a cd with a file redirect", `cd /work > /tmp/log && git commit -m "reboot"`],
+		["two cds", `cd /a && cd /b && git commit -m "reboot"`],
+	])("keeps the full scan for %s", (_why, command) => {
+		expect(criticalScanText(command)).toBe(command);
+	});
+
 	test("returns the text unchanged when the parser rejects it", () => {
 		const command = `git commit -m "unterminated reboot`;
 		expect(criticalScanText(command)).toBe(command);
