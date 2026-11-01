@@ -4,6 +4,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### A substitution holding `${…}` keeps the plain word match
+
+https://github.com/STRML/omp-classifier/pull/239 stopped the substitution scan from reading `eval` inside `eval-file` by treating `-` and `.` as part of a shell word. A parameter expansion breaks that rule: `$(${x:-rm} -rf y)` and `$(${x-rm} y)` run `rm`, and the `rm` follows a `-`. A span that holds `${` now uses the plain `\b` match it used before #239, so both flag `rm` again. Spans without one keep the shell-word reading.
+
 ### A substitution flags whole shell words
 
 `php tools/rebuild-claim-parts.php self-test` got a SAFE and still blocked with "classifier-safe but flags: eval". The judged text holds the PHP body, whose comment reads `` `wp eval-file <this file>` ``. The substitution scan reads backtick spans for risk verbs and matched each one with `\b`, which stops at `-` and `.`. So it found `eval` inside `eval-file`. A shell word runs on through those characters, and the top-level verb scan already reads it that way.

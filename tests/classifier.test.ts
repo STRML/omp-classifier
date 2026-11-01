@@ -292,7 +292,7 @@ describe("matcher unit spec", () => {
 		for (const benign of ["echo `wp eval-file x.php`", "echo $(docker run --rm img)", "echo $(./rm.sh)", "echo $(dd-wrt-status)"]) {
 			expect({ benign, flags: matchModerateRiskTokens(benign) }).toEqual({ benign, flags: [] });
 		}
-		for (const [risky, flag] of [["echo `eval $x`", "eval"], ["echo $(/bin/rm -rf x)", "rm"], ["echo $(x;rm y)", "rm"], ["echo $(\\rm y)", "rm"], ['echo "$(sudo ls)"', "sudo"]]) {
+		for (const [risky, flag] of [["echo `eval $x`", "eval"], ["echo $(${x:-rm} -rf y)", "rm"], ["echo $(${x-rm} -rf y)", "rm"], ["echo $(${x:-eval} \"$y\")", "eval"], ["echo $(/bin/rm -rf x)", "rm"], ["echo $(x;rm y)", "rm"], ["echo $(\\rm y)", "rm"], ['echo "$(sudo ls)"', "sudo"]]) {
 			expect({ risky, flags: matchModerateRiskTokens(risky) }).toEqual({ risky, flags: expect.arrayContaining([flag]) });
 		}
 	});
