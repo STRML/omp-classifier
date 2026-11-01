@@ -3085,10 +3085,35 @@ function evalChdirScope(masked: string, site: EvalCwdSiteMatch): EvalChdirScope 
  * one spawn in the session directory, another in `/` — there is no single
  * directory this payload runs in, and the answer is "ask", not one of the two.
  */
-/** Words that can rebind a name in text this scan never sees: a namespace
- *  written through as a dict, code built at run time, a star import, and a JS
- *  `with` block that puts an object's keys in scope. */
-const EVAL_NAME_REBINDERS = /\b(?:globals|locals|vars|exec|eval|setattr|__dict__|__builtins__|builtins|f_globals|f_locals|binding|local_variable_set)\b|\bimport\s*\*|\bwith\s*\(/u;
+/** Words that can rebind a name without writing `name =`: a namespace written
+ *  through as a dict or an object (`globals()`, `setattr`, `globalThis`), code
+ *  built at run time, a star import, and a JS `with` block that puts an
+ *  object's keys in scope. Tested against the RAW text, since an f-string,
+ *  `${}` or `#{}` interpolation runs code the mask hides. */
+const EVAL_NAME_REBINDERS = /(?<![\w$])(?:globals|locals|vars|exec|eval|setattr|__setattr__|__dict__|__builtins__|builtins|f_globals|f_locals|binding|local_variable_set|globalThis|window|global|Reflect)(?![\w$])|\bimport\s*\*|\bwith\s*\(/u;
+
+/** A Ruby heredoc opener, `=begin` block or percent literal: text maskCodeText
+ *  leaves visible although Ruby never runs it as code. */
+const EVAL_UNMASKED_RUBY_TEXT = /<<[~-]?(?:["'`]?[A-Za-z_])|^=begin\b|%[qQwWiIrsx]?[^\w\s(\[{<]/mu;
+
+/** Whether every use of `name` inside a string is plain text or a bare
+ *  interpolation read (`f"{wt}/a"`, `${wt}`, `#{wt}`). Anything else inside an
+ *  interpolation can change it where the mask hides the code: Ruby strings are
+ *  mutable (`"#{repo << '/x'}"`) and JS can destructure into a name
+ *  (`${[repo] = ["/"]}`). */
+function stringUsesAreReads(masked: string, code: string, name: string): boolean {
+	for (const match of code.matchAll(new RegExp(`(?<![\\w$])${name}(?![\\w$])`, "gu"))) {
+		const at = match.index ?? 0;
+		if (masked[at] !== MASK_FILL) continue;
+		let start = at;
+		while (start > 0 && masked[start - 1] === MASK_FILL) start -= 1;
+		const before = code.slice(start, at);
+		const open = (before.match(/\{/gu) ?? []).length - (before.match(/\}/gu) ?? []).length;
+		if (open <= 0) continue;
+		if (code[at - 1] !== "{" || code[at + name.length] !== "}") return false;
+	}
+	return true;
+}
 
 /** Whether the masked text before `at` puts it at the top level of the
  *  payload: no bracket left open, and not the body of a braceless `if (…)`,
@@ -3118,7 +3143,14 @@ function atPayloadTopLevel(masked: string, at: number): boolean {
  * that could rebind it unseen leaves the cwd unreadable, as before.
  */
 function constantCwdText(masked: string, code: string, name: string, siteAt: number): string | null {
-	if (!/^[A-Za-z_][\w]*$/u.test(name) || EVAL_NAME_REBINDERS.test(masked)) return null;
+	if (!/^[A-Za-z_][\w]*$/u.test(name) || EVAL_NAME_REBINDERS.test(code)) return null;
+	// An attribute or symbol spelling anywhere, interpolations included
+	// (`f"{importlib.import_module('__main__').repo}"`, `:repo`), can be a write.
+	if (new RegExp(`(?<![\\w$])[.:]${name}(?![\\w$])`, "u").test(code)) return null;
+	// Ruby text the mask does not hide (a heredoc body, `=begin` block or `%q|…|`
+	// literal) could hold a line that reads as the binding but never runs.
+	if (EVAL_UNMASKED_RUBY_TEXT.test(code)) return null;
+	if (!stringUsesAreReads(masked, code, name)) return null;
 	// The mask hides string bodies, and an interpolation inside one can write
 	// the name (`f"{(repo := '/')}"`, `${repo = "/"}`, `"#{repo = '/'}"`). So
 	// count writes in the raw text too: the one binding must be the only one.

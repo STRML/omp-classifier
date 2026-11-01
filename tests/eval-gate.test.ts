@@ -322,6 +322,13 @@ describe("eval spawn cwd (issue #14)", () => {
 		["a concatenation", 'repo="/tmp" + x\nsubprocess.run(["ls"], cwd=repo)'],
 		["a Ruby binding write", 'repo = "/tmp/r"\nbinding.local_variable_set(:repo, "/")\nsystem("ls", chdir: repo)'],
 		["inside an open bracket", 'x = (1,\nrepo = "/tmp/r")\nsubprocess.run(["ls"], cwd=repo)'],
+		// Code inside an interpolation runs where the mask hides it (review round 1).
+		["globals() inside an f-string", "repo=\"/tmp/r\"\nprint(f\"{globals().update({'repo': '/'})}\")\nsubprocess.run([\"rm\", \"-rf\", \".\"], cwd=repo)"],
+		["setattr with a split name inside an f-string", "repo=\"/tmp/r\"\nprint(f\"{setattr(sys.modules[__name__], 'r'+'epo', '/')}\")\nsubprocess.run([\"ls\"], cwd=repo)"],
+		["a module attribute inside an f-string", "repo=\"/tmp/r\"\nprint(f\"{__import__('importlib').import_module('__main__').repo}\")\nsubprocess.run([\"ls\"], cwd=repo)"],
+		["a Ruby in-place append inside an interpolation", "repo = \"/tmp/r\"\nputs \"#{repo << '/x'}\"\nsystem(\"ls\", chdir: repo)"],
+		["a fake binding in a Ruby heredoc", 'x = <<~EOS\nrepo = "/tmp/r"\nEOS\nsystem("ls", chdir: repo)'],
+		["a fake binding in a =begin block", '=begin\nrepo = "/tmp/r"\n=end\nsystem("ls", chdir: repo)'],
 	])("a name stays unreadable when it is %s", (_why, code) => {
 		expect(evalSpawnCwd(code, SESSION).kind).toBe("opaque");
 	});
