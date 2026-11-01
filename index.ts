@@ -3147,10 +3147,20 @@ function constantCwdText(masked: string, code: string, name: string, siteAt: num
 	if (!/^[A-Za-z_][\w]*$/u.test(name) || EVAL_NAME_REBINDERS.test(code)) return null;
 	// The scans match the name's ASCII spelling, and code can spell it other
 	// ways: a JS identifier escape (`r\u0065po = "/"`) and Python's NFKC
-	// folding (`ｒｅｐｏ = "/"` binds `repo`). Code outside strings that holds
-	// either is refused; the mask hides strings, so an escape or accent inside
-	// one costs nothing.
+	// folding (`ｒｅｐｏ = "/"` binds `repo`), inside an interpolation too
+	// (`${r\u0065po = "/"}`, `f"{(ｒｅｐｏ := '/')}"`). So decode the escapes
+	// and fold the whole raw text: any spelling that becomes the name there
+	// and is not the name here refuses. Code outside strings that holds a
+	// non-ASCII character or an escape refuses as well.
 	if (/[^\x00-\x7f]|\\u/u.test(masked)) return null;
+	const spellings = (text: string): number => (text.match(new RegExp(`(?<![\\w$])${name}(?![\\w$])`, "gu")) ?? []).length;
+	const folded = code
+		.replace(/\\u\{([0-9a-fA-F]{1,6})\}|\\u([0-9a-fA-F]{4})/gu, (escape, braced: string | undefined, plain: string | undefined) => {
+			const point = Number.parseInt(braced ?? plain ?? "", 16);
+			return point <= 0x10ffff ? String.fromCodePoint(point) : escape;
+		})
+		.normalize("NFKC");
+	if (spellings(folded) !== spellings(code)) return null;
 	// Ruby text the mask does not hide (a heredoc body, `=begin` block or `%q|…|`
 	// literal) could hold a line that reads as the binding but never runs.
 	if (EVAL_UNMASKED_RUBY_TEXT.test(code)) return null;
