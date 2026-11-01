@@ -3116,6 +3116,20 @@ function hiddenUsesAreReads(masked: string, code: string, name: string): boolean
 	return true;
 }
 
+/** Whether a `\u` escape or a non-ASCII character in `code` becomes an ASCII
+ *  identifier character once decoded or NFKC-folded (`\u0065`, `ｅ`, `ﬁ`). */
+function spellsAsciiIdentifier(code: string): boolean {
+	const identifier = /[A-Za-z0-9_$]/u;
+	for (const escape of code.matchAll(/\\u\{([0-9a-fA-F]{1,6})\}|\\u([0-9a-fA-F]{4})/gu)) {
+		const point = Number.parseInt(escape[1] ?? escape[2] ?? "", 16);
+		if (point <= 0x10ffff && identifier.test(String.fromCodePoint(point))) return true;
+	}
+	for (const char of code.matchAll(/[^\x00-\x7f]/gu)) {
+		if (identifier.test(char[0].normalize("NFKC"))) return true;
+	}
+	return false;
+}
+
 /** Whether the masked text before `at` puts it at the top level of the
  *  payload: no bracket left open, and not the body of a braceless `if (…)`,
  *  `else` or `do` on the line before. */
@@ -3148,19 +3162,11 @@ function constantCwdText(masked: string, code: string, name: string, siteAt: num
 	// The scans match the name's ASCII spelling, and code can spell it other
 	// ways: a JS identifier escape (`r\u0065po = "/"`) and Python's NFKC
 	// folding (`ｒｅｐｏ = "/"` binds `repo`), inside an interpolation too
-	// (`${r\u0065po = "/"}`, `f"{(ｒｅｐｏ := '/')}"`). So decode the escapes
-	// and fold the whole raw text: any spelling that becomes the name there
-	// and is not the name here refuses. Code outside strings that holds a
-	// non-ASCII character or an escape refuses as well.
-	if (/[^\x00-\x7f]|\\u/u.test(masked)) return null;
-	const spellings = (text: string): number => (text.match(new RegExp(`(?<![\\w$])${name}(?![\\w$])`, "gu")) ?? []).length;
-	const folded = code
-		.replace(/\\u\{([0-9a-fA-F]{1,6})\}|\\u([0-9a-fA-F]{4})/gu, (escape, braced: string | undefined, plain: string | undefined) => {
-			const point = Number.parseInt(braced ?? plain ?? "", 16);
-			return point <= 0x10ffff ? String.fromCodePoint(point) : escape;
-		})
-		.normalize("NFKC");
-	if (spellings(folded) !== spellings(code)) return null;
+	// (`${r\u0065po = "/"}`, `f"{(ｒｅｐｏ := '/')}"`). Any escape or character
+	// in the raw text that decodes or folds to an ASCII identifier character
+	// refuses; an accent, an arrow or an emoji in a message does not. Code
+	// outside strings that holds a non-ASCII character or an escape refuses too.
+	if (/[^\x00-\x7f]|\\u/u.test(masked) || spellsAsciiIdentifier(code)) return null;
 	// Ruby text the mask does not hide (a heredoc body, `=begin` block or `%q|…|`
 	// literal) could hold a line that reads as the binding but never runs.
 	if (EVAL_UNMASKED_RUBY_TEXT.test(code)) return null;

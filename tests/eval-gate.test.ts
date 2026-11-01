@@ -341,6 +341,7 @@ describe("eval spawn cwd (issue #14)", () => {
 		["rebound through an escape inside a template interpolation", 'let repo = "/tmp/r";\n`${r\\u0065po = "/"}`;\nsubprocess.run(["ls"], cwd=repo)'],
 		["rebound through an NFKC name inside an f-string", 'repo="/tmp/r"\nf"{(\uff52\uff45\uff50\uff4f := \'/\')}"\nsubprocess.run(["ls"], cwd=repo)'],
 		["an NFKC name after an inner {} inside an f-string", 'repo="/tmp/r"\nf"{ {}.get(1) or (\uff52\uff45\uff50\uff4f := \'/\') }"\nsubprocess.run(["ls"], cwd=repo)'],
+		["an NFKC name balanced by a match the folding removes", 'repo="/tmp/r"\nx = "repo\uff58"\nf"{(\uff52\uff45\uff50\uff4f := \'/\')}"\nsubprocess.run(["ls"], cwd=repo)'],
 		["rebound through an NFKC-folded Python name", 'repo="/tmp/r"\n\uff52\uff45\uff50\uff4f="/"\nsubprocess.run(["ls"], cwd=repo)'],
 		["written by code a constructor builds", 'repo = "/tmp/r"\n(() => {}).constructor("re" + "po = 1")()\nsubprocess.run(["ls"], cwd=repo)'],
 	])("a name stays unreadable when it is %s", (_why, code) => {

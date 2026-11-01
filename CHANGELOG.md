@@ -17,7 +17,7 @@ An eval payload that set `repo = "<worktree path>"` and then ran `subprocess.run
 | every other bare use is a cwd read | a parameter, a loop target, `obj.repo`, `:repo` |
 | no word that can rebind it unseen, anywhere in the raw text | `globals()`, `setattr`, `getattr`, `exec`, `pickle`, any dunder but `__name__`-style ones, `Function`, `constructor`, `instance_eval`, `globalThis`, `from x import *`, `binding`, `.repo`, `:repo` |
 | no Ruby text the mask leaves visible | a heredoc, `=begin` block or `%q\|…\|` literal anywhere in the payload |
-| no other spelling of the name: with `\u` escapes decoded and NFKC applied, the raw text holds no more copies of it, and code outside strings is ASCII | `r\u0065po = "/"` (JS), `ｒｅｐｏ = "/"` (Python folds it to `repo`), either inside `${…}` or `f"{…}"` |
+| no other spelling of the name: no `\u` escape or non-ASCII character anywhere decodes or NFKC-folds to an ASCII identifier character, and code outside strings is ASCII | `r\u0065po = "/"` (JS), `ｒｅｐｏ = "/"` (Python folds it to `repo`), either inside `${…}` or `f"{…}"` |
 
 Replayed against 3962 past eval payloads that name a cwd: 449 that refused now resolve, and no payload that resolved before changed kind or directory.
 
