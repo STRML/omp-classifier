@@ -2168,6 +2168,12 @@ const MODERATE_RISK_TOKENS = new Set([
 	"rm", "unlink", "dd", "ddrescue", "shred", "wipefs", "sudo", "eval",
 ]);
 
+// The other ways to run a command as another user. Like `sudo`, a SAFE does
+// not release them, but only as the command a segment runs (directly or
+// through a wrapper): `su` is also a word in prose and a variable name, so it
+// is not scanned for in code text or substitution spans.
+const PRIVILEGE_VERBS = new Set(["doas", "run0", "pkexec", "su", "sudo-rs", "sudoedit"]);
+
 // Interpreters that only matter when they execute inline code (-c/-e);
 // `bash script.sh` is an ordinary invocation.
 const INLINE_CODE_INTERPRETERS = new Set(["python", "python2", "python3", "bash", "sh", "perl"]);
@@ -5033,7 +5039,7 @@ export function matchModerateRiskTokens(
 			flags.add("mkfs");
 			return true;
 		}
-		if (MODERATE_RISK_TOKENS.has(w)) {
+		if (MODERATE_RISK_TOKENS.has(w) || PRIVILEGE_VERBS.has(w)) {
 			flags.add(w);
 			return true;
 		}
@@ -5076,7 +5082,7 @@ export function matchModerateRiskTokens(
 			if (rmForcesDialog(words.slice(1), effectiveCwd)) flags.add(verb);
 			continue;
 		}
-		if (MODERATE_RISK_TOKENS.has(verb)) {
+		if (MODERATE_RISK_TOKENS.has(verb) || PRIVILEGE_VERBS.has(verb)) {
 			flags.add(verb);
 			continue;
 		}

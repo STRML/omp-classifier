@@ -4,6 +4,12 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### `doas`, `run0`, `pkexec`, `su` and `sudoedit` hold like `sudo`
+
+A SAFE verdict does not release `sudo`: the judge can be steered by text in the command, and privilege escalation is one of the forced-flag classes. The other ways to run a command as another user were not in that class, so `doas rm -rf /srv/x` or `run0 systemctl stop x` ran on a SAFE. `doas`, `run0`, `pkexec`, `su`, `sudo-rs` and `sudoedit` now flag when they are the command a segment runs, directly, by path, or through a wrapper such as `timeout`. Only the verb position counts: `su` is also a word in prose and a variable name, so `grep su notes.txt` and code text are not scanned for it.
+
+Replayed against the decision log: of the 9 distinct bash commands that mention one of these words, none gains a flag. Each mention is prose or code, not a command.
+
 ### `py_compile.compile(` is not a second execution
 
 `python3 -c "import py_compile; py_compile.compile('/tmp/x/a.py', doraise=True)"` got a SAFE and still blocked with "classifier-safe but flags: python3 -c". The second-execution scan reads `compile(` as the builtin that turns source into runnable code, and exempts only `re.compile(` and `regex.compile(`. `py_compile.compile(` writes a `.pyc` file and runs none of it, so it now gets the same exemption, under the same rebinding guard: `import builtins as py_compile` or `py_compile = builtins` still flags.
