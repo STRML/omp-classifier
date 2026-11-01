@@ -4,6 +4,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### A substitution holding `${…}` keeps the plain word match
+
+https://github.com/STRML/omp-classifier/pull/239 stopped the substitution scan from reading `eval` inside `eval-file` by treating `-` and `.` as part of a shell word. A parameter expansion breaks that rule: `$(${x:-rm} -rf y)` and `$(${x-rm} y)` run `rm`, and the `rm` follows a `-`. A span that holds `${` now uses the plain `\b` match it used before #239, so both flag `rm` again. Spans without one keep the shell-word reading.
+
 ### A commit message is blanked after a leading `cd`
 
 `cd <repo> && git add -A && git commit -q -m "Refuse ota and reboot ..."` refused with "critical pattern: matches a built-in dangerous-command pattern", and a critical refusal never yields for the session. The critical scan already blanks `git commit` message words in a plain chain of `git add`, `git commit`, `git log` and `git status`, but any other command in the chain turned blanking off, and agents start most chains with `cd`. One leading `cd <literal dir>` is now allowed in front of the chain. `git -C <dir>` already did the same thing.

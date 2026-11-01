@@ -5196,8 +5196,11 @@ function addSubstitutionFlags(text: string, flags: Set<string>): void {
 			// A shell word runs on through `-` and `.`: `wp eval-file`, `--rm` and
 			// `rm.sh` name other words, and the top-level verb scan reads them
 			// the same way. `\b` matched `eval` inside a PHP comment's
-			// `` `wp eval-file` `` and blocked the run on a SAFE.
-			if (new RegExp(`(?<![\\w.-])${token}(?![\\w.-])`, "iu").test(span)) flags.add(token);
+			// `` `wp eval-file` `` and blocked the run on a SAFE. A `${…}`
+			// expansion breaks that rule: `${x:-rm}` and `${x-rm}` expand to
+			// `rm` after a `-`, so a span that holds one keeps the plain `\b`.
+			const boundary = span.includes("${") ? `\\b${token}\\b` : `(?<![\\w.-])${token}(?![\\w.-])`;
+			if (new RegExp(boundary, "iu").test(span)) flags.add(token);
 		}
 		if (/^mkfs\b|^mkfs\./iu.test(span.trim())) flags.add("mkfs");
 	}
