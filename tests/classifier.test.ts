@@ -284,6 +284,19 @@ describe("matcher unit spec", () => {
 		expect(matchModerateRiskTokens("git commit -m x --amend")).toEqual([]);
 	});
 
+	// From the decision log: a PHP tool's comment `` `wp eval-file <this file>` ``
+	// spliced into the judged text read as a substitution, and `\beval\b` matched
+	// inside `eval-file`, blocking the run on a SAFE.
+	test("a substitution flags whole shell words, not a token inside a longer word", async () => {
+		const { matchModerateRiskTokens } = await import("../index.ts");
+		for (const benign of ["echo `wp eval-file x.php`", "echo $(docker run --rm img)", "echo $(./rm.sh)", "echo $(dd-wrt-status)"]) {
+			expect({ benign, flags: matchModerateRiskTokens(benign) }).toEqual({ benign, flags: [] });
+		}
+		for (const [risky, flag] of [["echo `eval $x`", "eval"], ["echo $(/bin/rm -rf x)", "rm"], ["echo $(x;rm y)", "rm"], ["echo $(\\rm y)", "rm"], ['echo "$(sudo ls)"', "sudo"]]) {
+			expect({ risky, flags: matchModerateRiskTokens(risky) }).toEqual({ risky, flags: expect.arrayContaining([flag]) });
+		}
+	});
+
 	test("benign lookalikes of the pass-3 fixes stay unflagged", async () => {
 		const { matchModerateRiskTokens } = await import("../index.ts");
 		expect(matchModerateRiskTokens("echo $(date)")).toEqual([]);

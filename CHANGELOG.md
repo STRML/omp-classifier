@@ -4,6 +4,17 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### A substitution flags whole shell words
+
+`php tools/rebuild-claim-parts.php self-test` got a SAFE and still blocked with "classifier-safe but flags: eval". The judged text holds the PHP body, whose comment reads `` `wp eval-file <this file>` ``. The substitution scan reads backtick spans for risk verbs and matched each one with `\b`, which stops at `-` and `.`. So it found `eval` inside `eval-file`. A shell word runs on through those characters, and the top-level verb scan already reads it that way.
+
+| Span | Before | After |
+|---|---|---|
+| `` `wp eval-file x.php` `` | `eval` | nothing |
+| `$(docker run --rm img)` | `rm` | nothing |
+| `$(./rm.sh)` | `rm` | nothing |
+| `$(/bin/rm -rf x)`, `$(x;rm y)`, `$(\rm y)` | `rm` | `rm` |
+
 ### A syntax check reads no script body
 
 A `php -l` lint of a PHP tool refused with "body exceeds the review limit": the reader sent the 313 KB file to review, though a lint runs none of it. Ruby (`-c`), bash (`-n`) and Python's `py_compile` already counted as syntax-only. The interpreter grammar now marks these too:
