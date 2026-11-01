@@ -3084,6 +3084,68 @@ function evalChdirScope(masked: string, site: EvalCwdSiteMatch): EvalChdirScope 
  * one spawn in the session directory, another in `/` — there is no single
  * directory this payload runs in, and the answer is "ask", not one of the two.
  */
+/** Words that can rebind a name in text this scan never sees: a namespace
+ *  written through as a dict, code built at run time, a star import, and a JS
+ *  `with` block that puts an object's keys in scope. */
+const EVAL_NAME_REBINDERS = /\b(?:globals|locals|vars|exec|eval|setattr|__dict__|__builtins__|builtins|f_globals|f_locals|binding|local_variable_set)\b|\bimport\s*\*|\bwith\s*\(/u;
+
+/** Whether the masked text before `at` puts it at the top level of the
+ *  payload: no bracket left open, and not the body of a braceless `if (…)`,
+ *  `else` or `do` on the line before. */
+function atPayloadTopLevel(masked: string, at: number): boolean {
+	let depth = 0;
+	for (let i = 0; i < at; i += 1) {
+		const char = masked[i];
+		if (char === "(" || char === "[" || char === "{") depth += 1;
+		else if (char === ")" || char === "]" || char === "}") depth -= 1;
+	}
+	if (depth !== 0) return false;
+	const previous = masked.slice(0, at).trimEnd();
+	return previous === "" || !(/[)\\:,=+\-*/%&|^!<>?]$/u.test(previous) || /\b(?:else|do)$/u.test(previous));
+}
+
+/**
+ * The directory text a bare name in a cwd argument stands for, or null.
+ *
+ * `repo = "/x"` then `subprocess.run([...], cwd=repo)` names /x as plainly as
+ * the literal does, but only when nothing else can change what `repo` holds.
+ * Deny-by-default: the name must be bound exactly once, by a top-level,
+ * unconditional `name = "<plain literal>"` line (`const`/`let`/`var` allowed)
+ * written before the site, and every other use of it must be a cwd read
+ * (`cwd=name`, `chdir=name`, `.chdir(name)`). Any other use (a parameter, a
+ * loop target, `global name`, `obj.name`, a second assignment) and any word
+ * that could rebind it unseen leaves the cwd unreadable, as before.
+ */
+function constantCwdText(masked: string, code: string, name: string, siteAt: number): string | null {
+	if (!/^[A-Za-z_][\w]*$/u.test(name) || EVAL_NAME_REBINDERS.test(masked)) return null;
+	// The mask hides string bodies, and an interpolation inside one can write
+	// the name (`f"{(repo := '/')}"`, `${repo = "/"}`, `"#{repo = '/'}"`). So
+	// count writes in the raw text too: the one binding must be the only one.
+	const writes = new RegExp(`(?<![\\w$])${name}\\s*(?:\\*\\*|//|<<|>>|[-+*/%&|^:])?=(?!=)|(?<![\\w$])${name}\\s*(?:\\+\\+|--)|(?:\\+\\+|--)\\s*${name}(?![\\w$])`, "gu");
+	if ((code.match(writes) ?? []).length !== 1) return null;
+	let binding: string | null = null;
+	for (const match of masked.matchAll(new RegExp(`(?<![\\w$])[.:]?${name}(?![\\w$])`, "gu"))) {
+		const at = match.index ?? 0;
+		if (match[0] !== name) return null;
+		const lineStart = masked.lastIndexOf("\n", at - 1) + 1;
+		const head = masked.slice(lineStart, at);
+		const after = masked.slice(at + name.length);
+		const assignment = /^\s*=(?!=)\s*/u.exec(after);
+		if (assignment && /^(?:(?:const|let|var)\s+)?$/u.test(head)) {
+			if (binding !== null || at > siteAt || !atPayloadTopLevel(masked, lineStart)) return null;
+			const valueStart = at + name.length + assignment[0].length;
+			const lineEnd = masked.indexOf("\n", valueStart);
+			const tail = masked.slice(valueStart, lineEnd === -1 ? masked.length : lineEnd).replace(/[\s;]+$/u, "");
+			binding = cwdLiteralText(code.slice(valueStart, valueStart + tail.length));
+			if (binding === null) return null;
+			continue;
+		}
+		const read = /(?:(?<![\w$.])(?:cwd|chdir)\s*=|\.chdir\(\s*)$/u.test(masked.slice(Math.max(0, at - 40), at)) && /^\s*[,)\n]/u.test(`${after}\n`);
+		if (!read) return null;
+	}
+	return binding;
+}
+
 export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
 	const masked = maskCodeText(code);
 	const sites = evalCwdSites(masked);
@@ -3118,18 +3180,15 @@ export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
 			perSite.push(current);
 			continue;
 		}
-		if (argument.kind === "dynamic") {
-			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${argument.detail})`;
-			continue;
-		}
-		const literal = cwdLiteralText(argument.value);
+		const source = argument.kind === "dynamic" ? argument.detail : argument.value;
+		const literal = (argument.kind === "value" ? cwdLiteralText(argument.value) : null) ?? constantCwdText(masked, code, source.trim(), site.at);
 		if (literal === null) {
-			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${truncated(argument.value, 60)})`;
+			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${truncated(source, 60)})`;
 			continue;
 		}
 		const resolved = resolveSpawnCwdLiteral(literal, current);
 		if (resolved === null) {
-			if (opaque === "") opaque = `${site.name}: ${truncated(argument.value, 60)} does not name a directory`;
+			if (opaque === "") opaque = `${site.name}: ${truncated(source, 60)} does not name a directory`;
 			continue;
 		}
 		if (site.kind === "chdir") {

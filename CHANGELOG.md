@@ -4,6 +4,20 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### A spawn cwd named by a constant reads as that constant
+
+An eval payload that set `repo = "<worktree path>"` and then ran `subprocess.run([...], cwd=repo)` refused with "unreadable spawn cwd: the cwd is not a literal (repo)". The scan read only a string written at the spawn itself. A bare name in `cwd=`, `chdir=` or `.chdir(...)` now resolves to the string it holds, under deny-by-default rules:
+
+| Rule | Example that stays unreadable |
+|---|---|
+| bound exactly once, counting writes inside f-strings and templates | `repo="/a"` then `repo="/"`; `f"{(repo := '/')}"` |
+| the binding is a top-level, unconditional `name = "<plain literal>"` (optionally `const`/`let`/`var`) | inside an `if`, a bracket, or after a braceless `if (…)` |
+| written before the spawn | `cwd=repo` above `repo = …` |
+| every other bare use is a cwd read | a parameter, a loop target, `obj.repo`, `:repo` |
+| no word that can rebind it unseen | `globals()`, `setattr`, `exec`, `from x import *`, `binding` |
+
+Replayed against 3962 past eval payloads that name a cwd: 526 that refused now resolve, and no payload that resolved before changed kind or directory.
+
 ### A venv's own site-packages is trusted at interpreter startup
 
 Sam's call (2026-10-31, "Trust user site-packages"). https://github.com/STRML/omp-classifier/pull/218 refused any Python run whose site-packages held a `.pth` file with an import line or a path, or a `sitecustomize`, because that code runs at startup and the reviewer never reads it. Ordinary venvs carry those files: setuptools' `distutils-precedence.pth`, coverage's `.pth`, and an editable install's path file. So every run of the agent's own venv refused. The venv's own site-packages is now trusted like the standard library. Startup files under the venv root are not checked. The base install's site-packages (for a venv that includes system site packages), the user site, a non-root `pythonXY.zip`, `PYTHON*` variables and a stdlib-named file beside the script are still checked as before. The accepted risk is code an earlier call planted in that venv.
