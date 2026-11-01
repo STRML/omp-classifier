@@ -2234,9 +2234,9 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	// POSIX shells: `bash -c '…'`, `bash -s < script`, `bash -o errexit x.sh`.
 	bash: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^[-+]O$|^--rcfile$|^--init-file$/u, stdinFlag: true },
 	sh: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^[-+]O$|^--rcfile$|^--init-file$/u, stdinFlag: true },
-	zsh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
-	dash: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
-	ksh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	zsh: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	dash: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	ksh: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
 	fish: { inline: /^-c$|^--command$/u, value: /^-C$|^--init-command$|^--config$/u, stdinFlag: true },
 	csh: { inline: /^-c$/u, value: /^-f$/u, stdinFlag: true },
 	tcsh: { inline: /^-c$/u, value: /^-f$/u, stdinFlag: true },
@@ -2260,7 +2260,7 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	// long spelling only — the short `-r./pre.js` is a syntax error to node —
 	// which this table does not need to model, since reading a file the
 	// interpreter rejects is the safe direction.
-	node: { inline: /^-e$|^--eval$|^-p$|^--print$/u, syntaxOnly: /^--check$/u, value: /^--input-type$|^-C$|^--conditions$|^--title$/u, file: /^-r$|^--require$|^--import$/u, stdinFlag: false },
+	node: { inline: /^-e$|^--eval$|^-p$|^--print$/u, syntaxOnly: /^--check$|^-c$/u, value: /^--input-type$|^-C$|^--conditions$|^--title$/u, file: /^-r$|^--require$|^--import$/u, stdinFlag: false },
 	deno: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--ext$|^--config$|^--import-map$|^--v8-flags$/u, stdinFlag: false },
 	// `bun --help` here: `-r, --preload=<val>` ("import a module before other
 	// modules are loaded") and its Node-compatibility aliases `--require` and
@@ -2271,7 +2271,8 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	// `-f` is the flag that names the script in its VALUE, so it belongs in the
 	// file class and is read in its attached spellings too (`php -f=x.php`,
 	// `php -fx.php` — both run that file on this machine; round 3 review).
-	php: { inline: PHP_INLINE_FLAG, value: /^-c$|^-d$|^-z$|^--php-ini$|^--define$/u, file: /^-f$|^--file$/u, stdinFlag: false },
+	// `php -l` / `--syntax-check` only lints the file and runs none of it.
+	php: { inline: PHP_INLINE_FLAG, syntaxOnly: /^-l$|^--syntax-check$/u, value: /^-c$|^-d$|^-z$|^--php-ini$|^--define$/u, file: /^-f$|^--file$/u, stdinFlag: false },
 	// `lua -l mod` loads a module through the interpreter's own path and `-i`
 	// is interactive: neither takes a separate value word here, and `--` only
 	// ends the options — so no flag of lua's may consume the script operand
