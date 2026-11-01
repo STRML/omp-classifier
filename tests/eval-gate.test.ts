@@ -337,6 +337,16 @@ describe("eval spawn cwd (issue #14)", () => {
 		["a write the mask took for a string (a regex literal opens one)", 'repo = "/tmp/r"\nx = /"/; repo, = "/"; y = /"/\nDir.chdir(repo)'],
 		["mentioned in plain text", 'repo="/tmp/r"\nprint("repo")\nsubprocess.run(["ls"], cwd=repo)'],
 		["written through a function's __globals__", 'repo="/tmp/r"\ndef f(): pass\nf.__globals__["re"+"po"]="/"\nsubprocess.run(["ls"], cwd=repo)'],
+		["rebound through a JS identifier escape", 'let repo = "/tmp/r";\nr\\u0065po = "/";\nsubprocess.run(["ls"], cwd=repo)'],
+		["rebound through an escape inside a template interpolation", 'let repo = "/tmp/r";\n`${r\\u0065po = "/"}`;\nsubprocess.run(["ls"], cwd=repo)'],
+		["rebound through an NFKC name inside an f-string", 'repo="/tmp/r"\nf"{(\uff52\uff45\uff50\uff4f := \'/\')}"\nsubprocess.run(["ls"], cwd=repo)'],
+		["an NFKC name after an inner {} inside an f-string", 'repo="/tmp/r"\nf"{ {}.get(1) or (\uff52\uff45\uff50\uff4f := \'/\') }"\nsubprocess.run(["ls"], cwd=repo)'],
+		["an NFKC name balanced by a match the folding removes", 'repo="/tmp/r"\nx = "repo\uff58"\nf"{(\uff52\uff45\uff50\uff4f := \'/\')}"\nsubprocess.run(["ls"], cwd=repo)'],
+		["rebound through a padded braced escape", 'let repo = "/tmp/r";\n`${r\\u{00000065}po = "/"}`;\nsubprocess.run(["ls"], cwd=repo)'],
+		["aliased by a top-level cwd = name in Ruby", 'repo = "/tmp/r"\ncwd = repo\ncwd.replace("/")\nDir.chdir(repo)'],
+		["set through methodcaller on __main__", 'import operator, __main__\noperator.methodcaller("__se" + "tattr__", "re" + "po", "/")(__main__)\nrepo="/tmp/r"\nsubprocess.run(["ls"], cwd=repo)'],
+		["rebound by cProfile.run on a built string", 'import cProfile\nrepo="/tmp/r"\ncProfile.run("re" + "po = \'/\'")\nsubprocess.run(["ls"], cwd=repo)'],
+		["rebound through an NFKC-folded Python name", 'repo="/tmp/r"\n\uff52\uff45\uff50\uff4f="/"\nsubprocess.run(["ls"], cwd=repo)'],
 		["written by code a constructor builds", 'repo = "/tmp/r"\n(() => {}).constructor("re" + "po = 1")()\nsubprocess.run(["ls"], cwd=repo)'],
 	])("a name stays unreadable when it is %s", (_why, code) => {
 		expect(evalSpawnCwd(code, SESSION).kind).toBe("opaque");

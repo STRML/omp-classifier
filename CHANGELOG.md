@@ -25,11 +25,12 @@ An eval payload that set `repo = "<worktree path>"` and then ran `subprocess.run
 | any use the mask hides (string, comment) is a bare `{repo}` read; the mask can misread code (`//` is floor division in Python, `/"/` opens a string) | `"#{repo << '/x'}"`, `n = 1 // 2; [repo] = ["/"]`, `print("repo")` |
 | the binding is a top-level, unconditional `name = "<plain literal>"` (optionally `const`/`let`/`var`) | inside an `if`, a bracket, or after a braceless `if (…)` |
 | written before the spawn | `cwd=repo` above `repo = …` |
-| every other bare use is a cwd read | a parameter, a loop target, `obj.repo`, `:repo` |
-| no word that can rebind it unseen, anywhere in the raw text | `globals()`, `setattr`, `getattr`, `exec`, `pickle`, any dunder but `__name__`-style ones, `Function`, `constructor`, `instance_eval`, `globalThis`, `from x import *`, `binding`, `.repo`, `:repo` |
+| every other bare use is a cwd read inside a spawn or chdir call's own arguments | a parameter, a loop target, `obj.repo`, `:repo`, a Ruby `cwd = repo` alias |
+| no word that can rebind it unseen, anywhere in the raw text | `globals()`, `setattr`, `getattr`, `exec`, `pickle`, any dunder but `__name__`-style ones, `sys.modules`, `import __main__`, frame access, `methodcaller`, `pdb`/`cProfile`/`trace`/`doctest`/`timeit`, `Function`, `constructor`, `instance_eval`, `globalThis`, `from x import *`, `binding`, `.repo`, `:repo` |
 | no Ruby text the mask leaves visible | a heredoc, `=begin` block or `%q\|…\|` literal anywhere in the payload |
+| no other spelling of the name: no `\u` escape or non-ASCII character anywhere decodes or NFKC-folds to an ASCII identifier character, and code outside strings is ASCII | `r\u0065po = "/"` (JS), `ｒｅｐｏ = "/"` (Python folds it to `repo`), either inside `${…}` or `f"{…}"` |
 
-Replayed against 3962 past eval payloads that name a cwd: 449 that refused now resolve, and no payload that resolved before changed kind or directory.
+Replayed against 3962 past eval payloads that name a cwd: 447 that refused now resolve, and no payload that resolved before changed kind or directory.
 
 ### A syntax check reads no script body
 
