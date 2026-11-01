@@ -2342,12 +2342,32 @@ const REBINDS_REGEX_NAME =
  *  JS regex `/ # /`, PHP's `?>`, a Python f-string spanning lines), so a
  *  comment that names a marker flags. */
 function hasInterpreterCodeRisk(text: string): boolean {
-	// NFKC first: Python folds identifiers, so `ｒｅ = builtins` binds `re`.
-	const joined = text.normalize("NFKC").replace(/\\\r?\n/gu, " ");
+	// Python folds identifiers with NFKC (`ｒｅ = builtins` binds `re`) but reads
+	// punctuation as written, so both spellings are checked and either flags:
+	// folding can add a flag, never remove one.
+	return codeRiskIn(text) || codeRiskIn(text.normalize("NFKC"));
+}
+
+function codeRiskIn(text: string): boolean {
+	const joined = text.replace(/\\(?:\r\n?|\n)/gu, " ");
 	if (INTERPRETER_CODE_RISK.test(joined)) return true;
 	if (!COMPILE_CALL.test(joined)) return false;
 	if (COMPILE_CODE_MODE.test(joined) || RUNTIME_REBINDERS.test(joined) || REGEX_ATTRIBUTE_WRITE.test(joined)) return true;
+	if (!compileOnlyCalledOnRegexModules(joined)) return true;
 	return REBINDS_REGEX_NAME.test(joined) || !regexNamesOnlyRead(joined) || REGEX_COMPILE_ONLY.test(joined);
+}
+
+/** Whether every `compile` and `_compile` token is a call on a regex module:
+ *  `re.compile(`, `regex.compile(`, `py_compile.compile(`. Any other spelling
+ *  (`re.compile, x = builtins.compile, 1`, `re._compile = …`, a string
+ *  `'compile'` for `setattr`) can swap the function the exemption trusts. */
+function compileOnlyCalledOnRegexModules(text: string): boolean {
+	for (const match of text.matchAll(/\b_?compile\b/gu)) {
+		const at = match.index ?? 0;
+		if (match[0] !== "compile" || !/(?<![\w.])(?:re|regex|py_compile)[ \t]*\.[ \t]*$/u.test(text.slice(Math.max(0, at - 20), at))) return false;
+		if (!/^[ \t]*\(/u.test(text.slice(at + match[0].length))) return false;
+	}
+	return true;
 }
 
 /** A compile that builds code: `re.compile` never takes an `exec`, `eval` or
@@ -2355,8 +2375,10 @@ function hasInterpreterCodeRisk(text: string): boolean {
 const COMPILE_CODE_MODE = /compile\([^)]*["'](?:exec|eval|single)["']/u;
 
 /** Ways to rebind `re` without spelling it (`globals().update({"r"+"e": …})`,
- *  `sys.modules[...]`, `setattr`): any of them voids the compile exemption. */
-const RUNTIME_REBINDERS = /(?<![\w.])(?:globals|locals|vars|setattr|delattr)\s*\(|__dict__|__builtins__|(?<![\w.])builtins\b|\bsys\s*\.\s*modules\b|\bimportlib\b/u;
+ *  `sys.modules[...]`, `setattr`), and ways to run a code object without
+ *  `exec` (`types.FunctionType(code, {})()`, `f.__code__ = code`): any of them
+ *  voids the compile exemption. */
+const RUNTIME_REBINDERS = /(?<![\w.])(?:globals|locals|vars|setattr|delattr)\s*\(|__dict__|__builtins__|__code__|(?<![\w.])builtins\b|\bsys\s*\.\s*modules\b|\bimportlib\b|\b(?:FunctionType|CodeType)\b/u;
 
 /** A write to an attribute of the module itself: `re.compile = builtins.compile`,
  *  `re.__dict__["compile"] = …`, `del re.compile`. */
