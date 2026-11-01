@@ -2342,16 +2342,31 @@ const REBINDS_REGEX_NAME =
  *  JS regex `/ # /`, PHP's `?>`, a Python f-string spanning lines), so a
  *  comment that names a marker flags. */
 function hasInterpreterCodeRisk(text: string): boolean {
-	const joined = text.replace(/\\\r?\n/gu, " ");
+	// NFKC first: Python folds identifiers, so `ｒｅ = builtins` binds `re`.
+	const joined = text.normalize("NFKC").replace(/\\\r?\n/gu, " ");
 	if (INTERPRETER_CODE_RISK.test(joined)) return true;
 	if (!COMPILE_CALL.test(joined)) return false;
+	if (COMPILE_CODE_MODE.test(joined) || RUNTIME_REBINDERS.test(joined) || REGEX_ATTRIBUTE_WRITE.test(joined)) return true;
 	return REBINDS_REGEX_NAME.test(joined) || !regexNamesOnlyRead(joined) || REGEX_COMPILE_ONLY.test(joined);
 }
+
+/** A compile that builds code: `re.compile` never takes an `exec`, `eval` or
+ *  `single` mode, whatever name the call goes through. */
+const COMPILE_CODE_MODE = /compile\([^)]*["'](?:exec|eval|single)["']/u;
+
+/** Ways to rebind `re` without spelling it (`globals().update({"r"+"e": …})`,
+ *  `sys.modules[...]`, `setattr`): any of them voids the compile exemption. */
+const RUNTIME_REBINDERS = /(?<![\w.])(?:globals|locals|vars|setattr|delattr)\s*\(|__dict__|__builtins__|(?<![\w.])builtins\b|\bsys\s*\.\s*modules\b|\bimportlib\b/u;
+
+/** A write to an attribute of the module itself: `re.compile = builtins.compile`,
+ *  `re.__dict__["compile"] = …`, `del re.compile`. */
+const REGEX_ATTRIBUTE_WRITE =
+	/(?<![\w.])(?:re|regex|py_compile)[ \t]*\.[\w \t.[\]'"]*?(?:\*\*|\/\/|<<|>>|[-+*/%&|^@])?=(?!=)|\bdel\s+(?:re|regex|py_compile)\s*\./u;
 
 /** A plain import statement: `import os, re as regex`, `from re import
  *  compile`. Read per statement, between `;` and line breaks. */
 const PLAIN_IMPORT_STATEMENT =
-	/^[ \t]*(?:import[ \t]+[\w.]+(?:[ \t]+as[ \t]+\w+)?(?:[ \t]*,[ \t]*[\w.]+(?:[ \t]+as[ \t]+\w+)?)*|from[ \t]+(?:re|regex|py_compile)[ \t]+import[ \t]+[^;\n#]+)[ \t]*(?:#[^\n]*)?$/u;
+	/^[ \t]*(?:import[ \t]+[\w.]+(?:[ \t]+as[ \t]+\w+)?(?:[ \t]*,[ \t]*[\w.]+(?:[ \t]+as[ \t]+\w+)?)*|from[ \t]+(?:re|regex|py_compile)[ \t]+import[ \t]+[^;\r\n#]+)[ \t]*(?:#[^\r\n]*)?$/u;
 
 /**
  * Whether every bare `re`, `regex` or `py_compile` in the text is an attribute
@@ -2365,8 +2380,9 @@ function regexNamesOnlyRead(text: string): boolean {
 	for (const match of text.matchAll(/(?<![\w.])(?:re|regex|py_compile)\b/gu)) {
 		const at = match.index ?? 0;
 		if (/^\s*\./u.test(text.slice(at + match[0].length))) continue;
-		const start = Math.max(text.lastIndexOf("\n", at - 1), text.lastIndexOf(";", at - 1)) + 1;
-		const ends = [text.indexOf("\n", at), text.indexOf(";", at)].filter(end => end !== -1);
+		// Python ends a line at \n, \r or \r\n; a statement also ends at `;`.
+		const start = Math.max(text.lastIndexOf("\n", at - 1), text.lastIndexOf("\r", at - 1), text.lastIndexOf(";", at - 1)) + 1;
+		const ends = [text.indexOf("\n", at), text.indexOf("\r", at), text.indexOf(";", at)].filter(end => end !== -1);
 		if (PLAIN_IMPORT_STATEMENT.test(text.slice(start, ends.length > 0 ? Math.min(...ends) : text.length))) continue;
 		return false;
 	}
