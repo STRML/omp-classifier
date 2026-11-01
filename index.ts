@@ -2234,9 +2234,9 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	// POSIX shells: `bash -c '…'`, `bash -s < script`, `bash -o errexit x.sh`.
 	bash: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^[-+]O$|^--rcfile$|^--init-file$/u, stdinFlag: true },
 	sh: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^[-+]O$|^--rcfile$|^--init-file$/u, stdinFlag: true },
-	zsh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
-	dash: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
-	ksh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	zsh: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	dash: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	ksh: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
 	fish: { inline: /^-c$|^--command$/u, value: /^-C$|^--init-command$|^--config$/u, stdinFlag: true },
 	csh: { inline: /^-c$/u, value: /^-f$/u, stdinFlag: true },
 	tcsh: { inline: /^-c$/u, value: /^-f$/u, stdinFlag: true },
@@ -2260,7 +2260,7 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	// long spelling only — the short `-r./pre.js` is a syntax error to node —
 	// which this table does not need to model, since reading a file the
 	// interpreter rejects is the safe direction.
-	node: { inline: /^-e$|^--eval$|^-p$|^--print$/u, syntaxOnly: /^--check$/u, value: /^--input-type$|^-C$|^--conditions$|^--title$/u, file: /^-r$|^--require$|^--import$/u, stdinFlag: false },
+	node: { inline: /^-e$|^--eval$|^-p$|^--print$/u, syntaxOnly: /^--check$|^-c$/u, value: /^--input-type$|^-C$|^--conditions$|^--title$/u, file: /^-r$|^--require$|^--import$/u, stdinFlag: false },
 	deno: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--ext$|^--config$|^--import-map$|^--v8-flags$/u, stdinFlag: false },
 	// `bun --help` here: `-r, --preload=<val>` ("import a module before other
 	// modules are loaded") and its Node-compatibility aliases `--require` and
@@ -2271,7 +2271,8 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	// `-f` is the flag that names the script in its VALUE, so it belongs in the
 	// file class and is read in its attached spellings too (`php -f=x.php`,
 	// `php -fx.php` — both run that file on this machine; round 3 review).
-	php: { inline: PHP_INLINE_FLAG, value: /^-c$|^-d$|^-z$|^--php-ini$|^--define$/u, file: /^-f$|^--file$/u, stdinFlag: false },
+	// `php -l` / `--syntax-check` only lints the file and runs none of it.
+	php: { inline: PHP_INLINE_FLAG, syntaxOnly: /^-l$|^--syntax-check$/u, value: /^-c$|^-d$|^-z$|^--php-ini$|^--define$/u, file: /^-f$|^--file$/u, stdinFlag: false },
 	// `lua -l mod` loads a module through the interpreter's own path and `-i`
 	// is interactive: neither takes a separate value word here, and `--` only
 	// ends the options — so no flag of lua's may consume the script operand
@@ -4006,29 +4007,62 @@ function hasBundledSyntaxOnlyFlag(word: string, grammar: InterpreterFlagGrammar 
 	return false;
 }
 
-/** True when the interpreter's main file is only parsed, not executed. */
+/** Short options that change only what a syntax check prints (verbose, warnings,
+ *  xtrace), alone or bundled with the check itself (`ruby -cw`, `bash -vn`). */
+const SYNTAX_CHECK_COMPANION = /^-[vwWx]+$/u;
+
+/** Whether a bundle (`-vn`, `-cw`) holds the syntax-only letter and nothing but
+ *  companion letters. A bundle that mixes in any other letter is not a check. */
+function isSyntaxOnlyBundle(word: string, grammar: InterpreterFlagGrammar | undefined): boolean {
+	if (!hasBundledSyntaxOnlyFlag(word, grammar)) return false;
+	return [...word.slice(1)].every(letter => grammar?.syntaxOnly?.test(`-${letter}`) || /[vwWx]/u.test(letter));
+}
+
+/**
+ * True when the interpreter's main file is only parsed, not executed.
+ *
+ * Every option before the program counts, not only the first syntax-only one:
+ * a later option can undo the check (`bash -n +n x.sh`, `zsh -n -i x.sh`,
+ * `zsh -n -o exec x.sh`, `bash -n +o noexec x.sh` and `node -c --no-check x.js`
+ * all run x on this machine). So the check holds only when every other option
+ * is a companion that changes the output alone. Any other option, a `+`
+ * option, or a value-taking one reads the bodies, which is the safe direction.
+ */
 function interpreterSyntaxOnly(segment: string[]): boolean {
 	const invocation = interpreterInvocation(segment);
 	if (!invocation || "opaque" in invocation) return false;
 	const { verb, rest } = invocation;
 	const grammar = INTERPRETER_FLAG_GRAMMAR[verb] ?? INTERPRETER_FLAG_GRAMMAR[verb.replace(/[\d.]+$/u, "")];
+	let checks = false;
+	let other = false;
 	for (let i = 0; i < rest.length; i++) {
 		const word = rest[i];
-		if (word === "--") return false;
-		if (!word.startsWith("-") || word === "-") return false;
+		if (word.startsWith("+")) return false;
+		if (word === "--" || !word.startsWith("-") || word === "-") break;
 		const flag = splitAttachedFlagValue(word);
-		if (hasBundledSyntaxOnlyFlag(word, grammar)) return true;
-		if (grammar?.syntaxOnly?.test(flag.name)) return true;
 		if (verb.startsWith("python") && (flag.name === "-m" || flag.name === "--module")) {
 			return rest[i + 1] === "py_compile";
 		}
-		if (grammar?.value?.test(flag.name) || grammar?.file?.test(flag.name)) {
+		if (SHARED_INLINE_FLAG.test(flag.name) || grammar?.inline.test(flag.name)) return false;
+		if (flag.attached === undefined && grammar?.syntaxOnly?.test(flag.name)) {
+			checks = true;
+			continue;
+		}
+		if (isSyntaxOnlyBundle(word, grammar)) {
+			checks = true;
+			continue;
+		}
+		if (SYNTAX_CHECK_COMPANION.test(word)) continue;
+		// A preload (`node --check -r x.js`) runs, and interpreterProgramRefs
+		// reads it as a loader whatever this returns; it does not undo the check.
+		if (grammar?.file?.test(flag.name)) {
 			if (flag.attached === undefined) i++;
 			continue;
 		}
-		if (SHARED_INLINE_FLAG.test(flag.name) || grammar?.inline.test(flag.name)) return false;
+		other = true;
+		if (grammar?.value?.test(flag.name) && flag.attached === undefined) i++;
 	}
-	return false;
+	return checks && !other;
 }
 
 /** Whether an interpreter has no separate program and will execute stdin. */

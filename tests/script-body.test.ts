@@ -1365,6 +1365,54 @@ describe("syntax-only interpreter modes do not execute file contents", () => {
 		const read = readInterpretedScriptBodies(command, root, 8000);
 		expect({ refusal: read.refusal, bodies: read.bodies, text: read.text }).toEqual({ refusal: null, bodies: [], text: command });
 	});
+	// From the decision log: `php -l` on a 313 KB file refused for the review
+	// limit, though a lint runs none of the file.
+	test.each([
+		["php -l", "php -l payload.php", "payload.php"],
+		["php --syntax-check", "php --syntax-check payload.php", "payload.php"],
+		["node -c", "node -c payload.js", "payload.js"],
+		["zsh -n", "zsh -n payload.sh", "payload.sh"],
+		["dash -n", "dash -n payload.sh", "payload.sh"],
+		["ksh -n", "ksh -n payload.sh", "payload.sh"],
+	])("%s checks syntax and reads no body", (_name, command, file) => {
+		writeScript(root, file, "x".repeat(20000));
+		const read = readInterpretedScriptBodies(command, root, 8000);
+		expect({ refusal: read.refusal, bodies: read.bodies }).toEqual({ refusal: null, bodies: [] });
+	});
+
+	// Each of these runs the file on bash 5, zsh, dash and node 22: a later
+	// option undoes the check, so the body is read.
+	test.each([
+		"bash -n +n payload.sh",
+		"bash -n +o noexec payload.sh",
+		"zsh -n -i payload.sh",
+		"zsh -n -o exec payload.sh",
+		"dash -n +o noexec payload.sh",
+		"ksh -n -e payload.sh",
+		"node -c --no-check payload.sh",
+	])("an option after the check makes it a run: %s", command => {
+		writeScript(root, "payload.sh", "echo ran\n");
+		const read = readInterpretedScriptBodies(command, root, 8000);
+		expect(read.bodies.length).toBe(1);
+	});
+
+	test.each(["bash -vn payload.sh", "bash -n -x payload.sh", "ruby -cw payload.sh"])("a check with output-only companions reads nothing: %s", command => {
+		writeScript(root, "payload.sh", "echo ran\n");
+		expect(readInterpretedScriptBodies(command, root, 8000).bodies).toEqual([]);
+	});
+
+	test("a syntax check beside a real run still reads the run's body", () => {
+		writeScript(root, "payload.php", "<?php system('id');\n");
+		const read = readInterpretedScriptBodies("php -l payload.php && php payload.php", root, 8000);
+		expect(read.bodies.map(body => body.operand)).toEqual(["payload.php"]);
+	});
+
+	test("node -c still reads a module it preloads with -r", () => {
+		writeScript(root, "payload.js", "require('child_process').execSync('id');\n");
+		const read = readInterpretedScriptBodies("node -c payload.js -r ./payload.js", root, 8000);
+		expect(read.bodies.length).toBe(1);
+	});
+
 	test("Ruby attached -r values cannot masquerade as bundled syntax-only flags", () => {
 		const body = 'system("rm -rf ./out")\n';
 		writeScript(root, "payload.rb", body);
