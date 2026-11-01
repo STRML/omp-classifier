@@ -245,6 +245,7 @@ describe("second-execution markers read code, not prose", () => {
 		["compile through re on a multi-line def header", "def f(\n    x: int,\n    re,\n):\n    return re.compile(src, 'x', 'exec')\n"],
 		["compile through re after a colon in a lambda string default", "f = lambda a='x:y', *, re: re.compile(src)\n"],
 		["compile through re after a nested dict lambda default", "f = lambda a={1: {2: 3}}, *, re: re.compile(src)\n"],
+		["compile through re in a lambda split across lines", "f = (lambda a=1,\n    re: re.compile(src))\n"],
 		["compile through re after a nested subscript lambda default", "f = lambda a=d[e[f[0]]], *, re: re.compile(src)\n"],
 		["compile through re after a lambda default slice", "f = lambda a=d[1:2], re=None: re.compile(src)\n"],
 		["compile through re as a lambda parameter", "f = lambda re: re.compile(src, 'x', 'exec')\nf(builtins)\n"],

@@ -2331,10 +2331,11 @@ const REGEX_COMPILE_ONLY = /(?<!\b(?:re|regex|py_compile)\.)compile\(/;
  *  target (`for x, re in`), and the name written as a string, which is how
  *  `setattr` or `globals()` would rebind it. A parameter is read fail-closed:
  *  the bare name anywhere in a `def` header (up to the `):` that ends a line)
- *  or on a `lambda`'s line counts, since nesting and strings in defaults
+ *  or on a `lambda`'s line (or before its first `:`, for a lambda split
+ *  across lines inside brackets) counts, since nesting and strings in defaults
  *  defeat any bracket count a regex can do. */
 const REBINDS_REGEX_NAME =
-	/(?<!^[ \t]*import[ \t]+(?:\w+(?:[ \t]+as[ \t]+\w+)?[ \t]*,[ \t]*)*(?:re|regex)[ \t]+)\bas\s+(?:re|regex|py_compile)\b|(?<![\w.])(?:re|regex|py_compile)\s*(?::[^=\n]*)?:?=(?!=)|\b(?:def|class|for)\s+(?:re|regex|py_compile)\b|\bdef\s+\w+\s*\((?:(?!\)\s*(?:->[^\n]*)?:[ \t]*(?:#[^\n]*)?$)[\s\S]){0,2000}?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)|\blambda\b[^\n]*?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)|\bfor\s[^:\n]*?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)[^:\n]*?\bin\b|["'](?:re|regex|py_compile)["']/m;
+	/(?<!^[ \t]*import[ \t]+(?:\w+(?:[ \t]+as[ \t]+\w+)?[ \t]*,[ \t]*)*(?:re|regex)[ \t]+)\bas\s+(?:re|regex|py_compile)\b|(?<![\w.])(?:re|regex|py_compile)\s*(?::[^=\n]*)?:?=(?!=)|\b(?:def|class|for)\s+(?:re|regex|py_compile)\b|\bdef\s+\w+\s*\((?:(?!\)\s*(?:->[^\n]*)?:[ \t]*(?:#[^\n]*)?$)[\s\S]){0,2000}?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)|\blambda\b[^\n]*?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)|\blambda\b[^:]*?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)|\bfor\s[^:\n]*?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)[^:\n]*?\bin\b|["'](?:re|regex|py_compile)["']/m;
 
 /** Whether inline code or a script body carries a second-execution marker.
  *  Comments read as code: where a `#` comment ends depends on the language (a
