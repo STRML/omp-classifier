@@ -4,6 +4,20 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### A syntax check reads no script body
+
+A `php -l` lint of a PHP tool refused with "body exceeds the review limit": the reader sent the 313 KB file to review, though a lint runs none of it. Ruby (`-c`), bash (`-n`) and Python's `py_compile` already counted as syntax-only. The interpreter grammar now marks these too:
+
+| Interpreter | Syntax-only flag |
+|---|---|
+| php | `-l`, `--syntax-check` |
+| node | `-c` (`--check` already counted) |
+| zsh, dash, ksh | `-n` |
+
+Only the flagged invocation reads nothing. `php -l x.php && php x.php` still reads `x.php` for the second command, and `node -c a.js -r ./b.js` still reads the module `-r` preloads.
+
+A check also counts only when every other option before the program changes output alone (`-v`, `-w`, `-W`, `-x`) or names a preload, which is read anyway. Before, the first `-n` won, though a later option can undo it: `bash -n +n x.sh`, `zsh -n -i x.sh`, `zsh -n -o exec x.sh`, `dash -n +o noexec x.sh` and `node -c --no-check x.js` each ran `x` on this machine with its body unread. That gap was older than this change for bash and sh. Any `+` option, value-taking option or unknown option now reads the body.
+
 ### A venv's own site-packages is trusted at interpreter startup
 
 Sam's call (2026-10-31, "Trust user site-packages"). https://github.com/STRML/omp-classifier/pull/218 refused any Python run whose site-packages held a `.pth` file with an import line or a path, or a `sitecustomize`, because that code runs at startup and the reviewer never reads it. Ordinary venvs carry those files: setuptools' `distutils-precedence.pth`, coverage's `.pth`, and an editable install's path file. So every run of the agent's own venv refused. The venv's own site-packages is now trusted like the standard library. Startup files under the venv root are not checked. The base install's site-packages (for a venv that includes system site packages), the user site, a non-root `pythonXY.zip`, `PYTHON*` variables and a stdlib-named file beside the script are still checked as before. The accepted risk is code an earlier call planted in that venv.
