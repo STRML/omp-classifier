@@ -125,16 +125,18 @@ describe("logJudgedStates", () => {
 		expect(fs.statSync(file).mode & 0o777).toBe(0o600);
 	});
 
-	test("a prior refusal's target is redacted in the states file", async () => {
+	test("a reworded retry's states entry carries no refusal record and no secret", async () => {
 		writeConfig({ logJudgedStates: true });
 		const sid = session();
 		setJevAnswer(jevUnsafeAnswer());
 		await fire("tool_call", makeEvent("mysql --password hunter2-secret -e 'drop table t'"), makeCtx({ sessionId: sid }));
 		setJevAnswer(jevSafeAnswer());
-		// Reworded (two spaces), so the cache misses and the refusal rides in the state.
+		// Reworded (two spaces), so the cache misses and the state is rebuilt.
 		await fire("tool_call", makeEvent("mysql  --password hunter2-secret -e 'drop table t'"), makeCtx({ sessionId: sid }));
 		const second = states()[1];
-		expect(JSON.stringify(second.states.risk)).toContain("priorRefusal");
+		// Refusal memory is the gate's own bookkeeping and stays out of the
+		// judged state; the command is still redacted.
+		expect(JSON.stringify(second.states.risk)).not.toContain("priorRefusal");
 		expect(fs.readFileSync(path.join(dir, "judged-states.jsonl"), "utf8")).not.toContain("hunter2-secret");
 	});
 

@@ -4,6 +4,18 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-10-31
 
+### A host you named reaches the reviewer at UNSAFE too, and refusal memory stops deciding the next verdict
+
+OMP session `01a17b9f`, 2026-10-30/31: the user asked for root ssh to their own TV, said "you run it" repeatedly, and every attempt was refused. The same command scored `escalates_privilege` 0.63, 0.64, 0.70, 0.80, 0.87, 0.88 across six retries, then 0.94 twice the next day. At or above `hazardBlock` the derive takes branch 1 to UNSAFE, and an UNSAFE with that hazard was barred from the reviewer unconditionally, so the user's permission never reached a decision. The message was in the state and the v3 shadow read it as `authorization: goal`; the live jev-v2 path does not consult authorization at all.
+
+| What was wrong | Change |
+|---|---|
+| `escalates_privilege` barred the reviewer on an UNSAFE even when the user named every host the command acts on | the named-host exemption (`namesRemoteHost`) now covers UNSAFE, not just UNSURE; a local sudo, an unnamed host and `destructive_or_irreversible` stay barred |
+| `exposes_secrets` 0.57 on `ssh -i ~/.ssh/key root@host` barred the same command even after that | it yields only for a remote command whose one local secret is the identity file it presents — allowlisted options, named hosts, no other secret-shaped word |
+| The gate's own refusal rode in the judge's state (`recordExtras.priorRefusal`), and each retry scored lower | refusal memory stays out of the state entirely; the refusal still blocks a retried SAFE and still needs the user's words or the reviewer to lift it, and the audit line records `priorRefusal: true` when the memory decided the block |
+
+`logJudgedStates` no longer carries a refusal record, and `tests/refusal-memory.test.ts` reads the audit line instead of the judged state.
+
 ### `doas`, `run0`, `pkexec`, `su` and `sudoedit` hold like `sudo`
 
 A SAFE verdict does not release `sudo`: the judge can be steered by text in the command, and privilege escalation is one of the forced-flag classes. The other ways to run a command as another user were not in that class, so `doas rm -rf /srv/x` or `run0 systemctl stop x` ran on a SAFE. `doas`, `run0`, `pkexec`, `su`, `sudo-rs` and `sudoedit` now flag when they are the command a segment runs, directly, by path, or through a wrapper such as `timeout`. Like `sudo`, they are also matched as words where the segment scan reads a whole segment (a wrapper's or `find`'s arguments), so `timeout 5 grep su notes.txt` flags; over-flagging there is the safe direction. Plain `grep su notes.txt`, code text and substitution spans are not scanned for them, since `su` is also a word in prose and a variable name.
@@ -499,7 +511,7 @@ Whether the user's words cover the command stays the reviewer's call: the code c
 This change alone would not have let the session's commands through:
 
 - No user message or ask named `192.168.86.53`. The user wrote "the TV".
-- The two stop commands also scored `exposes_secrets` 0.64, from `-i ~/.ssh/tv_root_ed25519`, and that hazard stays hard.
+- The two stop commands also scored `exposes_secrets` 0.64, from `-i ~/.ssh/device_ed25519`, and that hazard stays hard.
 - They ran ssh through a variable (`SSH="ssh … root@…"; $SSH '…'`), and the read-only probe ran under `timeout 30`. Shape B does not read either form.
 
 The Codex and Claude review lanes and an adversarial pass found the bypasses the bullets above close: a second ssh in a substitution, a remote-to-remote scp, `ProxyCommand` and `HostName` (before and after the host), `-J`, `-F`, `rsync -e`, `scp -S`, URL operands, an assignment prefix, a local program named `ssh`, options in a variable and a bracketed IPv6 host. Each has a test.

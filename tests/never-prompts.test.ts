@@ -219,12 +219,12 @@ describe("a refusal and the user's words", () => {
 		const named = [...before, userMessage("u2", "yes, delete the branch topic")];
 		expect(resultText(await fire("tool_call", makeEvent(refusedBranch), uiCtx(sid, named)))).toBe("ALLOWED");
 
-		// The record stays: the next call still carries the refusal to the judge
-		// and meets the same check.
+		// The record stays: the next call still meets the refusal, though the
+		// judge is not told about it (the gate's own verdict is not evidence).
 		const calls = modelCalls.length;
 		await fire("tool_call", makeEvent(`${refusedBranch} `), uiCtx(sid, [...named, userMessage("u3", "and again")]));
 		expect(modelCalls.length).toBe(calls + 1);
-		expect(JSON.stringify(stateOf(calls))).toContain("priorRefusal");
+		expect(JSON.stringify(stateOf(calls))).not.toContain("priorRefusal");
 	});
 
 	test("words from before the refusal do not count", async () => {

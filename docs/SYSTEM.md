@@ -315,15 +315,18 @@ behind it. The sweep in L5 exists to make that cheap enough to be routine.
   identity (the active backend and the model it answers with), and cleared whenever the
   effective config signature changes. `UNAVAILABLE` is never cached.
 - **Refusal memory**: what this session refused, keyed by `normalizeActionTarget` (issue #64)
-  plus the cwd, and fed back into the state as `priorRefusal` so rewording cannot launder a
-  refusal into a fresh judgment. A refusal stands for the session: new evidence or operator
-  context reaches the judge but does not erase it. A SAFE under a prior refusal blocks, except
+  plus the cwd. It guards the decision and is never sent to the judge: the gate's own verdict
+  is bookkeeping, not evidence about the command, and feeding it back made a retry score lower
+  on every pass until a hazard crossed its block line and no chat reply could clear it. A
+  refusal stands for the session: new evidence or operator context reaches the judge but does
+  not erase it. A SAFE under a prior refusal blocks, except
   for one call past a model refusal in two cases. The user's messages since the refusal name
   the command's target by `literalMatch` and the SAFE's authorization is grounded
   (`priorRefusalLifts`). Or the stage 2 reviewer allows it, quoting words the user gave since
   the refusal, and those words or the ask question they answer name the target
   (`reviewerLifts`). Critical and cap refusals never yield. ssh, scp and rsync key on where
-  they act, with options dropped (`remoteRefusalKey`).
+  they act, with options dropped (`remoteRefusalKey`). The audit line records `priorRefusal`
+  when the memory, not the verdict, produced the block.
 - **Decision audit**: one JSONL line per decision at
   `<agentDir>/omp-classifier/decisions.jsonl`, every path, with session/decision ids,
   `policyVersion`/`policyHash` (the battery hash), `modelId`, `verdict`, `reasonCode`, the
