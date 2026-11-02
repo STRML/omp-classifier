@@ -4,6 +4,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-11-02
 
+### No agent lifts a refusal for another agent
+
+https://github.com/STRML/omp-classifier/issues/142 asked whether a coordinator may lift a headless worker's refusal. It may not, and that was already the behavior: only the user's own words (`attribution: "user"`) or a stage 2 allow quoting them lift a model refusal, and a headless session reads no user channel. Two tests now pin it: a coordinator steer that names the target does not lift a refusal, and a cap refusal, which never yields, holds in a headless session. `docs/SYSTEM.md` says so in the refusal-memory entry. A wedged headless worker is restart-only.
+
 ### Fixtures and the weekly report carry no private host or path
 
 Test fixtures, eval corpus rows, a plan doc and two changelog lines named a real LAN address, a home directory and private repository paths. They now use `10.0.0.53`, `10.0.1.x`, `/home/dev/...` and generic repo names. The weekly shadow report comment on https://github.com/STRML/omp-classifier/issues/116 printed the full local report path; it now prints it relative to `~`.

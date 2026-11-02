@@ -247,6 +247,30 @@ describe("a refusal and the user's words", () => {
 		expect(refusalOf(await fire("tool_call", makeEvent(`${refusedBranch} `), uiCtx(sid, branch, false))).layer).toBe("prior-refusal");
 	});
 
+	// https://github.com/STRML/omp-classifier/issues/142: no agent may lift a
+	// refusal on another agent's behalf. A coordinator's brief or steer reaches
+	// the worker as a role-user message the host stamps `attribution: "agent"`.
+	test("agent-written words that name the target do not lift a refusal", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		await fire("tool_call", makeEvent(refusedBranch), uiCtx(sid, [userMessage("u1", "tidy up the repo")]));
+		setJevAnswer(jevSafeAnswer());
+		const steer = { type: "message", id: "a1", message: { role: "user", attribution: "agent", content: "yes, delete the branch topic" } };
+		const after = [userMessage("u1", "tidy up the repo"), steer];
+		expect(refusalOf(await fire("tool_call", makeEvent(`${refusedBranch} `), uiCtx(sid, after))).layer).toBe("prior-refusal");
+	});
+
+	// A critical pattern refuses on every call by itself, so the cap is the
+	// refusal that only memory can hold: the short retry passes the length cap.
+	test("a cap refusal stays in a headless session too", async () => {
+		const sid = nextSession();
+		const longTrash = `trash old.log ${"x ".repeat(4100)}`;
+		expect(refusalOf(await fire("tool_call", makeEvent(longTrash), uiCtx(sid, [], false))).layer).toBe("cap");
+		setJevAnswer(jevSafeAnswer());
+		const branch = [userMessage("u1", "yes, delete old.log")];
+		expect(refusalOf(await fire("tool_call", makeEvent("trash old.log"), uiCtx(sid, branch, false))).layer).toBe("prior-refusal");
+	});
+
 	test("with evidenceUserMessages 0 the judge sees no user words, so nothing yields", async () => {
 		fs.writeFileSync(path.join(dir, "omp-classifier.json"), JSON.stringify({ evidenceUserMessages: 0 }));
 		const sid = nextSession();
