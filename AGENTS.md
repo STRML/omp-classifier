@@ -31,12 +31,14 @@ subagents should use the local `node_modules/@oh-my-pi/pi-coding-agent/{src,dist
   logging. A full map is in `codemaps/`.
 - There is no prompt and no text parsing any more. Jev never writes prose: it answers typed
   questions (`choice`, `noul`, `score`), and the verdict is derived in code from the
-  returned probabilities (`deriveJevDecision` under policy version `jev-v2.18`). Do not go
+  returned probabilities: `deriveJevDecision` over the risk battery, read by the jev-v3
+  decision order (`deriveDecisionOrder`, policy version `jev-v3.9`) beside the authorization
+  question's answer. Do not go
   looking for `CLASSIFIER_PROMPT`, a `VERDICT:` regex, or an analysis string to check
   things against; a decision's `reason` is assembled from numbers and hazard ids.
-- The battery is the contract: `jevQuestionsHash()` is the sha256 (first 16 hex chars) of
-  the policy version, the serialized battery, and the default policy, and it participates in
-  the cache key. Editing a question, an option description, or a default threshold therefore
+- The battery is the contract: `CLASSIFIER_POLICY_HASH` hashes `jevQuestionsHash(jev-v3.9)`
+  (the policy version, the serialized battery, and the default policy), the authorization
+  question and its floor, and it participates in the cache key. Editing a question, an option description, or a default threshold therefore
   invalidates every cached verdict — that is the intent, not a bug to paper over with a
   version bump.
 - The credential resolves through the host's AuthStorage (`/login typesafe`, a

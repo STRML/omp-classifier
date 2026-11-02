@@ -51,13 +51,57 @@
  * decisions log itself follows (#71): real history carries private paths,
  * hosts and credential-bearing flags.
  */
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { decisionsLogPath, type DecisionRecord } from "../index";
 import { redactSecrets } from "../redact";
 import { type RoutineRule, type RoutineVariant, ROUTINE_VERBS, SEARCH_VERBS, type SessionTaint, recognizeRoutineCommand } from "../recognizer";
 import { parseShell, verbOf } from "../shell-ast";
-import { type DecisionLog, readDecisionLog } from "./live-report";
+
+interface DecisionLog {
+	lines: DecisionRecord[];
+	/** Line numbers (1-based) that did not parse, or parsed into something
+	 *  that is not a decision line. */
+	malformed: number[];
+}
+
+/** The fields this measurement reads, checked rather than cast: `{}` parses
+ *  as JSON and is still no decision. */
+function isDecisionLine(value: unknown): value is DecisionRecord {
+	if (typeof value !== "object" || value === null) return false;
+	const line = value as Record<string, unknown>;
+	return (
+		typeof line.ts === "string" &&
+		!Number.isNaN(Date.parse(line.ts)) &&
+		(line.tool === "bash" || line.tool === "eval") &&
+		(line.decision === "allow" || line.decision === "block") &&
+		typeof line.layer === "string" &&
+		typeof line.cmd === "string"
+	);
+}
+
+/** Read the log strictly: a missing file throws, and every line that fails to
+ *  parse is reported, never skipped in silence. */
+function readDecisionLog(file: string): DecisionLog {
+	if (!existsSync(file)) throw new Error(`no decision log at ${file}`);
+	const log: DecisionLog = { lines: [], malformed: [] };
+	readFileSync(file, "utf8")
+		.split("\n")
+		.forEach((raw, index) => {
+			if (raw.trim() === "") return;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(raw);
+			} catch {
+				log.malformed.push(index + 1);
+				return;
+			}
+			if (isDecisionLine(parsed)) log.lines.push(parsed);
+			else log.malformed.push(index + 1);
+		});
+	return log;
+}
 
 /** One mined row. `count` only exists on history rows; `label` only on the
  *  authored corpora; `_comment` is the schema line and is skipped. */

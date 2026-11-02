@@ -28,7 +28,6 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { JudgeDeps } from "@oh-my-pi/pi-coding-agent/judgment";
 import * as hostJudgment from "@oh-my-pi/pi-coding-agent/judgment";
 import * as hostAi from "@oh-my-pi/pi-ai";
-import { JEV_V3_POLICY_VERSION, jevQuestions } from "../jev";
 
 export type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "UNAVAILABLE";
 
@@ -221,28 +220,32 @@ export interface CapturedJevRequest {
 export const modelCalls: CapturedJevRequest[] = [];
 
 /**
- * Requests from the jev-v3 shadow (plan Phase 2 step 8), kept apart from
- * `modelCalls`, which counts the live judgment only. A shadow request is
- * answered here without touching the live script: it never uses up a scripted
- * failure, a queued answer, or the delay, so every live assertion reads the
- * same with the shadow on or off.
+ * The authorization requests (jev-v3's second request, asked beside the risk
+ * battery over its own state), kept apart from `modelCalls`, which holds the
+ * risk battery only. An authorization request is answered from its own
+ * script, so it never uses up a scripted risk failure, a queued answer, or the
+ * risk delay: every risk assertion reads the same whatever the authorization
+ * request does.
  */
-export const shadowCalls: CapturedJevRequest[] = [];
-const V3_VERDICT_QUESTION = JSON.stringify(jevQuestions(JEV_V3_POLICY_VERSION).verdict);
-const isShadowRequest = (questions: Record<string, unknown>): boolean =>
-	"user_authorization" in questions || JSON.stringify(questions.verdict) === V3_VERDICT_QUESTION;
-const DEFAULT_SHADOW_AUTHORIZATION = { choice: "none", probabilities: { none: 0.9, goal: 0.05, named: 0.05 }, confidence: 0.9 };
-let shadowAuthorization: Record<string, unknown> = { ...DEFAULT_SHADOW_AUTHORIZATION };
-let shadowFails = false;
+export const authorizationCalls: CapturedJevRequest[] = [];
+const DEFAULT_AUTHORIZATION = { choice: "none", probabilities: { none: 0.9, goal: 0.05, named: 0.05 }, confidence: 0.9 };
+let authorizationAnswer: Record<string, unknown> = { ...DEFAULT_AUTHORIZATION };
+let authorizationFails = false;
+let authorizationDelayMs = 0;
 
-/** Script the shadow's authorization answer. */
-export function setShadowAuthorization(choice: "none" | "goal" | "named", probabilities: Record<string, number>, confidence = 0.9): void {
-	shadowAuthorization = { choice, probabilities, confidence };
+/** Script the authorization answer. */
+export function setAuthorization(choice: "none" | "goal" | "named", probabilities: Record<string, number>, confidence = 0.9): void {
+	authorizationAnswer = { choice, probabilities, confidence };
 }
 
-/** Make every shadow request fail, to prove the live path does not notice. */
-export function setShadowFailure(fail: boolean): void {
-	shadowFails = fail;
+/** Make every authorization request fail while the risk battery answers. */
+export function setAuthorizationFailure(fail: boolean): void {
+	authorizationFails = fail;
+}
+
+/** Hold every authorization request this long (abortable). */
+export function setAuthorizationDelay(ms: number): void {
+	authorizationDelayMs = ms;
 }
 
 /**
@@ -473,10 +476,11 @@ const scriptedJudge: Judge & { readonly kind: "typesafe" } = {
 		// one nothing was ever sent, and a capture here would claim otherwise.
 		if (!jevApiKeyPresent) throw new Error("no TypeSafe credential for provider typesafe");
 		const questions = request.questions as Record<string, unknown>;
-		if (isShadowRequest(questions)) {
-			shadowCalls.push({ state: request.state, questions, model: typesafeModel() });
-			if (shadowFails) throw new Error("shadow judge unavailable");
-			const answers = "user_authorization" in questions ? { user_authorization: { type: "choice", ...shadowAuthorization } } : jevDefaultAnswers;
+		if ("user_authorization" in questions) {
+			authorizationCalls.push({ state: request.state, questions, model: typesafeModel(), signal: options?.signal });
+			await sleepWithAbort(authorizationDelayMs, options?.signal);
+			if (authorizationFails) throw new Error("authorization judge unavailable");
+			const answers = { user_authorization: { type: "choice", ...authorizationAnswer } };
 			return {
 				api: jevAnsweringApi,
 				provider: TYPESAFE_PROVIDER,
@@ -575,6 +579,16 @@ async function fakeJevFetch(
 	init?: { method?: string; body?: string; headers?: unknown; signal?: AbortSignal },
 ): Promise<Response> {
 	const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : undefined;
+	const asked = (body?.questions ?? {}) as Record<string, unknown>;
+	if ("user_authorization" in asked) {
+		authorizationCalls.push({ state: body?.state, questions: asked, model: body?.model, headers: headerRecord(init?.headers), signal: init?.signal });
+		await sleepWithAbort(authorizationDelayMs, init?.signal);
+		if (authorizationFails) return new Response('{"error":"service unavailable"}', { status: 503 });
+		return new Response(JSON.stringify({ model: JEV_FIXTURE_MODEL, answers: { user_authorization: { type: "choice", ...authorizationAnswer } }, usage: { input_tokens: 528, output_tokens: 126 } }), {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
+	}
 	// Captured BEFORE the delay: a judgement that times out was still attempted,
 	// and that is the only evidence a timeout triggered no silent allow.
 	modelCalls.push({
@@ -661,9 +675,10 @@ export async function loadPlugin(settings: Settings): Promise<void> {
 	handlers.clear();
 	registeredCommands.clear();
 	modelCalls.length = 0;
-	shadowCalls.length = 0;
-	shadowAuthorization = { ...DEFAULT_SHADOW_AUTHORIZATION };
-	shadowFails = false;
+	authorizationCalls.length = 0;
+	authorizationAnswer = { ...DEFAULT_AUTHORIZATION };
+	authorizationFails = false;
+	authorizationDelayMs = 0;
 	resolvedJudgeDeps.length = 0;
 	// Every stub knob resets here: each test file's beforeEach loadPlugin()
 	// then starts from the pristine default, so no file can inherit another's
@@ -677,16 +692,6 @@ export async function loadPlugin(settings: Settings): Promise<void> {
 	jevRawQueue.length = 0;
 	jevAnsweringApi = TYPESAFE_PROVIDER;
 	restoreJevApiKey();
-	// The jev-v3 shadow adds two judge requests and several shell parses to
-	// every classification. The suite runs thousands of them in one process,
-	// and on a Linux runner that held the event loop for seconds: refusal
-	// memory > store caps at 20 took 19 to 32 s against its 5 s limit, with
-	// the shadow on and 0.2 s with it off (bisected in a bun 1.3.14
-	// container; no single function was slow). Tests that are not about the
-	// shadow start without it, and a file that is calls enableShadow() after
-	// this. A config the test already wrote is left as it is.
-	const configTarget = process.env.OMP_JEV_CONFIG ?? useTempConfigFile();
-	if (!fs.existsSync(configTarget)) writeConfigFile({ shadowV3: false }, configTarget);
 	const mod = await import("../index.ts");
 	mod.default({
 		pi: { settings },
@@ -744,7 +749,7 @@ export interface CtxOptions {
 	/** Session branch entries for evidence collection (issue #31). Empty by
 	 *  default; the gate reads getBranch() only when evidenceUserMessages > 0. */
 	branch?: ReadonlyArray<{ type: string; id?: string; message?: { id?: string; role?: string; attribution?: string; content?: unknown } }>;
-	/** The session's artifacts directory, which the jev-v3 shadow treats as
+	/** The session's artifacts directory, which the literal match treats as
 	 *  its scratch root. None by default. */
 	artifactsDir?: string;
 }
@@ -927,14 +932,6 @@ export function writeConfigFile(raw: Record<string, unknown>, target: string = u
 	const mtimeMs = Math.max(Date.now(), lastConfigMtimeMs + 1);
 	fs.utimesSync(target, mtimeMs / 1000, mtimeMs / 1000);
 	lastConfigMtimeMs = mtimeMs;
-}
-
-/** Turn the jev-v3 shadow on for a test file that exercises it, keeping any
- *  other config the file already wrote. Call it after loadPlugin(). */
-export function enableShadow(): void {
-	const target = process.env.OMP_JEV_CONFIG ?? useTempConfigFile();
-	const current = fs.existsSync(target) ? (JSON.parse(fs.readFileSync(target, "utf8")) as Record<string, unknown>) : {};
-	writeConfigFile({ ...current, shadowV3: true }, target);
 }
 
 export function removeConfigFile(): void {

@@ -14,7 +14,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { buildJevState, JEV_V3_POLICY_VERSION, jevQuestions } from "../jev";
-import { collectTaskEvidence, collectTaskEvidenceV3, collectToolEvidence, collectUserEvidence } from "../index";
+import { collectTaskEvidenceV3, collectToolEvidence, collectUserEvidence } from "../index";
 import {
 	evidenceOf,
 	fire,
@@ -53,14 +53,14 @@ const userEntry = (content: string | Array<Record<string, unknown>>): BranchEntr
 });
 
 describe("default config", () => {
-	test("the state carries the newest three user messages by default", async () => {
+	test("the state carries the newest three user messages by default, after the pinned first one", async () => {
 		const ctx = makeCtx({
 			sessionId: nextSession(), hasUI: true,
 			branch: [userEntry("one"), userEntry("two"), userEntry("three"), userEntry("four")],
 		});
 		await fire("tool_call", makeEvent("git status"), ctx);
 		expect(modelCalls.length).toBe(1);
-		expect(evidenceOf().userMessages).toEqual(["two", "three", "four"]);
+		expect(evidenceOf().userMessages).toEqual(["one", "two", "three", "four"]);
 	});
 });
 
@@ -82,7 +82,8 @@ describe("evidenceUserMessages", () => {
 		await fire("tool_call", makeEvent("git status"), ctx);
 		expect(modelCalls.length).toBe(1);
 		const evidence = evidenceOf();
-		expect(evidence.userMessages).toEqual(["alpha\nbeta", `${"y".repeat(1_000)}\n…\n${"y".repeat(1_000)}`]);
+		// The first message since /clear is pinned ahead of the window.
+		expect(evidence.userMessages).toEqual(["oldest message, outside the window", "alpha\nbeta", `${"y".repeat(1_000)}\n…\n${"y".repeat(1_000)}`]);
 	});
 });
 
@@ -159,7 +160,7 @@ describe("bounds", () => {
 		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true, branch: [userEntry("check"), userEntry("again"), userEntry("third"), userEntry("fourth")] });
 		await fire("tool_call", makeEvent("git status"), ctx);
 		expect(modelCalls.length).toBe(1);
-		expect(evidenceOf().userMessages).toEqual(["again", "third", "fourth"]);
+		expect(evidenceOf().userMessages).toEqual(["check", "again", "third", "fourth"]);
 	});
 
 	test("zero sends no evidence at all", async () => {
@@ -199,7 +200,7 @@ describe("collectUserEvidence", () => {
 	const branch = [userEntry("one"), { type: "compact", id: "c1" }, userEntry("two"), userEntry("three")];
 
 	test("task evidence retains an old scope instruction and a newer restriction", () => {
-		const snapshot = collectTaskEvidence(
+		const snapshot = collectTaskEvidenceV3(
 			[
 				{ type: "message", id: "m1", message: { role: "user", attribution: "user", content: "For this task, update only the generated build output." } },
 				{ type: "message", id: "m2", message: { role: "user", attribution: "user", content: "continue" } },
@@ -208,8 +209,9 @@ describe("collectUserEvidence", () => {
 			],
 			1,
 		);
-		expect(snapshot.ids).toEqual(["m1", "m4"]);
-		expect(snapshot.messages).toEqual(["For this task, update only the generated build output.", "Do not touch source files."]);
+		// "status?" is the one unscoped message kept as a task-statement candidate.
+		expect(snapshot.ids).toEqual(["m1", "m3", "m4"]);
+		expect(snapshot.messages).toEqual(["For this task, update only the generated build output.", "status?", "Do not touch source files."]);
 	});
 
 	test("empty branch yields an empty list", () => {
@@ -311,11 +313,11 @@ describe("the live collectors start after the latest /clear (#103)", () => {
 		expect(collectUserEvidence(twice, 5)).toEqual(["hi"]);
 	});
 
-	test("collectTaskEvidence reads only post-boundary messages", () => {
-		expect(collectTaskEvidence(branch, 5).ids).toEqual(["h-new1", "h-new2"]);
+	test("collectTaskEvidenceV3 reads only post-boundary messages", () => {
+		expect(collectTaskEvidenceV3(branch, 5).ids).toEqual(["h-new1", "h-new2"]);
 		const twice = [user("a", "deploy"), { type: "reset_boundary" }, user("b", "merge it"), { type: "reset_boundary" }, user("c", "hi")];
-		expect(collectTaskEvidence(twice, 5).ids).toEqual(["h-c"]);
-		expect(collectTaskEvidence([user("a", "deploy"), { type: "reset_boundary", id: "r" }], 5)).toEqual({ messages: [], ids: [] });
+		expect(collectTaskEvidenceV3(twice, 5).ids).toEqual(["h-c"]);
+		expect(collectTaskEvidenceV3([user("a", "deploy"), { type: "reset_boundary", id: "r" }], 5)).toEqual({ messages: [], ids: [] });
 	});
 
 	test("collectToolEvidence reads only post-boundary tool activity", () => {
@@ -333,7 +335,7 @@ describe("the live collectors start after the latest /clear (#103)", () => {
 	test("a branch with no reset_boundary behaves exactly as before", () => {
 		const plain = [user("m1", "deploy production"), user("m2", "look at the logs")];
 		expect(collectUserEvidence(plain, 5)).toEqual(["deploy production", "look at the logs"]);
-		expect(collectTaskEvidence(plain, 5).ids).toEqual(["h-m1", "h-m2"]);
+		expect(collectTaskEvidenceV3(plain, 5).ids).toEqual(["h-m1", "h-m2"]);
 		expect(collectToolEvidence([toolCall("t1", "git status")])).toContain("git status");
 	});
 });
@@ -344,7 +346,7 @@ describe("collectTaskEvidenceV3", () => {
 	test("a task statement that opens the session survives three short replies", () => {
 		// The neuralwatt case. jev-v2 drops it: no scope word, outside the tail.
 		const branch = [user("m1", "add the provider neuralwatt to omp"), user("m2", "ok"), user("m3", "yes"), user("m4", "try it now")];
-		expect(collectTaskEvidence(branch, 3).ids).toEqual(["m2", "m3", "m4"]);
+		expect(collectTaskEvidenceV3(branch, 3).ids).toEqual(["m2", "m3", "m4"]);
 		const snapshot = collectTaskEvidenceV3(branch, 3);
 		expect(snapshot.ids).toEqual(["m2", "m3", "m4"]);
 		expect(snapshot.pinned).toEqual({ id: "m1", text: "add the provider neuralwatt to omp" });

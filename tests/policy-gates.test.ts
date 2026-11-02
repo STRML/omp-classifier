@@ -191,7 +191,7 @@ describe("the battery", () => {
 	test("asks the frozen question set, one question per hazard", async () => {
 		await gate("git status");
 		const questions = questionsOf(0);
-		const expected = ["verdict", ...JEV_FIXTURE_HAZARDS, "blast_radius"];
+		const expected = ["verdict", ...JEV_FIXTURE_HAZARDS, "task_statement", "blast_radius"];
 		expect(Object.keys(questions).sort()).toEqual([...expected].sort());
 		expect((questions.verdict as { type?: string }).type).toBe("choice");
 		expect((questions.blast_radius as { type?: string }).type).toBe("score");

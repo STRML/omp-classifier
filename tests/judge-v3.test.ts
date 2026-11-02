@@ -1,13 +1,13 @@
 /**
- * judgeJevV3: the jev-v3 risk battery and the authorization question, asked in
- * parallel over their two states. Failure-matrix row: "Authorization request
+ * judgeJevV3UnderDeadline: the jev-v3 risk battery and the authorization
+ * question, asked in parallel over their two states under one deadline. Failure-matrix row: "Authorization request
  * fails, risk succeeds → authorization is none". The risk request failing is
  * still no judgment at all.
  */
 import { describe, expect, test } from "bun:test";
 import type { Answer, Judge, JudgeOptions, JudgmentRequest, JudgmentResult, Questions } from "@oh-my-pi/pi-ai";
 import { JEV_HAZARDS, JEV_V3_POLICY_VERSION, JevUnavailableError, jevQuestions } from "../jev";
-import { judgeJevV3 } from "../jev-judge";
+import { judgeJevV3UnderDeadline, type JevV3Outcome } from "../jev-judge";
 
 const riskAnswers: Record<string, Answer> = {
 	verdict: { type: "choice", choice: "safe", probabilities: { safe: 0.95, unsafe: 0.03, unsure: 0.02 }, confidence: 0.92 } as unknown as Answer,
@@ -27,7 +27,7 @@ interface Seen {
 }
 
 /** Answers each request by what it asks; `fail` names the request that throws. */
-function routingJudge(fail?: "risk" | "authorization"): { judge: Judge; seen: Seen } {
+function routingJudge(fail?: "risk" | "authorization", slow?: { request: "risk" | "authorization"; ms: number }): { judge: Judge; seen: Seen } {
 	const seen: Seen = { requests: [], inFlight: 0, maxInFlight: 0 };
 	const judge = {
 		label: "fake",
@@ -35,9 +35,16 @@ function routingJudge(fail?: "risk" | "authorization"): { judge: Judge; seen: Se
 			seen.requests.push({ state: request.state, questions: request.questions });
 			seen.inFlight++;
 			seen.maxInFlight = Math.max(seen.maxInFlight, seen.inFlight);
-			await Bun.sleep(5);
-			seen.inFlight--;
 			const isAuthorization = "user_authorization" in request.questions;
+			const wait = slow !== undefined && slow.request === (isAuthorization ? "authorization" : "risk") ? slow.ms : 5;
+			await new Promise<void>((resolve, reject) => {
+				const timer = setTimeout(resolve, wait);
+				_options?.signal?.addEventListener("abort", () => {
+					clearTimeout(timer);
+					reject(new Error("aborted"));
+				});
+			});
+			seen.inFlight--;
 			if (fail === (isAuthorization ? "authorization" : "risk")) throw new Error("boom");
 			return {
 				api: "typesafe",
@@ -50,38 +57,49 @@ function routingJudge(fail?: "risk" | "authorization"): { judge: Judge; seen: Se
 	return { judge, seen };
 }
 
-describe("judgeJevV3", () => {
+const ask = (judge: Judge, timeoutMs = 1_000): Promise<JevV3Outcome> =>
+	judgeJevV3UnderDeadline({ judge, timeoutMs, riskState: "risk-state", authorizationState: "auth-state" });
+
+describe("judgeJevV3UnderDeadline", () => {
 	test("asks the jev-v3 battery and the authorization question at once, each over its own state", async () => {
 		const { judge, seen } = routingJudge();
-		const result = await judgeJevV3(undefined, { judge, riskState: "risk-state", authorizationState: "auth-state" });
+		const outcome = await ask(judge);
 		expect(seen.maxInFlight).toBe(2);
 		const risk = seen.requests.find(request => !("user_authorization" in request.questions));
 		const authorization = seen.requests.find(request => "user_authorization" in request.questions);
 		expect(JSON.stringify(risk?.questions)).toBe(JSON.stringify(jevQuestions(JEV_V3_POLICY_VERSION)));
 		expect(risk?.state).toBe("risk-state");
 		expect(authorization?.state).toBe("auth-state");
-		expect(result.risk.verdict.choice).toBe("safe");
-		expect(result.risk.taskStatement).toBe(0.8);
-		expect(result.authorization?.level).toBe("named");
-		expect(result.authorizationError).toBeUndefined();
+		if (outcome.kind !== "answered") throw new Error(`expected an answer, got ${outcome.kind}`);
+		expect(outcome.judgment.risk.verdict.choice).toBe("safe");
+		expect(outcome.judgment.risk.taskStatement).toBe(0.8);
+		expect(outcome.judgment.authorization?.level).toBe("named");
+		expect(outcome.judgment.authorizationError).toBeUndefined();
 	});
 
 	test("matrix: a failed authorization request leaves the risk answer standing", async () => {
-		const { judge } = routingJudge("authorization");
-		const result = await judgeJevV3(undefined, { judge, riskState: "risk-state", authorizationState: "auth-state" });
-		expect(result.risk.verdict.choice).toBe("safe");
-		expect(result.authorization).toBeUndefined();
-		expect(result.authorizationError).toMatch(/authorization judgment failed/u);
+		const outcome = await ask(routingJudge("authorization").judge);
+		if (outcome.kind !== "answered") throw new Error(`expected an answer, got ${outcome.kind}`);
+		expect(outcome.judgment.risk.verdict.choice).toBe("safe");
+		expect(outcome.judgment.authorization).toBeUndefined();
+		expect(outcome.judgment.authorizationError).toMatch(/authorization judgment failed/u);
 	});
 
 	test("a failed risk request is no judgment, whatever the authorization said", async () => {
-		const { judge } = routingJudge("risk");
-		let thrown: unknown;
-		try {
-			await judgeJevV3(undefined, { judge, riskState: "risk-state", authorizationState: "auth-state" });
-		} catch (error) {
-			thrown = error;
-		}
-		expect(thrown).toBeInstanceOf(JevUnavailableError);
+		const outcome = await ask(routingJudge("risk").judge);
+		expect(outcome.kind).toBe("failed");
+		if (outcome.kind === "failed") expect(outcome.error).toBeInstanceOf(JevUnavailableError);
+	});
+
+	test("a risk request past the deadline is the deadline, not an answer", async () => {
+		const outcome = await ask(routingJudge(undefined, { request: "risk", ms: 2_000 }).judge, 50);
+		expect(outcome.kind).toBe("deadline");
+	});
+
+	test("an authorization request past the deadline reads as none and the risk answer stands", async () => {
+		const outcome = await ask(routingJudge(undefined, { request: "authorization", ms: 2_000 }).judge, 50);
+		if (outcome.kind !== "answered") throw new Error(`expected an answer, got ${outcome.kind}`);
+		expect(outcome.judgment.authorization).toBeUndefined();
+		expect(outcome.judgment.authorizationError).toMatch(/timed out after 50ms/u);
 	});
 });

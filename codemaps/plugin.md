@@ -16,7 +16,7 @@ Read this before opening index.ts. Line numbers are where each declaration start
 | 1060-1230 | plugin lockfile diagnostic, config format | `lockfileDisablesPlugin`, `formatClassifierConfig`, `QUESTIONS_CONTRACT`, `CLASSIFIER_POLICY_HASH` |
 | 1230-1475 | evidence fingerprinting, outbound network | `evidenceUserSnapshot`, `citableEvidence`, `evidenceFingerprint`, `commandHasOutboundNetwork` |
 | 1474-1580 | judgement tail | `annotateJudgement`, `ReplayDecisionInput`, `replayDecision` (1537) |
-| 1580-1870 | provenance-tiered evidence (#31) | `collectUserEvidence`, `collectTaskEvidence`, `collectTaskEvidenceV3`, `operatorContextFromInput`, `collectToolEvidence`, `mergeOperatorContext` |
+| 1580-1870 | provenance-tiered evidence (#31) | `collectUserEvidence`, `collectTaskEvidenceV3`, `judgedEvidence`, `operatorContextFromInput`, `collectToolEvidence`, `mergeOperatorContext` |
 | 1872-2840 | eval payload scanning | `MODERATE_RISK_TOKENS`, `INTERPRETER_FLAG_GRAMMAR`, `INTERPRETER_CODE_RISK`, `evalRiskFlags`, `evalSubprocessMarkers`, `evalCwdSites`, `evalSpawnCwd` |
 | 2839-3910 | wrappers, interpreters, script bodies (#67) | `WRAPPER_OPTION_GRAMMAR`, `POLICY_UNSTABLE_VERBS`, `interpreterInvocation`, `withoutWrittenHeredocBodies`, `interpreterProgramRefs`, `readInterpretedScriptBodies` (3775) |
 | 3911-4515 | pipe / compound splitting, risk overlay | `splitPipeStages`, `isPlainReadOnlyFetch`, `splitTopLevelCommands`, `rmForcesDialog`, `matchModerateRiskTokens` (4279), `trashFootnote` |
@@ -29,7 +29,6 @@ Read this before opening index.ts. Line numbers are where each declaration start
 |---|---|---|
 | 4701 | `pi.registerCommand("classifier")` | L6 subcommands (below) |
 | 4889 | `readHostPolicy` | host `bash.patterns` + `tools.approval.bash` |
-| 4920 | `shadowJevV3` | v3 shadow; never throws; result goes in `Judgement.v3` |
 | 5061 | `classify` | the live judgment (see pipeline.md) |
 | 5271 | `refusalPayload` | JSON block reason for the agent: `{classifier:"blocked", tool, layer, why, next, notThis, ...axes}` |
 | 5306 | `logDecision` | appends to decisions.jsonl; redacts and truncates `cmd` to 120 chars; dry-run captures here |
@@ -64,8 +63,7 @@ Read this before opening index.ts. Line numbers are where each declaration start
 | `maxCommandLength` | 8000 | bounds 64-100000 |
 | `evidenceUserMessages` | 3 | bounds 0-6 |
 | `trustPolicy` | null | set only by `/classifier trust-policy` |
-| `shadowV3` | true | runs `shadowJevV3` |
-| `logJudgedStates` | false | writes redacted judged states to `judged-states.jsonl` (`recordJudgedState`, 0600, keyed by lead `decisionId`); `BOOLEAN_CONFIG_NOTICES` holds the on/off notices for the three boolean keys |
+| `logJudgedStates` | false | writes redacted judged states to `judged-states.jsonl` (`recordJudgedState`, 0600, keyed by lead `decisionId`); `BOOLEAN_CONFIG_NOTICES` holds the on/off notices for the boolean key |
 
 Config signature (cache-clearing): enabled, typesafeModel, backend id, merged policy, timeoutMs,
 maxCommandLength, evidenceUserMessages, trust-policy signature.
@@ -75,16 +73,16 @@ maxCommandLength, evidenceUserMessages, trust-policy signature.
 (none) prints config · `file` · `dry-run <cmd>` runs `handleToolCall` with capture, nothing
 executes · `status` writes status.json · `reset` · `trust-policy` · `enabled true|false` ·
 `off` / `on` (session pause) · `policy` (read-only merged policy + battery hash) ·
-`timeoutMs` · `maxCommandLength` · `evidenceUserMessages` · `shadowV3` · `logJudgedStates`.
+`timeoutMs` · `maxCommandLength` · `evidenceUserMessages` · `logJudgedStates`.
 
 ## `DecisionRecord` (one audit line, index.ts:922)
 
 `ts, decisionId, sessionId, policyVersion, policyHash, modelId, reasonCode, jev{model,
 probabilities, hazards, confidence, blastRadius, usage, latencyMs}, userMessageIds,
-authorization, v3, tool, decision, layer, why, cmd, cwd, spawnCwd, verdict, cached, ms,
+authorization, tool, decision, layer, why, cmd, cwd, spawnCwd, verdict, cached, ms,
 staleCode, floor{asks, entries}, followsDecisionId, criticalBodies` (`criticalBodies`: JS/Python bodies a critical pattern matched, which went to the judge) (blocked lines point at the verdict/cwd/critical/environment line before them; unclassified lines carry none). Older logs also carry `approval`.
 
-No-UI sessions: `userChannelBranch(ctx)` returns an empty branch when `!ctx.hasUI`, so `evidenceUserSnapshot` and `shadowJevV3` see no user words; tool evidence still reads the whole branch. In a UI session it runs `askAnswersAsUserWords` first, which recasts each `ask` tool result the user answered by hand (not `timedOut`) as a user message, so every user-word reader sees clicks as typed replies. Only the answer (labels, typed input, note) becomes user words, never the agent's question. `collectToolEvidence` drops the calls the gate refused (`refusedToolCallIds`, recorded by the `tool_call` wrapper) with their results, keeps the newest entries under `TOOL_EVIDENCE_MAX_CHARS`, and pins the newest `skill://` read.
+No-UI sessions: `userChannelBranch(ctx)` returns an empty branch when `!ctx.hasUI`, so `evidenceUserSnapshot` sees no user words; tool evidence still reads the whole branch. In a UI session it runs `askAnswersAsUserWords` first, which recasts each `ask` tool result the user answered by hand (not `timedOut`) as a user message, so every user-word reader sees clicks as typed replies. Only the answer (labels, typed input, note) becomes user words, never the agent's question. `collectToolEvidence` drops the calls the gate refused (`refusedToolCallIds`, recorded by the `tool_call` wrapper) with their results, keeps the newest entries under `TOOL_EVIDENCE_MAX_CHARS`, and pins the newest `skill://` read.
 
 `layer` values: `cap`, `rule`, `cwd`, `script-body`, `critical`, `environment`,
 `verdict`, `cached`, `blocked`, `unclassified`, `internal-error` (older logs also hold `dialog`, `headless`, `granted` and `late-verdict`).
@@ -94,7 +92,7 @@ No-UI sessions: `userChannelBranch(ctx)` returns an empty branch when `!ctx.hasU
 | Export | Consumers |
 |---|---|
 | `replayDecision`, `evalRiskFlags`, `matchModerateRiskTokens` | eval/run.ts, tests |
-| `decisionsLogPath`, `DecisionRecord` | eval/live-report.ts, eval/recognizer-measure.ts |
+| `decisionsLogPath`, `DecisionRecord` | eval/recognizer-measure.ts |
 | `classifierConfigPath`, `classifierDataDir`, `readClassifierConfig`, `formatClassifierConfig`, `buildStatusReport`, `normalizeActionTarget`, `collect*Evidence`, `operatorContextFromInput`, `annotateJudgement`, `commandHasOutboundNetwork`, `readInterpretedScriptBodies`, `withoutWrittenHeredocBodies`, `evalSpawnCwd`, `evalSubprocessMarkers`, `pluginStaleSuffix`, `STALE_CODE_SUFFIX` | tests |
 | `jevPolicyFor`, `trashFootnote` | exported, but no consumer outside index.ts |
 | default export | OMP host (and tests/fixtures.ts `loadPlugin`) |

@@ -20,7 +20,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_JEV_POLICY, deriveJevDecision, JEV_HAZARDS, JEV_POLICY_VERSION, type JevAnswers, type JevHazard } from "../jev";
+import { DEFAULT_JEV_POLICY, deriveJevDecision, JEV_HAZARDS, JEV_V3_POLICY_VERSION, type JevAnswers, type JevHazard } from "../jev";
 import {
 	computeIntentMetrics,
 	parseArgs,
@@ -230,8 +230,8 @@ describe("computeIntentMetrics — driven by a fake judge (no network)", () => {
 
 describe("parseArgs", () => {
 	test("--battery selects the battery and rejects an unknown one", () => {
-		expect(parseArgs(["--battery", "jev-v3.8"]).battery).toBe("jev-v3.8");
-		expect(parseArgs([]).battery).toBe(JEV_POLICY_VERSION);
+		expect(parseArgs(["--battery", "jev-v3.9"]).battery).toBe("jev-v3.9");
+		expect(parseArgs([]).battery).toBe(JEV_V3_POLICY_VERSION);
 		expect(() => parseArgs(["--battery", "jev-v9"])).toThrow(/--battery must be one of/u);
 	});
 
@@ -254,8 +254,8 @@ describe("parseArgs", () => {
 	});
 
 	test("an unknown flag or a stray word is an error", () => {
-		expect(() => parseArgs(["--batery", "jev-v3.8"])).toThrow();
-		expect(() => parseArgs(["jev-v3.8"])).toThrow();
+		expect(() => parseArgs(["--batery", "jev-v3.9"])).toThrow();
+		expect(() => parseArgs(["jev-v3.9"])).toThrow();
 	});
 
 	test("numeric flags keep their bounds and --replay its switch", () => {

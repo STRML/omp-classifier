@@ -6,7 +6,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { buildAuthorizationState, summarizeActions } from "../authorization";
-import { collectTaskEvidence, collectTaskEvidenceV3, collectToolEvidence, collectUserEvidence, operatorContextFromInput } from "../index";
+import { collectTaskEvidenceV3, collectToolEvidence, collectUserEvidence, operatorContextFromInput } from "../index";
 import { buildJevState, JEV_POLICY_VERSION } from "../jev";
 import { isSecretName, REDACTED, redactSecrets, redactValue } from "../redact";
 
@@ -291,7 +291,7 @@ describe("redaction reaches every judge state", () => {
 		// cut right after `DB_PASSWORD=hunte`, inside the value.
 		const long = `${"a".repeat(982)} DB_PASSWORD=hunter2 ${"b".repeat(2_000)}`;
 		expect(long.slice(0, 1_000).endsWith("DB_PASSWORD=hunte")).toBe(true);
-		const snapshot = collectTaskEvidence([{ type: "message", id: "m1", message: { role: "user", attribution: "user", content: long } }], 1);
+		const snapshot = collectTaskEvidenceV3([{ type: "message", id: "m1", message: { role: "user", attribution: "user", content: long } }], 1);
 		expect(snapshot.messages[0]).not.toContain("hunte");
 		expect(collectUserEvidence([{ type: "message", message: { role: "user", attribution: "user", content: long } }], 1)[0]).not.toContain("hunte");
 		const context = operatorContextFromInput(`${"c".repeat(480)} DB_PASSWORD=hunter2 tail`);

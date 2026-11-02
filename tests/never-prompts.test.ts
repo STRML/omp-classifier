@@ -34,6 +34,7 @@ import {
 	setJevAnswer,
 	setJevUnavailable,
 	stateOf,
+	setAuthorization,
 } from "./fixtures";
 
 type Branch = ReadonlyArray<{ type: string; id?: string; message?: { role?: string; attribution?: string; content?: unknown } }>;
@@ -216,6 +217,8 @@ describe("a refusal and the user's words", () => {
 		await fire("tool_call", makeEvent(refusedBranch), uiCtx(sid, before));
 
 		setJevAnswer(jevSafeAnswer());
+		// The authorization question reads the user's words as naming the delete.
+		setAuthorization("named", { none: 0.02, goal: 0.03, named: 0.95 });
 		const named = [...before, userMessage("u2", "yes, delete the branch topic")];
 		expect(resultText(await fire("tool_call", makeEvent(refusedBranch), uiCtx(sid, named)))).toBe("ALLOWED");
 

@@ -30,6 +30,7 @@ import {
 	removeConfigFile,
 	resultText,
 	setJevAnswer,
+	setAuthorization,
 } from "./fixtures";
 
 type Entry = { type: string; id?: string; message?: Record<string, unknown> };
@@ -142,6 +143,7 @@ describe("an ask answer and a refusal", () => {
 		expect(refusalOf(await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid, hasUI: true, branch: before }))).layer).toBe("unsafe");
 
 		setJevAnswer(jevSafeAnswer());
+		setAuthorization("named", { none: 0.02, goal: 0.03, named: 0.95 });
 		const after = [...before, askResult("a1", clicked("The gate refused this. Delete the branch topic?", "Yes, delete the branch topic"))];
 		expect(resultText(await fire("tool_call", makeEvent(refused), makeCtx({ sessionId: sid, hasUI: true, branch: after })))).toBe("ALLOWED");
 	});

@@ -83,7 +83,7 @@ Other exports: `secretStoreRead` (95), `secretVariableNames` (102), `secretPathI
 ## literal-match.ts (419 lines): the user's own words cover every segment
 
 `literalMatch(input)` (line 109) → `{matched, actions, incomplete, reason}`. Caller: index
-`shadowJevV3` only (shell language), which feeds `deriveDecisionOrder` branch 4.
+`classify` (shell language), which feeds `deriveDecisionOrder` branch 4.
 - Extracted kinds: `delete` (rm/trash/unlink inside cwd or the session temp dir), `branch-delete`,
   `merge` (`gh pr merge <n>`), `deploy` (a script inside cwd).
 - Inert verbs: ls, pwd, true, cat, echo, and git status/diff/log/show/branch. A redirect, glob,
@@ -147,9 +147,9 @@ signature changes. Repository-local files are never read.
 
 | Function | Line | Role | Called from |
 |---|---|---|---|
-| `matchModerateRiskTokens(cmd, cwd)` | 4279 | destructive-token overlay; a SAFE with flags still asks | bash SAFE branch, late guard, `shadowJevV3`, eval/run |
+| `matchModerateRiskTokens(cmd, cwd)` | 4279 | destructive-token overlay; a SAFE with flags still asks | bash overlay flags (SAFE block + decision order), eval/run |
 | `rmForcesDialog(args, cwd)` | 4259 | rm/unlink shapes: recursive, glob, `..`, dotpath, outside cwd | `matchModerateRiskTokens` |
-| `evalRiskFlags(code)` | 2095 | eval-code overlay | eval SAFE branch, `shadowJevV3`, eval/run |
+| `evalRiskFlags(code)` | 2095 | eval-code overlay | eval overlay flags (SAFE block + decision order), eval/run |
 | `evalSubprocessMarkers(code, lang)` | 2110 | whether an eval payload spawns at all (JS/PY/RB/JL tables) | eval path entry |
 | `evalSpawnCwd(code, cwd)` | 2755 | literal / opaque spawn cwd | eval path |
 | `readInterpretedScriptBodies(cmd, cwd, limit)` | 4220 | splices interpreter script bodies into the judged text, or refuses. Text pass over the masked segments, then a parse pass that reads every interpreter program the text pass did not (same resolved file), and refuses on an expanded verb, any command the parser rejects, or a walk that disagrees with the parse | bash path step 4 |

@@ -23,7 +23,7 @@ Runtime dep: `mvdan-sh` (shell parser, loaded lazily by `shell-ast.ts`). Dev dep
 | Layer | Holds | Files |
 |---|---|---|
 | L6 control plane | `/classifier` command, config bounds, kill switches, status | index.ts (plugin factory, config section) |
-| L5 self-measurement | eval harness, corpora, sweep, shadow report | eval/*.ts, eval/corpus/*.jsonl, eval/weekly-report.sh |
+| L5 self-measurement | eval harness, corpora, sweep | eval/*.ts, eval/corpus/*.jsonl |
 | L4 interaction | refusal payloads, dry-run (the gate never prompts) | index.ts (`refuse`, `REFUSAL_GUIDANCE`, `refusalPayload`) |
 | L3 memory | verdict cache, refusal memory, audit log | index.ts (module state, `logDecision`) |
 | L2 judgment | state + battery, transport, derivation | jev.ts, jev-judge.ts, decision-order.ts, authorization.ts |
@@ -49,7 +49,7 @@ recognizer.ts ─► floor.ts, shell-ast.ts      (not imported by index.ts)
 
 | Module | Imports (local) | Imported by |
 |---|---|---|
-| index.ts | floor, shell-cwd, shell-ast, jev-judge, authorization, decision-order, literal-match, redact, trust-policy, jev | eval/run.ts, eval/live-report.ts, eval/recognizer-measure.ts, tests |
+| index.ts | floor, shell-cwd, shell-ast, jev-judge, authorization, decision-order, literal-match, redact, trust-policy, jev | eval/run.ts, eval/recognizer-measure.ts, tests |
 | jev.ts | redact, shell-ast, shell-cwd, trust-policy(type) | index, jev-judge, decision-order, authorization(type), eval/run, eval/mine-history |
 | jev-judge.ts | authorization, jev | index, eval/run |
 | decision-order.ts | authorization(type), jev | index |
@@ -82,19 +82,18 @@ recognizer.ts ─► floor.ts, shell-ast.ts      (not imported by index.ts)
 
 | Path | Decides? | Where |
 |---|---|---|
-| jev-v2 battery → `deriveJevDecision` | **live** | `classify` (index.ts:5313) |
 | code floor `evaluateFloor` | shadow: `floor` field on every audit line | `shadowFloor` (index.ts:5706) |
-| jev-v3 battery + authorization → `deriveDecisionOrder` (uses `literalMatch`) | shadow: `v3` field; config `shadowV3` (default true) | `shadowJevV3` (index.ts:5168) |
+| jev-v3 battery + authorization → `deriveDecisionOrder` (uses `literalMatch`, reads `deriveJevDecision`) | **live** since #116 | `classify` (index.ts) |
 | `recognizeRoutineCommand` | measurement only | eval/recognizer-measure.ts |
 
 ## Identities and versions
 
 | Name | Value | Defined |
 |---|---|---|
-| `JEV_POLICY_VERSION` (= `CLASSIFIER_POLICY_VERSION`) | `jev-v2.18` | jev.ts:99, index.ts:392 |
-| `JEV_V3_POLICY_VERSION` | `jev-v3.8` | jev.ts:107 |
+| `JEV_V3_POLICY_VERSION` (= `CLASSIFIER_POLICY_VERSION`) | `jev-v3.9` | jev.ts, index.ts |
+| `JEV_POLICY_VERSION` | `jev-v2.18` (base texts; eval baseline) | jev.ts |
 | `AUTHORIZATION_VERSION` | `jev-auth-v2` | authorization.ts:818 |
-| `CLASSIFIER_POLICY_HASH` | `jevQuestionsHash()`: sha256 of version + battery + default policy, 16 hex | index.ts:1228 |
+| `CLASSIFIER_POLICY_HASH` | sha256 of `jevQuestionsHash(v3)` + `jevAuthorizationHash()` + `DEFAULT_AUTHORIZATION_POLICY`, 16 hex | index.ts |
 | `QUESTIONS_CONTRACT` | `questions+probabilities` | index.ts:1222 |
 | `DEFAULT_JEV_MODEL` | `jev-latest` | jev.ts:112 |
 | backend id | `typesafe/<model>` or `endpoint/<baseUrl>#<model>` | jev-judge.ts `judgeBackendFor` |

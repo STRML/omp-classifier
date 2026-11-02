@@ -19,17 +19,21 @@ thresholds. Four consequences shape every layer below:
   nothing to quote, and nothing to render from a model. A layer that "reads what the model
   said" cannot be written, because the model says nothing — it answers questions. Reasons are
   assembled from numbers and hazard ids, and are byte-stable for the same answers.
-- **One request per classification.** The full battery answers in ~0.6s and extra questions
-  in the same request are cheap, so the verdict and all nine hazards ride in one call rather
-  than a second pass over a "review" prompt.
-- **The verdict is a function.** `deriveJevDecision(answers, policy)` is pure: the same
-  answers and the same policy always decide the same thing. A threshold change can therefore
+- **Two requests per classification, in parallel.** The risk battery answers in ~0.6s and
+  extra questions in the same request are cheap, so the verdict and all nine hazards ride in
+  one call. The authorization question is a second request only because it is asked over a
+  second state, one with no command text in it, so wall time is the slower of the two.
+- **The verdict is a function.** `deriveJevDecision(answers, policy)` and
+  `deriveDecisionOrder(input, policy)` are pure: the same answers and the same policy always
+  decide the same thing. A threshold change can therefore
   be scored against recorded answers offline instead of re-asking the model (L5).
 - **Fail-closed is a code path, not a promise.** A missing key, a non-2xx, a timeout, or an
   answer that does not match the battery yields `UNAVAILABLE`, which blocks and is
   never cached. Nothing admits a guess in place of an answer.
-- **A missed deadline is unavailable.** The gate waits for the answer up to `timeoutMs`, then
-  aborts the request and the call is `UNAVAILABLE`. Nothing keeps listening behind the
+- **A missed deadline is unavailable.** The gate waits for the risk answer up to `timeoutMs`,
+  then aborts both requests and the call is `UNAVAILABLE`. An authorization answer that misses
+  the deadline or fails reads as `none`: the command loses only the named fast allow, and that
+  verdict is not cached, so the retry asks again. Nothing keeps listening behind the
   deadline (https://github.com/STRML/omp-classifier/issues/184).
 
 ## The tower
@@ -140,8 +144,8 @@ the session, so printing it later asks. The destination is judged above the floo
 `evaluateFloor` is pure: taint arrives as an argument and leaves as a return value. The plugin
 holds the per-session taint and wipes it at the same boundaries as the verdict cache.
 
-Today the floor runs in shadow. Every `decisions.jsonl` line carries a `floor` field saying what
-it would have done, and the live decision is unchanged until the `jev-v3` flip (#55).
+The floor runs in shadow. Every `decisions.jsonl` line carries a `floor` field saying what it
+would have done; the jev-v3 flip (#116) left it in shadow.
 
 ### The literal match (`literal-match.ts`)
 
@@ -167,9 +171,9 @@ authorizes: only filler words or another target of the same command may sit betw
 code and quoted lines are stripped first, typographic apostrophes are folded so `don’t` cancels
 like `don't`, and a pinned or inherited message never produces a match.
 
-`literalMatch` is pure. Its only production caller is the jev-v3 shadow path (`shadowJevV3` in `index.ts`; `eval/run.ts` and `eval/literal-match-probe.ts` also call it),
-where it feeds branch 4 of the decision order. The live decision does not read it, and branch 4
-has not fired on live traffic.
+`literalMatch` is pure. Its production caller is `classify` in `index.ts` (`eval/run.ts` and
+`eval/literal-match-probe.ts` also call it), where it feeds branch 4 of the decision order. It
+reads the recent window only; the pinned first message reaches the judges and never the match.
 
 ### The routine recognizer (`recognizer.ts`, measured only)
 
@@ -226,8 +230,11 @@ One request, two inputs, no prose:
   tier is negative only: it never says a destination is the user's, and each lookalike is also
   an overlay flag, so a SAFE on one still blocks). A measured tier carries a `note` saying so, is absent when
   nothing could be measured, and is never written by the command's author.
-- **Battery** — `jevQuestions()`: one `choice` question for the verdict, one `noul` per
-  hazard in `JEV_HAZARDS`, one `score` question for blast radius. The battery is a pure
+- **Battery** — `jevQuestions(JEV_V3_POLICY_VERSION)`: one `choice` question for the verdict,
+  one `noul` per hazard in `JEV_HAZARDS`, the `task_statement` `noul`, one `score` question for
+  blast radius. The authorization question (`jevAuthorizationQuestions()`, `authorization.ts`)
+  is asked over `buildAuthorizationState`: the user messages and a typed action summary, never
+  the command text. The battery is a pure
   function of the module, not of config, so its hash is a stable identity (below).
 
 The response's answers are validated field by field (`judgeBattery` in `jev-judge.ts` throws
@@ -248,8 +255,33 @@ through), then `deriveJevDecision(answers, policy)` derives the verdict in a fix
 5. blast radius at or above `blastRadiusReview` → `UNSURE`
 6. otherwise `UNSURE`, below the safe gate's floors
 
-Every branch writes a `reasonCode` (`jev:safe`, `jev:hazard:<id>`, `jev:below-floor`,
-`jev:unavailable`) and a `reason` string assembled from the numbers that decided. The decode
+That is the risk derivation. The live verdict is `deriveDecisionOrder` (`decision-order.ts`,
+jev-v3, live since #116), which reads it beside the authorization answer, the literal match,
+and the overlay flags. First match wins:
+
+1. `state_contains_injection` at or above `hazardReview` → `UNSAFE`
+2. a one-hot risk answer → `UNSAFE` with a hazard or p(unsafe) at the floor, otherwise
+   `UNSURE`; never `SAFE`, never a refusal, never the reviewer
+3. the risk derivation is `SAFE` and there is no overlay flag → `SAFE`
+4. the risk derivation is not `UNSAFE`, authorization `named` at or above
+   `namedMinProbability`, the literal match holds, no overlay flag → `SAFE`
+5. the risk derivation is `UNSURE`, or `SAFE` with no overlay flag, and authorization is
+   `named` or `goal` → `UNSURE`, which stage 2 reviews like any `UNSURE`
+6. an overlay flag with a `SAFE` risk derivation at any authorization, or with an `UNSURE`
+   one and authorization `none` → the risk derivation's verdict. An overlaid `SAFE` skips the
+   reviewer because the overlay would block its allow anyway. The plan had `UNSURE` ("a dialog, as today"); since #184 there is no
+   dialog, and today's outcome for an overlaid `SAFE` is the `flagged` refusal with the flag's
+   own guidance, which the gate's overlay check still produces from the same flag list.
+7. otherwise → the risk derivation
+
+No authorization answer softens the risk derivation's `UNSAFE`: it reaches branch 7 with its
+verdict, reason and refusal, and stage 2 applies its `UNSAFE` bars to it. The overlay flags the
+order reads are the ones the gate blocks a `SAFE` on (moderate-risk tokens, lookalike
+destinations, script-body markers, critical patterns in a body), so no branch allows what the
+overlay then blocks.
+
+Every branch writes a `reasonCode` naming its number (`jev-v3:3:safe`,
+`jev-v3:7:jev:hazard:<id>`; `jev:unavailable` for an outage) and a `reason` string assembled from the numbers that decided. The decode
 parameters belong to the harness now: the judge is OMP's native one (TypeSafe when a
 credential exists, otherwise the tiny/smol/default chain, whose one-hot answers tag every
 reason with `(llm keyword answer)`), the model is whatever that judge resolves
@@ -399,8 +431,9 @@ disables it and changes the cache signature until its pinned bytes are restored 
 
 | Identity | Value | Changes when |
 | --- | --- | --- |
-| `JEV_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v2.18` | the meaning of a verdict or a policy knob changes, or the state the battery reads changes |
-| `jevQuestionsHash()` (`CLASSIFIER_POLICY_HASH`) | sha256 over version + serialized battery + `DEFAULT_JEV_POLICY`, first 16 hex | the battery, its question ids, or the shipped default changes |
+| `JEV_V3_POLICY_VERSION` (`CLASSIFIER_POLICY_VERSION`) | `jev-v3.9` | the meaning of a verdict or a policy knob changes, or the state the battery reads changes |
+| `CLASSIFIER_POLICY_HASH` | sha256 over `jevQuestionsHash(JEV_V3_POLICY_VERSION)` + `jevAuthorizationHash()` + `DEFAULT_AUTHORIZATION_POLICY`, first 16 hex | the risk battery, the authorization question, or a shipped default changes |
+| `JEV_POLICY_VERSION` | `jev-v2.18` | the base the v3 texts spread over; asked only by `eval/run.ts --battery jev-v2.18` |
 | `QUESTIONS_CONTRACT` | `questions+probabilities` | the answer shape the parser accepts changes |
 
 The battery hash is what makes mixed-version decisions visible: cache entries, audit lines,

@@ -37,7 +37,7 @@ and the reason is JSON from `refusalPayload`. Every decision writes one audit li
 | 10 | `config.enabled === false` | return undefined | (dry-run: `config`) |
 | 11 | `/classifier off` for this session (`sessionOff`) | return undefined | (dry-run: `session`) |
 | 14 | dry-run with no cached verdict | `dryRunStop(would: classify)` | `classifier` |
-| 15 | **`classify(...)`** or a cache hit (`withoutShadow(cached)`) | Judgement (see below) | |
+| 15 | overlay `flags` computed (moderate-risk tokens, lookalikes, script-body markers, critical bodies), then **`classify(..., flags)`** or a cache hit | Judgement (see below) | |
 | 15a | classify threw | `refuse(unclassified)` | `unclassified` |
 | 16 | verdict SAFE, no `matchModerateRiskTokens` flags, no script `INTERPRETER_CODE_RISK`, no `criticalBodies` (5a), and no prior refusal or `priorRefusalLifts` holds for this call (the record stays) | allow | `verdict` / `cached` |
 | 17 | verdict SAFE but flags, or a prior refusal that did not lift | `refuse(flagged)` / `refuse(prior-refusal)` | `verdict` |
@@ -63,15 +63,16 @@ measureGitWorktreeProvenance(cwd)          │ undefined = "not measured"
 measureGitRefProvenance(cmd, cwd)          │
 measureNetworkProvenance(cmd, startCwd)    │
 measureDeleteTargets(cmd, startCwd)        ┘ (shell only)
-shadowJevV3(...) started in parallel when config.shadowV3
-judgeBatteryUnderDeadline({timeoutMs, state: buildJevState(...), backend})   jev-judge.ts
-  ├ answered → judgementFrom(answers)
-  │     deriveJevDecision(answers, jevPolicyFor(config))   jev.ts  ◄── THE VERDICT
+judgeJevV3UnderDeadline({timeoutMs, riskState: buildJevState(...),
+                         authorizationState: buildAuthorizationState(summarizeActions(...)), backend})
+  ├ answered → deriveAuthorization; literalMatch (window only, shell only)
+  │     deriveDecisionOrder({risk, authorization, literal, overlayFlags})  ◄── THE VERDICT
   │     risk tier: routine | review | irreversible (destructive hazard ≥ hazardBlock)
-  │     authorization label: missing | grounded | not-required
-  │     annotateJudgement(...)  fills reasonCode/risk defaults
+  │     authorization label: named/goal → grounded; none → missing (unauthorized hazard) | not-required
+  │     oneHot flag (stage 2 skips it); annotateJudgement(...)
   ├ failed   → UNAVAILABLE, noCache, reason "Jev unavailable: <err>"
-  └ deadline → request aborted; UNAVAILABLE, noCache
+  └ deadline → both requests aborted; UNAVAILABLE, noCache
+  (authorization failed or late alone → none, the risk answer decides, noCache)
 ```
 
 ## `refuse` (index.ts:5505), L4

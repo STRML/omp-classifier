@@ -339,9 +339,9 @@ function endpointBackend(config: Extract<JudgeBackendConfig, { kind: "endpoint" 
  * state and map the answers into `JevAnswers`.
  *
  * `signal` is the request's own control, not the gate's deadline — the two are
- * separate on purpose. The shadow and the eval harness hand in
- * `AbortSignal.timeout(...)`. The live path owns its deadline
- * (`judgeBatteryUnderDeadline` below) so it can tell a timeout from a failure.
+ * separate on purpose. The eval harness hands in `AbortSignal.timeout(...)`.
+ * The live path owns its deadline (`judgeJevV3UnderDeadline` below) so it can
+ * tell a timeout from a failure.
  *
  * `undefined` leaves the native timeouts in charge. One call, no retries of our
  * own and no second opinion: the judge already retries its own transients, and
@@ -364,49 +364,6 @@ export async function judgeBattery(signal: AbortSignal | undefined, options: Jud
 	// Measured across the whole call, so latencyMs is what the classification
 	// waited for the judgment rather than the time to the first answer.
 	return toJevAnswers(result, battery, Math.round(performance.now() - startedAt));
-}
-
-/** How one judgment request ended under its deadline. */
-export type BatteryOutcome =
-	| { kind: "answered"; answers: JevAnswers }
-	| { kind: "failed"; error: unknown }
-	| { kind: "deadline" };
-
-export interface JudgeBatteryDeadlineOptions extends JudgeBatteryOptions {
-	/** The caller's deadline in millis (config `timeoutMs`). */
-	timeoutMs: number;
-}
-
-/**
- * Ask the battery under a deadline. The gate waits for the answer up to
- * `timeoutMs`, then aborts the request and reports `deadline`
- * (https://github.com/STRML/omp-classifier/issues/184). Nothing keeps
- * listening behind the deadline: with no dialog left to refine, an answer that
- * lands later has nobody to tell. Every way out clears the deadline timer, so
- * a decided call holds no timer.
- */
-export async function judgeBatteryUnderDeadline(options: JudgeBatteryDeadlineOptions): Promise<BatteryOutcome> {
-	const { timeoutMs, ...request } = options;
-	const controller = new AbortController();
-	const pending = judgeBattery(controller.signal, request);
-	let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-	const deadline = new Promise<BatteryOutcome>(resolve => {
-		deadlineTimer = setTimeout(() => resolve({ kind: "deadline" }), timeoutMs);
-	});
-	try {
-		const outcome = await Promise.race([
-			pending.then(
-				(answers): BatteryOutcome => ({ kind: "answered", answers }),
-				(error): BatteryOutcome => ({ kind: "failed", error }),
-			),
-			deadline,
-		]);
-		// The abort makes `pending` reject, into the race's own handler above.
-		if (outcome.kind === "deadline") controller.abort();
-		return outcome;
-	} finally {
-		clearTimeout(deadlineTimer);
-	}
 }
 
 /** How far a returned distribution may sit from summing to 1 before it stops
@@ -472,31 +429,78 @@ export interface JevV3Judgment {
 	authorizationError?: string;
 }
 
+/** How one jev-v3 judgment ended under its deadline. */
+export type JevV3Outcome =
+	| { kind: "answered"; judgment: JevV3Judgment }
+	| { kind: "failed"; error: unknown }
+	| { kind: "deadline" };
+
+export interface JevV3DeadlineOptions extends Omit<JudgeBatteryOptions, "state" | "version"> {
+	/** The caller's deadline in millis (config `timeoutMs`). */
+	timeoutMs: number;
+	riskState: unknown;
+	authorizationState: unknown;
+}
+
+type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
+const settle = <T>(pending: Promise<T>): Promise<Settled<T>> =>
+	pending.then(
+		(value): Settled<T> => ({ ok: true, value }),
+		(error): Settled<T> => ({ ok: false, error }),
+	);
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
 /**
- * Ask the jev-v3 risk battery and the authorization question in parallel,
- * each over its own state. Wall time is the slower of the two.
+ * Ask the jev-v3 risk battery and the authorization question in parallel, each
+ * over its own state, under one deadline. Wall time is the slower of the two.
  *
- * The two failures are not equal. A risk request that fails throws
- * `JevUnavailableError`, because there is no judgment without it. An
- * authorization request that fails only costs the command its fast path: the
- * result carries `authorization: undefined` and the risk answer still decides.
+ * The two failures are not equal. A risk request that fails or misses the
+ * deadline is no judgment (`failed` / `deadline`), and the caller fails closed
+ * to UNAVAILABLE. An authorization request that fails or is still pending at
+ * the deadline only costs the command its fast path: the judgment carries
+ * `authorization: undefined`, which `deriveAuthorization` reads as `none`, and
+ * the risk answer still decides. Nothing keeps listening behind the deadline:
+ * it aborts whatever is still in flight, and every way out clears the timer
+ * (https://github.com/STRML/omp-classifier/issues/184).
  */
-export async function judgeJevV3(
-	signal: AbortSignal | undefined,
-	options: Omit<JudgeBatteryOptions, "state" | "version"> & { riskState: unknown; authorizationState: unknown },
-): Promise<JevV3Judgment> {
-	const { riskState, authorizationState, ...rest } = options;
-	// Resolved once so both requests ask the same judge, through the same
-	// backend: the shadow must measure the judge that actually decided.
-	const judge = rest.judge ?? judgeBackendFor(rest.backend).judge({ ...rest, state: riskState });
-	const [risk, authorization] = await Promise.allSettled([
-		judgeBattery(signal, { judge, state: riskState, version: JEV_V3_POLICY_VERSION }),
-		judgeAuthorization(signal, { judge, state: authorizationState }),
-	]);
-	if (risk.status === "rejected") throw risk.reason;
-	if (authorization.status === "fulfilled") return { risk: risk.value, authorization: authorization.value };
-	const reason = authorization.reason;
-	return { risk: risk.value, authorization: undefined, authorizationError: reason instanceof Error ? reason.message : String(reason) };
+export async function judgeJevV3UnderDeadline(options: JevV3DeadlineOptions): Promise<JevV3Outcome> {
+	const { timeoutMs, riskState, authorizationState, ...rest } = options;
+	const controller = new AbortController();
+	let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+	const deadline = new Promise<"deadline">(resolve => {
+		deadlineTimer = setTimeout(() => resolve("deadline"), timeoutMs);
+	});
+	try {
+		// Resolved once so both requests ask the same judge, through the same
+		// backend and credential path.
+		const judge = rest.judge ?? judgeBackendFor(rest.backend).judge({ ...rest, state: riskState });
+		const risk = settle(judgeBattery(controller.signal, { judge, state: riskState, version: JEV_V3_POLICY_VERSION }));
+		const authorization = settle(judgeAuthorization(controller.signal, { judge, state: authorizationState }));
+		const riskOutcome = await Promise.race([risk, deadline]);
+		if (riskOutcome === "deadline") {
+			controller.abort();
+			return { kind: "deadline" };
+		}
+		if (!riskOutcome.ok) {
+			controller.abort();
+			return { kind: "failed", error: riskOutcome.error };
+		}
+		const authorizationOutcome = await Promise.race([authorization, deadline]);
+		if (authorizationOutcome === "deadline") {
+			controller.abort();
+			return { kind: "answered", judgment: { risk: riskOutcome.value, authorization: undefined, authorizationError: `authorization judgment timed out after ${timeoutMs}ms` } };
+		}
+		if (!authorizationOutcome.ok) {
+			return { kind: "answered", judgment: { risk: riskOutcome.value, authorization: undefined, authorizationError: errorText(authorizationOutcome.error) } };
+		}
+		return { kind: "answered", judgment: { risk: riskOutcome.value, authorization: authorizationOutcome.value } };
+	} catch (error) {
+		// Resolving the judge can throw before either request starts.
+		controller.abort();
+		return { kind: "failed", error };
+	} finally {
+		clearTimeout(deadlineTimer);
+	}
 }
 
 function toAuthorizationAnswer(

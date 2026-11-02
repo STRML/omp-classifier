@@ -108,14 +108,13 @@ import { parseShell, shellDefinesFunction, shellLayout, substitutionSpans, verbN
 import {
 	DEFAULT_JUDGE_BACKEND,
 	judgeBackendFor,
-	judgeBatteryUnderDeadline,
-	judgeJevV3,
+	judgeJevV3UnderDeadline,
 	parseJudgeBackend,
 	type JudgeBackendConfig,
 } from "./jev-judge";
-import { buildAuthorizationState, DEFAULT_AUTHORIZATION_POLICY, deriveAuthorization, summarizeActions, type ActionSummaryEntry, type JevAuthorizationLevel } from "./authorization";
+import { buildAuthorizationState, DEFAULT_AUTHORIZATION_POLICY, deriveAuthorization, jevAuthorizationHash, summarizeActions, type ActionSummaryEntry, type AuthorizationVerdict } from "./authorization";
 import { CRITICAL_BODY_NOTE, scanCriticalPatterns } from "./critical-scan";
-import { deriveDecisionOrder, type DecisionBranch } from "./decision-order";
+import { deriveDecisionOrder } from "./decision-order";
 import { literalMatch } from "./literal-match";
 import { redactCommand, redactSecrets, redactValue } from "./redact";
 import { quotesUserWords, reviewerModelCall, runReviewer, type ReviewerOutcome, type ReviewerTranscriptEntry } from "./reviewer";
@@ -124,8 +123,7 @@ import { formatTrustPolicyPin, normalizeTrustPolicyPin, pinUserInstructionFiles,
 import {
 	buildJevState,
 	DEFAULT_JEV_POLICY,
-	deriveJevDecision,
-	JEV_POLICY_VERSION,
+	JEV_V3_POLICY_VERSION,
 	jevQuestionsHash,
 	type DeleteTarget,
 	type GitPushProvenance,
@@ -133,8 +131,6 @@ import {
 	type GitWorktreeProvenance,
 	type JevHazard,
 	type JevPolicy,
-	type JevAnswers,
-	type JevVerdict,
 	type NetworkProvenance,
 	gateTempRoots,
 	lookalikeDestinationFlags,
@@ -146,35 +142,6 @@ import {
 } from "./jev";
 
 type Verdict = "SAFE" | "UNSAFE" | "UNSURE" | "UNAVAILABLE";
-
-/**
- * What the jev-v3 judgment decided in shadow for one fresh classification
- * (plan Phase 2 step 8). Labels and numbers only, never message text. It is
- * logged beside the live verdict and read by no decision until the flip.
- */
-export type ShadowV3 = (
-	| {
-			verdict: JevVerdict;
-			branch: DecisionBranch;
-			reasonCode: string;
-			authorization: JevAuthorizationLevel;
-			namedFirm: boolean;
-			/** null on the eval path, which has no shell to match. */
-			literalMatched: boolean | null;
-			overlay: string[];
-			ms: number;
-			/** Why the authorization request failed; the level then reads `none`. */
-			authorizationError?: string;
-	  }
-	| { error: string; ms: number }
-) & {
-	/** The live jev-v2 verdict this shadow ran beside. Logs written before
-	 *  https://github.com/STRML/omp-classifier/issues/184 have dialog lines
-	 *  that carry no verdict of their own, so this is how a report tells a
-	 *  denied dialog
-	 *  that followed a real verdict from one that followed an outage. */
-	live?: JevVerdict;
-};
 
 interface Judgement {
 	verdict: Verdict;
@@ -215,26 +182,14 @@ interface Judgement {
 	/** False when an UNSAFE must not be written to refusal memory (a one-hot
 	 *  keyword answer, jev-v2.1). Absent means true. */
 	persistRefusal?: boolean;
-	/** The jev-v3 shadow for this classification, when it ran. */
-	v3?: ShadowV3;
+	/** The risk answer came from a keyword bridge rather than a distribution.
+	 *  Stage 2 never reviews such a verdict. */
+	oneHot?: boolean;
 }
 
-/** A cached judgement minus its shadow. The shadow ran for the call that
- *  filled the cache; carried onto a later call's blocked line it would read as
- *  a fresh shadow result for a call that asked nothing. */
-function withoutShadow(judgement: Judgement): Judgement {
-	const { v3: _shadow, ...rest } = judgement;
-	return rest;
-}
-
-/** The judgement fields every decision line carries once a judgement exists.
- *  One helper, so no log site can carry the authorization label and drop the
- *  shadow, or the other way round. */
-function judgementAudit(judgement: Judgement): Pick<DecisionRecord, "authorization" | "v3"> {
-	return {
-		...(judgement.authorization ? { authorization: judgement.authorization } : {}),
-		...(judgement.v3 ? { v3: judgement.v3 } : {}),
-	};
+/** The judgement fields every decision line carries once a judgement exists. */
+function judgementAudit(judgement: Judgement): Pick<DecisionRecord, "authorization"> {
+	return judgement.authorization ? { authorization: judgement.authorization } : {};
 }
 
 /** Every way the gate blocks a judged call, as the refusal payload's `layer`. */
@@ -382,7 +337,7 @@ const DEFAULT_MAX_COMMAND_LENGTH = 8_000;
  *  tracks jev.ts's own version on purpose: the battery and the derivation
  *  rules move together, so a second identity here could only hide a
  *  half-landed change. CLASSIFIER_POLICY_HASH carries the question text. */
-export const CLASSIFIER_POLICY_VERSION = JEV_POLICY_VERSION;
+export const CLASSIFIER_POLICY_VERSION = JEV_V3_POLICY_VERSION;
 type BashPatternApproval = "allow" | "deny" | "prompt";
 
 interface BashApprovalPatternRule {
@@ -756,15 +711,9 @@ interface ClassifierConfig {
 	 * included in classifierConfigSignature so stale verdicts cannot survive.
 	 */
 	trustPolicy: TrustPolicyPin | null;
-	/** Run the jev-v3 judgment in shadow beside the live one (plan Phase 2
-	 *  step 8) and log it on the same decision line. It costs two more Jev
-	 *  requests per fresh classification and decides nothing, so it stays
-	 *  out of classifierConfigSignature: flipping it changes no cached
-	 *  verdict. */
-	shadowV3: boolean;
 	/** Write each fresh classification's judged state, redacted, to
 	 *  judged-states.jsonl (spec step 0b). Off by default. It changes no
-	 *  verdict, so like shadowV3 it stays out of
+	 *  verdict, so it stays out of
 	 *  classifierConfigSignature: turning it on must not flush caches. */
 	logJudgedStates: boolean;
 	/** The stage 2 reviewer's model, `provider/id` (docs/plans/2026-10-27-stage-2-reviewer.md).
@@ -820,7 +769,6 @@ const CLASSIFIER_CONFIG_DEFAULTS: Omit<ClassifierConfig, "typesafeModel"> = {
 	maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH,
 	evidenceUserMessages: 3,
 	trustPolicy: null,
-	shadowV3: true,
 	logJudgedStates: false,
 	reviewerModel: null,
 	reviewerTimeoutMs: 15_000,
@@ -829,12 +777,8 @@ const CLASSIFIER_CONFIG_DEFAULTS: Omit<ClassifierConfig, "typesafeModel"> = {
 /** The boolean keys `/classifier <key> true|false` sets, with what each value
  *  means for the operator. One table, so a new switch is a row, not another
  *  branch in the command handler. */
-type BooleanConfigKey = "shadowV3" | "logJudgedStates";
+type BooleanConfigKey = "logJudgedStates";
 const BOOLEAN_CONFIG_NOTICES: Record<BooleanConfigKey, { on: string; off: string }> = {
-	shadowV3: {
-		on: "classifier shadowV3=true. Each fresh classification also asks the jev-v3 judgment (two more Jev requests) and logs it; it decides nothing.",
-		off: "classifier shadowV3=false. Only the live jev-v2 judgment runs.",
-	},
 	logJudgedStates: {
 		on: "classifier logJudgedStates=true. Each fresh classification writes its redacted judged state to judged-states.jsonl beside decisions.jsonl.",
 		off: "classifier logJudgedStates=false. No judged state is written.",
@@ -893,7 +837,6 @@ function normalizeClassifierConfig(raw: Record<string, unknown>): ClassifierConf
 	};
 	if (typeof raw.enabled === "boolean") config.enabled = raw.enabled;
 	config.trustPolicy = normalizeTrustPolicyPin(raw.trustPolicy);
-	if (typeof raw.shadowV3 === "boolean") config.shadowV3 = raw.shadowV3;
 	if (typeof raw.logJudgedStates === "boolean") config.logJudgedStates = raw.logJudgedStates;
 	if (typeof raw.reviewerModel === "string" && /^[^/\s]+\/\S+$/u.test(raw.reviewerModel.trim())) config.reviewerModel = raw.reviewerModel.trim();
 	if (typeof raw.reviewerTimeoutMs === "number" && Number.isFinite(raw.reviewerTimeoutMs) && raw.reviewerTimeoutMs > 0) {
@@ -962,7 +905,7 @@ export function readClassifierConfig(): ClassifierConfig {
 function writeClassifierConfig(patch: Record<string, unknown>): ClassifierConfig {
 	const before = readClassifierConfig();
 	const raw: Record<string, unknown> = {};
-	for (const key of ["enabled", "judgeBackend", "jevPolicy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "trustPolicy", "shadowV3", "logJudgedStates"] as const) {
+	for (const key of ["enabled", "judgeBackend", "jevPolicy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "trustPolicy", "logJudgedStates"] as const) {
 		if (key in patch) raw[key] = patch[key];
 	}
 	const next = normalizeClassifierConfig({ ...before, ...raw });
@@ -1094,9 +1037,6 @@ export interface DecisionRecord {
 	 *  that followed one). Absent on lines with no judgement (critical, env,
 	 *  static rule, cap, unclassified). */
 	authorization?: Judgement["authorization"];
-	/** The jev-v3 shadow (plan Phase 2 step 8), carried like `authorization`
-	 *  onto every line that followed a judgement. Decides nothing. */
-	v3?: ShadowV3;
 	/** Whether an unlifted refusal of the command's target applied to this
 	 *  line. Refusal memory is the gate's own bookkeeping and is kept out of
 	 *  the judge's state, so this field is the only place a decision records
@@ -1351,7 +1291,6 @@ export function formatClassifierConfig(config: ClassifierConfig): string {
 		`maxCommandLength: ${config.maxCommandLength}`,
 		`evidenceUserMessages: ${config.evidenceUserMessages}`,
 		`trustPolicy: ${config.trustPolicy?.sha256 ?? "unpinned"}`,
-		`shadowV3: ${config.shadowV3}`,
 		`logJudgedStates: ${config.logJudgedStates}`,
 		`contract: ${QUESTIONS_CONTRACT}`,
 		`policyHash: ${CLASSIFIER_POLICY_HASH}`,
@@ -1369,11 +1308,16 @@ export function formatClassifierConfig(config: ClassifierConfig): string {
  */
 export const QUESTIONS_CONTRACT = "questions+probabilities";
 
-/** Hash of the loaded decision policy: the question battery and the thresholds
- *  it is read through, over jev.ts's policy version. Keeping the hash separate
- *  from the semantic version lets mixed-session replay and shadow reports
- *  distinguish battery edits that forgot to bump a version. */
-export const CLASSIFIER_POLICY_HASH = jevQuestionsHash();
+/** Hash of the loaded decision policy: the jev-v3 risk battery and the
+ *  thresholds it is read through, the authorization question, and the
+ *  authorization floor. Every one of them decides a verdict, so an edit to any
+ *  of them must miss the verdict cache. Keeping the hash separate from the
+ *  semantic version lets a replay tell battery edits that forgot to bump a
+ *  version. */
+export const CLASSIFIER_POLICY_HASH = createHash("sha256")
+	.update([jevQuestionsHash(JEV_V3_POLICY_VERSION), jevAuthorizationHash(), JSON.stringify(DEFAULT_AUTHORIZATION_POLICY)].join("\0"))
+	.digest("hex")
+	.slice(0, 16);
 
 function truncated(value: string, max: number): string {
 	return value.length > max ? `${value.slice(0, max)}…` : value;
@@ -1583,12 +1527,12 @@ export function askAnswersAsUserWords(branch: ReadonlyArray<EvidenceBranchEntry>
  * snapshots it once per call so the cache key and refusal memory
  * agree about what the judge actually saw.
  */
-function evidenceUserSnapshot(ctx: ExtensionContext): UserEvidenceSnapshot | undefined {
+function evidenceUserSnapshot(ctx: ExtensionContext): UserEvidenceSnapshotV3 | undefined {
 	const limit = readClassifierConfig().evidenceUserMessages;
 	if (limit <= 0) return undefined;
-	let snapshot: UserEvidenceSnapshot;
+	let snapshot: UserEvidenceSnapshotV3;
 	try {
-		snapshot = collectTaskEvidence(userChannelBranch(ctx), limit);
+		snapshot = collectTaskEvidenceV3(userChannelBranch(ctx), limit);
 	} catch {
 		// Isolated contexts may omit branch history. Evidence stays enabled but
 		// empty, so a judge cannot cite a user who was not actually supplied.
@@ -1784,6 +1728,19 @@ function writeTargetOutsideCwd(target: string, cwd: string): boolean {
 	return true;
 }
 
+/**
+ * The audit label for jev-v3's authorization answer. `named` and `goal` are
+ * the user's words covering the action: `grounded`, which is what lets a
+ * literal match lift a refusal (priorRefusalLifts). `none` is `missing` when
+ * the risk battery also flagged the action as unauthorized, and otherwise
+ * `not-required`. A failed authorization request is `none`, so it is never
+ * `grounded`. With no user words at all nothing can be grounded.
+ */
+function authorizationLabel(authorization: AuthorizationVerdict, hazards: Partial<Record<JevHazard, number>>, hadUserEvidence: boolean): Judgement["authorization"] {
+	if (hadUserEvidence && (authorization.level === "named" || authorization.level === "goal")) return "grounded";
+	return hazards.unauthorized_consequential_action !== undefined ? "missing" : "not-required";
+}
+
 /** Attach stable machine fields after every decision path. classify() derives
  * these from the Jev decision it just made, so they are FILLED and never
  * overwritten: a hand-built judgement (replay, the eval harness, tests) gets
@@ -1976,28 +1933,6 @@ type EvidenceBranchEntry = {
 	message?: { id?: string; role?: string; attribution?: string; content?: unknown };
 };
 
-export function collectTaskEvidence(branch: ReadonlyArray<EvidenceBranchEntry>, limit: number): UserEvidenceSnapshot {
-	if (limit <= 0) return { messages: [], ids: [] };
-	const all: Array<{ text: string; id: string; index: number; anchored: boolean }> = [];
-	for (let index = branchStartAfterLatestResetBoundary(branch); index < branch.length; index++) {
-		const entry = branch[index];
-		if (entry.type !== "message") continue;
-		const message = entry.message;
-		if (message?.role !== "user" || message.attribution !== "user") continue;
-		const text = textOf(message.content);
-		if (text.trim() === "") continue;
-		const id = message.id ?? entry.id ?? `user-${index}`;
-		all.push({ text: headAndTail(redactSecrets(text), EVIDENCE_MESSAGE_MAX_CHARS), id, index, anchored: TASK_SCOPE_RE.test(text) });
-	}
-	if (all.length === 0) return { messages: [], ids: [] };
-	const tail = new Set(all.slice(-limit).map(item => item.id));
-	const anchors = all.filter(item => item.anchored).slice(-TASK_EVIDENCE_MAX);
-	const selected = [...all.filter(item => tail.has(item.id)), ...anchors.filter(item => !tail.has(item.id))]
-		.sort((a, b) => a.index - b.index)
-		.slice(-TASK_EVIDENCE_MAX);
-	return { messages: selected.map(item => item.text), ids: selected.map(item => item.id) };
-}
-
 export interface UserEvidenceSnapshotV3 extends UserEvidenceSnapshot {
 	/** The first user message since the latest `/clear`, when the newest-8
 	 *  slice drops it. It remains positional context, not authorization by
@@ -2013,8 +1948,8 @@ export interface UserEvidenceSnapshotV3 extends UserEvidenceSnapshot {
  * statement question. The first-message pin remains separate; the battery
  * judges the same bounded evidence the gate already sends.
  *
- * collectTaskEvidence stays unchanged because the jev-v2 shadow baseline reads
- * it.
+ * The gate takes one snapshot per tool call (`evidenceUserSnapshot`), and the
+ * cache key, the audit ids, the judge states and refusal memory all read it.
  */
 export function collectTaskEvidenceV3(branch: ReadonlyArray<EvidenceBranchEntry>, limit: number): UserEvidenceSnapshotV3 {
 	if (limit <= 0) return { messages: [], ids: [] };
@@ -2054,6 +1989,14 @@ export function collectTaskEvidenceV3(branch: ReadonlyArray<EvidenceBranchEntry>
 	const first = all[0];
 	if (selected.some(item => item.id === first.id)) return snapshot;
 	return { ...snapshot, pinned: { id: first.id, text: first.text } };
+}
+
+/** What the judges read from a snapshot: the pinned first message, when there
+ *  is one, then the window. The literal match reads the window alone. */
+export function judgedEvidence(snapshot: UserEvidenceSnapshotV3 | undefined): UserEvidenceSnapshot | undefined {
+	if (snapshot === undefined) return undefined;
+	if (snapshot.pinned === undefined) return { messages: snapshot.messages, ids: snapshot.ids };
+	return { messages: [snapshot.pinned.text, ...snapshot.messages], ids: [snapshot.pinned.id, ...snapshot.ids] };
 }
 
 /**
@@ -5796,7 +5739,7 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	if ((judgement.verdict !== "UNSURE" && judgement.verdict !== "UNSAFE" && !refusedSafe) || model === null) return { judgement };
 	const skip = (why: string) => ({ judgement, audit: { skipped: why } });
 	if (!ctx.hasUI) return skip("headless session");
-	if (judgement.persistRefusal === false) return skip("one-hot answers");
+	if (judgement.oneHot === true) return skip("one-hot answers");
 	if (judgement.jev === undefined) return skip("no stage-1 answers");
 	const { hazardReview, hazardBlock } = jevPolicyFor(config);
 	// Read the branch only once a check needs it: a call that skips on a hard
@@ -6117,7 +6060,7 @@ function consentSince(ctx: ExtensionContext, afterId: string | undefined): Revie
 }
 
 /** The id of the newest user-typed message since the latest `/clear`, read the
- *  way collectTaskEvidence reads them but independent of the evidence window,
+ *  way collectTaskEvidenceV3 reads them but independent of the evidence window,
  *  so a config change cannot make an old message look new. */
 function newestUserMessageId(ctx: ExtensionContext): string | undefined {
 	const messages = userMessagesSince(ctx, undefined);
@@ -6164,9 +6107,9 @@ export default function (pi: ExtensionAPI) {
 	// prints the effective config and the file path.
 	pi.registerCommand("classifier", {
 		description:
-		"View or set omp-classifier options: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, trust-policy, shadowV3, logJudgedStates, reset, status, dry-run, off, on",
+		"View or set omp-classifier options: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, trust-policy, logJudgedStates, reset, status, dry-run, off, on",
 		getArgumentCompletions: (prefix: string) => {
-			const keywords = ["enabled", "policy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "trust-policy", "shadowV3", "logJudgedStates", "reset", "status", "dry-run", "off", "on", "file"] as const;
+			const keywords = ["enabled", "policy", "timeoutMs", "maxCommandLength", "evidenceUserMessages", "trust-policy", "logJudgedStates", "reset", "status", "dry-run", "off", "on", "file"] as const;
 			return keywords
 				.filter(keyword => keyword.startsWith(prefix.toLowerCase()))
 				.map(keyword => ({ label: keyword, value: keyword }));
@@ -6230,7 +6173,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (key === "reset") {
-				writeClassifierConfig({ enabled: true, judgeBackend: DEFAULT_JUDGE_BACKEND, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, trustPolicy: null, shadowV3: true, logJudgedStates: false });
+				writeClassifierConfig({ enabled: true, judgeBackend: DEFAULT_JUDGE_BACKEND, jevPolicy: {}, timeoutMs: DEFAULT_TIMEOUT_MS, maxCommandLength: DEFAULT_MAX_COMMAND_LENGTH, evidenceUserMessages: 3, trustPolicy: null, logJudgedStates: false });
 				notify(`omp-classifier reset to defaults (${classifierConfigPath()})`);
 				return;
 			}
@@ -6332,7 +6275,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			notify(
-				`unknown key "${key}". Keys: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, trust-policy, shadowV3, logJudgedStates, reset, status, dry-run, off, on, file`,
+				`unknown key "${key}". Keys: enabled, policy, timeoutMs, maxCommandLength, evidenceUserMessages, trust-policy, logJudgedStates, reset, status, dry-run, off, on, file`,
 				"error",
 			);
 		},
@@ -6370,157 +6313,28 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * The jev-v3 judgment in shadow (plan Phase 2 step 8): its own evidence
-	 * builder, the jev-v3 battery and the authorization question in parallel,
-	 * the literal match, the overlay flags, and the decision order. It runs
-	 * beside the live jev-v2 judgment and decides nothing; its result rides the
-	 * decision line as `v3`.
+	 * Judge one command with jev-v3: the risk battery and the authorization
+	 * question, asked in parallel under one deadline (judgeJevV3UnderDeadline),
+	 * then the literal match, the overlay flags and the decision order
+	 * (decision-order.ts). No retries of our own and no second pass: the
+	 * native judge retries its own transients. A risk request that cannot be
+	 * made, answered, or read, or that misses the deadline, is an UNAVAILABLE
+	 * verdict, which the caller blocks and never caches. An authorization
+	 * request that fails on its own reads as `none`: the command loses only
+	 * the named fast allow.
 	 *
-	 * Never throws: any failure becomes `{ error }`, because a measurement that
-	 * breaks must not change the live outcome. The literal match reads only the
-	 * recent window; the pinned first message reaches the judges and never the
-	 * match, so an old request can't authorize a new command by itself.
-	 */
-	const shadowJevV3 = async (
-		ctx: ExtensionContext,
-		input: {
-			command: string;
-			language: "shell" | "code";
-			cwd: string;
-			timeoutMs: number;
-			operatorContext?: string;
-			pushProvenance?: GitPushProvenance;
-			worktreeProvenance?: GitWorktreeProvenance;
-			refProvenance?: GitRefProvenance[];
-			networkProvenance?: NetworkProvenance;
-			deleteTargets?: DeleteTarget[];
-			trustedPolicy?: readonly TrustedPolicyDocument[];
-			recordExtras: Record<string, unknown>;
-		},
-	): Promise<ShadowV3> => {
-		const began = Date.now();
-		try {
-			const config = readClassifierConfig();
-			let snapshot: UserEvidenceSnapshotV3 = { messages: [], ids: [] };
-			try {
-				snapshot = collectTaskEvidenceV3(userChannelBranch(ctx), config.evidenceUserMessages);
-			} catch {
-				// No branch in an isolated SDK context: no user evidence, as live.
-			}
-			const judgedMessages = snapshot.pinned ? [snapshot.pinned.text, ...snapshot.messages] : snapshot.messages;
-			const judgedIds = snapshot.pinned ? [snapshot.pinned.id, ...snapshot.ids] : snapshot.ids;
-			const userEvidence = judgedMessages.length > 0 ? { userMessages: judgedMessages, userMessageIds: judgedIds } : {};
-			let sessionId: string | undefined;
-			try {
-				sessionId = ctx.sessionManager.getSessionId();
-			} catch {
-				sessionId = undefined;
-			}
-			// The session's own artifacts directory is its scratch space: a delete
-			// the user named there may match, like one under the working directory.
-			let sessionTempDir: string | undefined;
-			try {
-				sessionTempDir = ctx.sessionManager.getArtifactsDir() ?? undefined;
-			} catch {
-				sessionTempDir = undefined;
-			}
-			const shell = input.language === "shell";
-			// The eval tool's code is no shell: it is one run-code action whose
-			// arguments nothing here can name.
-			const actions: ActionSummaryEntry[] = shell
-				? summarizeActions({ command: input.command, taintedVars: sessionId ? (floorTaint.get(sessionId) ?? []) : [] })
-				: [{ kind: "run-code", count: 1, targets: ["unnamed-arguments"] }];
-			const judgment = await judgeJevV3(AbortSignal.timeout(input.timeoutMs), {
-				riskState: buildJevState({
-					command: input.command,
-					workingDirectory: input.cwd,
-					...userEvidence,
-					...(input.trustedPolicy && input.trustedPolicy.length > 0 ? { trustedPolicy: input.trustedPolicy } : {}),
-					...(input.operatorContext ? { operatorContext: input.operatorContext } : {}),
-					...(input.pushProvenance !== undefined ? { gitPushProvenance: input.pushProvenance } : {}),
-					...(input.worktreeProvenance !== undefined ? { gitWorktreeProvenance: input.worktreeProvenance } : {}),
-					...(input.refProvenance !== undefined ? { gitRefProvenance: input.refProvenance } : {}),
-					...(input.networkProvenance !== undefined ? { networkProvenance: input.networkProvenance } : {}),
-					...(input.deleteTargets !== undefined ? { deleteTargets: input.deleteTargets } : {}),
-					...(Object.keys(input.recordExtras).length > 0 ? { extra: input.recordExtras } : {}),
-				}),
-				authorizationState: buildAuthorizationState({
-					actions,
-					...userEvidence,
-					...(input.trustedPolicy && input.trustedPolicy.length > 0
-						? {
-							trustedPolicy: input.trustedPolicy,
-							gateMeasurements: {
-								...(input.pushProvenance !== undefined ? { gitPushProvenance: input.pushProvenance } : {}),
-								...(input.worktreeProvenance !== undefined ? { gitWorktreeProvenance: input.worktreeProvenance } : {}),
-								...(input.refProvenance !== undefined ? { gitRefProvenance: input.refProvenance } : {}),
-								...(input.networkProvenance !== undefined ? { networkProvenance: input.networkProvenance } : {}),
-							},
-						}
-						: {}),
-				}),
-				context: ctx,
-				settings,
-				// The shadow measures the judge that actually decides: same backend,
-				// same credential path. Anything else would report a disagreement
-				// between two judges as a policy disagreement.
-				backend: config.judgeBackend,
-			});
-			const authorization = deriveAuthorization(judgment.authorization, DEFAULT_AUTHORIZATION_POLICY);
-			const literal = shell
-				? literalMatch({
-						command: input.command,
-						cwd: input.cwd,
-						homeDir: os.homedir(),
-						userMessages: snapshot.messages,
-						...(snapshot.pinned ? { pinnedUserMessage: snapshot.pinned.text } : {}),
-						...(sessionTempDir ? { sessionTempDir } : {}),
-						resolveRealPath: realPathOf,
-					})
-				: undefined;
-			const overlay = shell ? matchModerateRiskTokens(input.command, input.cwd) : evalRiskFlags(input.command);
-			const decision = deriveDecisionOrder(
-				{ risk: judgment.risk, authorization, literal, overlayFlags: overlay, headless: !ctx.hasUI },
-				jevPolicyFor(config),
-			);
-			return {
-				verdict: decision.verdict,
-				branch: decision.branch,
-				reasonCode: decision.reasonCode,
-				authorization: authorization.level,
-				namedFirm: authorization.namedFirm,
-				literalMatched: literal === undefined ? null : literal.matched,
-				overlay,
-				ms: Date.now() - began,
-				...(judgment.authorizationError ? { authorizationError: truncated(judgment.authorizationError, 160) } : {}),
-			};
-		} catch (error) {
-			return { error: truncated(error instanceof Error ? error.message : String(error), 160), ms: Date.now() - began };
-		}
-	};
-
-	/**
-	 * Ask the native judgment module to judge one command. One judge call per
-	 * classification, no retries of our own and no second pass: judgeBattery
-	 * (jev-judge.ts) carries the whole battery, the native judge already
-	 * retries its own transients and falls back to the chat chain, and the
-	 * verdict is derived from the answer probabilities (jev.ts). A request
-	 * that cannot be made, answered, or read surfaces as JevUnavailableError
-	 * and becomes an UNAVAILABLE verdict, which the caller blocks — never a
-	 * silent allow.
-	 *
-	 * `timeoutMs` is the deadline (judgeBatteryUnderDeadline): the gate waits
-	 * that long for the answer, then aborts the request and the call is
-	 * UNAVAILABLE.
+	 * `overlayFlags` are the deterministic overlays the caller blocks a SAFE
+	 * on (moderate-risk tokens, lookalike destinations, script-body markers,
+	 * critical patterns in a body). The decision order reads the same list,
+	 * so branches 3 and 4 never allow what the overlay would then block.
 	 *
 	 * `cwd` is the directory the command RUNS in — the judge's
 	 * `workingDirectory`. `startCwd` is the directory its text STARTS in, which
 	 * is a different directory exactly when the caller resolved a `cd` out of
-	 * the command's own text (the host's leading-`cd` extraction): the two
+	 * the command's own text (the host's leading-`cd` extraction): the
 	 * provenance measurements walk the command's `cd` chain themselves, so
 	 * they take `startCwd` with the unmodified text, or they apply the resolved
-	 * `cd` a second time (round 4 review). It defaults to `cwd`, which is the
-	 * same directory for a caller whose text carries no leading `cd`.
+	 * `cd` a second time (round 4 review). It defaults to `cwd`.
 	 */
 	const classify = async (
 		ctx: ExtensionContext,
@@ -6529,13 +6343,14 @@ export default function (pi: ExtensionAPI) {
 		timeoutMs: number,
 		recordExtras: Record<string, unknown> = {},
 		operatorContext?: string,
-		evidenceSnapshot?: UserEvidenceSnapshot,
+		evidenceSnapshot?: UserEvidenceSnapshotV3,
 		language: "shell" | "code" = "shell",
 		startCwd: string = cwd,
 		trustedPolicy: readonly TrustedPolicyDocument[] = [],
 		/** The `decisionId` the caller will log this judgment's verdict line
 		 *  under; the judged state is written under the same id. */
 		decisionId?: string,
+		overlayFlags: readonly string[] = [],
 	): Promise<Judgement> => {
 		const config = readClassifierConfig();
 		const policy = jevPolicyFor(config);
@@ -6544,9 +6359,10 @@ export default function (pi: ExtensionAPI) {
 		// restores the pre-#31 shape — no user messages at all. The snapshot is
 		// taken once per tool call by the caller so the cache key and the refusal
 		// memory describe the same state the judge saw.
-		const taskEvidence = evidenceSnapshot === undefined ? evidenceUserSnapshot(ctx) : evidenceSnapshot;
-		const userMessages = taskEvidence?.messages;
-		const hadUserEvidence = (userMessages?.length ?? 0) > 0;
+		const windowEvidence = evidenceSnapshot === undefined ? evidenceUserSnapshot(ctx) : evidenceSnapshot;
+		// The judges read the pinned first message too; the literal match reads
+		// the window alone, so an old request cannot authorize a new command.
+		const taskEvidence = judgedEvidence(windowEvidence);
 		// Gate-measured git push provenance (issue #63). Runs the plumbing in
 		// the repository the command's own `cd` chain reaches from `startCwd`;
 		// a non-push command, a push the repo does not track, or a plumbing
@@ -6602,95 +6418,47 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			deleteTargets = undefined;
 		}
-		// Started before the live request so the two run in parallel; awaited
-		// on both return paths below, and it never throws.
-		const shadow = config.shadowV3
-			? shadowJevV3(ctx, {
-					command,
-					language,
-					cwd,
-					timeoutMs,
-					recordExtras,
-					...(trustedPolicy.length > 0 ? { trustedPolicy } : {}),
-					...(operatorContext ? { operatorContext } : {}),
-					...(pushProvenance !== undefined ? { pushProvenance } : {}),
-					...(worktreeProvenance !== undefined ? { worktreeProvenance } : {}),
-					...(refProvenance !== undefined ? { refProvenance } : {}),
-					...(networkProvenance !== undefined ? { networkProvenance } : {}),
-					...(deleteTargets !== undefined ? { deleteTargets } : {}),
-				})
-			: undefined;
-		// Answers -> verdict.
-		const judgementFrom = async (answers: JevAnswers): Promise<Judgement> => {
-			const decision = deriveJevDecision(answers, policy);
-			// `decision.hazards` carries only the hazards that reached
-			// hazardReview, so "fired" is presence, not a threshold re-check.
-			// The destructive hazard is the one that names damage no user can
-			// undo, so an UNSAFE it triggered reports as irreversible; every
-			// other non-SAFE verdict is review-tier. UNAVAILABLE is kept in the
-			// ladder because the verdict union allows it — a non-answer
-			// mislabelled "review" would understate why nothing was decided.
-			const destructive = decision.hazards.destructive_or_irreversible;
-			const irreversible =
-				decision.reasonCode.includes("destructive_or_irreversible") ||
-				(destructive !== undefined && destructive >= policy.hazardBlock);
-			const risk: Judgement["risk"] =
-				decision.verdict === "SAFE"
-					? "routine"
-					: decision.verdict === "UNAVAILABLE"
-						? "unavailable"
-						: irreversible
-							? "irreversible"
-							: "review";
-			// Authorization is a provenance question, not a hazard question:
-			// "missing" only when the battery flagged it, "grounded" when the
-			// question was asked and cleared against real user evidence, and
-			// otherwise the action never depended on authorization at all.
-			const authorization: Judgement["authorization"] =
-				decision.hazards.unauthorized_consequential_action !== undefined
-					? "missing"
-					: hadUserEvidence
-						? "grounded"
-						: "not-required";
-			const v3 = shadow ? { ...(await shadow), live: decision.verdict } : undefined;
-			return annotateJudgement({
-				verdict: decision.verdict,
-				reason: decision.reason,
-				reasonCode: decision.reasonCode,
-				...(v3 ? { v3 } : {}),
-				...(decision.persistRefusal ? {} : { persistRefusal: false }),
-				risk,
-				authorization,
-				modelId: answers.model,
-				jev: {
-					model: answers.model,
-					probabilities: answers.verdict.probabilities,
-					hazards: answers.hazards,
-					confidence: answers.verdict.confidence,
-					blastRadius: answers.blastRadius.score,
-					...(answers.usage ? { usage: answers.usage } : {}),
-					latencyMs: answers.latencyMs,
-				},
-			});
+		const userEvidence = taskEvidence !== undefined && taskEvidence.messages.length > 0 ? { userMessages: taskEvidence.messages, userMessageIds: taskEvidence.ids } : {};
+		const hadUserEvidence = taskEvidence !== undefined && taskEvidence.messages.length > 0;
+		const sessionId = sessionIdOf(ctx);
+		const shell = language === "shell";
+		// The eval tool's code is no shell: it is one run-code action whose
+		// arguments nothing here can name.
+		const actions: ActionSummaryEntry[] = shell
+			? summarizeActions({ command, taintedVars: sessionId ? (floorTaint.get(sessionId) ?? []) : [] })
+			: [{ kind: "run-code", count: 1, targets: ["unnamed-arguments"] }];
+		const measured = {
+			...(pushProvenance !== undefined ? { gitPushProvenance: pushProvenance } : {}),
+			...(worktreeProvenance !== undefined ? { gitWorktreeProvenance: worktreeProvenance } : {}),
+			...(refProvenance !== undefined ? { gitRefProvenance: refProvenance } : {}),
+			...(networkProvenance !== undefined ? { networkProvenance } : {}),
 		};
 		const riskState = buildJevState({
-				command,
-				workingDirectory: cwd,
-				...(userMessages ? { userMessages } : {}),
-				...(trustedPolicy.length > 0 ? { trustedPolicy } : {}),
-				...(taskEvidence?.ids.length ? { userMessageIds: taskEvidence.ids } : {}),
-				...(operatorContext ? { operatorContext } : {}),
-				...(pushProvenance !== undefined ? { gitPushProvenance: pushProvenance } : {}),
-				...(worktreeProvenance !== undefined ? { gitWorktreeProvenance: worktreeProvenance } : {}),
-				...(refProvenance !== undefined ? { gitRefProvenance: refProvenance } : {}),
-				...(networkProvenance !== undefined ? { networkProvenance } : {}),
-				...(deleteTargets !== undefined ? { deleteTargets } : {}),
-				...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
+			command,
+			workingDirectory: cwd,
+			...userEvidence,
+			...(trustedPolicy.length > 0 ? { trustedPolicy } : {}),
+			...(operatorContext ? { operatorContext } : {}),
+			...measured,
+			...(deleteTargets !== undefined ? { deleteTargets } : {}),
+			...(Object.keys(recordExtras).length > 0 ? { extra: recordExtras } : {}),
 		});
+		// No command text in it: the authorization question reads a typed
+		// summary of the actions, so prose inside the command cannot steer it.
+		const authorizationState = buildAuthorizationState({
+			actions,
+			...userEvidence,
+			...(trustedPolicy.length > 0 ? { trustedPolicy, gateMeasurements: measured } : {}),
+		});
+		// The risk state only. The authorization state's targets are operand
+		// words chosen by a word-level secret rule, and the log's redaction
+		// reads text, so a `--password hunter2-secret` value would reach the
+		// file as a bare target the redactor has no flag to recognize by.
 		if (config.logJudgedStates && decisionId !== undefined) recordJudgedState(ctx, decisionId, language === "code" ? "eval" : "bash", { risk: riskState });
-		const outcome = await judgeBatteryUnderDeadline({
+		const outcome = await judgeJevV3UnderDeadline({
 			timeoutMs,
-			state: riskState,
+			riskState,
+			authorizationState,
 			// The host settings instance, not a plugin-local singleton copy:
 			// the native resolver reads providers.judgmentProvider and the
 			// credential store through it (see the header note on settings).
@@ -6700,28 +6468,75 @@ export default function (pi: ExtensionAPI) {
 			// path; an endpoint backend ignores `settings`/`context` entirely.
 			backend: config.judgeBackend,
 		});
-		if (outcome.kind === "answered") return await judgementFrom(outcome.answers);
 		if (outcome.kind === "failed") {
 			// Fail closed, name the failure, and never cache it: a missing key,
 			// a non-2xx, or a body whose answers do not match the battery says
 			// nothing about the command, and a cached non-answer would keep the
 			// session from re-asking once the endpoint recovers.
-			const v3 = shadow ? { ...(await shadow), live: "UNAVAILABLE" as const } : undefined;
 			return annotateJudgement({
 				verdict: "UNAVAILABLE",
 				reason: `Jev unavailable: ${truncated(outcome.error instanceof Error ? outcome.error.message : String(outcome.error), 160)}`,
 				noCache: true,
-				...(v3 ? { v3 } : {}),
 			});
 		}
-		// The deadline fired and the request was aborted. The reason names the
-		// deadline instead of implying the gate broke.
-		const v3 = shadow ? { ...(await shadow), live: "UNAVAILABLE" as const } : undefined;
+		if (outcome.kind === "deadline") {
+			// The deadline fired and the requests were aborted. The reason names
+			// the deadline instead of implying the gate broke.
+			return annotateJudgement({ verdict: "UNAVAILABLE", reason: `Jev unavailable: judgment timed out after ${timeoutMs}ms`, noCache: true });
+		}
+		const { risk: answers } = outcome.judgment;
+		const authorization = deriveAuthorization(outcome.judgment.authorization, DEFAULT_AUTHORIZATION_POLICY);
+		// The session's own artifacts directory is its scratch space: a delete
+		// the user named there may match, like one under the working directory.
+		let sessionTempDir: string | undefined;
+		try {
+			sessionTempDir = ctx.sessionManager.getArtifactsDir() ?? undefined;
+		} catch {
+			sessionTempDir = undefined;
+		}
+		const literal = shell
+			? literalMatch({
+					command,
+					cwd,
+					homeDir: os.homedir(),
+					userMessages: windowEvidence?.messages ?? [],
+					...(windowEvidence?.pinned ? { pinnedUserMessage: windowEvidence.pinned.text } : {}),
+					...(sessionTempDir ? { sessionTempDir } : {}),
+					resolveRealPath: realPathOf,
+				})
+			: undefined;
+		const decision = deriveDecisionOrder({ risk: answers, authorization, literal, overlayFlags: [...overlayFlags] }, policy);
+		// `decision.hazards` carries only the hazards that reached hazardReview,
+		// so "fired" is presence, not a threshold re-check. The destructive
+		// hazard is the one that names damage no user can undo, so an UNSAFE it
+		// triggered reports as irreversible; every other non-SAFE verdict is
+		// review-tier.
+		const destructive = decision.hazards.destructive_or_irreversible;
+		const irreversible = decision.reasonCode.includes("destructive_or_irreversible") || (destructive !== undefined && destructive >= policy.hazardBlock);
+		const risk: Judgement["risk"] = decision.verdict === "SAFE" ? "routine" : irreversible ? "irreversible" : "review";
+		const authorizationError = outcome.judgment.authorizationError;
 		return annotateJudgement({
-			verdict: "UNAVAILABLE",
-			reason: `Jev unavailable: judgment timed out after ${timeoutMs}ms`,
-			noCache: true,
-			...(v3 ? { v3 } : {}),
+			verdict: decision.verdict,
+			reason: authorizationError === undefined ? decision.reason : `${decision.reason}; authorization request failed: ${truncated(authorizationError, 120)}`,
+			reasonCode: decision.reasonCode,
+			...(decision.persistRefusal ? {} : { persistRefusal: false }),
+			...(answers.oneHot === true ? { oneHot: true } : {}),
+			// A verdict reached without the authorization answer is a transient
+			// state, like an outage: cached, it would keep the fast allow away
+			// after the endpoint recovers.
+			...(authorizationError === undefined ? {} : { noCache: true }),
+			risk,
+			authorization: authorizationLabel(authorization, decision.hazards, hadUserEvidence),
+			modelId: answers.model,
+			jev: {
+				model: answers.model,
+				probabilities: answers.verdict.probabilities,
+				hazards: answers.hazards,
+				confidence: answers.verdict.confidence,
+				blastRadius: answers.blastRadius.score,
+				...(answers.usage ? { usage: answers.usage } : {}),
+				latencyMs: answers.latencyMs,
+			},
 		});
 	};
 
@@ -6977,7 +6792,7 @@ export default function (pi: ExtensionAPI) {
 		 *  through from handleToolCall so the terminal line carries the same
 		 *  evidence ids, verdict, authorization label and shadow floor as the
 		 *  lead line it follows. */
-		auditExtras: Pick<DecisionRecord, "userMessageIds" | "authorization" | "v3" | "floor" | "spawnCwd" | "followsDecisionId"> & { verdict?: Verdict } = {},
+		auditExtras: Pick<DecisionRecord, "userMessageIds" | "authorization" | "floor" | "spawnCwd" | "followsDecisionId"> & { verdict?: Verdict } = {},
 	): { block: true; reason: string } => {
 		const guidance = REFUSAL_GUIDANCE[cause];
 		const detail = reason ? `${guidance.headline}: ${reason}` : guidance.headline;
@@ -6995,7 +6810,6 @@ export default function (pi: ExtensionAPI) {
 			...(stale === "" ? {} : { staleCode: 1 as const }),
 			...(auditExtras.userMessageIds && auditExtras.userMessageIds.length > 0 ? { userMessageIds: auditExtras.userMessageIds } : {}),
 			...(auditExtras.authorization ? { authorization: auditExtras.authorization } : {}),
-			...(auditExtras.v3 ? { v3: auditExtras.v3 } : {}),
 			...(auditExtras.floor ? { floor: auditExtras.floor } : {}),
 			...(auditExtras.spawnCwd ? { spawnCwd: auditExtras.spawnCwd } : {}),
 			...(auditExtras.followsDecisionId ? { followsDecisionId: auditExtras.followsDecisionId } : {}),
@@ -7062,23 +6876,25 @@ export default function (pi: ExtensionAPI) {
 		// and cache identity must agree about what the judge actually saw; reading
 		// the branch independently at each site let a new user message make a
 		// cached SAFE stale while the old refusal still won.
-		let userEvidenceSnapshot: UserEvidenceSnapshot | undefined;
+		let evidenceSnapshot: UserEvidenceSnapshotV3 | undefined;
 		try {
-			userEvidenceSnapshot = evidenceUserSnapshot(ctx);
+			evidenceSnapshot = evidenceUserSnapshot(ctx);
 		} catch {
 			// A missing branch is equivalent to no citable user evidence. The model
 			// still receives the command and can judge its effects directly.
-			userEvidenceSnapshot = undefined;
+			evidenceSnapshot = undefined;
 		}
+		// The messages and ids the judges read, pinned first message included:
+		// the cache key, the audit ids and the lookalike overlay all key on them.
+		const userEvidenceSnapshot = judgedEvidence(evidenceSnapshot);
 		const citableUserEvidence = citableEvidence(userEvidenceSnapshot?.messages);
 		// The newest thing the user said, for refusal memory: a refusal records
 		// it, and only a newer one can lift that refusal.
 		const newestUserId = newestUserMessageId(ctx);
-		const evidenceSnapshot = userEvidenceSnapshot;
 		// Attach the same snapshot's ids to every audit line for this tool call,
 		// including the early returns before classification (issue #33 audit
 		// evidence fields). One snapshot, reused everywhere it is logged — never
-		// a second collectTaskEvidence call, and never the message text itself.
+		// a second evidence read, and never the message text itself.
 		const auditUserMessageIds: string[] | undefined =
 			userEvidenceSnapshot && userEvidenceSnapshot.ids.length > 0 ? userEvidenceSnapshot.ids : undefined;
 		// The code floor, in shadow (plan Phase 2 step 1, rollout per #55). It
@@ -7350,7 +7166,14 @@ export default function (pi: ExtensionAPI) {
 			};
 			try {
 				let classifyError = "";
-				const judgement = cached ? withoutShadow(cached) : (await classify(ctx, evalCode, cwd, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, reviewOperatorContext, evidenceSnapshot, "code", cwd, trustedPolicySnapshot.documents, leadDecisionId).catch(
+				// Assignment positions name variables, not commands: the
+				// `const rm = Bun.spawnSync(...)` shape flagged "rm" and
+				// blocked a SAFE the judge reached on the visible spawn.
+				// A real destructive verb reads as a call or an argument
+				// (`rm -rf`, spawn(["rm", …])) and never as `token =`. The
+				// decision order reads the same list the SAFE branch blocks on.
+				const flagList = [...evalRiskFlags(evalCode), ...lookalikeDestinationFlags(evalCode, userEvidenceSnapshot?.messages)];
+				const judgement = cached ?? (await classify(ctx, evalCode, cwd, config.timeoutMs, { kind: "eval-code", language, ...recordExtras }, reviewOperatorContext, evidenceSnapshot, "code", cwd, trustedPolicySnapshot.documents, leadDecisionId, flagList).catch(
 					(err: unknown) => {
 						classifyError = err instanceof Error ? err.message : String(err);
 						pi.logger.warn(`classifier: classify failed: ${classifyError}`);
@@ -7367,12 +7190,6 @@ export default function (pi: ExtensionAPI) {
 						` tool=eval lang=${language || "?"} cached=${cached ? 1 : 0} reason="${judgement.reason}" code="${logCode}"`,
 				);
 				if (judgement.verdict === "SAFE") {
-					// Assignment positions name variables, not commands: the
-					// `const rm = Bun.spawnSync(...)` shape flagged "rm" and
-					// blocked a SAFE the judge reached on the visible spawn.
-					// A real destructive verb reads as a call or an argument
-					// (`rm -rf`, spawn(["rm", …])) and never as `token =`.
-					const flagList = [...evalRiskFlags(evalCode), ...lookalikeDestinationFlags(evalCode, evidenceSnapshot?.messages)];
 					const replay = replayDecision({
 						tool: "eval",
 						command: evalCode,
@@ -7820,8 +7637,29 @@ export default function (pi: ExtensionAPI) {
 					note: "the classifier model would run here; skipped in dry-run",
 				});
 			}
+			// The overlay flags. A SAFE still blocks on any of them: Jev reads
+			// the command as untrusted state and can still be steered by text
+			// inside it, and a judge that answers SAFE on a payload carrying an
+			// injected instruction must not auto-run rm/dd/mkfs-class commands
+			// the builtin critical list does not cover. The decision order reads
+			// the same list, so its fast allows never clear what this blocks.
+			// Issue #161: a destination the gate measured as a lookalike of a host the
+			// user named asks, whatever the judge made of the field in its state.
+			const flags = [...matchModerateRiskTokens(judgedCommand, cwd), ...lookalikeDestinationFlags(judgedCommand, userEvidenceSnapshot?.messages)];
+			// Issue #67: a script body is code the classifier read verbatim —
+			// the same class of payload as an inline `-c` argument — so the
+			// same second-execution markers apply. A SAFE cannot vouch for a
+			// script that re-execs or decodes its real work, and that must not
+			// depend on the judge noticing which file it is reading.
+			for (const body of script.bodies) {
+				if (hasInterpreterCodeRisk(body.body)) flags.push(`${body.verb} runs ${body.operand}`);
+			}
+			// A critical pattern in a JavaScript or Python body: no process
+			// API was found by name, which is not proof none is reached, so a
+			// SAFE alone does not release it.
+			for (const body of criticalBodies ?? []) flags.push(`critical pattern in ${body}`);
 			let classifyError = "";
-			const stage1 = cached ? withoutShadow(cached) : (await classify(ctx, judgedCommand, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot, "shell", startCwd, trustedPolicySnapshot.documents, leadDecisionId).catch((err: unknown) => {
+			const stage1 = cached ?? (await classify(ctx, judgedCommand, cwd, config.timeoutMs, recordExtras, reviewOperatorContext, evidenceSnapshot, "shell", startCwd, trustedPolicySnapshot.documents, leadDecisionId, flags).catch((err: unknown) => {
 				// Provider errors (quota exhausted, auth, HTTP failures) previously
 				// vanished into an opaque "unavailable". Keep the message so the
 				// refusal says WHY.
@@ -7864,27 +7702,8 @@ export default function (pi: ExtensionAPI) {
 			);
 
 			if (judgement.verdict === "SAFE") {
-				// SAFE verdicts still block when the command
-				// carries a destructive/irreversible token. Jev reads the command
-				// as untrusted state and can still be steered by text inside it,
-				// and a judge that answers SAFE on a payload carrying an injected
-				// instruction must not auto-run rm/dd/mkfs-class commands the
-				// builtin critical list does not cover.
-				// Issue #161: a destination the gate measured as a lookalike of a host the
-				// user named asks, whatever the judge made of the field in its state.
-				const flags = [...matchModerateRiskTokens(judgedCommand, cwd), ...lookalikeDestinationFlags(judgedCommand, evidenceSnapshot?.messages)];
-				// Issue #67: a script body is code the classifier read verbatim —
-				// the same class of payload as an inline `-c` argument — so the
-				// same second-execution markers apply. A SAFE cannot vouch for a
-				// script that re-execs or decodes its real work, and that must not
-				// depend on the judge noticing which file it is reading.
-				for (const body of script.bodies) {
-					if (hasInterpreterCodeRisk(body.body)) flags.push(`${body.verb} runs ${body.operand}`);
-				}
-				// A critical pattern in a JavaScript or Python body: no process
-				// API was found by name, which is not proof none is reached, so a
-				// SAFE alone does not release it.
-				for (const body of criticalBodies ?? []) flags.push(`critical pattern in ${body}`);
+				// SAFE verdicts still block on an overlay flag (`flags`, computed
+				// before classify and read by the decision order too).
 				const lifts =
 					prior !== undefined &&
 					(priorRefusalLifts(prior, judgement, judgedCommand, cwd, userMessagesSince(ctx, prior.userMessageId).map(message => message.text)) ||
