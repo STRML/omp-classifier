@@ -31,7 +31,7 @@ const namedFirm: AuthorizationVerdict = { level: "named", namedFirm: true, reaso
 const namedSoft: AuthorizationVerdict = { level: "named", namedFirm: false, reason: "authorization named 0.60 (<0.80)" };
 
 function input(over: Partial<DecisionOrderInput> = {}): DecisionOrderInput {
-	return { risk: risk(), authorization: none, literal: { matched: false }, overlayFlags: [], headless: false, ...over };
+	return { risk: risk(), authorization: none, literal: { matched: false }, overlayFlags: [], ...over };
 }
 
 const decide = (over: Partial<DecisionOrderInput> = {}) => deriveDecisionOrder(input(over), DEFAULT_JEV_POLICY);
@@ -136,25 +136,29 @@ describe("branch 4: the literal fast allow", () => {
 		expect(decision.reasonCode).toBe("jev-v3:5:reviewer");
 	});
 
-	test("a block-band hazard is jev-v2's UNSAFE and never takes the fast allow, headless or not", () => {
+	test("a block-band hazard is jev-v2's UNSAFE and never takes the fast allow", () => {
 		const blockBand = risk({ safe: 0.1, unsafe: 0.3, hazards: { destructive_or_irreversible: 0.95 } });
-		for (const headless of [true, false]) {
-			const decision = decide({ risk: blockBand, authorization: namedFirm, literal: { matched: true }, headless });
-			expect(decision.branch).toBe(7);
-			expect(decision.verdict).toBe("UNSAFE");
-			expect(decision.persistRefusal).toBe(true);
-		}
+		const decision = decide({ risk: blockBand, authorization: namedFirm, literal: { matched: true } });
+		expect(decision.branch).toBe(7);
+		expect(decision.verdict).toBe("UNSAFE");
+		expect(decision.persistRefusal).toBe(true);
 	});
 
 	test("p(unsafe) at unsafeMinProbability is jev-v2's UNSAFE and never takes the fast allow", () => {
 		const leaning = risk({ safe: 0.2, unsafe: 0.6, hazards: { destructive_or_irreversible: 0.7 } });
-		for (const headless of [true, false]) {
-			expect(decide({ risk: leaning, authorization: namedFirm, literal: { matched: true }, headless }).branch).toBe(7);
-		}
+		expect(decide({ risk: leaning, authorization: namedFirm, literal: { matched: true } }).branch).toBe(7);
 	});
 
-	test("headless: a review-band hazard alone still takes the fast allow", () => {
-		expect(decide({ risk: deleteAnswer, authorization: namedFirm, literal: { matched: true }, headless: true }).branch).toBe(4);
+	test("a review-band hazard alone still takes the fast allow", () => {
+		expect(decide({ risk: deleteAnswer, authorization: namedFirm, literal: { matched: true } }).branch).toBe(4);
+	});
+
+	test("an overlaid SAFE takes branch 6 at any authorization, never the reviewer", () => {
+		for (const authorization of [none, goal, namedSoft, namedFirm]) {
+			const decision = decide({ authorization, literal: { matched: true }, overlayFlags: ["rm"] });
+			expect(decision.branch).toBe(6);
+			expect(decision.verdict).toBe("SAFE");
+		}
 	});
 });
 
@@ -195,14 +199,12 @@ describe("branch 6: overlay flags without authorization", () => {
 
 	test("an overlay never softens a jev-v2 UNSAFE or drops its refusal (Codex, #101 gate round 3)", () => {
 		const unsafe = risk({ safe: 0.02, unsafe: 0.98, hazards: { destructive_or_irreversible: 0.95 } });
-		for (const headless of [true, false]) {
-			const decision = decide({ risk: unsafe, overlayFlags: ["rm"], headless });
-			const legacy = deriveJevDecision(unsafe, DEFAULT_JEV_POLICY);
-			expect(legacy.verdict).toBe("UNSAFE");
-			expect(decision.branch).toBe(7);
-			expect(decision.verdict).toBe("UNSAFE");
-			expect(decision.persistRefusal).toBe(true);
-		}
+		const decision = decide({ risk: unsafe, overlayFlags: ["rm"] });
+		const legacy = deriveJevDecision(unsafe, DEFAULT_JEV_POLICY);
+		expect(legacy.verdict).toBe("UNSAFE");
+		expect(decision.branch).toBe(7);
+		expect(decision.verdict).toBe("UNSAFE");
+		expect(decision.persistRefusal).toBe(true);
 	});
 });
 

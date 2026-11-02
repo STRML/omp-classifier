@@ -151,6 +151,16 @@ describe("branch 4: a named, literally matched local action", () => {
 		expect(readDecisions().some(line => line.reasonCode === "jev-v3:4:named-literal")).toBe(false);
 	});
 
+	test("an overlaid risk SAFE is refused as flagged with no reviewer call, whatever the authorization", async () => {
+		setJevAnswer(jevSafeAnswer());
+		setAuthorization("goal", GOAL);
+		scriptReviewer(reviewerReply("allow", "delete scratch-build"));
+		const result = await fire("tool_call", makeEvent("rm -r scratch-build"), uiCtx(nextSession(), [user("u1", "delete scratch-build")]));
+		expect(refusalOf(result).layer).toBe("flagged");
+		expect(reviewerCalls).toHaveLength(0);
+		expect(verdictLine()?.reasonCode).toBe("jev-v3:6:overlay");
+	});
+
 	test("named below namedMinProbability goes to the reviewer, not the fast allow", async () => {
 		setJevAnswer(jevUnsureAnswer());
 		setAuthorization("named", NAMED_SOFT);
@@ -424,6 +434,18 @@ describe("outages fail closed", () => {
 		expect(line?.verdict).toBe("UNSURE");
 		expect(line?.reasonCode).not.toBe("jev-v3:4:named-literal");
 		expect(line?.authorization).not.toBe("grounded");
+	});
+
+	test("a verdict reached without an authorization answer is not cached: the retry asks again", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsureAnswer());
+		setAuthorizationFailure(true);
+		expect(await fire("tool_call", makeEvent("trash scratch-build"), uiCtx(sid, [user("u1", "delete scratch-build")]))).toMatchObject({ block: true });
+		setAuthorizationFailure(false);
+		setAuthorization("named", NAMED);
+		const retry = await fire("tool_call", makeEvent("trash scratch-build"), uiCtx(sid, [user("u1", "delete scratch-build")]));
+		expect(authorizationCalls).toHaveLength(2);
+		expect(resultText(retry)).toBe("ALLOWED");
 	});
 
 	test("the authorization request failing alone leaves a SAFE risk answer SAFE", async () => {

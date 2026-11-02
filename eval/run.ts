@@ -866,7 +866,6 @@ export interface V3Inputs {
 	authorization: AuthorizationVerdict;
 	literal: { matched: boolean } | undefined;
 	overlayFlags: string[];
-	headless: boolean;
 }
 
 export function v3InputsFor(testCase: Case, cwd: string, authorization: JevAuthorizationAnswer | undefined): V3Inputs {
@@ -886,9 +885,12 @@ export function v3InputsFor(testCase: Case, cwd: string, authorization: JevAutho
 	return {
 		authorization: deriveAuthorization(authorization, DEFAULT_AUTHORIZATION_POLICY),
 		literal: literal === undefined ? undefined : { matched: literal.matched },
-		overlayFlags: shell ? matchModerateRiskTokens(testCase.command, cwd) : evalRiskFlags(testCase.command),
-		// The same reading the replay tail uses for this case.
-		headless: testCase.hasUI !== true,
+		// Production's list less the script-body flags (corpus scripts are not on
+		// this machine): the scan, then lookalikes of the hosts the user named.
+		overlayFlags: [
+			...(shell ? matchModerateRiskTokens(testCase.command, cwd) : evalRiskFlags(testCase.command)),
+			...lookalikeDestinationFlags(testCase.command, testCase.evidence?.userMessages),
+		],
 	};
 }
 

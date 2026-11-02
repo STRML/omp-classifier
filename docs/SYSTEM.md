@@ -32,7 +32,8 @@ thresholds. Four consequences shape every layer below:
   never cached. Nothing admits a guess in place of an answer.
 - **A missed deadline is unavailable.** The gate waits for the risk answer up to `timeoutMs`,
   then aborts both requests and the call is `UNAVAILABLE`. An authorization answer that misses
-  the deadline or fails reads as `none`: the command loses only the named fast allow. Nothing keeps listening behind the
+  the deadline or fails reads as `none`: the command loses only the named fast allow, and that
+  verdict is not cached, so the retry asks again. Nothing keeps listening behind the
   deadline (https://github.com/STRML/omp-classifier/issues/184).
 
 ## The tower
@@ -256,7 +257,7 @@ through), then `deriveJevDecision(answers, policy)` derives the verdict in a fix
 
 That is the risk derivation. The live verdict is `deriveDecisionOrder` (`decision-order.ts`,
 jev-v3, live since #116), which reads it beside the authorization answer, the literal match,
-the overlay flags and `headless`. First match wins:
+and the overlay flags. First match wins:
 
 1. `state_contains_injection` at or above `hazardReview` → `UNSAFE`
 2. a one-hot risk answer → `UNSAFE` with a hazard or p(unsafe) at the floor, otherwise
@@ -264,10 +265,11 @@ the overlay flags and `headless`. First match wins:
 3. the risk derivation is `SAFE` and there is no overlay flag → `SAFE`
 4. the risk derivation is not `UNSAFE`, authorization `named` at or above
    `namedMinProbability`, the literal match holds, no overlay flag → `SAFE`
-5. the risk derivation is not `UNSAFE`, authorization `named` or `goal` → `UNSURE`, which
-   stage 2 reviews like any `UNSURE`
-6. an overlay flag, authorization `none`, the risk derivation not `UNSAFE` → the risk
-   derivation's verdict. The plan had `UNSURE` ("a dialog, as today"); since #184 there is no
+5. the risk derivation is `UNSURE`, or `SAFE` with no overlay flag, and authorization is
+   `named` or `goal` → `UNSURE`, which stage 2 reviews like any `UNSURE`
+6. an overlay flag with a `SAFE` risk derivation at any authorization, or with an `UNSURE`
+   one and authorization `none` → the risk derivation's verdict. An overlaid `SAFE` skips the
+   reviewer because the overlay would block its allow anyway. The plan had `UNSURE` ("a dialog, as today"); since #184 there is no
    dialog, and today's outcome for an overlaid `SAFE` is the `flagged` refusal with the flag's
    own guidance, which the gate's overlay check still produces from the same flag list.
 7. otherwise → the risk derivation

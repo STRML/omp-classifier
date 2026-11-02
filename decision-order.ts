@@ -15,7 +15,8 @@
  *   3. jev-v2's safe gate, no overlay flags           → SAFE
  *   4. firm `named`, literal match, no overlay flags,
  *      jev-v2 not UNSAFE                              → SAFE
- *   5. `named` or `goal`, jev-v2 not UNSAFE           → UNSURE, which stage 2 reviews
+ *   5. `named` or `goal`, jev-v2 UNSURE, or SAFE with
+ *      no overlay flag                                → UNSURE, which stage 2 reviews
  *   6. overlay flags, authorization `none`, not UNSAFE → jev-v2's verdict,
  *      which the gate's overlay then blocks as `flagged` on a SAFE
  *   7. otherwise                                      → jev-v2's derivation
@@ -39,8 +40,6 @@ export interface DecisionOrderInput {
 	literal: { matched: boolean } | undefined;
 	/** The deterministic overlays that force a dialog after a SAFE today. */
 	overlayFlags: readonly string[];
-	/** No user to answer a dialog. */
-	headless: boolean;
 }
 
 export interface OrderedDecision extends JevDecision {
@@ -86,12 +85,17 @@ export function deriveDecisionOrder(input: DecisionOrderInput, policy: JevPolicy
 	// bars exactly as before the flip. A model-authored "the user asked for
 	// this" must not clear what the risk battery holds. The plan's headless
 	// exception (a block-band hazard or p(unsafe) at the floor) is the same
-	// set of answers, so it is covered for every session.
+	// set of answers, so it is covered for every session and the order needs
+	// no `headless` input.
 	const riskUnsafe = legacy.verdict === "UNSAFE";
 	if (!riskUnsafe && authorization.namedFirm && !overlaid && input.literal?.matched === true) {
 		return decide(4, "SAFE", "named-literal", `${authorization.reason}, every segment matched the user's words`, false);
 	}
-	if (!riskUnsafe && (authorization.level === "named" || authorization.level === "goal")) {
+	// An overlaid SAFE goes to branch 6 whatever the authorization: the
+	// overlay blocks it after any reviewer allow, so a review could only cost
+	// time and lose the flag's own guidance.
+	const overlaidSafe = overlaid && legacy.verdict === "SAFE";
+	if (!riskUnsafe && !overlaidSafe && (authorization.level === "named" || authorization.level === "goal")) {
 		const note = overlaid ? `; overlay ${overlayFlags.join(", ")}` : "";
 		return decide(5, "UNSURE", "reviewer", `${authorization.reason}${note}; risk: ${legacy.reason}`, false);
 	}

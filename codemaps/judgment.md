@@ -6,7 +6,7 @@
 judgeJevV3UnderDeadline (live, jev-v3.9; one deadline aborts both requests)
   ├ judgeBattery(jev-v3.9 battery over buildJevState)          ─► JevAnswers (risk)
   └ judgeAuthorization(over buildAuthorizationState, no command) ─► deriveAuthorization (failure/late → none)
-deriveDecisionOrder(risk, authorization, literalMatch, overlay, headless)
+deriveDecisionOrder(risk, authorization, literalMatch, overlay)
   └ reads deriveJevDecision(risk) for branches 3, 6, 7 ─► OrderedDecision ─► Judgement
 ```
 
@@ -100,7 +100,7 @@ distribution and only a keyword bridge is one-hot. Every failure path throws
 ## decision-order.ts: jev-v3 order, the live verdict since #116
 
 `deriveDecisionOrder(input, policy)`, the live verdict: index `classify`, eval/run. Input:
-`{risk, authorization, literal, overlayFlags, headless}`. `reasonCode` = `jev-v3:<branch>:<code>`.
+`{risk, authorization, literal, overlayFlags}`. `reasonCode` = `jev-v3:<branch>:<code>`.
 `overlayFlags` = the list the gate blocks a SAFE on (moderate-risk tokens, lookalikes, script-body
 markers, critical body patterns), computed before classify.
 
@@ -110,7 +110,7 @@ markers, critical body patterns), computed before classify.
 | 2 | one-hot risk answer | UNSAFE (gating ≥ review or unsafe ≥ floor) else UNSURE; no refusal, never SAFE |
 | 3 | v2 says SAFE, no overlay flags | SAFE |
 | 4 | v2 not UNSAFE, `namedFirm`, literal match, no overlay | SAFE |
-| 5 | v2 not UNSAFE, authorization `named` or `goal` | UNSURE (stage 2 reviews it) |
+| 5 | v2 UNSURE (or SAFE with no overlay), authorization `named` or `goal` | UNSURE (stage 2 reviews it) |
 | 6 | overlay flags, authorization `none`, v2 not UNSAFE | v2 verdict (a SAFE then blocks `flagged`) |
 | 7 | otherwise | v2 verdict, refusal intact |
 

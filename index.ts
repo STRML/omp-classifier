@@ -6505,7 +6505,7 @@ export default function (pi: ExtensionAPI) {
 					resolveRealPath: realPathOf,
 				})
 			: undefined;
-		const decision = deriveDecisionOrder({ risk: answers, authorization, literal, overlayFlags: [...overlayFlags], headless: !ctx.hasUI }, policy);
+		const decision = deriveDecisionOrder({ risk: answers, authorization, literal, overlayFlags: [...overlayFlags] }, policy);
 		// `decision.hazards` carries only the hazards that reached hazardReview,
 		// so "fired" is presence, not a threshold re-check. The destructive
 		// hazard is the one that names damage no user can undo, so an UNSAFE it
@@ -6521,6 +6521,10 @@ export default function (pi: ExtensionAPI) {
 			reasonCode: decision.reasonCode,
 			...(decision.persistRefusal ? {} : { persistRefusal: false }),
 			...(answers.oneHot === true ? { oneHot: true } : {}),
+			// A verdict reached without the authorization answer is a transient
+			// state, like an outage: cached, it would keep the fast allow away
+			// after the endpoint recovers.
+			...(authorizationError === undefined ? {} : { noCache: true }),
 			risk,
 			authorization: authorizationLabel(authorization, decision.hazards, hadUserEvidence),
 			modelId: answers.model,

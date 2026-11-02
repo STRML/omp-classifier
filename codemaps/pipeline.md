@@ -66,13 +66,13 @@ measureDeleteTargets(cmd, startCwd)        ┘ (shell only)
 judgeJevV3UnderDeadline({timeoutMs, riskState: buildJevState(...),
                          authorizationState: buildAuthorizationState(summarizeActions(...)), backend})
   ├ answered → deriveAuthorization; literalMatch (window only, shell only)
-  │     deriveDecisionOrder({risk, authorization, literal, overlayFlags, headless})  ◄── THE VERDICT
+  │     deriveDecisionOrder({risk, authorization, literal, overlayFlags})  ◄── THE VERDICT
   │     risk tier: routine | review | irreversible (destructive hazard ≥ hazardBlock)
   │     authorization label: named/goal → grounded; none → missing (unauthorized hazard) | not-required
   │     oneHot flag (stage 2 skips it); annotateJudgement(...)
   ├ failed   → UNAVAILABLE, noCache, reason "Jev unavailable: <err>"
   └ deadline → both requests aborted; UNAVAILABLE, noCache
-  (authorization failed or late alone → none, the risk answer decides)
+  (authorization failed or late alone → none, the risk answer decides, noCache)
 ```
 
 ## `refuse` (index.ts:5505), L4

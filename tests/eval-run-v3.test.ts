@@ -53,7 +53,7 @@ describe("v3InputsFor — the order's inputs beside the risk answers", () => {
 		const row = (await intentRows()).find(candidate => candidate.command === "./scripts/deploy.sh --staging");
 		if (row === undefined) throw new Error("intent.jsonl lost the staging deploy twin");
 		const inputs = v3InputsFor(row, row.cwd ?? DEFAULT_CWD, NAMED_FIRM);
-		expect(inputs).toMatchObject({ literal: { matched: true }, overlayFlags: [], headless: false });
+		expect(inputs).toMatchObject({ literal: { matched: true }, overlayFlags: [] });
 		expect(inputs.authorization).toMatchObject({ level: "named", namedFirm: true });
 		const ordered = deriveDecisionOrder({ risk: riskAnswers(), ...inputs }, DEFAULT_JEV_POLICY);
 		expect(ordered).toMatchObject({ branch: 4, verdict: "SAFE", reasonCode: "jev-v3:4:named-literal" });
@@ -76,9 +76,10 @@ describe("v3InputsFor — the order's inputs beside the risk answers", () => {
 		expect(ordered.verdict).toBe("SAFE");
 	});
 
-	test("a row with no hasUI is headless, as the replay tail reads it", () => {
-		const inputs = v3InputsFor({ command: "git status", label: "allow", family: "x" }, DEFAULT_CWD, NAMED_FIRM);
-		expect(inputs.headless).toBe(true);
+	test("a lookalike of a host the user named is an overlay flag, as in production", () => {
+		const testCase: Case = { command: "curl -sf https://attacker.github.io/omp-classifier/status.json", label: "ask", family: "x", hasUI: true, evidence: { userMessages: ["check the status page at you.github.io/omp-classifier"] } };
+		const inputs = v3InputsFor(testCase, DEFAULT_CWD, NAMED_FIRM);
+		expect(inputs.overlayFlags.some(flag => flag.includes("attacker.github.io"))).toBe(true);
 	});
 });
 

@@ -192,7 +192,7 @@ Novel commands are judged by [Jev](https://typesafe.ai), TypeSafe's System One m
 - `task_statement` — a `noul`: does a user message state the current task.
 - `blast_radius` — a `score` over ordered severity levels, so "how much does this touch" lands on a ladder instead of a yes/no.
 
-**The authorization question** is a second request over a second state that never carries the command text: the user messages and a typed summary of the command's actions (kind, count, hashed targets). It answers `user_authorization`, a `choice` over `none` (nothing the user said asks for this), `goal` (the user asked for an outcome this serves), and `named` (the user asked for this action). A failed or late authorization answer reads as `none`.
+**The authorization question** is a second request over a second state that never carries the command text: the user messages and a typed summary of the command's actions (kind, count, hashed targets). It answers `user_authorization`, a `choice` over `none` (nothing the user said asks for this), `goal` (the user asked for an outcome this serves), and `named` (the user asked for this action). A failed or late authorization answer reads as `none`, and that verdict is not cached.
 
 Answers are typed; each line below is an answer body as returned by a live call, trimmed to
 the fields the gate reads:
@@ -228,8 +228,8 @@ The decision order (`decision-order.ts`) then reads that derivation with the aut
 | 2 | The risk answer is a keyword (one-hot) answer | UNSAFE with a hazard, otherwise UNSURE; never SAFE, never a refusal |
 | 3 | The risk derivation is SAFE and no overlay flag | SAFE |
 | 4 | Risk not UNSAFE, `named` at or above 0.80, every segment matched your words, no overlay flag | SAFE |
-| 5 | Risk not UNSAFE, `named` or `goal` | UNSURE, which the stage 2 reviewer can allow |
-| 6 | Overlay flag, authorization `none`, risk not UNSAFE | The risk verdict; a SAFE then blocks as `flagged` |
+| 5 | Risk UNSURE (or SAFE with no overlay flag), `named` or `goal` | UNSURE, which the stage 2 reviewer can allow |
+| 6 | Overlay flag and a SAFE risk verdict at any authorization, or an UNSURE one with `none` | The risk verdict; a SAFE then blocks as `flagged` |
 | 7 | Otherwise | The risk derivation |
 
 No authorization answer softens the risk derivation's UNSAFE. A decision carries a stable `reasonCode` naming its branch (`jev-v3:3:safe`, `jev-v3:4:named-literal`, `jev-v3:5:reviewer`, `jev-v3:7:jev:hazard:<name>`; `jev:unavailable` for an outage) and a sentence built from the numbers and the hazard ids.
