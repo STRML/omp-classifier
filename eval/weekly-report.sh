@@ -15,6 +15,8 @@ bun="${BUN:-$HOME/.bun/bin/bun}"
 gh="${GH:-/opt/homebrew/bin/gh}"
 dir="$HOME/.omp/omp-classifier"
 full="$dir/shadow-report-$(date +%F).txt"
+# The comment is public: name the file relative to the home directory.
+shown="~${full#"$HOME"}"
 
 notify() {
 	/usr/bin/osascript -e "display notification \"$1\" with title \"omp-classifier shadow report\"" >/dev/null 2>&1 || true
@@ -46,7 +48,7 @@ body="Weekly jev-v3 shadow report, $(date +%F), last 7 days. $verdict
 $counts
 \`\`\`
 
-Counts only: the command rows stay local in \`$full\`, because logged command text can hold a secret (#71). Flip criterion: REGRESSIONS must read \`none\`."
+Counts only: the command rows stay local in \`$shown\`, because logged command text can hold a secret (#71). Flip criterion: REGRESSIONS must read \`none\`."
 
 # OMP_SHADOW_DRY_RUN=1 prints the comment instead of posting it.
 if [ -n "${OMP_SHADOW_DRY_RUN:-}" ]; then
