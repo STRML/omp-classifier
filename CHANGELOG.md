@@ -8,6 +8,10 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 https://github.com/STRML/omp-classifier/issues/142 asked whether a coordinator may lift a headless worker's refusal. It may not, and that was already the behavior: only the user's own words (`attribution: "user"`) or a stage 2 allow quoting them lift a model refusal, and a headless session reads no user channel. Two tests now pin it: a coordinator steer that names the target does not lift a refusal, and a cap refusal, which never yields, holds in a headless session. `docs/SYSTEM.md` says so in the refusal-memory entry. A wedged headless worker is restart-only.
 
+### Fixtures and the weekly report carry no private host or path
+
+Test fixtures, eval corpus rows, a plan doc and two changelog lines named a real LAN address, a home directory and private repository paths. They now use `10.0.0.53`, `10.0.1.x`, `/home/dev/...` and generic repo names. The weekly shadow report comment on https://github.com/STRML/omp-classifier/issues/116 printed the full local report path; it now prints it relative to `~`.
+
 ## 2026-10-31
 
 ### A host you named reaches the reviewer at UNSAFE too, and refusal memory stops deciding the next verdict
@@ -499,7 +503,7 @@ On an UNSURE, `escalates_privilege` no longer bars review when the user's words,
 
 The reviewer prompt moves a root command on a remote machine the user named from "block always" to "block unless the user's words name the machine and the change". A local `sudo` and granting new access stay "block always".
 
-Three fixes reach the lift check too, since it shares the host reader. A sentence's closing period no longer hides the name ("the TV is 192.168.86.53." counts). A URL operand (`rsync://host/mod`, `scp://user@host/path`) yields its host, not its scheme. And `.` or `_` is never a host.
+Three fixes reach the lift check too, since it shares the host reader. A sentence's closing period no longer hides the name ("the TV is 10.0.0.53." counts). A URL operand (`rsync://host/mod`, `scp://user@host/path`) yields its host, not its scheme. And `.` or `_` is never a host.
 
 | Case | Stage 2 |
 |---|---|
@@ -516,7 +520,7 @@ Whether the user's words cover the command stays the reviewer's call: the code c
 
 This change alone would not have let the session's commands through:
 
-- No user message or ask named `192.168.86.53`. The user wrote "the TV".
+- No user message or ask named `10.0.0.53`. The user wrote "the TV".
 - The two stop commands also scored `exposes_secrets` 0.64, from `-i ~/.ssh/device_ed25519`, and that hazard stays hard.
 - They ran ssh through a variable (`SSH="ssh … root@…"; $SSH '…'`), and the read-only probe ran under `timeout 30`. Shape B does not read either form.
 

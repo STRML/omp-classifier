@@ -49,7 +49,7 @@ const fixture = (): { sources: NetworkSources; home: string; project: string; re
 	mkdirSync(join(home, ".ssh"), { recursive: true });
 	writeFileSync(join(home, ".ssh", "config"), "Host fixture-host\n  HostName 10.1.2.3\n  User deploy\n\nHost *\n  AddKeysToAgent yes\n");
 	const hostsFile = join(home, "hosts");
-	writeFileSync(hostsFile, "192.168.1.9 fixture-nas alias-nas\n127.0.0.1 fixture-www fixture.local\n");
+	writeFileSync(hostsFile, "10.0.1.9 fixture-nas alias-nas\n127.0.0.1 fixture-www fixture.local\n");
 	writeFileSync(join(project, "compose.yaml"), "services:\n  db:\n    image: mysql:8\n  web:\n    image: wordpress\nvolumes:\n  data:\n");
 	return {
 		sources: { sshConfigPaths: [join(home, ".ssh", "config")], hostsFile, dockerState: () => SOCKET, env: {}, dockerConfigDir: join(home, ".docker"), homeDir: home },
@@ -78,7 +78,7 @@ describe("the loopback tier is read from the command's own URLs (#65)", () => {
 
 	test("the loopback predicate is the claim `localPorts` rests on", () => {
 		for (const host of ["localhost", "LOCALHOST", "api.localhost", "127.0.0.1", "127.13.9.4", "::1"]) expect(isLoopbackHost(host)).toBe(true);
-		for (const host of ["127.0.0.1.example.com", "notlocalhost", "0.0.0.0", "192.168.1.4", "localhost.example.com"]) expect(isLoopbackHost(host)).toBe(false);
+		for (const host of ["127.0.0.1.example.com", "notlocalhost", "0.0.0.0", "10.0.1.4", "localhost.example.com"]) expect(isLoopbackHost(host)).toBe(false);
 	});
 });
 
