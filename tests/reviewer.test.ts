@@ -306,6 +306,72 @@ describe("an UNSURE the user asked for", () => {
 		expect(reviewerCalls[0].input.transcript).toContainEqual({ from: "ask", agentQuestion: "Run update-fork.sh start?", userAnswer: "Yes" });
 	});
 
+	// OMP session 01a19d31: the detail of the agreed run ("against the local
+	// mlx-serve on port 11234") sat in the picked option's description, which
+	// the host's result drops, and the reviewer blocked that run as unasked.
+	describe("the picked option's description rides with the question", () => {
+		const question = "OK to run judge2.py on the Studio?";
+		const askCall = (id: string): Entry => ({
+			type: "message",
+			id: `call-msg-${id}`,
+			message: {
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: `call-${id}`,
+						name: "ask",
+						arguments: {
+							questions: [
+								{
+									id: "ssh",
+									question,
+									options: [
+										{ label: "Yes, run it", description: "Runs judge2.py against the local server on port 11234." },
+										{ label: "No, stay local", description: "Copies eval.json here instead." },
+									],
+								},
+							],
+						},
+					},
+				],
+			},
+		});
+
+		test("the reviewer reads the description of the option the user picked, and only that one", async () => {
+			scriptReviewer(reviewerReply("block"));
+			const branch = [user("u1", "resume the rejudge"), askCall("a1"), askAnswer("a1", question, "Yes, run it")];
+			await fire("tool_call", makeEvent("git fetch upstream"), uiCtx(nextSession(), branch));
+			const asked = (reviewerCalls[0].input as { transcript: Array<{ from: string }> }).transcript.find(entry => entry.from === "ask") as { agentQuestion: string; userAnswer: string } | undefined;
+			expect(asked?.agentQuestion).toBe(`${question}\nThe option the user picked, "Yes, run it", said: Runs judge2.py against the local server on port 11234.`);
+			expect(asked?.userAnswer).toBe("Yes, run it");
+			expect(JSON.stringify(reviewerCalls[0].input.transcript)).not.toContain("Copies eval.json");
+		});
+
+		test("an answer with no matching ask call keeps the bare question", async () => {
+			scriptReviewer(reviewerReply("block"));
+			const branch = [user("u1", "resume the rejudge"), askAnswer("a1", question, "Yes, run it")];
+			await fire("tool_call", makeEvent("git fetch upstream"), uiCtx(nextSession(), branch));
+			expect(reviewerCalls[0].input.transcript).toContainEqual({ from: "ask", agentQuestion: question, userAnswer: "Yes, run it" });
+		});
+
+		test("a description that names the target lets a reviewer allow lift a refusal", async () => {
+			const sid = nextSession();
+			const target = "scp judge2.py studio:bench/judge2.py";
+			setJevAnswer(jevUnsafeAnswer());
+			scriptReviewer(reviewerReply("block"));
+			expect(refusalOf(await fire("tool_call", makeEvent(target), uiCtx(sid, [user("u1", "resume the rejudge")]))).layer).toBe("unsafe");
+			const named: Entry = {
+				type: "message",
+				id: "call-msg-a2",
+				message: { role: "assistant", content: [{ type: "toolCall", id: "call-a2", name: "ask", arguments: { questions: [{ question: "Go ahead?", options: [{ label: "Yes", description: "Copies judge2.py to the studio and runs it." }] }] } }] },
+			};
+			scriptReviewer(reviewerReply("allow", "Yes"));
+			const result = await fire("tool_call", makeEvent(target), uiCtx(sid, [user("u1", "resume the rejudge"), named, askAnswer("a2", "Go ahead?", "Yes")]));
+			expect(resultText(result)).toBe("ALLOWED");
+		});
+	});
+
 	test("a cancelled multi-select is not an answer", async () => {
 		scriptReviewer(reviewerReply("block"));
 		const branch = [user("u1", "tidy up"), askAnswer("a1", "Delete these?", "build/", { multi: true, cancelled: true })];

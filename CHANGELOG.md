@@ -4,6 +4,15 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-11-02
 
+### The reviewer reads the option the user picked, and the steps the asked-for work needs
+
+OMP session `01a19d31`: the agent asked "I need to run `judge2.py` on the Studio's eval.json. OK to proceed?" and the user picked "Yes, run ssh on the Studio", whose description read "Runs judge2.py against the local mlx-serve on port 11234". The stage 2 reviewer then blocked four calls in a row, among them that very run, "against a live local server endpoint (http://127.0.0.1:11234) ... which is not what was asked". The host's ask result keeps only the option labels, and the reviewer never saw the description. The user turned the classifier off a minute later.
+
+- Each ask answer now reaches the reviewer (and the consent check that lifts a refusal) with the description of the option the user picked, read from the ask call's arguments. Options the user did not pick stay out. The description is the agent's text, like the question, and is never itself the user's words.
+- The reviewer's consent rule now covers the ordinary steps the asked-for work needs on the same host and paths: copying the script it runs there, preparing its input file, writing its output beside it, using the server or port it names. Three of the four blocks were those steps (copying `judge2.py` to the Studio, preparing `rejudge-w1.json`, passing `--split test`).
+
+Still blocked in that session, correctly: writing a keychain secret to a file, and a secret read into an inline environment variable for a script.
+
 ### No agent lifts a refusal for another agent
 
 https://github.com/STRML/omp-classifier/issues/142 asked whether a coordinator may lift a headless worker's refusal. It may not, and that was already the behavior: only the user's own words (`attribution: "user"`) or a stage 2 allow quoting them lift a model refusal, and a headless session reads no user channel. Two tests now pin it: a coordinator steer that names the target does not lift a refusal, and a cap refusal, which never yields, holds in a headless session. `docs/SYSTEM.md` says so in the refusal-memory entry. A wedged headless worker is restart-only.
