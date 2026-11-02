@@ -260,11 +260,15 @@ describe("a refusal and the user's words", () => {
 		expect(refusalOf(await fire("tool_call", makeEvent(`${refusedBranch} `), uiCtx(sid, after))).layer).toBe("prior-refusal");
 	});
 
-	test("a critical refusal stays in a headless session too", async () => {
+	// A critical pattern refuses on every call by itself, so the cap is the
+	// refusal that only memory can hold: the short retry passes the length cap.
+	test("a cap refusal stays in a headless session too", async () => {
 		const sid = nextSession();
-		await fire("tool_call", makeEvent("rm -rf /"), uiCtx(sid, [], false));
-		const branch = [userMessage("u1", "go ahead, run rm -rf /")];
-		expect(refusalOf(await fire("tool_call", makeEvent("rm -rf /"), uiCtx(sid, branch, false))).layer).toBe("critical");
+		const longTrash = `trash old.log ${"x ".repeat(4100)}`;
+		expect(refusalOf(await fire("tool_call", makeEvent(longTrash), uiCtx(sid, [], false))).layer).toBe("cap");
+		setJevAnswer(jevSafeAnswer());
+		const branch = [userMessage("u1", "yes, delete old.log")];
+		expect(refusalOf(await fire("tool_call", makeEvent("trash old.log"), uiCtx(sid, branch, false))).layer).toBe("prior-refusal");
 	});
 
 	test("with evidenceUserMessages 0 the judge sees no user words, so nothing yields", async () => {

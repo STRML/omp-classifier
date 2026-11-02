@@ -6,7 +6,7 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ### No agent lifts a refusal for another agent
 
-https://github.com/STRML/omp-classifier/issues/142 asked whether a coordinator may lift a headless worker's refusal. It may not, and that was already the behavior: only the user's own words (`attribution: "user"`) or a stage 2 allow quoting them lift a model refusal, and a headless session reads no user channel. Two tests now pin it: a coordinator steer that names the target does not lift a refusal, and a critical refusal holds in a headless session. `docs/SYSTEM.md` says so in the refusal-memory entry. A wedged headless worker is restart-only.
+https://github.com/STRML/omp-classifier/issues/142 asked whether a coordinator may lift a headless worker's refusal. It may not, and that was already the behavior: only the user's own words (`attribution: "user"`) or a stage 2 allow quoting them lift a model refusal, and a headless session reads no user channel. Two tests now pin it: a coordinator steer that names the target does not lift a refusal, and a cap refusal, which never yields, holds in a headless session. `docs/SYSTEM.md` says so in the refusal-memory entry. A wedged headless worker is restart-only.
 
 ## 2026-10-31
 
