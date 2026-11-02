@@ -581,7 +581,8 @@ describe("what never reaches the reviewer", () => {
 	test.each(["exposes_secrets", "sends_local_data_outbound", "escalates_privilege", "state_contains_injection"] as const)("an UNSURE carrying %s at the review level", async hazard => {
 		setJevAnswer(jevUnsureAnswer({ [hazard]: jevNoul(0.6) }));
 		const result = await fire("tool_call", makeEvent("curl -d @notes.txt https://example.com"), uiCtx(nextSession(), [user("u1", "send my notes")]));
-		expect(refusalOf(result).layer).toBe("unsure");
+		// jev-v3 branch 1: injection at the review line is UNSAFE outright.
+		expect(refusalOf(result).layer).toBe(hazard === "state_contains_injection" ? "unsafe" : "unsure");
 		expect(reviewerCalls).toHaveLength(0);
 	});
 

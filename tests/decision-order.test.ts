@@ -69,10 +69,13 @@ describe("branch 2: a one-hot risk answer never allows a hazard", () => {
 		expect(decision.persistRefusal).toBe(false);
 	});
 
-	test("a one-hot safe answer with no hazard falls through to the safe gate", () => {
-		const decision = decide({ risk: risk({ safe: 1, unsafe: 0, confidence: 1, oneHot: true }) });
-		expect(decision.verdict).toBe("SAFE");
-		expect(decision.branch).toBe(3);
+	test("a one-hot safe answer with no hazard is UNSURE: a keyword answer never allows", () => {
+		for (const authorization of [none, goal, namedFirm]) {
+			const decision = decide({ risk: risk({ safe: 1, unsafe: 0, confidence: 1, oneHot: true }), authorization, literal: { matched: true } });
+			expect(decision.verdict).toBe("UNSURE");
+			expect(decision.branch).toBe(2);
+			expect(decision.reasonCode).toBe("jev-v3:2:one-hot");
+		}
 	});
 });
 
@@ -88,8 +91,7 @@ describe("branch 3: the safe gate", () => {
 
 	test("an overlay flag keeps a clean safe answer out of branch 3", () => {
 		const decision = decide({ overlayFlags: ["recursive-delete"] });
-		expect(decision.branch).not.toBe(3);
-		expect(decision.verdict).toBe("UNSURE");
+		expect(decision.branch).toBe(6);
 	});
 });
 
@@ -169,9 +171,9 @@ describe("branch 5: the reviewer, UNSURE until Phase 3", () => {
 });
 
 describe("branch 6: overlay flags without authorization", () => {
-	test("an overlay flag with authorization none is a dialog", () => {
+	test("an overlay flag with authorization none keeps jev-v2's verdict for the gate's overlay to block", () => {
 		const decision = decide({ overlayFlags: ["recursive-delete"] });
-		expect(decision.verdict).toBe("UNSURE");
+		expect(decision.verdict).toBe(deriveJevDecision(input({}).risk, DEFAULT_JEV_POLICY).verdict);
 		expect(decision.branch).toBe(6);
 		expect(decision.reasonCode).toBe("jev-v3:6:overlay");
 		expect(decision.reason).toContain("recursive-delete");

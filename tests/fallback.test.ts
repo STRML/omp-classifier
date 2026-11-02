@@ -217,7 +217,7 @@ describe("the outage is visible in the audit trail", () => {
 		expect(lines[0].jev).toBeUndefined();
 		expect(lines[1]).toMatchObject({ decision: "block", layer: "blocked", verdict: "UNAVAILABLE" });
 		expect(lines[2].verdict).toBe("UNSAFE");
-		expect(lines[2].reasonCode).toMatch(/^jev:/u);
+		expect(lines[2].reasonCode).toMatch(/^jev-v3:/u);
 		expect(lines[2].jev?.model).toBeTruthy();
 		expect(lines[2].jev?.hazards).toBeDefined();
 		// The recovered decision's outcome line heads the same way.

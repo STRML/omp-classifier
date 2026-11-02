@@ -10,16 +10,19 @@
  *
  *   1. injection at hazardReview                      → UNSAFE
  *   2. one-hot risk answer with a hazard or unsafe    → UNSAFE, no refusal
+ *      one-hot risk answer otherwise                  → UNSURE: a keyword
+ *      answer has no distribution to clear a floor with, so it never allows
  *   3. jev-v2's safe gate, no overlay flags           → SAFE
  *   4. firm `named`, literal match, no overlay flags  → SAFE
  *      (headless with a block-band hazard or unsafe   → branch 5)
- *   5. `named` or `goal`                              → reviewer (UNSURE until Phase 3)
- *   6. overlay flags, authorization `none`, not UNSAFE → UNSURE
+ *   5. `named` or `goal`                              → UNSURE, which stage 2 reviews
+ *   6. overlay flags, authorization `none`, not UNSAFE → jev-v2's verdict,
+ *      which the gate's overlay then blocks as `flagged` on a SAFE
  *   7. otherwise                                      → jev-v2's derivation
  *
- * Pure, like deriveJevDecision, and separate from it on purpose: jev-v2 stays
- * the live decision until the flip, so the shadow week compares against code
- * that did not move.
+ * Pure. This is the live decision since the flip
+ * (https://github.com/STRML/omp-classifier/issues/116); branches 3 and 7 read
+ * `deriveJevDecision` over the same risk answers.
  */
 import type { AuthorizationVerdict } from "./authorization";
 import { deriveJevDecision, JEV_GATING_HAZARDS, type JevAnswers, type JevDecision, type JevPolicy, type JevVerdict } from "./jev";
@@ -71,6 +74,9 @@ export function deriveDecisionOrder(input: DecisionOrderInput, policy: JevPolicy
 	if (oneHot && (maxGating(input.risk) >= policy.hazardReview || unsafe >= policy.unsafeMinProbability)) {
 		return decide(2, "UNSAFE", "one-hot-hazard", `${legacy.reason}; a keyword answer cannot clear a hazard`, false);
 	}
+	if (oneHot) {
+		return decide(2, "UNSURE", "one-hot", `${legacy.reason}; a keyword answer never allows`, false);
+	}
 	if (legacy.verdict === "SAFE" && !overlaid) {
 		return decide(3, "SAFE", "safe", legacy.reason, legacy.persistRefusal);
 	}
@@ -82,12 +88,17 @@ export function deriveDecisionOrder(input: DecisionOrderInput, policy: JevPolicy
 	}
 	if (authorization.level === "named" || authorization.level === "goal") {
 		const note = overlaid ? `; overlay ${overlayFlags.join(", ")}` : "";
-		return decide(5, "UNSURE", "reviewer", `${authorization.reason}; reviewer not built yet${note}; risk: ${legacy.reason}`, false);
+		return decide(5, "UNSURE", "reviewer", `${authorization.reason}${note}; risk: ${legacy.reason}`, false);
 	}
-	// A dialog, as today: the overlay escalates a SAFE or UNSURE. It never
+	// The plan's branch 6 was "a dialog, as today". There is no dialog since
+	// https://github.com/STRML/omp-classifier/issues/184: today an overlaid
+	// SAFE is refused as `flagged` by the gate's overlay check, with the flag's
+	// own guidance (use trash, ask the user to run it). The branch therefore
+	// keeps jev-v2's verdict and names the overlay; the caller passes the same
+	// flag list it blocks a SAFE on, so a branch 6 SAFE never runs. It never
 	// softens an UNSAFE, which falls through to branch 7 with its refusal.
 	if (overlaid && legacy.verdict !== "UNSAFE") {
-		return decide(6, "UNSURE", "overlay", `overlay ${overlayFlags.join(", ")} with ${authorization.reason}`, false);
+		return decide(6, legacy.verdict, "overlay", `${legacy.reason}; overlay ${overlayFlags.join(", ")} with ${authorization.reason}`, legacy.persistRefusal);
 	}
 	return decide(7, legacy.verdict, legacy.reasonCode, legacy.reason, legacy.persistRefusal);
 }

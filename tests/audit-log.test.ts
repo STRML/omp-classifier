@@ -33,10 +33,11 @@ import {
 	setJevUnavailable,
 	useTempConfigFile,
 	removeConfigFile,
+	setAuthorization,
 } from "./fixtures";
 import { buildStatusReport, CLASSIFIER_POLICY_HASH, CLASSIFIER_POLICY_VERSION, type DecisionRecord } from "../index";
 
-/** A user branch entry with no explicit id, so collectTaskEvidence falls back
+/** A user branch entry with no explicit id, so collectTaskEvidenceV3 falls back
  *  to its synthetic `user-<index>` id — deterministic enough to assert on
  *  without wiring up a host message id. */
 type BranchEntry = { type: string; message?: { role?: string; attribution?: string; content?: unknown } };
@@ -114,7 +115,7 @@ describe("decision audit log", () => {
 			cached: 0,
 			policyVersion: CLASSIFIER_POLICY_VERSION,
 			policyHash: CLASSIFIER_POLICY_HASH,
-			reasonCode: "jev:safe",
+			reasonCode: "jev-v3:3:safe",
 			sessionId: "audit-safe",
 		});
 		expect(lines[0].decisionId).toMatch(/^[0-9a-f-]{36}$/u);
@@ -149,7 +150,7 @@ describe("decision audit log", () => {
 		expect(await fire("tool_call", makeEvent(command), ctx)).toBeUndefined();
 		lines = readDecisions();
 		expect(lines).toHaveLength(2);
-		expect(lines[1]).toMatchObject({ decision: "allow", layer: "cached", verdict: "SAFE", cached: 1, reasonCode: "jev:safe" });
+		expect(lines[1]).toMatchObject({ decision: "allow", layer: "cached", verdict: "SAFE", cached: 1, reasonCode: "jev-v3:3:safe" });
 	});
 
 	test("an UNSAFE verdict logs the reason code and hazard flags, never invented prose", async () => {
@@ -158,7 +159,7 @@ describe("decision audit log", () => {
 		const ctx = makeCtx({ sessionId: `audit-unsafe-${seq}` });
 		await fire("tool_call", makeEvent(`git branch -D audit-unsafe-${seq}`), ctx);
 		const line = readDecisions()[0];
-		expect(line).toMatchObject({ decision: "block", layer: "verdict", verdict: "UNSAFE", reasonCode: "jev:unsafe" });
+		expect(line).toMatchObject({ decision: "block", layer: "verdict", verdict: "UNSAFE", reasonCode: "jev-v3:7:jev:unsafe" });
 		// The reason is assembled from the numbers, so the line explains itself
 		// without any model text: unsafe 0.96 (>=0.50).
 		expect(line.why).toContain("unsafe 0.96");
@@ -253,7 +254,7 @@ describe("decision audit log", () => {
 		expect(refusalOf(blocked).layer).toBe("unsafe");
 		const lines = readDecisions();
 		expect(lines).toHaveLength(2);
-		expect(lines[0]).toMatchObject({ decision: "block", layer: "verdict", verdict: "UNSAFE", reasonCode: "jev:unsafe" });
+		expect(lines[0]).toMatchObject({ decision: "block", layer: "verdict", verdict: "UNSAFE", reasonCode: "jev-v3:7:jev:unsafe" });
 		expect(lines[1]).toMatchObject({ decision: "block", layer: "blocked", verdict: "UNSAFE" });
 		expect(lines[1].why.startsWith("follows verdict")).toBe(true);
 	});
@@ -273,7 +274,7 @@ describe("decision audit log", () => {
 		expect(refusalOf(blocked).layer).toBe("flagged");
 		const lines = readDecisions();
 		expect(lines).toHaveLength(2);
-		expect(lines[0]).toMatchObject({ decision: "block", layer: "verdict", verdict: "SAFE", cached: 0, reasonCode: "jev:safe" });
+		expect(lines[0]).toMatchObject({ decision: "block", layer: "verdict", verdict: "SAFE", cached: 0, reasonCode: "jev-v3:6:overlay" });
 		expect(lines[0].why).toContain("flags: rm");
 		expect(lines[1]).toMatchObject({ decision: "block", layer: "blocked" });
 		expect(lines[1].why.startsWith("follows verdict")).toBe(true);
@@ -324,14 +325,14 @@ describe("decision audit log", () => {
 			seq += 1;
 			const command = `echo audit-evidence-verdict-${seq}`;
 			const ctx = makeCtx({ sessionId: `audit-evidence-verdict-${seq}`, hasUI: true, branch: [userEntry(rawText)] });
+			setAuthorization("goal", { none: 0.1, goal: 0.8, named: 0.1 });
 			expect(await fire("tool_call", makeEvent(command), ctx)).toBeUndefined();
 			const lines = readDecisions();
 			expect(lines).toHaveLength(1);
 			expect(lines[0]).toMatchObject({ decision: "allow", layer: "verdict", verdict: "SAFE" });
 			expect(lines[0].userMessageIds).toEqual(["user-0"]);
-			// The default SAFE answer clears unauthorized_consequential_action, and
-			// this call had user evidence in the branch, so authorization is
-			// "grounded" — the judgement actually depended on it.
+			// The authorization question read the user's words as covering the
+			// action, so the label is "grounded".
 			expect(lines[0].authorization).toBe("grounded");
 			for (const line of lines) {
 				expect(JSON.stringify(line)).not.toContain(rawText);

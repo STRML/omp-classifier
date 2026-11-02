@@ -847,7 +847,7 @@ export function answerCacheKey(input: { battery: string; model: string; cwd: str
 
 /** The authorization state production builds for this case: the actions
  *  summarized from the command (one unnamed run-code action for eval code,
- *  as `shadowJevV3` does) and the case's own user words. The corpus carries no
+ *  as `classify` does) and the case's own user words. The corpus carries no
  *  pinned policy, and provenance belongs to the risk state, so neither is sent. */
 export function caseAuthorizationState(testCase: Case): unknown {
 	const actions =

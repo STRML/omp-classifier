@@ -47,6 +47,7 @@ import {
 	makeCtx,
 	makeEvent,
 	makeSettings,
+	authorizationCalls,
 	modelCalls,
 	notifyCalls,
 	questionsOf,
@@ -130,7 +131,7 @@ describe("the default backend", () => {
 	});
 
 	test("with the shadow off the default still resolves exactly one host judge", async () => {
-		writeConfigFile({ shadowV3: false });
+		writeConfigFile({});
 		expect(await gate("git status")).toBe("ALLOWED");
 		expect(resolvedJudgeDeps.length).toBe(1);
 		expect(modelCalls.length).toBe(1);
@@ -155,7 +156,7 @@ describe("the default backend", () => {
 
 		// The half-written key must not change the transport either: the command
 		// still classifies through the host judge.
-		writeConfigFile({ shadowV3: false, judgeBackend: { kind: "endpoint", baseUrl: "not a url", model: "m", apiKeyEnv: "K" } });
+		writeConfigFile({ judgeBackend: { kind: "endpoint", baseUrl: "not a url", model: "m", apiKeyEnv: "K" } });
 		const result = await gate("git status");
 		expect(result).toBe("ALLOWED");
 		expect(resolvedJudgeDeps.length).toBe(1);
@@ -208,14 +209,14 @@ describe("the endpoint backend", () => {
 
 	test("classifies one command through the endpoint, never the host path", async () => {
 		process.env.LOCAL_JUDGE_KEY = KEY_VALUE;
-		writeConfigFile({ shadowV3: false, judgeBackend: ENDPOINT });
+		writeConfigFile({ judgeBackend: ENDPOINT });
 
 		const result = await gate("git status");
 		// The endpoint's probability answer decided: safe answers default, so
 		// reaching ALLOWED means the whole answer path ran on the response.
 		expect(result).toBe("ALLOWED");
 		expect(resolvedJudgeDeps.length).toBe(0);
-		expect(requestedUrls).toEqual([`${ENDPOINT.baseUrl}/v1/systemone`]);
+		expect(requestedUrls).toEqual([`${ENDPOINT.baseUrl}/v1/systemone`, `${ENDPOINT.baseUrl}/v1/systemone`]);
 		expect(modelCalls.length).toBe(1);
 		expect(modelCalls[0].model).toBe(ENDPOINT.model);
 		expect(modelCalls[0].headers?.authorization).toBe(`Bearer ${KEY_VALUE}`);
@@ -226,22 +227,22 @@ describe("the endpoint backend", () => {
 		);
 	});
 
-	test("the shadow asks the configured backend too", async () => {
+	test("the authorization request asks the configured backend too", async () => {
 		process.env.LOCAL_JUDGE_KEY = KEY_VALUE;
-		// shadowV3 defaults on: the shadow must measure the judge that decided.
 		writeConfigFile({ judgeBackend: ENDPOINT });
 		await gate("git status");
-		// The live risk battery, then the shadow's risk and authorization
-		// questions — all three at the configured endpoint.
-		expect(requestedUrls.length).toBe(3);
+		// The risk battery and the authorization question, both at the
+		// configured endpoint: the two halves of one judgment ask one judge.
+		expect(requestedUrls.length).toBe(2);
 		expect(requestedUrls.every(url => url === `${ENDPOINT.baseUrl}/v1/systemone`)).toBe(true);
-		expect(modelCalls.every(call => call.model === ENDPOINT.model)).toBe(true);
+		expect(authorizationCalls.length).toBe(1);
+		expect(authorizationCalls[0].model).toBe(ENDPOINT.model);
 		expect(resolvedJudgeDeps.length).toBe(0);
 	});
 
 	test("a missing env var fails closed: no request, no verdict, nothing cached", async () => {
 		delete process.env.LOCAL_JUDGE_KEY;
-		writeConfigFile({ shadowV3: false, judgeBackend: ENDPOINT });
+		writeConfigFile({ judgeBackend: ENDPOINT });
 		const sid = nextSession();
 		const blocked = await fire("tool_call", makeEvent("git status"), makeCtx({ sessionId: sid }));
 		const payload = refusalOf(blocked);
@@ -258,12 +259,12 @@ describe("the endpoint backend", () => {
 
 		process.env.LOCAL_JUDGE_KEY = KEY_VALUE;
 		expect(await gate("git status")).toBe("ALLOWED");
-		expect(requestedUrls).toEqual([`${ENDPOINT.baseUrl}/v1/systemone`]);
+		expect(requestedUrls).toEqual([`${ENDPOINT.baseUrl}/v1/systemone`, `${ENDPOINT.baseUrl}/v1/systemone`]);
 	});
 
 	test("with a UI the missing key blocks instead of a silent run", async () => {
 		delete process.env.LOCAL_JUDGE_KEY;
-		writeConfigFile({ shadowV3: false, judgeBackend: ENDPOINT });
+		writeConfigFile({ judgeBackend: ENDPOINT });
 		const ctx = makeCtx({ sessionId: nextSession(), hasUI: true });
 		const blocked = await fire("tool_call", makeEvent("git status"), ctx);
 		expect(refusalOf(blocked).layer).toBe("unavailable");
@@ -272,7 +273,7 @@ describe("the endpoint backend", () => {
 
 	test("the credential value never reaches the audit log, banner, or status", async () => {
 		process.env.LOCAL_JUDGE_KEY = KEY_VALUE;
-		writeConfigFile({ shadowV3: false, judgeBackend: ENDPOINT });
+		writeConfigFile({ judgeBackend: ENDPOINT });
 		expect(await gate("git status")).toBe("ALLOWED");
 
 		expect(fs.readFileSync(decisionsLogPath(), "utf8")).not.toContain(KEY_VALUE);
@@ -293,7 +294,7 @@ describe("backend identity in the trust state", () => {
 		// KEY can tell the two backends apart. Without the backend id in the key,
 		// the probe would report the host judge's cached SAFE as if the endpoint
 		// had produced it.
-		writeConfigFile({ shadowV3: false });
+		writeConfigFile({});
 		const sid = nextSession();
 		const command = "git status";
 		await fire("tool_call", makeEvent(command), makeCtx({ sessionId: sid }));
@@ -301,23 +302,23 @@ describe("backend identity in the trust state", () => {
 		expect(buildStatusReport().cacheSizes[sid]).toBe(1);
 
 		process.env.LOCAL_JUDGE_KEY = KEY_VALUE;
-		writeConfigFile({ shadowV3: false, judgeBackend: ENDPOINT });
+		writeConfigFile({ judgeBackend: ENDPOINT });
 		const report = await dryRunReport(command, sid);
 		expect(report).toMatchObject({ would: "classify", layer: "classifier" });
 	});
 
 	test("a live switch reclassifies through the new backend", async () => {
-		writeConfigFile({ shadowV3: false });
+		writeConfigFile({});
 		const sid = nextSession();
 		const command = "git status";
 		expect(await fire("tool_call", makeEvent(command), makeCtx({ sessionId: sid }))).toBeUndefined();
 		expect(modelCalls.length).toBe(1);
 
 		process.env.LOCAL_JUDGE_KEY = KEY_VALUE;
-		writeConfigFile({ shadowV3: false, judgeBackend: ENDPOINT });
+		writeConfigFile({ judgeBackend: ENDPOINT });
 		expect(await fire("tool_call", makeEvent(command), makeCtx({ sessionId: sid }))).toBeUndefined();
 		expect(resolvedJudgeDeps.length).toBe(1);
-		expect(requestedUrls).toEqual([`${ENDPOINT.baseUrl}/v1/systemone`]);
+		expect(requestedUrls).toEqual([`${ENDPOINT.baseUrl}/v1/systemone`, `${ENDPOINT.baseUrl}/v1/systemone`]);
 	});
 
 	test("the endpoint id separates endpoints that differ only by base URL", () => {
@@ -331,7 +332,7 @@ describe("backend identity in the trust state", () => {
 
 	test("/classifier status reports the active backend", async () => {
 		expect(buildStatusReport().backendId).toBe(judgeBackendFor(DEFAULT_JUDGE_BACKEND).id);
-		writeConfigFile({ shadowV3: false, judgeBackend: ENDPOINT });
+		writeConfigFile({ judgeBackend: ENDPOINT });
 		expect(buildStatusReport().backendId).toBe(`endpoint/${ENDPOINT.baseUrl}#${ENDPOINT.model}`);
 		expect(buildStatusReport().config.judgeBackend).toEqual(ENDPOINT);
 	});
@@ -505,7 +506,7 @@ describe("the endpoint transport cannot follow a redirect", () => {
 			const target = start();
 			const endpoint = start(() => ({ status, headers: { location: `${target.baseUrl}/v1/systemone` } }));
 			process.env.LOCAL_JUDGE_KEY = KEY_VALUE;
-			writeConfigFile({ shadowV3: false, judgeBackend: { ...ENDPOINT, baseUrl: endpoint.baseUrl } });
+			writeConfigFile({ judgeBackend: { ...ENDPOINT, baseUrl: endpoint.baseUrl } });
 			const blocked = await (async () => {
 				globalThis.fetch = runtimeFetch;
 				try {
@@ -523,7 +524,8 @@ describe("the endpoint transport cannot follow a redirect", () => {
 			// message is the host client's own (`${provider}/${model} API error`),
 			// so the assertion names the judge the endpoint built, not a class.
 			expect(payload.why).toContain(`typesafe/${ENDPOINT.model} API error (${status})`);
-			expect(endpoint.calls.length).toBe(1);
+			// The risk battery and the authorization question each met the redirect.
+			expect(endpoint.calls.length).toBe(2);
 			expect(target.calls).toEqual([]);
 		});
 	}

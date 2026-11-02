@@ -9,7 +9,6 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { DecisionRecord } from "../index";
 import {
-	enableShadow,
 	evidenceOf,
 	fire,
 	jevSafeAnswer,
@@ -20,8 +19,8 @@ import {
 	makeSettings,
 	removeConfigFile,
 	setJevAnswer,
-	setShadowAuthorization,
-	shadowCalls,
+	setAuthorization,
+	authorizationCalls,
 	useTempConfigFile,
 } from "./fixtures";
 
@@ -36,14 +35,13 @@ const decisions = (): DecisionRecord[] =>
 		.split("\n")
 		.filter(line => line.trim() !== "")
 		.map(line => JSON.parse(line) as DecisionRecord);
-const authorizationState = (): string => JSON.stringify(shadowCalls.find(call => "user_authorization" in call.questions)?.state ?? {});
+const authorizationState = (): string => JSON.stringify(authorizationCalls[0]?.state ?? {});
 
 beforeEach(async () => {
 	removeConfigFile();
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-headless-"));
 	process.env.OMP_JEV_CONFIG = path.join(dir, "omp-classifier.json");
 	await loadPlugin(makeSettings([]));
-	enableShadow();
 	setJevAnswer(jevSafeAnswer());
 });
 
@@ -57,7 +55,7 @@ describe("a session with no UI has no user channel", () => {
 		await fire("tool_call", makeEvent("git status"), makeCtx({ sessionId: session(), hasUI: false, branch: [user(BRIEF)] }));
 		expect(evidenceOf(0).userMessages).toBeUndefined();
 		expect(evidenceOf(0).userMessageIds).toBeUndefined();
-		expect(shadowCalls.some(call => "user_authorization" in call.questions)).toBe(true);
+		expect(authorizationCalls).toHaveLength(1);
 		expect(authorizationState()).not.toContain("marker-brief-7731");
 		expect(decisions()[0].userMessageIds).toBeUndefined();
 	});
@@ -73,10 +71,10 @@ describe("a session with no UI has no user channel", () => {
 		fs.mkdirSync(path.join(cwd, "scratch-build"));
 		try {
 			setJevAnswer(jevUnsureAnswer());
-			setShadowAuthorization("named", { none: 0.02, goal: 0.03, named: 0.95 });
-			await fire("tool_call", makeEvent("trash scratch-build"), makeCtx({ sessionId: session(), hasUI: false, cwd, branch: [user("delete scratch-build")] }));
-			const v3 = decisions().find(line => line.v3 !== undefined)?.v3;
-			expect(v3).toMatchObject({ literalMatched: false, branch: 5 });
+			setAuthorization("named", { none: 0.02, goal: 0.03, named: 0.95 });
+			const result = await fire("tool_call", makeEvent("trash scratch-build"), makeCtx({ sessionId: session(), hasUI: false, cwd, branch: [user("delete scratch-build")] }));
+			expect(result).toMatchObject({ block: true });
+			expect(decisions().find(line => line.reasonCode !== undefined)?.reasonCode).toBe("jev-v3:5:reviewer");
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}

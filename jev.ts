@@ -112,9 +112,9 @@ import type { TrustedPolicyDocument } from "./trust-policy";
  */
 export const JEV_POLICY_VERSION = "jev-v2.18";
 /**
- * The intent-aware battery. It runs in shadow beside JEV_POLICY_VERSION and
- * decides nothing until the flip; its questions differ from jev-v2 only where
- * JEV_BATTERY_TEXTS says so. v3.2 shares v2.12's state notice (#160), and
+ * The intent-aware battery, the live one since the flip (#116). Its questions
+ * differ from jev-v2 only where JEV_BATTERY_TEXTS says so; JEV_POLICY_VERSION
+ * stays as the base those overrides spread over and as an eval baseline. v3.2 shares v2.12's state notice (#160), and
  * v3.3 shares v2.13's temp-cleanup wording, v3.4 v2.14's publish wording, and
  * v3.5 v2.15's measured delete targets, v3.6 v2.16's leased force push, v3.7 v2.17's bare push,
  * and v3.8 v2.18's `lookalikeDestinations` field and wording.
