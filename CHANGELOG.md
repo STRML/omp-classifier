@@ -511,7 +511,7 @@ Whether the user's words cover the command stays the reviewer's call: the code c
 This change alone would not have let the session's commands through:
 
 - No user message or ask named `192.168.86.53`. The user wrote "the TV".
-- The two stop commands also scored `exposes_secrets` 0.64, from `-i ~/.ssh/tv_root_ed25519`, and that hazard stays hard.
+- The two stop commands also scored `exposes_secrets` 0.64, from `-i ~/.ssh/device_ed25519`, and that hazard stays hard.
 - They ran ssh through a variable (`SSH="ssh … root@…"; $SSH '…'`), and the read-only probe ran under `timeout 30`. Shape B does not read either form.
 
 The Codex and Claude review lanes and an adversarial pass found the bypasses the bullets above close: a second ssh in a substitution, a remote-to-remote scp, `ProxyCommand` and `HostName` (before and after the host), `-J`, `-F`, `rsync -e`, `scp -S`, URL operands, an assignment prefix, a local program named `ssh`, options in a variable and a bracketed IPv6 host. Each has a test.
