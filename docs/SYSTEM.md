@@ -324,7 +324,10 @@ behind it. The sweep in L5 exists to make that cheap enough to be routine.
   the command's target by `literalMatch` and the SAFE's authorization is grounded
   (`priorRefusalLifts`). Or the stage 2 reviewer allows it, quoting words the user gave since
   the refusal, and those words or the ask question they answer name the target
-  (`reviewerLifts`). Critical and cap refusals never yield. ssh, scp and rsync key on where
+  (`reviewerLifts`). Critical and cap refusals never yield. No agent can lift a refusal on
+  another agent's behalf (issue #142): a coordinator's brief or steer is stamped
+  `attribution: "agent"` and never counts as the user's words, and a headless session has no
+  user channel at all, so a refusal there lasts until the session restarts. ssh, scp and rsync key on where
   they act, with options dropped (`remoteRefusalKey`). The audit line records `priorRefusal`
   when the memory, not the verdict, produced the block.
 - **Decision audit**: one JSONL line per decision at
