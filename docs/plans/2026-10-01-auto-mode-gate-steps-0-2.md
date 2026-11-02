@@ -164,7 +164,7 @@ Every row maps to a test that is written failing before its code.
 - [ ] **Step 1: Mark the intent rows that carry user words as UI rows**
 
 ```bash
-cd /Users/samuelreed/git/oss/omp-classifier
+cd omp-classifier
 bun -e '
 const fs = require("node:fs");
 const file = "eval/corpus/intent.jsonl";
