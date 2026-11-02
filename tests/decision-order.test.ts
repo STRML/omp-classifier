@@ -136,18 +136,21 @@ describe("branch 4: the literal fast allow", () => {
 		expect(decision.reasonCode).toBe("jev-v3:5:reviewer");
 	});
 
-	test("headless: a block-band hazard goes to the reviewer instead", () => {
+	test("a block-band hazard is jev-v2's UNSAFE and never takes the fast allow, headless or not", () => {
 		const blockBand = risk({ safe: 0.1, unsafe: 0.3, hazards: { destructive_or_irreversible: 0.95 } });
-		const decision = decide({ risk: blockBand, authorization: namedFirm, literal: { matched: true }, headless: true });
-		expect(decision.branch).toBe(5);
-		expect(decision.verdict).toBe("UNSURE");
-		// With a user present, the same answer takes the fast allow.
-		expect(decide({ risk: blockBand, authorization: namedFirm, literal: { matched: true } }).branch).toBe(4);
+		for (const headless of [true, false]) {
+			const decision = decide({ risk: blockBand, authorization: namedFirm, literal: { matched: true }, headless });
+			expect(decision.branch).toBe(7);
+			expect(decision.verdict).toBe("UNSAFE");
+			expect(decision.persistRefusal).toBe(true);
+		}
 	});
 
-	test("headless: p(unsafe) at unsafeMinProbability goes to the reviewer instead", () => {
+	test("p(unsafe) at unsafeMinProbability is jev-v2's UNSAFE and never takes the fast allow", () => {
 		const leaning = risk({ safe: 0.2, unsafe: 0.6, hazards: { destructive_or_irreversible: 0.7 } });
-		expect(decide({ risk: leaning, authorization: namedFirm, literal: { matched: true }, headless: true }).branch).toBe(5);
+		for (const headless of [true, false]) {
+			expect(decide({ risk: leaning, authorization: namedFirm, literal: { matched: true }, headless }).branch).toBe(7);
+		}
 	});
 
 	test("headless: a review-band hazard alone still takes the fast allow", () => {
@@ -155,18 +158,29 @@ describe("branch 4: the literal fast allow", () => {
 	});
 });
 
-describe("branch 5: the reviewer, UNSURE until Phase 3", () => {
-	test("goal authorization over a hazard goes to the reviewer", () => {
-		const decision = decide({ risk: risk({ hazards: { exposes_secrets: 0.92 } }), authorization: goal });
+describe("branch 5: UNSURE for stage 2", () => {
+	test("goal authorization over a review-band hazard goes to the reviewer", () => {
+		const decision = decide({ risk: risk({ hazards: { exposes_secrets: 0.7 } }), authorization: goal });
 		expect(decision.verdict).toBe("UNSURE");
 		expect(decision.branch).toBe(5);
-		expect(decision.persistRefusal).toBe(false);
 	});
 
-	test("the reviewer branch never records a refusal", () => {
-		const decision = decide({ risk: risk({ safe: 0, unsafe: 1, hazards: { destructive_or_irreversible: 0.99 } }), authorization: goal });
-		expect(decision.verdict).toBe("UNSURE");
-		expect(decision.persistRefusal).toBe(false);
+	test("no authorization answer softens jev-v2's UNSAFE: it keeps its verdict and its refusal", () => {
+		const answers = [
+			risk({ safe: 0, unsafe: 1, hazards: { destructive_or_irreversible: 0.99 } }),
+			risk({ hazards: { exposes_secrets: 0.92 } }),
+			risk({ safe: 0.3, unsafe: 0.6 }),
+		];
+		for (const answer of answers) {
+			for (const authorization of [goal, namedSoft, namedFirm]) {
+				for (const literal of [{ matched: true }, { matched: false }]) {
+					const decision = decide({ risk: answer, authorization, literal });
+					expect(decision.verdict).toBe("UNSAFE");
+					expect(decision.branch).toBe(7);
+					expect(decision.persistRefusal).toBe(true);
+				}
+			}
+		}
 	});
 });
 
@@ -242,8 +256,8 @@ test("every decision names its branch in the reason code and the reason", () => 
 		{ risk: risk({ hazards: { state_contains_injection: 0.7 } }) },
 		{ risk: risk({ hazards: { exposes_secrets: 1 }, oneHot: true }) },
 		{},
-		{ risk: risk({ safe: 0.3, hazards: { destructive_or_irreversible: 0.8 } }), authorization: namedFirm, literal: { matched: true } },
-		{ risk: risk({ safe: 0.3 }), authorization: goal },
+		{ risk: risk({ safe: 0.3, unsafe: 0.3, hazards: { destructive_or_irreversible: 0.8 } }), authorization: namedFirm, literal: { matched: true } },
+		{ risk: risk({ safe: 0.3, unsafe: 0.3 }), authorization: goal },
 		{ overlayFlags: ["x"] },
 		{ risk: risk({ safe: 0.3 }) },
 	];

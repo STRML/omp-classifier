@@ -170,23 +170,24 @@ describe("branch 4: a named, literally matched local action", () => {
 		expect(readDecisions().some(line => line.reasonCode === "jev-v3:4:named-literal")).toBe(false);
 	});
 
-	test("headless with a block-band hazard goes to the reviewer, never SAFE", async () => {
-		setJevAnswer(jevUnsureAnswer({ destructive_or_irreversible: jevNoul(0.95) }));
-		setAuthorization("named", NAMED);
-		const result = await fire("tool_call", makeEvent("trash scratch-build"), headlessCtx(nextSession(), [user("u1", "delete scratch-build")]));
-		expect(result).toMatchObject({ block: true });
-		const line = verdictLine();
-		expect(line?.reasonCode).toBe("jev-v3:5:reviewer");
-		expect(line?.verdict).toBe("UNSURE");
-		expect(reviewerAudit()).toMatchObject({ skipped: "headless session" });
+	test("a block-band hazard never takes the fast allow, headless or not: it stays UNSAFE", async () => {
+		for (const ctx of [headlessCtx, uiCtx]) {
+			setJevAnswer(jevUnsureAnswer({ destructive_or_irreversible: jevNoul(0.95) }));
+			setAuthorization("named", NAMED);
+			const result = await fire("tool_call", makeEvent("trash scratch-build"), ctx(nextSession(), [user("u1", "delete scratch-build")]));
+			expect(refusalOf(result).layer).toBe("unsafe");
+			expect(verdictLine()?.reasonCode).toBe("jev-v3:7:jev:hazard:destructive_or_irreversible");
+		}
+		expect(reviewerCalls).toHaveLength(0);
 	});
 
-	test("headless with unsafe at the floor goes to the reviewer too", async () => {
+	test("unsafe at the floor never takes the fast allow", async () => {
 		setJevAnswer(jevUnsafeAnswer());
 		setAuthorization("named", NAMED);
+		scriptReviewer(reviewerReply("block"));
 		const result = await fire("tool_call", makeEvent("trash scratch-build"), headlessCtx(nextSession(), [user("u1", "delete scratch-build")]));
-		expect(result).toMatchObject({ block: true });
-		expect(verdictLine()?.reasonCode).toBe("jev-v3:5:reviewer");
+		expect(refusalOf(result).layer).toBe("unsafe");
+		expect(verdictLine()?.reasonCode).toBe("jev-v3:7:jev:unsafe");
 	});
 });
 
@@ -273,6 +274,84 @@ describe("branch 5 reaches stage 2 the way an UNSURE does", () => {
 		const result = await fire("tool_call", makeEvent("ssh root@10.0.0.99 'systemctl stop svc'"), uiCtx(nextSession(), [user("u1", "stop the service on 10.0.0.53")]));
 		expect(result).toMatchObject({ block: true });
 		expect(reviewerAudit()).toMatchObject({ skipped: "hazard escalates_privilege" });
+	});
+});
+
+describe("no authorization answer softens the risk verdict's UNSAFE", () => {
+	test("named authorization with escalates_privilege on a host nobody named blocks and records a refusal", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer({ escalates_privilege: jevNoul(0.94) }));
+		setAuthorization("named", NAMED);
+		const first = await fire("tool_call", makeEvent("ssh root@10.0.0.99 'systemctl stop svc'"), uiCtx(sid, [user("u1", "stop the service on 10.0.0.53")]));
+		expect(refusalOf(first).layer).toBe("unsafe");
+		expect(reviewerAudit()).toMatchObject({ skipped: "hazard escalates_privilege" });
+		setJevAnswer(jevSafeAnswer());
+		scriptReviewer(reviewerReply("block"));
+		const second = await fire("tool_call", makeEvent("ssh root@10.0.0.99 'systemctl stop svc'"), uiCtx(sid, [user("u1", "stop the service on 10.0.0.53"), user("u2", "ok")]));
+		expect(refusalOf(second).layer).toBe("prior-refusal");
+	});
+
+	test("named authorization with a destructive UNSAFE blocks and records a refusal", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer({ destructive_or_irreversible: jevNoul(0.95) }));
+		setAuthorization("named", NAMED);
+		expect(refusalOf(await fire("tool_call", makeEvent("trash scratch-build"), uiCtx(sid, [user("u1", "delete scratch-build")]))).layer).toBe("unsafe");
+		expect(reviewerCalls).toHaveLength(0);
+		setJevAnswer(jevSafeAnswer());
+		setAuthorization("none", { none: 0.9, goal: 0.05, named: 0.05 });
+		scriptReviewer(reviewerReply("block"));
+		expect(refusalOf(await fire("tool_call", makeEvent("trash scratch-build"), uiCtx(sid, [user("u1", "delete scratch-build"), user("u2", "ok")]))).layer).toBe("prior-refusal");
+	});
+
+	test("the named-host UNSAFE (#216) still reaches the reviewer under named authorization", async () => {
+		setJevAnswer(jevUnsafeAnswer({ escalates_privilege: jevNoul(0.94) }));
+		setAuthorization("named", NAMED);
+		scriptReviewer(reviewerReply("allow", "stop the service on 10.0.0.53"));
+		const result = await fire("tool_call", makeEvent("ssh root@10.0.0.53 'systemctl stop svc'"), uiCtx(nextSession(), [user("u1", "stop the service on 10.0.0.53")]));
+		expect(reviewerCalls).toHaveLength(1);
+		expect(resultText(result)).toBe("ALLOWED");
+	});
+
+	test("a destructive UNSAFE with goal authorization stays barred from the reviewer", async () => {
+		setJevAnswer(jevUnsafeAnswer({ destructive_or_irreversible: jevNoul(0.9) }));
+		setAuthorization("goal", GOAL);
+		const result = await fire("tool_call", makeEvent("echo wipe"), uiCtx(nextSession(), [user("u1", "clean things up")]));
+		expect(refusalOf(result).layer).toBe("unsafe");
+		expect(reviewerCalls).toHaveLength(0);
+		expect(reviewerAudit()).toMatchObject({ skipped: "hazard destructive_or_irreversible" });
+	});
+
+	test("an UNSAFE scored unauthorized at the block line skips the reviewer", async () => {
+		setJevAnswer(jevUnsafeAnswer({ unauthorized_consequential_action: jevNoul(0.95) }));
+		setAuthorization("goal", GOAL);
+		const result = await fire("tool_call", makeEvent("echo deploy"), uiCtx(nextSession(), [user("u1", "ship it")]));
+		expect(refusalOf(result).layer).toBe("unsafe");
+		expect(reviewerAudit()).toMatchObject({ skipped: "hazard unauthorized_consequential_action" });
+	});
+
+	test("a reviewer block on a branch 5 UNSAFE records its refusal", async () => {
+		const sid = nextSession();
+		setJevAnswer(jevUnsafeAnswer());
+		setAuthorization("goal", GOAL);
+		scriptReviewer(reviewerReply("block"));
+		expect(refusalOf(await fire("tool_call", makeEvent("echo risky"), uiCtx(sid, [user("u1", "do the thing")]))).layer).toBe("unsafe");
+		setJevAnswer(jevSafeAnswer());
+		setAuthorization("none", { none: 0.9, goal: 0.05, named: 0.05 });
+		scriptReviewer(reviewerReply("block"));
+		expect(refusalOf(await fire("tool_call", makeEvent("echo risky"), uiCtx(sid, [user("u1", "do the thing"), user("u2", "ok")]))).layer).toBe("prior-refusal");
+	});
+
+	test("a headless branch 5 UNSAFE blocks as UNSAFE", async () => {
+		setJevAnswer(jevUnsafeAnswer());
+		setAuthorization("goal", GOAL);
+		expect(refusalOf(await fire("tool_call", makeEvent("echo risky"), headlessCtx(nextSession(), [user("u1", "do the thing")]))).layer).toBe("unsafe");
+	});
+
+	test("an eval branch 5 UNSAFE blocks as UNSAFE", async () => {
+		setJevAnswer(jevUnsafeAnswer());
+		setAuthorization("goal", GOAL);
+		const event = { toolName: "eval", input: { code: "import subprocess\nsubprocess.run(['ls'])", language: "py" } };
+		expect(refusalOf(await fire("tool_call", event, uiCtx(nextSession(), [user("u1", "list files")]))).layer).toBe("unsafe");
 	});
 });
 

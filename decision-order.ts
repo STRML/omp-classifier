@@ -13,9 +13,9 @@
  *      one-hot risk answer otherwise                  → UNSURE: a keyword
  *      answer has no distribution to clear a floor with, so it never allows
  *   3. jev-v2's safe gate, no overlay flags           → SAFE
- *   4. firm `named`, literal match, no overlay flags  → SAFE
- *      (headless with a block-band hazard or unsafe   → branch 5)
- *   5. `named` or `goal`                              → UNSURE, which stage 2 reviews
+ *   4. firm `named`, literal match, no overlay flags,
+ *      jev-v2 not UNSAFE                              → SAFE
+ *   5. `named` or `goal`, jev-v2 not UNSAFE           → UNSURE, which stage 2 reviews
  *   6. overlay flags, authorization `none`, not UNSAFE → jev-v2's verdict,
  *      which the gate's overlay then blocks as `flagged` on a SAFE
  *   7. otherwise                                      → jev-v2's derivation
@@ -80,13 +80,18 @@ export function deriveDecisionOrder(input: DecisionOrderInput, policy: JevPolicy
 	if (legacy.verdict === "SAFE" && !overlaid) {
 		return decide(3, "SAFE", "safe", legacy.reason, legacy.persistRefusal);
 	}
-	if (authorization.namedFirm && !overlaid && input.literal?.matched === true) {
-		const blockBand = maxGating(input.risk) >= policy.hazardBlock || unsafe >= policy.unsafeMinProbability;
-		if (!(input.headless && blockBand)) {
-			return decide(4, "SAFE", "named-literal", `${authorization.reason}, every segment matched the user's words`, false);
-		}
+	// No authorization answer softens the risk derivation's UNSAFE: branches 4
+	// and 5 read only a SAFE or UNSURE, and an UNSAFE falls through to branch 7
+	// with its verdict, reason and refusal, where stage 2 applies its UNSAFE
+	// bars exactly as before the flip. A model-authored "the user asked for
+	// this" must not clear what the risk battery holds. The plan's headless
+	// exception (a block-band hazard or p(unsafe) at the floor) is the same
+	// set of answers, so it is covered for every session.
+	const riskUnsafe = legacy.verdict === "UNSAFE";
+	if (!riskUnsafe && authorization.namedFirm && !overlaid && input.literal?.matched === true) {
+		return decide(4, "SAFE", "named-literal", `${authorization.reason}, every segment matched the user's words`, false);
 	}
-	if (authorization.level === "named" || authorization.level === "goal") {
+	if (!riskUnsafe && (authorization.level === "named" || authorization.level === "goal")) {
 		const note = overlaid ? `; overlay ${overlayFlags.join(", ")}` : "";
 		return decide(5, "UNSURE", "reviewer", `${authorization.reason}${note}; risk: ${legacy.reason}`, false);
 	}
