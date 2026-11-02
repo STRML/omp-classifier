@@ -1443,7 +1443,7 @@ function askAnswerLine(answer: Record<string, unknown>): string | undefined {
 /** Each question the user answered by hand in an ask tool result's details,
  *  with the agent's question beside the user's answer. The host records a
  *  single question flat and several under `results`. */
-export function askAnswerPairs(details: unknown): Array<{ question: string; answer: string }> {
+export function askAnswerPairs(details: unknown, callArguments?: unknown): Array<{ question: string; answer: string }> {
 	if (typeof details !== "object" || details === null) return [];
 	const results = (details as { results?: unknown }).results;
 	const answers = Array.isArray(results) ? results : [details];
@@ -1452,9 +1452,61 @@ export function askAnswerPairs(details: unknown): Array<{ question: string; answ
 		if (typeof answer !== "object" || answer === null) continue;
 		const record = answer as Record<string, unknown>;
 		const line = askAnswerLine(record);
-		if (line !== undefined) pairs.push({ question: nonEmptyString(record.question) ?? "", answer: line });
+		if (line === undefined) continue;
+		const question = nonEmptyString(record.question) ?? "";
+		const described = pickedOptionDescriptions(callArguments, question, record.selectedOptions);
+		pairs.push({ question: described === "" ? question : `${question}\n${described}`, answer: line });
 	}
 	return pairs;
+}
+
+/** The descriptions of the options the user picked, as the ask call showed
+ *  them under each label. The host's result keeps only the labels, so a
+ *  question whose detail lives in the option ("runs judge2.py against the
+ *  server on port 11234") reached the reviewer without it, and the reviewer
+ *  blocked that very run as unasked (OMP session 01a19d31). The description is
+ *  the agent's text, like the question: it says what the user agreed to, and
+ *  is never itself the user's words. */
+function pickedOptionDescriptions(callArguments: unknown, question: string, selected: unknown): string {
+	if (question === "" || !Array.isArray(selected) || typeof callArguments !== "object" || callArguments === null) return "";
+	const questions = (callArguments as { questions?: unknown }).questions;
+	if (!Array.isArray(questions)) return "";
+	// The result carries only the question's text and the picked labels, so a
+	// description is attached only when both match exactly one item: a repeated
+	// question or label would let the agent pin a description the user never saw
+	// beside the option they picked.
+	const asked = questions.filter(item => typeof item === "object" && item !== null && (item as { question?: unknown }).question === question);
+	if (asked.length !== 1) return "";
+	const options = (asked[0] as { options?: unknown }).options;
+	if (!Array.isArray(options)) return "";
+	const lines: string[] = [];
+	for (const label of selected) {
+		if (typeof label !== "string") continue;
+		const same = options.filter(item => typeof item === "object" && item !== null && (item as { label?: unknown }).label === label);
+		if (same.length !== 1) continue;
+		const description = nonEmptyString((same[0] as { description?: unknown }).description)?.trim();
+		if (description !== undefined && description !== "") lines.push(`The option the user picked, "${label}", said: ${truncatedDescription(description)}`);
+	}
+	return lines.join("\n");
+}
+
+/** A description longer than a line or two is not what a person reads under an
+ *  option before clicking it. */
+const ASK_DESCRIPTION_MAX = 400;
+const truncatedDescription = (text: string): string => (text.length > ASK_DESCRIPTION_MAX ? `${text.slice(0, ASK_DESCRIPTION_MAX)}…` : text);
+
+/** Each ask call's arguments by tool call id, so an answer can be read beside
+ *  the options the agent offered. */
+function askCallArguments(branch: ReadonlyArray<EvidenceBranchEntry>): Map<string, unknown> {
+	const calls = new Map<string, unknown>();
+	for (const item of branch) {
+		const message = item.message as (Record<string, unknown> & { role?: string }) | undefined;
+		if (item.type !== "message" || message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+		for (const block of message.content as Array<Record<string, unknown> | null>) {
+			if (block?.type === "toolCall" && block.name === "ask" && typeof block.id === "string") calls.set(block.id, block.arguments);
+		}
+	}
+	return calls;
 }
 
 /** The user's words in an ask tool result's details, one line per answered
@@ -1478,6 +1530,7 @@ const REVIEWER_TOOL_CALLS = 15;
  */
 export function reviewerTranscript(branch: ReadonlyArray<EvidenceBranchEntry>, refusedCallIds: ReadonlySet<string> = new Set()): ReviewerTranscriptEntry[] {
 	const entries: Array<{ entry: ReviewerTranscriptEntry; user: boolean }> = [];
+	const askCalls = askCallArguments(branch);
 	for (const item of branch.slice(branchStartAfterLatestResetBoundary(branch))) {
 		if (item.type !== "message") continue;
 		const message = item.message as (Record<string, unknown> & { role?: string }) | undefined;
@@ -1487,7 +1540,8 @@ export function reviewerTranscript(branch: ReadonlyArray<EvidenceBranchEntry>, r
 			continue;
 		}
 		if (message?.role === "toolResult" && message.toolName === "ask") {
-			for (const pair of askAnswerPairs(message.details)) entries.push({ entry: { from: "ask", agentQuestion: pair.question, userAnswer: pair.answer }, user: true });
+			const call = typeof message.toolCallId === "string" ? askCalls.get(message.toolCallId) : undefined;
+			for (const pair of askAnswerPairs(message.details, call)) entries.push({ entry: { from: "ask", agentQuestion: pair.question, userAnswer: pair.answer }, user: true });
 			continue;
 		}
 		if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
@@ -6037,14 +6091,18 @@ function consentSince(ctx: ExtensionContext, afterId: string | undefined): Revie
 	if (!ctx.hasUI) return entries;
 	try {
 		const branch = ctx.sessionManager.getBranch() as ReadonlyArray<EvidenceBranchEntry>;
+		const askCalls = askCallArguments(branch);
 		for (let index = branchStartAfterLatestResetBoundary(branch); index < branch.length; index++) {
 			const entry = branch[index];
 			if (entry.type !== "message") continue;
-			const message = entry.message as (EvidenceBranchEntry["message"] & { toolName?: string; details?: unknown }) | undefined;
+			const message = entry.message as (EvidenceBranchEntry["message"] & { toolName?: string; details?: unknown; toolCallId?: unknown }) | undefined;
 			const id = message?.id ?? entry.id ?? `user-${index}`;
 			let said: ReviewerTranscriptEntry[] = [];
 			if (message?.role === "user" && message.attribution === "user" && textOf(message.content).trim() !== "") said = [{ from: "user", text: textOf(message.content) }];
-			else if (message?.role === "toolResult" && message.toolName === "ask") said = askAnswerPairs(message.details).map(pair => ({ from: "ask" as const, agentQuestion: pair.question, userAnswer: pair.answer }));
+			else if (message?.role === "toolResult" && message.toolName === "ask") {
+				const call = typeof message.toolCallId === "string" ? askCalls.get(message.toolCallId) : undefined;
+				said = askAnswerPairs(message.details, call).map(pair => ({ from: "ask" as const, agentQuestion: pair.question, userAnswer: pair.answer }));
+			}
 			if (said.length === 0) continue;
 			if (id === afterId) {
 				entries.length = 0;
