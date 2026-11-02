@@ -167,6 +167,37 @@ describe("eval gate routing", () => {
 		expect(modelCalls.length).toBe(1);
 	});
 
+	// OMP session 01a18e06: a tuple element named `rm` flagged the payload as
+	// running `rm`, though the only process it starts is a grep.
+	test("a token read as a value (closing a tuple, call or list) is a variable, not a command", async () => {
+		setJevAnswer(jevSafeAnswer());
+		const result = await gateEval(
+			[
+				'for name, root in (("mxs", rx), ("mxm", rm)):',
+				"    print(name, len(list(root.iter())))",
+				"import subprocess",
+				'print(subprocess.run(["grep", "-rl", "PAGE_IDX", str(cfg)], capture_output=True, text=True).stdout)',
+			].join("\n"),
+			{},
+			"py",
+		);
+		expect(result).toBe("ALLOWED");
+	});
+
+	test.each([
+		['import subprocess\nsubprocess.run(["rm", "-rf", "build"])', "py"],
+		['import subprocess\nsubprocess.run("rm -rf build", shell=True)', "py"],
+		["import subprocess\nsubprocess.run(f\"cd x; rm\")\nsubprocess.run('rm build')", "py"],
+		["Bun.$`rm -rf ./build`", "js"],
+		['import os\nos.system("(cd x; rm)")', "py"],
+		['import os\nos.system("echo $(ls | xargs rm)")', "py"],
+		['import os\nos.system("{rm,-rf,build}")', "py"],
+		["const rm = name;\nBun.$`${rm} -rf ./build`", "js"],
+	])("a token a spawn runs still blocks on a SAFE: %s", async (code, language) => {
+		setJevAnswer(jevSafeAnswer());
+		expect(refusalOf(await gateEval(code, {}, language)).why).toContain("flags: rm");
+	});
+
 	test("verdict is cached per payload", async () => {
 		setJevAnswer(jevSafeAnswer());
 		const code = `import subprocess\nsubprocess.run(["echo", "cache-probe-${seq}"])`;
@@ -260,6 +291,65 @@ describe("eval spawn cwd (issue #14)", () => {
 		for (const [code, expected] of forms) {
 			expect(evalSpawnCwd(code, SESSION)).toEqual({ kind: "literal", cwd: expected });
 		}
+	});
+
+	// From the decision log: `repo = "<worktree>"` then `cwd=repo` refused as
+	// "the cwd is not a literal (repo)". 526 of 2845 such refusals in past
+	// sessions named a constant like this.
+	test("a name bound once to a plain literal reads as that literal", () => {
+		const forms: Array<[string, string]> = [
+			['import subprocess\nrepo="/tmp/r"\nphp = r"""\necho 1;\n"""\nsubprocess.run(["php", "-r", php], cwd=repo, capture_output=True)', "/tmp/r"],
+			['wt = "/tmp/wt"\nx = f"{wt}/a"\nsubprocess.run(["ls"], cwd=wt)\nsubprocess.run(["ls"], cwd=wt)', "/tmp/wt"],
+			// The binding's own literal may spell the name.
+			['wt = "/tmp/.wt"\nsubprocess.run(["ls"], cwd=wt)', "/tmp/.wt"],
+			['repo = "/tmp/rb"\nDir.chdir(repo) do\n  system("ls")\nend', "/tmp/rb"],
+		];
+		for (const [code, expected] of forms) {
+			expect(evalSpawnCwd(code, SESSION)).toEqual({ kind: "literal", cwd: expected });
+		}
+	});
+
+	test.each([
+		["bound twice", 'repo="/tmp/r"\nrepo="/"\nsubprocess.run(["rm", "-rf", "."], cwd=repo)'],
+		["bound after the spawn", 'subprocess.run(["ls"], cwd=repo)\nrepo="/tmp/r"'],
+		["bound inside a branch", 'if x:\n    repo="/tmp/r"\nsubprocess.run(["ls"], cwd=repo)'],
+		["a loop target", 'repo="/tmp/r"\nfor repo in ["/"]:\n    subprocess.run(["ls"], cwd=repo)'],
+		["a parameter", 'repo="/tmp/r"\ndef f(repo):\n    subprocess.run(["ls"], cwd=repo)\nf("/")'],
+		["written through globals()", 'repo="/tmp/r"\nglobals()["repo"]="/"\nsubprocess.run(["ls"], cwd=repo)'],
+		["written as a module attribute", 'repo="/tmp/r"\nsys.modules[__name__].repo="/"\nsubprocess.run(["ls"], cwd=repo)'],
+		["a star import after it", 'repo="/tmp/r"\nfrom elsewhere import *\nsubprocess.run(["ls"], cwd=repo)'],
+		["a walrus", 'repo="/tmp/r"\nif (repo := "/"):\n    subprocess.run(["ls"], cwd=repo)'],
+		["a walrus inside an f-string", "repo=\"/tmp/r\"\nprint(f\"{(repo := '/')}\")\nsubprocess.run([\"rm\", \"-rf\", \".\"], cwd=repo)"],
+		["an f-string value", 'repo=f"/tmp/{x}"\nsubprocess.run(["ls"], cwd=repo)'],
+		["a concatenation", 'repo="/tmp" + x\nsubprocess.run(["ls"], cwd=repo)'],
+		["a Ruby binding write", 'repo = "/tmp/r"\nbinding.local_variable_set(:repo, "/")\nsystem("ls", chdir: repo)'],
+		["inside an open bracket", 'x = (1,\nrepo = "/tmp/r")\nsubprocess.run(["ls"], cwd=repo)'],
+		// Code inside an interpolation runs where the mask hides it (review round 1).
+		["globals() inside an f-string", "repo=\"/tmp/r\"\nprint(f\"{globals().update({'repo': '/'})}\")\nsubprocess.run([\"rm\", \"-rf\", \".\"], cwd=repo)"],
+		["setattr with a split name inside an f-string", "repo=\"/tmp/r\"\nprint(f\"{setattr(sys.modules[__name__], 'r'+'epo', '/')}\")\nsubprocess.run([\"ls\"], cwd=repo)"],
+		["a module attribute inside an f-string", "repo=\"/tmp/r\"\nprint(f\"{__import__('importlib').import_module('__main__').repo}\")\nsubprocess.run([\"ls\"], cwd=repo)"],
+		["a Ruby in-place append inside an interpolation", "repo = \"/tmp/r\"\nputs \"#{repo << '/x'}\"\nsystem(\"ls\", chdir: repo)"],
+		["a fake binding in a Ruby heredoc", 'x = <<~EOS\nrepo = "/tmp/r"\nEOS\nsystem("ls", chdir: repo)'],
+		["a fake binding in a =begin block", '=begin\nrepo = "/tmp/r"\n=end\nsystem("ls", chdir: repo)'],
+		["an interpolation after a closing brace", "repo = \"/tmp/r\"\nputs \"} #{repo << 'x'}\"\nsystem(\"ls\", chdir: repo)"],
+		["a getattr with a split dunder", 'repo="/tmp/r"\ngetattr(sys.modules[__name__], "__di"+"ct__")["re"+"po"] = "/"\nsubprocess.run(["ls"], cwd=repo)'],
+		["a write after Python floor division", 'repo="/tmp/r"\nn = 1 // 2; [repo] = ["/"]\nsubprocess.run(["ls"], cwd=repo)'],
+		["a write the mask took for a string (a regex literal opens one)", 'repo = "/tmp/r"\nx = /"/; repo, = "/"; y = /"/\nDir.chdir(repo)'],
+		["mentioned in plain text", 'repo="/tmp/r"\nprint("repo")\nsubprocess.run(["ls"], cwd=repo)'],
+		["written through a function's __globals__", 'repo="/tmp/r"\ndef f(): pass\nf.__globals__["re"+"po"]="/"\nsubprocess.run(["ls"], cwd=repo)'],
+		["rebound through a JS identifier escape", 'let repo = "/tmp/r";\nr\\u0065po = "/";\nsubprocess.run(["ls"], cwd=repo)'],
+		["rebound through an escape inside a template interpolation", 'let repo = "/tmp/r";\n`${r\\u0065po = "/"}`;\nsubprocess.run(["ls"], cwd=repo)'],
+		["rebound through an NFKC name inside an f-string", 'repo="/tmp/r"\nf"{(\uff52\uff45\uff50\uff4f := \'/\')}"\nsubprocess.run(["ls"], cwd=repo)'],
+		["an NFKC name after an inner {} inside an f-string", 'repo="/tmp/r"\nf"{ {}.get(1) or (\uff52\uff45\uff50\uff4f := \'/\') }"\nsubprocess.run(["ls"], cwd=repo)'],
+		["an NFKC name balanced by a match the folding removes", 'repo="/tmp/r"\nx = "repo\uff58"\nf"{(\uff52\uff45\uff50\uff4f := \'/\')}"\nsubprocess.run(["ls"], cwd=repo)'],
+		["rebound through a padded braced escape", 'let repo = "/tmp/r";\n`${r\\u{00000065}po = "/"}`;\nsubprocess.run(["ls"], cwd=repo)'],
+		["aliased by a top-level cwd = name in Ruby", 'repo = "/tmp/r"\ncwd = repo\ncwd.replace("/")\nDir.chdir(repo)'],
+		["set through methodcaller on __main__", 'import operator, __main__\noperator.methodcaller("__se" + "tattr__", "re" + "po", "/")(__main__)\nrepo="/tmp/r"\nsubprocess.run(["ls"], cwd=repo)'],
+		["rebound by cProfile.run on a built string", 'import cProfile\nrepo="/tmp/r"\ncProfile.run("re" + "po = \'/\'")\nsubprocess.run(["ls"], cwd=repo)'],
+		["rebound through an NFKC-folded Python name", 'repo="/tmp/r"\n\uff52\uff45\uff50\uff4f="/"\nsubprocess.run(["ls"], cwd=repo)'],
+		["written by code a constructor builds", 'repo = "/tmp/r"\n(() => {}).constructor("re" + "po = 1")()\nsubprocess.run(["ls"], cwd=repo)'],
+	])("a name stays unreadable when it is %s", (_why, code) => {
+		expect(evalSpawnCwd(code, SESSION).kind).toBe("opaque");
 	});
 
 	test("the payload's language label does not decide which forms are read", () => {

@@ -239,6 +239,47 @@ describe("which commands stage 2 can vouch for", () => {
 	});
 });
 
+describe("a session whose shell an earlier call may have changed", () => {
+	// The host keeps one shell per session, so `export PATH=...` in one call
+	// changes what a bare name resolves to in the next. Stage 2 resolves names
+	// against the gate's own environment, which that export never touched.
+	test.each(["export PATH=/tmp/evil:$PATH", "a=PA; b=TH; export \"$a$b=/tmp/evil\"", "alias git=/tmp/evil"])("after %s, a later script is not reviewed", async earlier => {
+		const session = nextSession();
+		const branch = [user("u1", "update fork main")];
+		scriptReviewer(reviewerReply("block"));
+		await fire("tool_call", makeEvent(earlier), uiCtx(session, branch));
+		script("update.sh", "#!/bin/bash\ngit fetch origin\n");
+		scriptReviewer(reviewerReply("allow", "update fork main"));
+		const before = reviewerCalls.length;
+		const result = await fire("tool_call", makeEvent("./update.sh start"), uiCtx(session, branch));
+		expect(refusalOf(result).layer).toBe("unsure");
+		expect(reviewerCalls).toHaveLength(before);
+		expect(reviewerAudit()).toMatchObject({ skipped: expect.stringContaining("shell") });
+	});
+
+	test("a body that prints variables and does integer arithmetic still reaches the reviewer", async () => {
+		script("update.sh", "#!/bin/bash\nx=hi\nprintf '%s\\n' \"$x\"\necho $((1 + (2)))\necho ${x:-default} ${x:0:1}\n[ \"$1\" = start ] && git fetch origin\n[ -n \"$x\" ] && [ \"$#\" -eq 1 ] && [ \"$x\" ]\nexport FOO=bar\n");
+		scriptReviewer(reviewerReply("allow", "update fork main"));
+		expect(resultText(await fire("tool_call", makeEvent("./update.sh start"), uiCtx(nextSession(), [user("u1", "update fork main")])))).toBe("ALLOWED");
+	});
+
+	test("arithmetic over names the body sets to integers still reaches the reviewer", async () => {
+		script("update.sh", "#!/bin/bash\nstart=$SECONDS\nn=0\nfor ((i=0; i<2; i++)); do (( n++ )); done\necho \"took $((SECONDS - start))s, n=$n\"\n[[ $n -eq 2 ]] && git fetch origin\n");
+		scriptReviewer(reviewerReply("allow", "update fork main"));
+		expect(resultText(await fire("tool_call", makeEvent("./update.sh start"), uiCtx(nextSession(), [user("u1", "update fork main")])))).toBe("ALLOWED");
+	});
+
+	test("a session that never touched its shell still reaches the reviewer", async () => {
+		const session = nextSession();
+		const branch = [user("u1", "update fork main")];
+		scriptReviewer(reviewerReply("block"));
+		await fire("tool_call", makeEvent("git status"), uiCtx(session, branch));
+		script("update.sh", "#!/bin/bash\ngit fetch origin\n");
+		scriptReviewer(reviewerReply("allow", "update fork main"));
+		expect(resultText(await fire("tool_call", makeEvent("./update.sh start"), uiCtx(session, branch)))).toBe("ALLOWED");
+	});
+});
+
 describe("an UNSURE the user asked for", () => {
 	test("the reviewer allows it, quoting the user's words, and it runs", async () => {
 		script("update.sh", "#!/bin/bash\ncase \"$1\" in start) git fetch origin ;; esac\n");
@@ -525,6 +566,80 @@ describe("what never reaches the reviewer", () => {
 		["a script that hands a relative program to xargs", () => script("wrap.sh", "#!/bin/bash\necho a | xargs lib/real.sh\n"), "./wrap.sh"],
 		["a script written by a process substitution before it runs", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "cat <(printf x > gen.sh) && ./gen.sh"],
 		["a script written by an assignment's substitution", () => script("gen.sh", "#!/bin/bash\necho ok\n"), "X=\"$(printf x > gen.sh)\" ./gen.sh"],
+		// A variable's name built at run time can be PATH: no text names it.
+		["a script that exports a name it builds at run time", () => script("wrap.sh", "#!/bin/bash\na=PA; b=TH\nexport \"$a$b=/tmp/evil:/usr/bin\"\ngit status\n"), "./wrap.sh"],
+		["a script that declares a name it builds at run time", () => script("wrap.sh", "#!/bin/bash\nn=PATH\ndeclare -x \"$n=/tmp/evil\"\ngit status\n"), "./wrap.sh"],
+		["a script that reads into a name it builds at run time", () => script("wrap.sh", "#!/bin/bash\nn=PATH\nread -r \"$n\" < /tmp/p\ngit status\n"), "./wrap.sh"],
+		["a script that printf -v's a name it builds at run time", () => script("wrap.sh", "#!/bin/bash\nn=PATH\nprintf -v \"$n\" %s /tmp/evil\ngit status\n"), "./wrap.sh"],
+		// Arithmetic evaluates a variable's value as an expression, so
+		// `w='PATH=1'; (( w ))` assigns PATH without the text naming it.
+		["a script whose arithmetic evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\n(( w ))\ngit status\n"), "./wrap.sh"],
+		["a script whose let evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\nlet w\ngit status\n"), "./wrap.sh"],
+		["a script whose [[ ]] compares a variable as a number", () => script("wrap.sh", "#!/bin/bash\nw=x\n[[ $w -eq 1 ]]\ngit status\n"), "./wrap.sh"],
+		["a script whose [[ ]] numeric comparison spans a line continuation", () => script("wrap.sh", "#!/bin/bash\nw=x\n[[ $w \\\n-eq 1 ]]\ngit status\n"), "./wrap.sh"],
+		["a script whose $(( )) evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\necho $((w))\ngit status\n"), "./wrap.sh"],
+		["a script whose $(( )) evaluates a parenthesised variable", () => script("wrap.sh", "#!/bin/bash\nw=x\necho $(( 1 + (w) ))\ngit status\n"), "./wrap.sh"],
+		["a script whose legacy $[ ] evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\necho $[ w ]\ngit status\n"), "./wrap.sh"],
+		["a script whose substring offset evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x; s=abc\necho ${s:w:1}\ngit status\n"), "./wrap.sh"],
+		["a script whose array subscript evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\necho ${a[w]}\ngit status\n"), "./wrap.sh"],
+		["a script whose subscripted assignment evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\nx[w]=1\ngit status\n"), "./wrap.sh"],
+		["a script that exports a brace-expanded name", () => script("wrap.sh", "#!/bin/bash\nexport {A,PATH}=/tmp/evil\ngit status\n"), "./wrap.sh"],
+		["a script whose printf -v hides in a brace expansion", () => script("wrap.sh", "#!/bin/bash\nprintf {-v,X} y\ngit status\n"), "./wrap.sh"],
+		["a script whose substring offset on a positional evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\necho ${1:w}\ngit status\n"), "./wrap.sh"],
+		["a script whose substring offset on $@ evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\necho ${@:w}\ngit status\n"), "./wrap.sh"],
+		["a script whose substring offset on an element evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\necho ${a[0]:w}\ngit status\n"), "./wrap.sh"],
+		["a script whose compound array assignment evaluates a variable", () => script("wrap.sh", "#!/bin/bash\nw=x\na=( [w]=1 )\ngit status\n"), "./wrap.sh"],
+		["a script whose [[ ]] numeric comparison spans a newline", () => script("wrap.sh", "#!/bin/bash\nw=x\n[[ $w\n -eq 1 ]]\ngit status\n"), "./wrap.sh"],
+		["a script that declares an integer name", () => script("wrap.sh", "#!/bin/bash\ndeclare -i x\nx=w\ngit status\n"), "./wrap.sh"],
+		["a script that declares a nameref", () => script("wrap.sh", "#!/bin/bash\nn=x\ndeclare -n r=\"$n\"\nr=/tmp/evil\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a quoted name", () => script("wrap.sh", "#!/bin/bash\nw=x\n(( 'w' ))\ngit status\n"), "./wrap.sh"],
+		["a script whose for (( )) loop reads a name", () => script("wrap.sh", "#!/bin/bash\nw=x\nfor ((i=w; i<1; i++)); do :; done\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name filled by read", () => script("wrap.sh", "#!/bin/bash\nread -r w < /dev/null\necho $((w + 1))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a for-loop word", () => script("wrap.sh", "#!/bin/bash\nfor w in a b; do echo $((w)); done\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a substitution's result", () => script("wrap.sh", "#!/bin/bash\nw=$(cat count.txt)\n(( w++ ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name a default assigned", () => script("wrap.sh", "#!/bin/bash\n: \"${w:=$(cat count.txt)}\"\n(( w ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name a plain default assigned", () => script("wrap.sh", "#!/bin/bash\n: ${w=x}\necho $((w))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads REPLY, which read sets on its own", () => script("wrap.sh", "#!/bin/bash\nread < /dev/null\n(( REPLY ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a bundled read -a target", () => script("wrap.sh", "#!/bin/bash\nread -aw < /dev/null\n(( w ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a special it redefined", () => script("wrap.sh", "#!/bin/bash\nSECONDS=x\n(( SECONDS ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name it never assigns", () => script("wrap.sh", "#!/bin/bash\n(( i++ ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic assigns a name from its own old value", () => script("wrap.sh", "#!/bin/bash\n(( x = x + 1 ))\ngit status\n"), "./wrap.sh"],
+		["a script that reads into a name built at run time before its arithmetic", () => script("wrap.sh", "#!/bin/bash\nx=0; n=x\nread \"$n\" < /dev/null\n(( x ))\ngit status\n"), "./wrap.sh"],
+		["a script whose heredoc on the defining statement reads the name", () => script("wrap.sh", "#!/bin/bash\nn=0 <<EOF\n$((n))\nEOF\ngit status\n"), "./wrap.sh"],
+		["a script whose heredoc reads a name the same line assigns after it", () => script("wrap.sh", "#!/bin/bash\ncat <<EOF; n=0\n$((n))\nEOF\ngit status\n"), "./wrap.sh"],
+		["a script whose assignment's own arithmetic reads the name", () => script("wrap.sh", "#!/bin/bash\nn=$((n))\n(( n ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name before assigning it", () => script("wrap.sh", "#!/bin/bash\n(( n ))\nn=0\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name only a function assigns", () => script("wrap.sh", "#!/bin/bash\nf() { n=0; }\n(( n ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name only a branch assigns", () => script("wrap.sh", "#!/bin/bash\nif false; then n=0; fi\n(( n ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name only a prefix assigned", () => script("wrap.sh", "#!/bin/bash\nn=0 true\n(( n ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a bash-5-only special", () => script("wrap.sh", "#!/bin/bash\necho $((EPOCHSECONDS))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads $_, which every command overwrites", () => script("wrap.sh", "#!/bin/bash\n_=0\necho x\n(( _ ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a BASH variable it assigned", () => script("wrap.sh", "#!/bin/bash\nBASH_COMMAND=0\n(( BASH_COMMAND ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads REPLY after assigning it", () => script("wrap.sh", "#!/bin/bash\nREPLY=0\nread < /dev/null\n(( REPLY ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name declared with no value", () => script("wrap.sh", "#!/bin/bash\nlocal x\n(( x ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a name it appended to", () => script("wrap.sh", "#!/bin/bash\nx=0\nx+=1\n(( x ))\ngit status\n"), "./wrap.sh"],
+		["a script whose arithmetic reads a positional parameter", () => script("wrap.sh", "#!/bin/bash\n(( $1 ))\ngit status\n"), "./wrap.sh"],
+		["a script whose indirect expansion names a variable at run time", () => script("wrap.sh", "#!/bin/bash\nw=x\necho ${!w}\ngit status\n"), "./wrap.sh"],
+		["a script whose [[ -v ]] tests a subscripted name", () => script("wrap.sh", "#!/bin/bash\nw=x\n[[ -v 'a[w]' ]]\ngit status\n"), "./wrap.sh"],
+		["a script whose [ -v ] tests a name built at run time", () => script("wrap.sh", "#!/bin/bash\nn='a[w]'\n[ -v \"$n\" ]\ngit status\n"), "./wrap.sh"],
+		["a script whose test -R tests a name built at run time", () => script("wrap.sh", "#!/bin/bash\nn='a[w]'\ntest -R \"$n\"\ngit status\n"), "./wrap.sh"],
+		["a script whose wait -p stores into a name built at run time", () => script("wrap.sh", "#!/bin/bash\nn='a[w]'\nwait -p \"$n\"\ngit status\n"), "./wrap.sh"],
+		["a script whose [ ] builds its -v flag at run time", () => script("wrap.sh", "#!/bin/bash\nf=-v; n='a[w]'\n[ \"$f\" \"$n\" ]\ngit status\n"), "./wrap.sh"],
+		["a script whose test builds its -R flag after !", () => script("wrap.sh", "#!/bin/bash\nf=-R; n='a[w]'\ntest ! \"$f\" \"$n\"\ngit status\n"), "./wrap.sh"],
+		["a script whose wait is handed a built flag", () => script("wrap.sh", "#!/bin/bash\nf=-p; n='a[w]'\nwait \"$f\" \"$n\"\ngit status\n"), "./wrap.sh"],
+		["a script whose unquoted [ ] word splits into -v and a name", () => script("wrap.sh", "#!/bin/bash\ns='-v a[w]'\n[ $s ]\ngit status\n"), "./wrap.sh"],
+		["a script whose [ ] builds its connective too", () => script("wrap.sh", "#!/bin/bash\ng='!'; f=-v; n='a[w]'\n[ \"$g\" \"$f\" \"$n\" ]\ngit status\n"), "./wrap.sh"],
+		["a script whose unquoted verb splits into a program and its argument", () => script("wrap.sh", "#!/bin/bash\nX='bash payload.txt'\n$X\ngit status\n"), "./wrap.sh"],
+		["a script that pipes a file into an expanded verb", () => script("wrap.sh", "#!/bin/bash\nX=bash\ncat payload.txt | \"$X\"\ngit status\n"), "./wrap.sh"],
+		["a script whose [ ] gets \"$@\", which expands to many words", () => script("wrap.sh", "#!/bin/bash\n[ \"$@\" ]\ngit status\n"), "./wrap.sh"],
+		["a script whose expanded verb reads a script on stdin", () => script("wrap.sh", "#!/bin/bash\nX=bash\n$X < payload.txt\ngit status\n"), "./wrap.sh"],
+		["a script whose wait bundles -p", () => script("wrap.sh", "#!/bin/bash\nwait -fp 'a[w]'\ngit status\n"), "./wrap.sh"],
+		["a script that hands declare a compound assignment as text", () => script("wrap.sh", "#!/bin/bash\ndeclare 'a=([w]=1)'\ngit status\n"), "./wrap.sh"],
+		["a script that unsets a subscripted name", () => script("wrap.sh", "#!/bin/bash\nunset 'a[$(id)]'\ngit status\n"), "./wrap.sh"],
+		["a script that reads into a subscripted name", () => script("wrap.sh", "#!/bin/bash\nread -r 'a[w]' < /dev/null\ngit status\n"), "./wrap.sh"],
+		["a script whose expanded verb is handed a name to write", () => script("wrap.sh", "#!/bin/bash\nv=export\n$v X=1\ngit status\n"), "./wrap.sh"],
+		["a script whose verb is a brace expansion", () => script("wrap.sh", "#!/bin/bash\n{ex,}port X=1\ngit status\n"), "./wrap.sh"],
+		["a script whose printf -v format is built at run time", () => script("wrap.sh", "#!/bin/bash\nprintf \"${O:--v}\" X y\ngit status\n"), "./wrap.sh"],
 		[
 			"a symlink to a secret file",
 			() => {
@@ -686,9 +801,11 @@ describe("escalates_privilege on a remote host the user named", () => {
 	test("an ssh run through a variable has no host to name, so it stays barred", async () => {
 		setJevAnswer(privileged());
 		const indirect = `SSH="ssh root@192.168.86.53"; $SSH 'systemctl stop contents-recognition-service'`;
-		await fire("tool_call", makeEvent(indirect), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
+		const result = await fire("tool_call", makeEvent(indirect), uiCtx(nextSession(), [user("u1", "stop content recognition service on 192.168.86.53")]));
 		expect(reviewerCalls).toHaveLength(0);
-		expect(reviewerAudit()).toMatchObject({ skipped: "hazard escalates_privilege" });
+		// The script-body reader now refuses `$SSH <operand>` (an expanded verb
+		// that could run anything it is handed) before the judge or reviewer.
+		expect(resultText(result)).not.toBe("ALLOWED");
 	});
 });
 

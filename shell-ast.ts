@@ -66,9 +66,20 @@ let loadSh: ShLoader = () => requireSh("mvdan-sh");
 interface ShellRuntime {
 	syntax: Syntax;
 	parser: Parser;
+	/** A second parser that keeps comments, for {@link shellLayout} only: the
+	 *  readers above never see a comment node, and sharing one parser would
+	 *  hand every walk a node type it does not expect. */
+	commentParser: Parser;
 	redirect: Record<RedirectOpName, number>;
 	binary: Record<BinaryOpName, number>;
 	redirectDirection: Record<number, ShellRedirect["direction"] | undefined>;
+	/** `[[ ]]` operators that evaluate both operands as arithmetic. */
+	arithmeticTests: ReadonlySet<number>;
+	/** `[[ -v ]]` and `[[ -R ]]`: their operand is a variable name, and a
+	 *  subscript in it is evaluated. */
+	nameTests: ReadonlySet<number>;
+	/** The plain `=` inside arithmetic: it sets an integer without reading the name first. */
+	arithmeticAssign: number;
 }
 
 let runtime: ShellRuntime | undefined;
@@ -94,7 +105,7 @@ const deriveRuntime = (mod: unknown): ShellRuntime => {
 	 * renumbers them silently wrong in a security boundary, so each one is
 	 * read back from a parse of the spelling it belongs to.
 	 */
-	const operatorOf = (source: string, type: "Redirect" | "BinaryCmd"): number => {
+	const operatorOf = (source: string, type: "Redirect" | "BinaryCmd" | "BinaryTest" | "UnaryTest" | "BinaryArithm"): number => {
 		// Local walk, not the module-level one: walk() calls getShell(), and
 		// the runtime is not assigned until this function returns, so touching
 		// it here would re-enter this derivation forever.
@@ -146,7 +157,14 @@ const deriveRuntime = (mod: unknown): ShellRuntime => {
 		[redirect.readWrite]: "both",
 	};
 
-	return { syntax, parser, redirect, binary, redirectDirection };
+	const arithmeticTests = new Set(["-eq", "-ne", "-lt", "-le", "-gt", "-ge"].map(op => operatorOf(`[[ 1 ${op} 1 ]]`, "BinaryTest")));
+
+	const nameTests = new Set(["-v", "-R"].map(op => operatorOf(`[[ ${op} x ]]`, "UnaryTest")));
+
+	const arithmeticAssign = operatorOf("(( a = 1 ))", "BinaryArithm");
+
+	const commentParser = syntax.NewParser(syntax.Variant(syntax.LangBash), syntax.KeepComments(true));
+	return { syntax, parser, commentParser, redirect, binary, redirectDirection, arithmeticTests, nameTests, arithmeticAssign };
 };
 
 /** The live runtime, loading and deriving the parser on first use. */
@@ -174,12 +192,29 @@ function parse(source: string): unknown {
 	return getShell().parser.Parse(source, "command.sh");
 }
 
-/** Depth-first walk. Returning false stops the descent. */
+/**
+ * Depth-first walk. Returning false stops the descent.
+ *
+ * mvdan-sh's own Walk does not enter a parameter expansion's slice, but bash
+ * evaluates the offset and length, substitutions included: `${x:$(rm -rf
+ * ~/proj):1}` runs the `rm`. Every reader here (the substitution collector,
+ * the variable collector, the span and range finders) goes through this
+ * function, so the slice is walked once, here.
+ */
 function walk(tree: unknown, visit: (node: unknown) => boolean): void {
-	getShell().syntax.Walk(tree, node => {
-		if (node) return visit(node);
-		return true;
-	});
+	const { syntax } = getShell();
+	const visitor = (node: unknown): boolean => {
+		if (!node) return true;
+		const descend = visit(node);
+		if (descend && syntax.NodeType(node) === "ParamExp") {
+			// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+			const slice = (node as any).Slice;
+			if (slice?.Offset) syntax.Walk(slice.Offset, visitor);
+			if (slice?.Length) syntax.Walk(slice.Length, visitor);
+		}
+		return descend;
+	};
+	syntax.Walk(tree, visitor);
 }
 
 /** The operator table, for the test that pins it against real spellings. */
@@ -349,14 +384,48 @@ export function shellRunsInSourceOrder(text: string): boolean {
 		return false;
 	}
 	let ordered = true;
-	walk(tree, node => {
-		if (!ordered) return false;
-		const type = nodeType(node as NonNullable<unknown>);
-		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
-		if (OUT_OF_ORDER_SHAPES.has(type) || (type === "Stmt" && (node as any).Background === true)) ordered = false;
-		return ordered;
-	});
+	try {
+		walk(tree, node => {
+			if (!ordered) return false;
+			const type = nodeType(node as NonNullable<unknown>);
+			// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+			if (OUT_OF_ORDER_SHAPES.has(type) || (type === "Stmt" && (node as any).Background === true)) ordered = false;
+			return ordered;
+		});
+	} catch {
+		// A tree deeper than the walk's stack (a pipeline of a few thousand
+		// stages parses, then overflows) is a tree this did not read.
+		return false;
+	}
 	return ordered;
+}
+
+/**
+ * Whether `text` defines a shell function (`f() { … }`, `function f { … }`)
+ * anywhere, including inside a substitution or a block. A definition outlives
+ * the command in the host's persistent shell and can shadow any later verb,
+ * `git` included. A command the parser cannot read answers true.
+ */
+export function shellDefinesFunction(text: string): boolean {
+	let tree: unknown;
+	try {
+		tree = parse(text);
+	} catch {
+		return true;
+	}
+	let found = false;
+	try {
+		walk(tree, node => {
+			if (found) return false;
+			if (!node) return true;
+			if (nodeType(node) === "FuncDecl") found = true;
+			return !found;
+		});
+	} catch {
+		// Too deep to walk: not read, so answer the fail-closed way.
+		return true;
+	}
+	return found;
 }
 
 /** The parser's own message. Its error is a Go value whose `toString` is
@@ -558,6 +627,9 @@ function shallowStmts(cmd: any): any[] {
 	return found;
 }
 
+/** A substitution opener inside raw extglob pattern text. */
+const EXTGLOB_SUBSTITUTION = /\$\(|`|[<>]\(/u;
+
 /**
  * Every substitution inside a node, collected as commands, and the ones at the
  * substitution's own level returned.
@@ -576,6 +648,14 @@ function collectSubstitutions(node: any, source: string, out: ShellCommand[]): S
 		// A statement owns the substitutions inside it, and collectStmt has
 		// already been given it. Descending here would collect them twice.
 		if (type === "Stmt") return false;
+		// The parser keeps an extended glob's pattern as raw text, so a
+		// substitution inside it is never parsed, while bash with extglob on
+		// runs it: `echo @($(rm -rf ~/proj)|c)`. That is a command this adapter
+		// did not read, so the whole parse is refused rather than listing none.
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		if (type === "ExtGlob" && EXTGLOB_SUBSTITUTION.test((inner as any).Pattern?.Value ?? "")) {
+			throw new Error("an extended glob pattern holds a substitution the parser does not read");
+		}
 		if (type !== "CmdSubst" && type !== "ProcSubst") return true;
 		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
 		for (const stmt of (inner as any).Stmts ?? []) own.push(...collectStmt(stmt, "sequence", true, source, out));
@@ -604,16 +684,25 @@ function readRedirect(redir: any, source: string, out: ShellCommand[]): ShellRed
 	// An operator this table does not name is a redirect this adapter did not
 	// read. Guessing a direction is how `<>` came to read as output only.
 	if (direction === undefined) throw new Error(`unknown redirect operator ${code}`);
-	const duplicate = code === op.dupOut || code === op.dupIn;
 	const here = code === op.hereString || code === op.heredoc || code === op.heredocDash;
 	const both = code === op.both || code === op.bothAppend;
+	const fd: string = redir.N?.Value ?? "";
+	const target = readWord(redir.Word, source, out);
+	// bash copies a descriptor for `>&word` only when the word is a number or
+	// `-`. Any other word, with no descriptor or descriptor 1 before the
+	// operator, is a file opened for stdout and stderr exactly as `&>word` is:
+	// `>&out.txt`, `1>&out.txt` and `>&$f` all write. Reading every `>&` as a
+	// copy hid those writes from the action summary. `2>&word` and `<&word`
+	// with a file name are errors in bash and stay copies here.
+	const descriptor = target.literal && /^(?:\d+|-)$/u.test(target.value);
+	const fileForBoth = code === op.dupOut && !descriptor && (fd === "" || fd === "1");
 	const redirect: ShellRedirect = {
 		direction,
 		append: code === op.append || code === op.bothAppend,
-		duplicate,
+		duplicate: (code === op.dupOut || code === op.dupIn) && !fileForBoth,
 		here,
-		fd: both ? "&" : (redir.N?.Value ?? ""),
-		target: readWord(redir.Word, source, out),
+		fd: both || fileForBoth ? "&" : fd,
+		target,
 	};
 	// The body of `cat <<EOF` runs its `$(…)` when the delimiter is unquoted.
 	// Left unread, a heredoc body hid every command substituted into it.
@@ -832,26 +921,34 @@ export function verbName(command: ShellCommand): string {
 export function substitutionSpans(text: string): string[] {
 	if (!/\$\(|`|<\(/u.test(text)) return [];
 	const parsed = parseShell(text);
-	if (!parsed.ok) {
-		const spans: string[] = [];
-		for (const m of text.matchAll(/\$\(([^)]*)\)/gu)) spans.push(m[1]);
-		for (const m of text.matchAll(/`([^`]*)`/gu)) spans.push(m[1]);
-		const dollarTail = /\$\(([^)]*)$/u.exec(text);
-		if (dollarTail) spans.push(dollarTail[1]);
-		const backtickTail = /`([^`]*)$/u.exec(text);
-		if (backtickTail) spans.push(backtickTail[1]);
-		return spans;
-	}
+	if (!parsed.ok) return quoteBlindSpans(text);
 	const spans: string[] = [];
-	// biome-ignore lint/suspicious/noExplicitAny: untyped AST
-	walk(parse(text), (node: unknown) => {
-		if (!node) return true;
-		const type = nodeType(node);
-		if (type !== "CmdSubst" && type !== "ProcSubst") return true;
-		const inner = sliceOf(node, text);
-		spans.push(inner.replace(/^\$\(|^<\(|^`/u, "").replace(/\)$|`$/u, ""));
-		return true;
-	});
+	try {
+		walk(parse(text), (node: unknown) => {
+			if (!node) return true;
+			const type = nodeType(node);
+			if (type !== "CmdSubst" && type !== "ProcSubst") return true;
+			const inner = sliceOf(node, text);
+			spans.push(inner.replace(/^\$\(|^<\(|^`/u, "").replace(/\)$|`$/u, ""));
+			return true;
+		});
+	} catch {
+		// A tree too deep for the walk: read it the way unparsed text is read.
+		return quoteBlindSpans(text);
+	}
+	return spans;
+}
+
+/** The fallback pairing for text the parser could not read: each `$(` with the
+ *  next `)`, each backtick pair, and an unclosed tail. */
+function quoteBlindSpans(text: string): string[] {
+	const spans: string[] = [];
+	for (const m of text.matchAll(/\$\(([^)]*)\)/gu)) spans.push(m[1]);
+	for (const m of text.matchAll(/`([^`]*)`/gu)) spans.push(m[1]);
+	const dollarTail = /\$\(([^)]*)$/u.exec(text);
+	if (dollarTail) spans.push(dollarTail[1]);
+	const backtickTail = /`([^`]*)$/u.exec(text);
+	if (backtickTail) spans.push(backtickTail[1]);
 	return spans;
 }
 
@@ -894,6 +991,147 @@ export function shellSubstitutionRanges(text: string): ShellSubstitutionRange[] 
 	return ranges;
 }
 
+/** A half-open range of string indexes into the text that was parsed. */
+export interface ShellSpan {
+	start: number;
+	end: number;
+}
+
+/**
+ * Where the parser found text the shell never reads as a command, and where it
+ * found commands that do not run where they are written.
+ *
+ * The text readers in `shell-cwd.ts` and the script-body reader split a command
+ * with a quote-aware tokenizer that knows nothing else. Every shape below used
+ * to be guessed from the text, and each guess failed open: a quote inside a
+ * comment opened a quote that never closed, and every `<<` (a here-string, an
+ * arithmetic shift, a quoted or commented `<<`) opened a heredoc. Both blanked
+ * the rest of the command, so a later `python3 p.py` was never read.
+ */
+export interface ShellLayout {
+	/** Every `# …` comment, from the `#` to the end of its line. */
+	comments: ShellSpan[];
+	/** Every heredoc body together with its closing delimiter line. */
+	heredocBodies: ShellSpan[];
+	/** Function bodies, loops and coprocesses: commands inside run later, more
+	 *  than once, or not at all, so a `cd` there is not a `cd` at that point. */
+	deferred: ShellSpan[];
+	/** The function definitions among `deferred`: a body runs wherever the
+	 *  function is called, so its commands have no directory of their own. */
+	functions: ShellSpan[];
+}
+
+const DEFERRED_SHAPES = new Set(["FuncDecl", "ForClause", "WhileClause", "CoprocClause"]);
+
+let lastLayout: { text: string; layout: ShellLayout | null } | undefined;
+
+/**
+ * The parser's {@link ShellLayout} of `text`, or null when it cannot be read:
+ * a syntax error, a parser that did not load, a tree too deep to walk, or a
+ * heredoc whose closer is not where the parse says it is. A null layout is the
+ * caller's cue to fall back to its text reading and to distrust it.
+ *
+ * Several readers ask about the same command in one gate call, so the last
+ * answer is kept.
+ */
+export function shellLayout(text: string): ShellLayout | null {
+	if (lastLayout?.text === text) return lastLayout.layout;
+	const layout = readLayout(text);
+	lastLayout = { text, layout };
+	return layout;
+}
+
+interface HeredocOpener {
+	/** Where the operator's delimiter word ends. */
+	wordEnd: number;
+	dash: boolean;
+	delimiter: string;
+	body?: ShellSpan;
+}
+
+function readLayout(text: string): ShellLayout | null {
+	let tree: unknown;
+	try {
+		tree = getShell().commentParser.Parse(text, "command.sh");
+	} catch {
+		return null;
+	}
+	const comments: ShellSpan[] = [];
+	const deferred: ShellSpan[] = [];
+	const functions: ShellSpan[] = [];
+	const openers: HeredocOpener[] = [];
+	const { redirect: op } = getShell();
+	const spanOf = (node: unknown): ShellSpan | null => {
+		const start = sourceOffsetOf(node, text);
+		const end = sourceEndOffsetOf(node, text);
+		return start === undefined || end === undefined || end < start ? null : { start, end };
+	};
+	let unreadable = false;
+	try {
+		walk(tree, (node: unknown) => {
+			const type = nodeType(node as NonNullable<unknown>);
+			if (type === "Comment" || DEFERRED_SHAPES.has(type)) {
+				const span = spanOf(node);
+				if (span === null) unreadable = true;
+				else (type === "Comment" ? comments : deferred).push(span);
+				if (span !== null && type === "FuncDecl") functions.push(span);
+				return true;
+			}
+			if (type !== "Redirect") return true;
+			// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+			const redir = node as any;
+			if (redir.Op !== op.heredoc && redir.Op !== op.heredocDash) return true;
+			const word = spanOf(redir.Word);
+			const body = redir.Hdoc ? spanOf(redir.Hdoc) : undefined;
+			if (word === null || body === null) {
+				unreadable = true;
+				return true;
+			}
+			openers.push({ wordEnd: word.end, dash: redir.Op === op.heredocDash, delimiter: readWord(redir.Word, text, []).value, body });
+			return true;
+		});
+	} catch {
+		// A tree deeper than the walk's stack is a tree this did not read.
+		return null;
+	}
+	if (unreadable) return null;
+	const heredocBodies = heredocSpans(text, openers);
+	if (heredocBodies === null) return null;
+	return { comments, heredocBodies, deferred, functions };
+}
+
+/**
+ * Each heredoc's body and closer line. The parser hands back a body word that
+ * already ends at the closer, but an EMPTY body has no word at all, and its
+ * closer line would otherwise survive as a segment of its own: `cat <<python3`
+ * closed by a `python3` line reads as an interpreter call. That line is found
+ * the way the shell finds it (the line after the opener's line, or the line
+ * after the previous body when two openers share a line) and checked against
+ * the delimiter; a line that does not match means this reading is wrong.
+ */
+function heredocSpans(text: string, openers: HeredocOpener[]): ShellSpan[] | null {
+	const spans: ShellSpan[] = [];
+	let cursor = 0;
+	for (const opener of [...openers].sort((a, b) => a.wordEnd - b.wordEnd)) {
+		if (opener.body !== undefined) {
+			spans.push(opener.body);
+			const newline = text.indexOf("\n", opener.body.end);
+			cursor = newline === -1 ? text.length : newline + 1;
+			continue;
+		}
+		const openerLineEnd = text.indexOf("\n", opener.wordEnd);
+		if (openerLineEnd === -1) continue;
+		const lineStart = Math.max(openerLineEnd + 1, cursor);
+		const newline = text.indexOf("\n", lineStart);
+		const lineEnd = newline === -1 ? text.length : newline;
+		const line = text.slice(lineStart, lineEnd);
+		if ((opener.dash ? line.replace(/^\t+/u, "") : line) !== opener.delimiter) return null;
+		spans.push({ start: lineStart, end: lineEnd });
+		cursor = newline === -1 ? text.length : newline + 1;
+	}
+	return spans;
+}
+
 /**
  * Every name a word expands: each parameter expansion however deep, and each
  * bare name inside arithmetic. Stops at a substitution, whose commands are
@@ -932,6 +1170,262 @@ function arithmeticNames(node: any): string[] {
 		return true;
 	});
 	return names;
+}
+
+/** A word's text when every part is a plain literal; otherwise a marker no
+ *  flag pattern accepts, so a built word fails closed. */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+const literalWordText = (word: any): string => {
+	const parts = word?.Parts ?? [];
+	// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+	return parts.every((part: any) => nodeType(part) === "Lit") ? parts.map((part: any) => part.Value ?? "").join("") : "\0";
+};
+
+/** Node types an arithmetic expression may hold and still read nothing:
+ *  operators over integer literals. Anything else (a name, a quoted word, an
+ *  expansion, a substitution) counts as reading, so an unknown shape fails
+ *  closed. */
+const PLAIN_ARITHMETIC = new Set(["Word", "Lit", "BinaryArithm", "UnaryArithm", "ParenArithm"]);
+
+/** Specials whose value bash itself sets to an integer, in every bash that
+ *  runs a reviewed body: macOS still ships 3.2, which has no `SRANDOM`,
+ *  `EPOCHSECONDS` or `BASHPID`, so there those are ordinary names. */
+const INTEGER_SPECIALS = new Set(["SECONDS", "RANDOM", "LINENO", "PPID", "UID", "EUID", "#", "?", "$", "!"]);
+/** Names bash fills on its own (`read` with no name sets REPLY, `=~` sets
+ *  BASH_REMATCH): never trusted, whatever the body assigns. */
+const BASH_MANAGED = new Set(["_", "REPLY", "MAPFILE", "OPTARG", "OPTIND", "OPTERR", "COPROC", "PIPESTATUS", "FUNCNAME", "DIRSTACK", "GROUPS", "COMP_WORDS", "COMPREPLY", "READLINE_LINE", "READLINE_POINT", "READLINE_MARK", "HISTCMD", "COLUMNS", "LINES", "PWD", "OLDPWD", "IFS", "PATH"]);
+/** `$_` is overwritten after every command, and every `BASH*` variable is
+ *  bash's own: neither is trusted, whatever the body assigns. */
+const bashManaged = (name: string): boolean => BASH_MANAGED.has(name) || name.startsWith("BASH");
+/** Builtins that write the names they are handed from input the text does not show. */
+const INPUT_WRITERS = new Set(["read", "mapfile", "readarray", "getopts"]);
+
+/** A plain `$NAME` or `${NAME}`: no subscript, slice, default or indirection. */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+const plainParam = (node: any): string | undefined =>
+	nodeType(node) === "ParamExp" && !node.Excl && !node.Length && !node.Width && !node.Index && !node.Slice && !node.Repl && !node.Exp && !node.Names ? (node.Param?.Value ?? undefined) : undefined;
+
+/** Whether an assignment's value is one bash makes an integer, or an empty
+ *  one: digits, an arithmetic expansion, or an integer special. The
+ *  arithmetic inside `$(( ))` is checked where it sits. */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function integerValue(word: any): boolean {
+	if (!word) return true;
+	// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+	const parts: any[] = word.Parts ?? [];
+	if (parts.length !== 1) return parts.length === 0;
+	const [part] = parts;
+	const type = nodeType(part);
+	if (type === "Lit") return /^[0-9]+$/u.test(part.Value ?? "");
+	if (type === "ArithmExp") return true;
+	const name = plainParam(part);
+	return name !== undefined && INTEGER_SPECIALS.has(name);
+}
+
+/**
+ * The names arithmetic may read: deny by default. A name is trusted when the
+ * body assigns it, every assignment is an integer (digits, `$(( ))`, an
+ * integer special, or a plain `=` inside arithmetic, which sets it without
+ * reading it first), and nothing else writes it. An integer special the body
+ * never writes is trusted too. Everything else is not: a name the body never
+ * assigns (bash sets `REPLY`, `MAPFILE`, `OPTARG`, `BASH_REMATCH` and more on
+ * its own, and the environment can hold anything), a positional parameter,
+ * and any name a `read`/`mapfile`/`getopts`/`printf -v`/`unset`, a `for` or
+ * `select` word, a `${w:=…}` default (any default operator counts) or a
+ * non-integer assignment touches.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function trustedNames(tree: any): Map<string, number> {
+	const { arithmeticAssign } = getShell();
+	const integerAssigned = new Set<string>();
+	const written = new Set<string>();
+	const writtenNames = (words: readonly unknown[]): void => {
+		for (const word of words) {
+			const text = literalWordText(word);
+			// `-aNAME`, `-vNAME` or a bundle ending in a name: take every identifier run.
+			for (const name of text.replace(/\[.*$/u, "").match(/[A-Za-z_][A-Za-z0-9_]*/gu) ?? []) written.add(name);
+			if (text === "\0") written.add("\0");
+		}
+	};
+	walk(tree, (node: unknown) => {
+		if (!node) return true;
+		const type = nodeType(node);
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		const n = node as any;
+		// No value (`local x`, `declare x`) keeps whatever the name held, and
+		// `x+=…` appends text: neither sets an integer the body vouches for.
+		if (type === "Assign" && n.Name?.Value) (n.Array || n.Index || n.Append || !n.Value || !integerValue(n.Value) ? written : integerAssigned).add(n.Name.Value);
+		if ((type === "WordIter" || type === "SelectClause") && n.Name?.Value) written.add(n.Name.Value);
+		if (type === "ParamExp" && n.Exp && n.Param?.Value) written.add(n.Param.Value);
+		// `(( x = x + 1 ))` reads x before it sets it, so only a right side of
+		// plain integers makes the assignment one the body vouches for.
+		if (type === "BinaryArithm" && n.Op === arithmeticAssign && !arithmeticReadsAnything(n.Y, new Map()) && nodeType(n.X) === "Word" && (n.X.Parts ?? []).length === 1 && nodeType(n.X.Parts[0]) === "Lit") integerAssigned.add(n.X.Parts[0].Value ?? "");
+		if (type === "CallExpr") {
+			// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+			const words: any[] = n.Args ?? [];
+			const verb = words[0] && literalWordText(words[0]);
+			if (INPUT_WRITERS.has(verb) || verb === "unset" || verb === "printf") writtenNames(words.slice(1));
+		}
+		return true;
+	});
+	// The name to its first top-level, unconditional integer assignment: a
+	// plain assignment statement (not a prefix on a command, not backgrounded,
+	// not inside a function, subshell, condition or loop body), a top-level
+	// `(( x = 1 ))`, or the init of a top-level `for (( x = 0; … ))`. A read
+	// earlier in the text, or one the assignment may never reach, sees
+	// whatever the name held before.
+	const defined = new Map<string, number>();
+	const define = (name: string, at: number): void => {
+		if (!defined.has(name)) defined.set(name, at);
+	};
+	// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+	const arithmeticDefines = (expr: any): void => {
+		if (expr && nodeType(expr) === "BinaryArithm" && expr.Op === arithmeticAssign && !arithmeticReadsAnything(expr.Y, new Map()) && nodeType(expr.X) === "Word" && (expr.X.Parts ?? []).length === 1 && nodeType(expr.X.Parts[0]) === "Lit") define(expr.X.Parts[0].Value ?? "", expr.End().Offset());
+	};
+	// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+	for (const stmt of (tree as any)?.Stmts ?? []) {
+		const cmd = stmt?.Cmd;
+		// A redirect on the statement (a heredoc above all) is expanded before
+		// the statement's own assignments take effect.
+		if (!cmd || stmt.Background || stmt.Coprocess || stmt.Negated || (stmt.Redirs ?? []).length > 0) continue;
+		const type = nodeType(cmd);
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		if (type === "CallExpr" && (cmd.Args ?? []).length === 0) for (const assign of cmd.Assigns ?? []) if (assign.Name?.Value && !assign.Array && !assign.Index && !assign.Append && assign.Value && integerValue(assign.Value)) define(assign.Name.Value, assign.End().Offset());
+		if (type === "ArithmCmd") arithmeticDefines(cmd.X);
+		if (type === "ForClause" && nodeType(cmd.Loop) === "CStyleLoop") arithmeticDefines(cmd.Loop.Init);
+	}
+	const trusted = new Map<string, number>();
+	// A writer whose target is built at run time (`read "$n"`) can write any
+	// name, so nothing the body assigns can be trusted.
+	if (written.has("\0")) return trusted;
+	for (const name of integerAssigned) {
+		const at = defined.get(name);
+		if (at !== undefined && !written.has(name) && !INTEGER_SPECIALS.has(name) && !bashManaged(name)) trusted.set(name, at);
+	}
+	for (const name of INTEGER_SPECIALS) if (!written.has(name) && !integerAssigned.has(name)) trusted.set(name, -1);
+	return trusted;
+}
+
+/** Whether `name` is trusted where `node` reads it: after its defining assignment. */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+const trustedAt = (trusted: ReadonlyMap<string, number>, name: string, node: any): boolean => {
+	const at = trusted.get(name);
+	if (at === undefined) return false;
+	if (at < 0) return true;
+	const offset: number = node?.Pos?.().Offset?.() ?? -1;
+	// A heredoc body is expanded when its command runs, before the commands
+	// after it on the same line, though its text comes later: inside one, the
+	// assignment must come before the `<<` that owns the body.
+	const heredoc = (HEREDOC_RANGES.get(trusted) ?? []).find(([from, to]) => offset >= from && offset <= to);
+	return at < (heredoc === undefined ? offset : heredoc[2]);
+};
+
+/** The heredoc body spans of the text a trusted-name map was built from. */
+const HEREDOC_RANGES = new WeakMap<ReadonlyMap<string, number>, Array<[number, number, number]>>();
+
+/** Whether an arithmetic expression (or any node under it) reads something
+ *  that is not an integer the body can vouch for: an untrusted name, a quoted
+ *  word, a substitution, or any node outside integer arithmetic. */
+// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+function arithmeticReadsAnything(node: any, trusted: ReadonlyMap<string, number>): boolean {
+	if (!node) return false;
+	if (Array.isArray(node)) return node.some(inner => arithmeticReadsAnything(inner, trusted));
+	let reads = false;
+	walk(node, (inner: unknown) => {
+		if (reads || !inner) return !reads;
+		const type = nodeType(inner);
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		const value: string = (inner as any).Value ?? "";
+		if (type === "ParamExp") {
+			const name = plainParam(inner);
+			reads = name === undefined || !trustedAt(trusted, name, inner);
+			return false;
+		}
+		// `x = 5` over plain integers writes x without reading it: only the
+		// right side is a read.
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		const n = inner as any;
+		if (type === "BinaryArithm" && n.Op === getShell().arithmeticAssign && nodeType(n.X) === "Word" && (n.X.Parts ?? []).length === 1 && nodeType(n.X.Parts[0]) === "Lit" && IDENTIFIER.test(n.X.Parts[0].Value ?? "")) {
+			reads = arithmeticReadsAnything(n.Y, trusted);
+			return false;
+		}
+		if (type === "Lit") {
+			if (/^[0-9\s]*$/u.test(value)) return true;
+			reads = !IDENTIFIER.test(value) || !trustedAt(trusted, value, inner);
+			return !reads;
+		}
+		if (!PLAIN_ARITHMETIC.has(type)) reads = true;
+		return !reads;
+	});
+	return reads;
+}
+
+/**
+ * Why a shell text evaluates arithmetic that reads a name, or undefined.
+ * bash evaluates a variable's VALUE as an expression wherever it does
+ * arithmetic, so with `w='PATH=/x'` each of these assigns PATH though no
+ * text spells it: `(( w ))`, `let w`, `$(( w ))`, a subscript (`${a[w]}`,
+ * `x[w]=1`, `( [w]=1 )`), a substring offset or length (`${s:w:1}`), and a
+ * `[[ ]]` numeric comparison. `declare -i` makes every later assignment to
+ * the name arithmetic, and `declare -n` makes the name an alias of another,
+ * so both refuse outright. Read from the parse; slices and subscripts are
+ * read off the node itself.
+ */
+export function hiddenArithmetic(text: string): string | undefined {
+	let tree: unknown;
+	try {
+		tree = parse(text);
+	} catch {
+		return "its shell body could not be parsed";
+	}
+	let why: string | undefined;
+	try {
+		walkArithmetic(tree, found => {
+			why = found;
+		});
+	} catch {
+		// A tree deeper than the walk's stack is a tree this did not read.
+		return "its shell body is too deep to read";
+	}
+	return why;
+}
+
+function walkArithmetic(tree: unknown, report: (why: string) => void): void {
+	const { arithmeticTests, nameTests } = getShell();
+	const trusted = trustedNames(tree);
+	const heredocs: Array<[number, number, number]> = [];
+	walk(tree, (node: unknown) => {
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		const hdoc = node && nodeType(node) === "Redirect" ? (node as any).Hdoc : undefined;
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		if (hdoc) heredocs.push([hdoc.Pos().Offset(), hdoc.End().Offset(), (node as any).Pos().Offset()]);
+		return true;
+	});
+	HEREDOC_RANGES.set(trusted, heredocs);
+	const reads = (node: unknown): boolean => arithmeticReadsAnything(node, trusted);
+	let why: string | undefined;
+	walk(tree, (node: unknown) => {
+		if (why !== undefined || !node) return why === undefined;
+		const type = nodeType(node);
+		// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+		const n = node as any;
+		if ((type === "ArithmCmd" || type === "LetClause" || type === "ArithmExp") && reads(n.X ?? n.Exprs ?? n)) why = "arithmetic evaluates a variable, which can assign any name";
+		else if (type === "CStyleLoop" && (reads(n.Init) || reads(n.Cond) || reads(n.Post))) why = "a for (( )) loop evaluates a variable, which can assign any name";
+		// `${!w}` expands the variable whose name is w's value, and a subscript
+		// in that value (`a[$(cmd)]`) is evaluated.
+		else if (type === "ParamExp" && n.Excl) why = "an indirect expansion names its variable at run time";
+		else if (type === "UnaryTest" && nameTests.has(n.Op) && !(nodeType(n.X) === "Word" && (n.X.Parts ?? []).length === 1 && nodeType(n.X.Parts[0]) === "Lit" && IDENTIFIER.test(n.X.Parts[0].Value ?? ""))) why = "a -v or -R test evaluates the subscript in a name";
+		else if (type === "ParamExp" && (reads(n.Index) || reads(n.Slice?.Offset) || reads(n.Slice?.Length))) why = "a subscript or substring offset evaluates a variable, which can assign any name";
+		else if ((type === "Assign" || type === "ArrayElem") && reads(n.Index)) why = "a subscript evaluates a variable, which can assign any name";
+		else if (type === "BinaryTest" && arithmeticTests.has(n.Op) && (reads(n.X) || reads(n.Y))) why = "a numeric comparison evaluates a variable, which can assign any name";
+		else if (type === "DeclClause") {
+			// biome-ignore lint/suspicious/noExplicitAny: untyped AST
+			const flags = (n.Args ?? []).filter((arg: any) => arg.Naked && arg.Value).map((arg: any) => literalWordText(arg.Value));
+			if (flags.some((flag: string) => /^[-+][A-Za-z]*[in]/u.test(flag) || !/^[-+A-Za-z0-9_]*$/u.test(flag))) why = "declare -i or -n changes what a later assignment does";
+		}
+		if (why !== undefined) report(why);
+		return why === undefined;
+	});
 }
 
 /** A code point bash would emit, or the escape as written when it is out of

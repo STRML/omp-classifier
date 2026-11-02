@@ -82,7 +82,7 @@ executes · `status` writes status.json · `reset` · `trust-policy` · `enabled
 `ts, decisionId, sessionId, policyVersion, policyHash, modelId, reasonCode, jev{model,
 probabilities, hazards, confidence, blastRadius, usage, latencyMs}, userMessageIds,
 authorization, v3, tool, decision, layer, why, cmd, cwd, spawnCwd, verdict, cached, ms,
-staleCode, floor{asks, entries}, followsDecisionId` (blocked lines point at the verdict/cwd/critical/environment line before them; unclassified lines carry none). Older logs also carry `approval`.
+staleCode, floor{asks, entries}, followsDecisionId, criticalBodies` (`criticalBodies`: JS/Python bodies a critical pattern matched, which went to the judge) (blocked lines point at the verdict/cwd/critical/environment line before them; unclassified lines carry none). Older logs also carry `approval`.
 
 No-UI sessions: `userChannelBranch(ctx)` returns an empty branch when `!ctx.hasUI`, so `evidenceUserSnapshot` and `shadowJevV3` see no user words; tool evidence still reads the whole branch. In a UI session it runs `askAnswersAsUserWords` first, which recasts each `ask` tool result the user answered by hand (not `timedOut`) as a user message, so every user-word reader sees clicks as typed replies. Only the answer (labels, typed input, note) becomes user words, never the agent's question. `collectToolEvidence` drops the calls the gate refused (`refusedToolCallIds`, recorded by the `tool_call` wrapper) with their results, keeps the newest entries under `TOOL_EVIDENCE_MAX_CHARS`, and pins the newest `skill://` read.
 

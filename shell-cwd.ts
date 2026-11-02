@@ -30,7 +30,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { parseShell, shellSubstitutionRanges, type ShellSubstitutionRange } from "./shell-ast";
+import { parseShell, type ShellCommand, shellLayout, type ShellSpan, shellSubstitutionRanges, type ShellSubstitutionRange } from "./shell-ast";
 
 /** A word carrying one of these is expanded by the shell before the reader
  *  ever sees it, so the path it names is not readable text. `{` and `[` are
@@ -160,17 +160,26 @@ export interface MaskedScanText {
 	 * tokenizes the content as fresh text; the seen-set stops a repeat.
 	 */
 	quoted: string[];
+	/**
+	 * True when the mask blanked to the end of the command because it lost its
+	 * place: a heredoc delimiter it could not read, or a quote it never saw
+	 * close. Everything after that point is gone from `masked`, so a reader
+	 * that looks for COMMANDS there (the script-body reader) cannot trust what
+	 * it did not find. The risk-token readers scan the blanked tail separately
+	 * and need no flag.
+	 */
+	lost: boolean;
 }
 
-export function maskHeredocBodiesAndAnsiSpans(command: string): MaskedScanText {
-	const bodies: string[] = [];
-	// 1. Heredoc bodies, in shell body order. Openers are reported on the
-	// original text; one line's openers consume consecutive bodies, so an
-	// opener whose body-start sits inside an already-consumed span is data
-	// to an outer heredoc and opens nothing. An opener with no body start
-	// (`<<EOF` ending the text) has no body at all. An UNKNOWN delimiter
-	// covers to EOF: the whole tail moves to the isolated-body scan, which
-	// only ever over-flags.
+/**
+ * Heredoc bodies from the text alone, for a command the parser cannot read.
+ * In shell body order: one line's openers consume consecutive bodies, so an
+ * opener whose body-start sits inside an already-consumed span is data to an
+ * outer heredoc and opens nothing. An opener with no body start (`<<EOF`
+ * ending the text) has no body at all. An UNKNOWN delimiter covers to EOF,
+ * which over-flags for a risk-token scan and is reported as `lost`.
+ */
+function textHeredocSpans(command: string): { spans: Array<{ start: number; end: number }>; lost: boolean } {
 	const spans: Array<{ start: number; end: number }> = [];
 	let cursor = 0;
 	for (const op of shadowOpeners(command)) {
@@ -178,16 +187,28 @@ export function maskHeredocBodiesAndAnsiSpans(command: string): MaskedScanText {
 		if (op.index < cursor) continue;
 		if (op.delim === null) {
 			spans.push({ start: op.bodyStart, end: command.length });
-			bodies.push(command.slice(op.bodyStart));
-			cursor = command.length;
-			continue;
+			return { spans, lost: true };
 		}
 		const closer = new RegExp(`^${op.tabs ? "\\t*" : ""}${op.delim}$`, "mu").exec(command.slice(op.bodyStart));
 		const bodyEnd = closer === null ? command.length : op.bodyStart + closer.index;
 		spans.push({ start: op.bodyStart, end: bodyEnd });
-		bodies.push(command.slice(op.bodyStart, bodyEnd));
 		cursor = bodyEnd;
 	}
+	return { spans, lost: false };
+}
+
+export function maskHeredocBodiesAndAnsiSpans(command: string): MaskedScanText {
+	// 1. Heredoc bodies and comments. When the parser reads the command it
+	// says where both are: a `<<` that is a here-string, an arithmetic shift,
+	// or text inside quotes or a comment opens nothing, and a quote inside a
+	// comment is not a quote. Only a command the parser rejects falls back to
+	// finding heredocs from the text, and that reading can lose its place.
+	const layout = shellLayout(command);
+	const fallback = layout === null ? textHeredocSpans(command) : null;
+	const spans = layout?.heredocBodies ?? fallback?.spans ?? [];
+	const comments = layout?.comments ?? [];
+	let lost = fallback?.lost ?? false;
+	const bodies = spans.map(span => command.slice(span.start, span.end));
 	// 2. Quote spans the tokenizer mis-READS, walked OUTSIDE the body
 	// regions (quotes inside a body are body data; the isolated-body
 	// recursion handles them):
@@ -212,6 +233,12 @@ export function maskHeredocBodiesAndAnsiSpans(command: string): MaskedScanText {
 			i = region.end;
 			continue;
 		}
+		const comment = comments.find(c => i >= c.start && i < c.end);
+		if (comment !== undefined) {
+			// A comment's quotes open nothing: the shell stopped reading at `#`.
+			i = comment.end;
+			continue;
+		}
 		const ch = command[i];
 		if (ch === "\\" && i + 1 < command.length) {
 			i += 2;
@@ -234,6 +261,7 @@ export function maskHeredocBodiesAndAnsiSpans(command: string): MaskedScanText {
 			if (!closed) {
 				quoteSpans.push({ start: i, end: command.length });
 				i = command.length;
+				lost = true;
 			}
 			continue;
 		}
@@ -260,6 +288,7 @@ export function maskHeredocBodiesAndAnsiSpans(command: string): MaskedScanText {
 			if (!closed) {
 				quoteSpans.push({ start: i, end: command.length });
 				i = command.length;
+				lost = true;
 			}
 			continue;
 		}
@@ -290,6 +319,7 @@ export function maskHeredocBodiesAndAnsiSpans(command: string): MaskedScanText {
 			if (!closed) {
 				quoteSpans.push({ start: i, end: command.length });
 				i = command.length;
+				lost = true;
 			}
 			continue;
 		}
@@ -297,7 +327,7 @@ export function maskHeredocBodiesAndAnsiSpans(command: string): MaskedScanText {
 	}
 	// Apply ALL masks (heredoc bodies + mis-read quote spans) to a single
 	// output buffer. Every newline is kept so segment structure survives.
-	const all = [...spans, ...quoteSpans].sort((a, b) => a.start - b.start);
+	const all = [...spans, ...comments, ...quoteSpans].sort((a, b) => a.start - b.start);
 	const chars = command.split("");
 	for (const span of all) {
 		for (let k = span.start; k < Math.min(span.end, chars.length); k++) {
@@ -310,7 +340,7 @@ export function maskHeredocBodiesAndAnsiSpans(command: string): MaskedScanText {
 	// whole tail after the opener, tokenized as fresh text exactly once;
 	// the seen-set stops any repeat.
 	const quoted = quoteSpans.map(s => command.slice(s.start + 1, s.end));
-	return { masked, bodies: bodies, quoted };
+	return { masked, bodies, quoted, lost };
 }
 
 /**
@@ -546,9 +576,27 @@ interface SourceWalkContext {
 	 *  ./hop.sh\`, with \`move\` as the only line of hop.sh), so no sourced file
 	 *  in that command is modelled. */
 	aliasesDefined: boolean;
+	/** CDPATH is in play: the command text names it, or the gate's own
+	 *  environment (which the shell inherits) sets it. bash then resolves a
+	 *  bare `cd name` through CDPATH before the current directory, so where it
+	 *  lands is not in the text. A CDPATH exported by an earlier call in the
+	 *  host's persistent shell is not visible here. */
+	cdpath: boolean;
 }
 
-const newSourceWalkContext = (text = ""): SourceWalkContext => ({ activeFiles: new Set(), filesRead: 0, aliasesDefined: SOURCE_ALIAS_RE.test(text) });
+const CDPATH_NAME = /\bCDPATH\b/u;
+
+const newSourceWalkContext = (text = ""): SourceWalkContext => ({
+	activeFiles: new Set(),
+	filesRead: 0,
+	aliasesDefined: SOURCE_ALIAS_RE.test(text),
+	cdpath: CDPATH_NAME.test(text) || (process.env.CDPATH ?? "") !== "",
+});
+
+/** A `cd` target bash searches CDPATH for: not absolute, and not spelled from
+ *  `.` or `..`, the two spellings CDPATH never applies to. */
+const searchesCdpath = (target: string): boolean =>
+	!path.isAbsolute(target) && target !== "." && target !== ".." && !target.startsWith("./") && !target.startsWith("../");
 
 /**
  * Where one segment leaves the shell's working directory.
@@ -557,9 +605,11 @@ const newSourceWalkContext = (text = ""): SourceWalkContext => ({ activeFiles: n
  * or `.` path is followed through the readable source graph. An expanded or
  * unsupported source, an opaque shell construct, or a directory command the
  * walk cannot model resolves to "unknown", which the reader treats as a
- * refusal rather than a guess. A target that is not an existing directory
- * leaves the shell where it was (a failed `cd` changes nothing), and a target
- * the gate cannot even stat is unknown.
+ * refusal rather than a guess. A target that is not an existing directory is
+ * unknown too: a failed `cd` leaves the shell where it was, but an earlier
+ * segment of the same command can create the directory (`mkdir -p nd && cd
+ * nd`, a clone, an archive), and the text cannot say which happened. So is a
+ * bare name while CDPATH is in play, and a target the gate cannot even stat.
  */
 function segmentDirectoryChange(
 	words: string[],
@@ -584,19 +634,16 @@ function segmentDirectoryChange(
 	// An absolute target needs no starting directory; a relative one does, so a
 	// relative `cd` while the directory is unknown stays unknown.
 	if (cwd === null && !path.isAbsolute(expanded)) return { moves: true, path: null };
+	if (context.cdpath && searchesCdpath(expanded)) return { moves: true, path: null };
 	let resolved: string;
 	let stat: fs.Stats;
 	try {
 		resolved = resolveCwd(expanded, cwd ?? os.homedir());
 		stat = fs.statSync(resolved);
-	} catch (err) {
-		// A target that is not there fails the `cd`, leaving the shell where it
-		// was; anything the gate cannot even stat is not a place it may guess
-		// about.
-		if ((err as NodeJS.ErrnoException).code === "ENOENT") return { moves: true, path: cwd };
+	} catch {
 		return { moves: true, path: null };
 	}
-	return { moves: true, path: stat.isDirectory() ? resolved : cwd };
+	return { moves: true, path: stat.isDirectory() ? resolved : null };
 }
 
 /**
@@ -787,6 +834,8 @@ function sourceTextIsWalkable(text: string): boolean {
 	// defines an alias, or turns alias expansion on, is therefore not walkable
 	// — the text cannot say where it ends up.
 	if (SOURCE_ALIAS_RE.test(text)) return false;
+	// A sourced file that sets CDPATH changes where every later bare `cd` lands.
+	if (CDPATH_NAME.test(text)) return false;
 	// The text walk loses literalness, so a dynamic command name cannot be cleared as inert.
 	if (parsed.commands.some(command => command.words.length > 0 && hasDynamicCommandVerb(command.words))) return false;
 	const events = shellWalk(text);
@@ -1016,6 +1065,56 @@ export function segmentWorkingDirectories(
 	const cwds = walkedDirectories(events, base, resolveCwd, newSourceWalkContext(text)).segments;
 	for (let index = 0; index < cwds.length && index < dirs.length; index++) dirs[index] = cwds[index].cwd;
 	return dirs;
+}
+
+/** What a directory-changing segment is matched on: the verb, after any
+ *  assignment, control word or `time`, and the word after it. Null for a
+ *  segment that cannot move the shell. */
+function directoryChangeKey(words: string[]): string | null {
+	if (!mayChangeDirectory(words)) return null;
+	let index = 0;
+	while (index < words.length && (ASSIGNMENT_WORD.test(words[index]) || CONTROL_PREFIXES[words[index]] === true || words[index] === "time")) index++;
+	return words.slice(index, index + 2).join("\0");
+}
+
+/**
+ * Whether the text walk and the parser agree on every command that can move
+ * the shell, so the walk's directories may be used at all.
+ *
+ * The walk reads `cd` off the text, and the text can lie to it: a `cd` in a
+ * comment, inside a function body (`function f { cd ..; }` is one walk segment
+ * whose verb is `function`), or in a loop the walk counts once. The parser
+ * knows which of those are commands and which run in place. Each side's
+ * directory-changing commands are counted by verb and first operand, and any
+ * difference, or a parsed one inside a function body or loop (`deferred`),
+ * means the walk's answer is not the shell's.
+ *
+ * `text` is the masked command the walk reads; `commands` are the parse of the
+ * original command, whose offsets the masked text keeps.
+ */
+/** Whether a command (its words, as the shell sees them) can move the shell's
+ *  working directory: a `cd`, a stack command, a `source`, an `eval`. */
+export function commandMayChangeDirectory(words: string[]): boolean {
+	return mayChangeDirectory(words);
+}
+
+export function directoryChangesAgree(text: string, commands: readonly ShellCommand[], deferred: readonly ShellSpan[]): boolean {
+	const counts = new Map<string, number>();
+	for (const event of shellWalk(text)) {
+		if (event.kind !== "segment") continue;
+		const key = directoryChangeKey(event.words);
+		if (key !== null) counts.set(key, (counts.get(key) ?? 0) + 1);
+	}
+	for (const command of commands) {
+		const key = directoryChangeKey(command.words.map(word => word.value));
+		if (key === null) continue;
+		const offset = command.sourceOffset;
+		if (offset === undefined || deferred.some(span => offset >= span.start && offset < span.end)) return false;
+		const left = counts.get(key) ?? 0;
+		if (left === 0) return false;
+		counts.set(key, left - 1);
+	}
+	return [...counts.values()].every(left => left === 0);
 }
 
 function cwdAtOffset(walked: readonly ShellSegmentDirectory[], offset: number, base: string | null): string | null {

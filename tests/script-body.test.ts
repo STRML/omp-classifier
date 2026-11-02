@@ -206,6 +206,10 @@ describe("second-execution markers read code, not prose", () => {
 		["re aliased as regex inside an import list", "import os, re as regex\nPAT = regex.compile(r'a+')\n"],
 		["re aliased as regex", "import re as regex\nPAT = regex.compile(r'a+')\n"],
 		["regex aliased as re", "import regex as re\nPAT = re.compile(r'a+')\n"],
+		// From the decision log: a py_compile check of a file refused on a SAFE.
+		["a parameter annotated with a regex type", "import re\ndef f(p: re.Pattern, s: str) -> bool:\n    return bool(p.match(s))\nprint(f(re.compile('a'), 'a'))\n"],
+		["a function annotated with a regex type", "import re\ndef f(x) -> re.Pattern:\n    return re.compile(x)\nfor m in re.finditer('a', 'aa'):\n    print(m)\n"],
+		["a py_compile check", "import py_compile, sys\npy_compile.compile('/tmp/x/a.py', doraise=True)\nprint('compiled ok')\n"],
 	])("%s runs on a SAFE", async (_name, body) => {
 		writeScript(root, "probe.py", body);
 		expect(await gate("python3 probe.py")).toBe("ALLOWED");
@@ -227,6 +231,39 @@ describe("second-execution markers read code, not prose", () => {
 		["subprocess imported from a package", "from pkg import subprocess\n"],
 		["compile borrowed through an alias of re", "import builtins as re\nre.compile(src, 'x', 'exec')\n"],
 		["compile through a name assigned to re", "re = builtins\nre.compile(src, 'x', 'exec')\n"],
+		["compile borrowed through an alias of py_compile", "import builtins as py_compile\npy_compile.compile(src, 'x', 'exec')\n"],
+		["compile through a name assigned to py_compile", "py_compile = builtins\npy_compile.compile(src, 'x', 'exec')\n"],
+		["compile through re bound by an annotated assignment", "re: object = builtins\nre.compile(src, 'x', 'exec')\n"],
+		["compile through re bound by a walrus", "if (re := builtins):\n    re.compile(src, 'x', 'exec')\n"],
+		["compile through re as a parameter", "def f(x, re):\n    return re.compile(src, 'x', 'exec')\nf(1, builtins)\n"],
+		["compile through re after an annotated parameter", "def f(x: int, re):\n    return re.compile(src, 'x', 'exec')\n"],
+		["compile through re after a default with a call", "def f(x=g(1), re=None):\n    return re.compile(src, 'x', 'exec')\n"],
+		["compile through re after a doubly nested default", "def f(x=g(h(1)), re=None):\n    return re.compile(src, 'x', 'exec')\n"],
+		["compile through re after a triply nested default", "def f(x=g(h(i(1))), *, re):\n    return re.compile(src, 'x', 'exec')\n"],
+		["compile through re after a nested call in an annotation", "def f(x: g(h(i(1))), re):\n    return re.compile(src, 'x', 'exec')\n"],
+		["compile through re after a paren in a string default", "def f(x=')', *, re):\n    return re.compile(src, 'x', 'exec')\n"],
+		["compile through re on a multi-line def header", "def f(\n    x: int,\n    re,\n):\n    return re.compile(src, 'x', 'exec')\n"],
+		["compile through re after a colon in a lambda string default", "f = lambda a='x:y', *, re: re.compile(src)\n"],
+		["compile through re after a nested dict lambda default", "f = lambda a={1: {2: 3}}, *, re: re.compile(src)\n"],
+		["compile through re after a string default that holds ):", "def f(x=\"):\\n\", re=None):\n    return re.compile(src, 'x', 'exec')\n"],
+		["compile through re passed to a helper", "import re\ndef g(m):\n    return m\nh = g(re)\nh.compile(src)\nre.compile(src)\n"],
+		["compile through re bound in an import line with a semicolon", "import os; re = builtins\nre.compile(src, 'x', 'exec')\n"],
+		["compile after re.compile is reassigned", "import re, builtins\nre.compile = builtins.compile\nre.compile(src, 'x', 'exec')\n"],
+		["compile after a write through re.__dict__", "import re\nre.__dict__['compile'] = c\nre.compile(src)\n"],
+		["compile after re is rebuilt through globals()", "import re\nglobals().update({'r' + 'e': b})\nre.compile(src)\n"],
+		["a compile in exec mode through re", "import re\nre.compile(src, 'x', 'exec')\n"],
+		["compile through an NFKC-folded rebinding", "import re\n\uff52\uff45 = b\nre.compile(src)\n"],
+		["compile through a rebinding after a carriage return", "from re import escape\r(re := b)\nre.compile(src)\n"],
+		["compile after a tuple assignment to re.compile", "import re, b\nre.compile, x = b.compile, 1\nre.compile(src)\n"],
+		["compile after re._compile is swapped", "import re\nre._compile = c\nre.compile(src)\n"],
+		["a code object run through FunctionType", "import re, types\nc = re.compile(src)\ntypes.FunctionType(c, {})()\n"],
+		["compile after a fullwidth backslash continuation", "import re\n# x\uff3c\nre = b\nre.compile(src)\n"],
+		["compile through re in a lambda split across lines", "f = (lambda a=1,\n    re: re.compile(src))\n"],
+		["compile through re after a nested subscript lambda default", "f = lambda a=d[e[f[0]]], *, re: re.compile(src)\n"],
+		["compile through re after a lambda default slice", "f = lambda a=d[1:2], re=None: re.compile(src)\n"],
+		["compile through re as a lambda parameter", "f = lambda re: re.compile(src, 'x', 'exec')\nf(builtins)\n"],
+		["compile through re as a loop target", "for x, re in [(1, builtins)]:\n    re.compile(src, 'x', 'exec')\n"],
+		["compile through re rebound with setattr", "import sys, re\nsetattr(sys.modules[__name__], 're', builtins)\nre.compile(src, 'x', 'exec')\n"],
 		["compile through another module imported as regex", "from builtins import compile as c\nfrom evil import re as regex\nregex.compile(src)\n"],
 		["a JS private field that runs exec", "class A {\n#run = require('child_process').exec('ls');\n}\n"],
 		["code after a comment line", "# setup\nimport subprocess\n"],
@@ -444,6 +481,38 @@ describe("wrapper option arity", () => {
 		const read = readInterpretedScriptBodies("timeout --unknown-option 5s python3 payload.py", root, 8000);
 		expect(read.refusal?.why).toContain("unknown timeout option");
 		expect(read.bodies).toEqual([]);
+	});
+
+	// `command -v` and `-V` describe how each name resolves and run none of
+	// them, so there is no program to read. The gate refused the lookup as
+	// "command option -v cannot be resolved" (OMP session 01a18e06).
+	test.each([
+		"command -v git",
+		"command -V git",
+		"command -v berth berthd wt 2>/dev/null; echo '---'; ls ~/.claude/commands 2>/dev/null | head -40",
+		"command -p -v python3",
+		"command -pv python3",
+		"command -vp python3 payload.py",
+	])("a lookup runs nothing and reads nothing: %s", command => {
+		writeScript(root, "payload.py", BENIGN);
+		const read = readInterpretedScriptBodies(command, root, 8000);
+		expect(read.refusal).toBeNull();
+		expect(read.bodies).toEqual([]);
+	});
+
+	test("a command -v lookup reaches the judge and runs on a SAFE", async () => {
+		expect(await gate("command -v git")).toBe("ALLOWED");
+	});
+
+	test("command without a lookup option still reads the program it runs", async () => {
+		writeScript(root, "payload.py", HARMFUL_CODE);
+		const result = await gate("command -p python3 payload.py");
+		expect(refusalOf(result).why).toContain("flags: python3 runs payload.py");
+	});
+
+	test("an option command does not know keeps the command opaque", () => {
+		const read = readInterpretedScriptBodies("command -x python3 payload.py", root, 8000);
+		expect(read.refusal?.why).toContain("unknown command option");
 	});
 });
 
@@ -1333,6 +1402,54 @@ describe("syntax-only interpreter modes do not execute file contents", () => {
 		const read = readInterpretedScriptBodies(command, root, 8000);
 		expect({ refusal: read.refusal, bodies: read.bodies, text: read.text }).toEqual({ refusal: null, bodies: [], text: command });
 	});
+	// From the decision log: `php -l` on a 313 KB file refused for the review
+	// limit, though a lint runs none of the file.
+	test.each([
+		["php -l", "php -l payload.php", "payload.php"],
+		["php --syntax-check", "php --syntax-check payload.php", "payload.php"],
+		["node -c", "node -c payload.js", "payload.js"],
+		["zsh -n", "zsh -n payload.sh", "payload.sh"],
+		["dash -n", "dash -n payload.sh", "payload.sh"],
+		["ksh -n", "ksh -n payload.sh", "payload.sh"],
+	])("%s checks syntax and reads no body", (_name, command, file) => {
+		writeScript(root, file, "x".repeat(20000));
+		const read = readInterpretedScriptBodies(command, root, 8000);
+		expect({ refusal: read.refusal, bodies: read.bodies }).toEqual({ refusal: null, bodies: [] });
+	});
+
+	// Each of these runs the file on bash 5, zsh, dash and node 22: a later
+	// option undoes the check, so the body is read.
+	test.each([
+		"bash -n +n payload.sh",
+		"bash -n +o noexec payload.sh",
+		"zsh -n -i payload.sh",
+		"zsh -n -o exec payload.sh",
+		"dash -n +o noexec payload.sh",
+		"ksh -n -e payload.sh",
+		"node -c --no-check payload.sh",
+	])("an option after the check makes it a run: %s", command => {
+		writeScript(root, "payload.sh", "echo ran\n");
+		const read = readInterpretedScriptBodies(command, root, 8000);
+		expect(read.bodies.length).toBe(1);
+	});
+
+	test.each(["bash -vn payload.sh", "bash -n -x payload.sh", "ruby -cw payload.sh"])("a check with output-only companions reads nothing: %s", command => {
+		writeScript(root, "payload.sh", "echo ran\n");
+		expect(readInterpretedScriptBodies(command, root, 8000).bodies).toEqual([]);
+	});
+
+	test("a syntax check beside a real run still reads the run's body", () => {
+		writeScript(root, "payload.php", "<?php system('id');\n");
+		const read = readInterpretedScriptBodies("php -l payload.php && php payload.php", root, 8000);
+		expect(read.bodies.map(body => body.operand)).toEqual(["payload.php"]);
+	});
+
+	test("node -c still reads a module it preloads with -r", () => {
+		writeScript(root, "payload.js", "require('child_process').execSync('id');\n");
+		const read = readInterpretedScriptBodies("node -c payload.js -r ./payload.js", root, 8000);
+		expect(read.bodies.length).toBe(1);
+	});
+
 	test("Ruby attached -r values cannot masquerade as bundled syntax-only flags", () => {
 		const body = 'system("rm -rf ./out")\n';
 		writeScript(root, "payload.rb", body);

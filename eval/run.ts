@@ -56,7 +56,7 @@ import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs as parseCliArgs } from "node:util";
 import { type Judge, NativeJudge } from "@oh-my-pi/pi-ai";
-import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import { commandMatchesCriticalPattern } from "../critical-scan";
 import {
 	buildAuthorizationState,
 	DEFAULT_AUTHORIZATION_POLICY,
@@ -947,7 +947,7 @@ function riskFlagsFor(testCase: Case, cwd: string): string[] {
 	const flags = testCase.kind === "eval-code" ? evalRiskFlags(testCase.command) : matchModerateRiskTokens(testCase.command, cwd);
 	// Issue #161: production adds the measured-lookalike flags at the same sites.
 	flags.push(...lookalikeDestinationFlags(testCase.command, testCase.evidence?.userMessages));
-	if (testCase.kind !== "eval-code" && CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(testCase.command))) {
+	if (testCase.kind !== "eval-code" && commandMatchesCriticalPattern(testCase.command)) {
 		flags.push("critical");
 	}
 	return flags;

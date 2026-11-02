@@ -89,14 +89,22 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 import { cfgBashPatterns } from "@oh-my-pi/pi-coding-agent/exec/settings";
-import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { cfgToolsApproval } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
-import { getPluginsDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
+import { filterChildShellEnv, getPluginsDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
 import { evaluateFloor, isSecretPath, secretStoreRead, type FloorEntry } from "./floor";
-import { heredocShadowedAt, maskHeredocBodiesAndAnsiSpans, openQuoteBefore, segmentWorkingDirectories, SHELL_WORD_EXPANSION } from "./shell-cwd";
-import { parseShell, substitutionSpans, verbName, type ShellCommand, type ShellRedirect } from "./shell-ast";
+import {
+	commandMayChangeDirectory,
+	directoryChangesAgree,
+	heredocShadowedAt,
+	maskHeredocBodiesAndAnsiSpans,
+	openQuoteBefore,
+	segmentCwdLookup,
+	segmentWorkingDirectories,
+	SHELL_WORD_EXPANSION,
+} from "./shell-cwd";
+import { parseShell, shellDefinesFunction, shellLayout, substitutionSpans, verbName, type ShellCommand, type ShellRedirect, type ShellWord } from "./shell-ast";
 import {
 	DEFAULT_JUDGE_BACKEND,
 	judgeBackendFor,
@@ -106,9 +114,10 @@ import {
 	type JudgeBackendConfig,
 } from "./jev-judge";
 import { buildAuthorizationState, DEFAULT_AUTHORIZATION_POLICY, deriveAuthorization, summarizeActions, type ActionSummaryEntry, type JevAuthorizationLevel } from "./authorization";
+import { CRITICAL_BODY_NOTE, scanCriticalPatterns } from "./critical-scan";
 import { deriveDecisionOrder, type DecisionBranch } from "./decision-order";
 import { literalMatch } from "./literal-match";
-import { redactSecrets, redactValue } from "./redact";
+import { redactCommand, redactSecrets, redactValue } from "./redact";
 import { quotesUserWords, reviewerModelCall, runReviewer, type ReviewerOutcome, type ReviewerTranscriptEntry } from "./reviewer";
 import { forgetReviewerBlocks, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged, withoutFilterForKey, withoutOutputFilter } from "./stage-two";
 import { formatTrustPolicyPin, normalizeTrustPolicyPin, pinUserInstructionFiles, resolvePinnedUserPolicy, type TrustPolicyPin, type TrustedPolicyDocument } from "./trust-policy";
@@ -127,6 +136,7 @@ import {
 	type JevAnswers,
 	type JevVerdict,
 	type NetworkProvenance,
+	gateTempRoots,
 	lookalikeDestinationFlags,
 	measureDeleteTargets,
 	measureGitPushProvenance,
@@ -538,6 +548,133 @@ function normalizeUserPolicy(value: unknown): "allow" | "deny" | "prompt" | unde
 	return lowered === "allow" || lowered === "deny" || lowered === "prompt" ? lowered : undefined;
 }
 
+/**
+ * The `TMPDIR` the bash tool's shell will hold for a command started in `cwd`,
+ * or null when the gate cannot vouch for it (#176). The shell's environment is
+ * this process's, filtered the way the host filters it for child shells
+ * (`filterChildShellEnv` drops values a project dotenv file supplied), and the
+ * session's shell snapshot never exports `TMPDIR`. The other writers are a
+ * repo's direnv, which loads the nearest `.envrc` above the start directory,
+ * so any `.envrc` there leaves the value unknown, an earlier command in the
+ * same persistent shell (`shellEnvTouched`), and a shell prefix the host
+ * prepends to the command. A caller-supplied `env`
+ * blocks the call before judgment, so it never reaches this.
+ */
+export function shellTmpdirFor(cwds: readonly string[], env: Record<string, string | undefined> = process.env, shellTouched = false): string | null {
+	if (shellTouched || shellPrefixSet(env) || cwds.some(hasEnvrcAbove)) return null;
+	const value = filterChildShellEnv(env).TMPDIR;
+	return value === undefined || value === "" ? null : value;
+}
+
+/** The host prepends this text to every command line it runs
+ *  (`PI_SHELL_PREFIX`, else `CLAUDE_CODE_SHELL_PREFIX`), after the gate has
+ *  read the command, so a prefix such as `TMPDIR=/x;` is unmeasured text. */
+const shellPrefixSet = (env: Record<string, string | undefined>): boolean => Boolean(env.PI_SHELL_PREFIX || env.CLAUDE_CODE_SHELL_PREFIX);
+
+/** Whether `cwd` or any directory above it holds an `.envrc`, the file the
+ *  host's direnv preflight walks up to. */
+function hasEnvrcAbove(cwd: string): boolean {
+	for (let dir = path.resolve(cwd); ; dir = path.dirname(dir)) {
+		try {
+			if (fs.statSync(path.join(dir, ".envrc")).isFile()) return true;
+		} catch {
+			// no .envrc here, keep walking up
+		}
+		if (path.dirname(dir) === dir) return false;
+	}
+}
+
+/** Reads of the two variables that change nothing, taken out before the name check. */
+const SHELL_ENV_READS = /\$\{TMPDIR\}|\$TMPDIR(?![A-Za-z0-9_])|\$IFS(?![A-Za-z0-9_])/gu;
+/** Either name as anything but a plain read (an assignment, `unset`, a `for`
+ *  variable, `${TMPDIR:=x}`), or an expansion that evaluates arithmetic and
+ *  can assign to a name built some other way: `${...:=...}`, `$((...))`, an
+ *  array subscript (`${a[i=1]}`) and a substring offset (`${s:i=2}`). */
+const SHELL_ENV_NAMES = /(?<![A-Za-z0-9_])(?:TMPDIR|IFS)(?![A-Za-z0-9_])|:=|\$\(\(|\$\{[^}]*\[|\$\{[A-Za-z0-9_]+:(?![-=+?])/u;
+/** Builtins and keywords that write a shell variable, run text or a file in
+ *  the current shell, or change how later commands are looked up. */
+const SHELL_STATE_VERBS = new Set([
+	"export", "declare", "typeset", "local", "readonly", "read", "mapfile", "readarray", "unset", "set", "getopts", "wait",
+	"eval", "source", ".", "shopt", "enable", "alias", "unalias", "hash", "trap", "builtin", "command", "exec", "let", "coproc", "function",
+]);
+
+/** Whether one parsed command can leave the persistent shell changed. */
+function commandTouchesShell(command: ShellCommand): boolean {
+	// `[[ ]]` evaluates its operands as arithmetic (`[[ a -eq b ]]`, a
+	// subscript in `[[ ${x[i=1]} ]]`), and `(( ))` and `let` assign outright.
+	if (command.unreadShape !== undefined || command.expression !== undefined) return true;
+	const verb = command.words[0];
+	// A bare assignment persists; a prefix one lasts for its command only.
+	if (verb === undefined) return command.assigns.length > 0 || command.redirects.length > 0;
+	// A verb built from an expansion could be any builtin.
+	if (!verb.literal) return true;
+	if (SHELL_STATE_VERBS.has(verb.value)) return true;
+	// `printf -v name` writes a variable, and an expanded option (`"${O:--v}"`)
+	// can spell it.
+	if (verb.value === "printf" && command.words.some(word => !word.literal || /^-[A-Za-z]*v/u.test(word.value))) return true;
+	return false;
+}
+
+/**
+ * Whether `command` may change the persistent shell's `TMPDIR` or `IFS` for
+ * the commands after it. Fails closed: a command that does not parse, one
+ * that parses to a shape the gate does not read, a builtin that writes a
+ * variable or runs text in the current shell, a verb built from an expansion,
+ * a bare assignment, and any mention of either name beyond a plain read all
+ * count. Over-matching only costs an ask.
+ */
+export function touchesShellEnv(command: string): boolean {
+	if (SHELL_ENV_NAMES.test(command.replace(SHELL_ENV_READS, ""))) return true;
+	const parsed = parseShell(command);
+	// A function definition persists and can shadow any later verb.
+	return !parsed.ok || parsed.commands.some(commandTouchesShell) || shellDefinesFunction(command);
+}
+
+/** Sessions where an earlier bash command may have changed the persistent
+ *  shell's `TMPDIR` or `IFS` (the host reuses one shell per session), so a
+ *  later `$TMPDIR` cannot be read from this process's environment. */
+const shellEnvTouched = new Set<string>();
+// Never cleared at a session boundary: the host keys the persistent shell by
+// session id and keeps it until that session is disposed, so a switch away and
+// back finds the same changed shell. The set grows by one id per touched
+// session for the life of the process.
+
+/** The shell's `TMPDIR` only when the command names it: the walk and the env
+ *  filter read files, and most commands have no use for either. Both the
+ *  directory the host runs the command in (after it extracts a leading `cd`)
+ *  and the one the text starts in are walked, so either `.envrc` counts. A
+ *  call with no session id cannot be tracked, so it is not vouched for. */
+const shellTmpdirIfNamed = (command: string, cwds: readonly string[], sessionId: string | undefined): string | null =>
+	command.includes("TMPDIR") ? shellTmpdirFor(cwds, process.env, sessionId === undefined || shellEnvTouched.has(sessionId)) : null;
+
+/** Every directory the host may load direnv from for this bash call: the
+ *  session's, the call's own `cwd` input, and the target of a leading
+ *  `cd X &&` the host strips and runs the command in. An unresolvable one is
+ *  stood in for by the session's, and the walk covers it. */
+function directoriesHostRunsIn(command: string, input: unknown, sessionCwd: string): string[] {
+	const named = typeof input === "object" && input !== null && "cwd" in input ? input.cwd : undefined;
+	const candidates = [typeof named === "string" && named !== "" ? named : undefined, extractLeadingCdTarget(command)?.path];
+	const dirs = [sessionCwd];
+	for (const candidate of candidates) {
+		if (candidate === undefined || candidate.includes("://") || candidate.includes("local:/")) continue;
+		try {
+			dirs.push(resolveToCwd(candidate, sessionCwd));
+		} catch {
+			// unresolvable: the session's directory is already in the list
+		}
+	}
+	return dirs;
+}
+
+/** The host session id, or undefined in an isolated SDK context that has none. */
+function sessionIdOf(ctx: ExtensionContext): string | undefined {
+	try {
+		return ctx.sessionManager.getSessionId();
+	} catch {
+		return undefined;
+	}
+}
+
 interface CanonicalEnv {
 	key: string;
 	keys: string[];
@@ -924,6 +1061,10 @@ export interface DecisionRecord {
 	 *  critical or environment line of the same tool call (spec step 0). An ask
 	 *  joins to what a human did next by id, not by session, command and time. */
 	followsDecisionId?: string;
+	/** Script bodies in JavaScript or Python that a built-in critical pattern
+	 *  matched, as `<verb> runs <operand>`. The hit went to the judge instead
+	 *  of the critical layer (critical-scan.ts). */
+	criticalBodies?: string[];
 	/** Session that produced the decision, when the host exposed one. */
 	sessionId?: string;
 	/** Policy identity that produced this line; lets status/eval distinguish
@@ -2036,6 +2177,14 @@ const MODERATE_RISK_TOKENS = new Set([
 	"rm", "unlink", "dd", "ddrescue", "shred", "wipefs", "sudo", "eval",
 ]);
 
+// The other ways to run a command as another user. Like `sudo`, a SAFE does
+// not release them. They are matched as shell words, the way the segment scan
+// matches `sudo`: as the verb, and anywhere in a segment the scan reads whole
+// (a wrapper's arguments, `find`'s arguments), where over-flagging is the safe
+// direction. `su` is also a word in prose and a variable name, so unlike the
+// moderate-risk tokens they are not looked for in code text or substitutions.
+const PRIVILEGE_VERBS = new Set(["doas", "run0", "pkexec", "su", "sudo-rs", "sudoedit"]);
+
 // Interpreters that only matter when they execute inline code (-c/-e);
 // `bash script.sh` is an ordinary invocation.
 const INLINE_CODE_INTERPRETERS = new Set(["python", "python2", "python3", "bash", "sh", "perl"]);
@@ -2102,9 +2251,9 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	// POSIX shells: `bash -c '…'`, `bash -s < script`, `bash -o errexit x.sh`.
 	bash: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^[-+]O$|^--rcfile$|^--init-file$/u, stdinFlag: true },
 	sh: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^[-+]O$|^--rcfile$|^--init-file$/u, stdinFlag: true },
-	zsh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
-	dash: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
-	ksh: { inline: /^-c$|^--command$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	zsh: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	dash: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
+	ksh: { inline: /^-c$|^--command$/u, syntaxOnly: /^-n$/u, value: /^[-+]o$|^--rcfile$|^--init-file$/u, stdinFlag: true },
 	fish: { inline: /^-c$|^--command$/u, value: /^-C$|^--init-command$|^--config$/u, stdinFlag: true },
 	csh: { inline: /^-c$/u, value: /^-f$/u, stdinFlag: true },
 	tcsh: { inline: /^-c$/u, value: /^-f$/u, stdinFlag: true },
@@ -2128,7 +2277,7 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	// long spelling only — the short `-r./pre.js` is a syntax error to node —
 	// which this table does not need to model, since reading a file the
 	// interpreter rejects is the safe direction.
-	node: { inline: /^-e$|^--eval$|^-p$|^--print$/u, syntaxOnly: /^--check$/u, value: /^--input-type$|^-C$|^--conditions$|^--title$/u, file: /^-r$|^--require$|^--import$/u, stdinFlag: false },
+	node: { inline: /^-e$|^--eval$|^-p$|^--print$/u, syntaxOnly: /^--check$|^-c$/u, value: /^--input-type$|^-C$|^--conditions$|^--title$/u, file: /^-r$|^--require$|^--import$/u, stdinFlag: false },
 	deno: { inline: /^-e$|^--eval$|^-p$|^--print$/u, value: /^--ext$|^--config$|^--import-map$|^--v8-flags$/u, stdinFlag: false },
 	// `bun --help` here: `-r, --preload=<val>` ("import a module before other
 	// modules are loaded") and its Node-compatibility aliases `--require` and
@@ -2139,7 +2288,8 @@ const INTERPRETER_FLAG_GRAMMAR: Record<string, InterpreterFlagGrammar> = {
 	// `-f` is the flag that names the script in its VALUE, so it belongs in the
 	// file class and is read in its attached spellings too (`php -f=x.php`,
 	// `php -fx.php` — both run that file on this machine; round 3 review).
-	php: { inline: PHP_INLINE_FLAG, value: /^-c$|^-d$|^-z$|^--php-ini$|^--define$/u, file: /^-f$|^--file$/u, stdinFlag: false },
+	// `php -l` / `--syntax-check` only lints the file and runs none of it.
+	php: { inline: PHP_INLINE_FLAG, syntaxOnly: /^-l$|^--syntax-check$/u, value: /^-c$|^-d$|^-z$|^--php-ini$|^--define$/u, file: /^-f$|^--file$/u, stdinFlag: false },
 	// `lua -l mod` loads a module through the interpreter's own path and `-i`
 	// is interactive: neither takes a separate value word here, and `--` only
 	// ends the options — so no flag of lua's may consume the script operand
@@ -2185,26 +2335,97 @@ const SCRIPT_FILE_EXTENSION = /\.(?:py|pyw|rb|js|mjs|cjs|ts|mts|cts|tsx|jsx|sh|b
 // continuation or a parenthesized import list.
 const INTERPRETER_CODE_RISK =
 	/exec\(|eval\((?!\s*\))|os\.system|\bsubprocess\s*\.|\bimport\b[^\n]*\bsubprocess\b|\bimport\s*\([^)]*\bsubprocess\b|\bfrom\s+subprocess\b|["']subprocess["']|create_subprocess_|base64|b64decode|__import__|marshal|\\x[0-9a-f]{2}/;
-/** `compile(` as a builtin. `re.compile(` and `regex.compile(` are exempt only
- *  while the text never rebinds those names, so `import builtins as re` cannot
- *  borrow the exemption. */
+/** `compile(` as a builtin. `re.compile(` and `regex.compile(` build a regex
+ *  and `py_compile.compile(` writes a `.pyc` without running it; they are
+ *  exempt only while the text never rebinds those names, so
+ *  `import builtins as re` cannot borrow the exemption. */
 const COMPILE_CALL = /compile\(/;
-const REGEX_COMPILE_ONLY = /(?<!\b(?:re|regex)\.)compile\(/;
+const REGEX_COMPILE_ONLY = /(?<!\b(?:re|regex|py_compile)\.)compile\(/;
 /** A plain `import a, b as c, re as regex` statement that aliases one regex
  *  module to the other is not a rebind: every module in it is a bare name, so
- *  no `;`, `from` or dotted module can sit in front. Any other `as re` is. */
+ *  no `;`, `from` or dotted module can sit in front. Any other `as re` is, and
+ *  so is an assignment (annotated too: `re: Any = builtins`) or walrus, a loop
+ *  target (`for x, re in`), and the name written as a string, which is how
+ *  `setattr` or `globals()` would rebind it. A parameter is read fail-closed:
+ *  the bare name anywhere in a `def` header (up to the `):` that ends a line)
+ *  or on a `lambda`'s line (or before its first `:`, for a lambda split
+ *  across lines inside brackets) counts, since nesting and strings in defaults
+ *  defeat any bracket count a regex can do. */
 const REBINDS_REGEX_NAME =
-	/(?<!^[ \t]*import[ \t]+(?:\w+(?:[ \t]+as[ \t]+\w+)?[ \t]*,[ \t]*)*(?:re|regex)[ \t]+)\bas\s+(?:re|regex)\b|(?<![\w.])(?:re|regex)\s*=(?!=)|\b(?:def|class|for)\s+(?:re|regex)\b/m;
+	/(?<!^[ \t]*import[ \t]+(?:\w+(?:[ \t]+as[ \t]+\w+)?[ \t]*,[ \t]*)*(?:re|regex)[ \t]+)\bas\s+(?:re|regex|py_compile)\b|(?<![\w.])(?:re|regex|py_compile)\s*(?::[^=\n]*)?:?=(?!=)|\b(?:def|class|for)\s+(?:re|regex|py_compile)\b|\bdef\s+\w+\s*\((?:(?!\)\s*(?:->[^\n]*)?:[ \t]*(?:#[^\n]*)?$)[\s\S]){0,2000}?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)|\blambda\b[^\n]*?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)|\blambda\b[^:]*?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)|\bfor\s[^:\n]*?(?<![\w.])(?:re|regex|py_compile)\b(?!\s*\.)[^:\n]*?\bin\b|["'](?:re|regex|py_compile)["']/m;
 
 /** Whether inline code or a script body carries a second-execution marker.
  *  Comments read as code: where a `#` comment ends depends on the language (a
  *  JS regex `/ # /`, PHP's `?>`, a Python f-string spanning lines), so a
  *  comment that names a marker flags. */
 function hasInterpreterCodeRisk(text: string): boolean {
-	const joined = text.replace(/\\\r?\n/gu, " ");
+	// Python folds identifiers with NFKC (`ｒｅ = builtins` binds `re`) but reads
+	// punctuation as written, so both spellings are checked and either flags:
+	// folding can add a flag, never remove one.
+	return codeRiskIn(text) || codeRiskIn(text.normalize("NFKC"));
+}
+
+function codeRiskIn(text: string): boolean {
+	const joined = text.replace(/\\(?:\r\n?|\n)/gu, " ");
 	if (INTERPRETER_CODE_RISK.test(joined)) return true;
 	if (!COMPILE_CALL.test(joined)) return false;
-	return REBINDS_REGEX_NAME.test(joined) || REGEX_COMPILE_ONLY.test(joined);
+	if (COMPILE_CODE_MODE.test(joined) || RUNTIME_REBINDERS.test(joined) || REGEX_ATTRIBUTE_WRITE.test(joined)) return true;
+	if (!compileOnlyCalledOnRegexModules(joined)) return true;
+	return REBINDS_REGEX_NAME.test(joined) || !regexNamesOnlyRead(joined) || REGEX_COMPILE_ONLY.test(joined);
+}
+
+/** Whether every `compile` and `_compile` token is a call on a regex module:
+ *  `re.compile(`, `regex.compile(`, `py_compile.compile(`. Any other spelling
+ *  (`re.compile, x = builtins.compile, 1`, `re._compile = …`, a string
+ *  `'compile'` for `setattr`) can swap the function the exemption trusts. */
+function compileOnlyCalledOnRegexModules(text: string): boolean {
+	for (const match of text.matchAll(/\b_?compile\b/gu)) {
+		const at = match.index ?? 0;
+		if (match[0] !== "compile" || !/(?<![\w.])(?:re|regex|py_compile)[ \t]*\.[ \t]*$/u.test(text.slice(Math.max(0, at - 20), at))) return false;
+		if (!/^[ \t]*\(/u.test(text.slice(at + match[0].length))) return false;
+	}
+	return true;
+}
+
+/** A compile that builds code: `re.compile` never takes an `exec`, `eval` or
+ *  `single` mode, whatever name the call goes through. */
+const COMPILE_CODE_MODE = /compile\([^)]*["'](?:exec|eval|single)["']/u;
+
+/** Ways to rebind `re` without spelling it (`globals().update({"r"+"e": …})`,
+ *  `sys.modules[...]`, `setattr`), and ways to run a code object without
+ *  `exec` (`types.FunctionType(code, {})()`, `f.__code__ = code`): any of them
+ *  voids the compile exemption. */
+const RUNTIME_REBINDERS = /(?<![\w.])(?:globals|locals|vars|setattr|delattr)\s*\(|__dict__|__builtins__|__code__|(?<![\w.])builtins\b|\bsys\s*\.\s*modules\b|\bimportlib\b|\b(?:FunctionType|CodeType)\b/u;
+
+/** A write to an attribute of the module itself: `re.compile = builtins.compile`,
+ *  `re.__dict__["compile"] = …`, `del re.compile`. */
+const REGEX_ATTRIBUTE_WRITE =
+	/(?<![\w.])(?:re|regex|py_compile)[ \t]*\.[\w \t.[\]'"]*?(?:\*\*|\/\/|<<|>>|[-+*/%&|^@])?=(?!=)|\bdel\s+(?:re|regex|py_compile)\s*\./u;
+
+/** A plain import statement: `import os, re as regex`, `from re import
+ *  compile`. Read per statement, between `;` and line breaks. */
+const PLAIN_IMPORT_STATEMENT =
+	/^[ \t]*(?:import[ \t]+[\w.]+(?:[ \t]+as[ \t]+\w+)?(?:[ \t]*,[ \t]*[\w.]+(?:[ \t]+as[ \t]+\w+)?)*|from[ \t]+(?:re|regex|py_compile)[ \t]+import[ \t]+[^;\r\n#]+)[ \t]*(?:#[^\r\n]*)?$/u;
+
+/**
+ * Whether every bare `re`, `regex` or `py_compile` in the text is an attribute
+ * access (`re.compile`) or sits in a plain import statement. Deny-by-default: any
+ * other use (a parameter however its header is spelled, a loop target, a
+ * walrus, a string key for `setattr`, a mention in a comment) voids the
+ * compile exemption. REBINDS_REGEX_NAME still reads `import builtins as re`,
+ * which is an import statement.
+ */
+function regexNamesOnlyRead(text: string): boolean {
+	for (const match of text.matchAll(/(?<![\w.])(?:re|regex|py_compile)\b/gu)) {
+		const at = match.index ?? 0;
+		if (/^\s*\./u.test(text.slice(at + match[0].length))) continue;
+		// Python ends a line at \n, \r or \r\n; a statement also ends at `;`.
+		const start = Math.max(text.lastIndexOf("\n", at - 1), text.lastIndexOf("\r", at - 1), text.lastIndexOf(";", at - 1)) + 1;
+		const ends = [text.indexOf("\n", at), text.indexOf("\r", at), text.indexOf(";", at)].filter(end => end !== -1);
+		if (PLAIN_IMPORT_STATEMENT.test(text.slice(start, ends.length > 0 ? Math.min(...ends) : text.length))) continue;
+		return false;
+	}
+	return true;
 }
 
 // Same token set as a word-boundary regex, for matching inside joined
@@ -2285,7 +2506,19 @@ export function evalRiskFlags(code: string): string[] {
 	const flags = new Set<string>();
 	for (const match of code.matchAll(new RegExp(EVAL_CODE_FLAG_RE.source, `${EVAL_CODE_FLAG_RE.flags}g`))) {
 		const end = (match.index ?? 0) + match[0].length;
-		if (/^\s*(=>|=[^=])/u.test(code.slice(end)) || /^\.\w/u.test(code.slice(end))) continue;
+		const after = code.slice(end);
+		// A token being assigned (`rm = ...`, `rm => ...`) or dereferenced
+		// (`rm.stdout`) is a program variable. So is a bare element of an
+		// argument list, tuple or list (`("mxm", rm)`, `f(x, rm)`, `[rm]`):
+		// both neighbours must be value punctuation, `(` `[` or `,` before and
+		// `,` `)` `]` `}` after. In shell text a command word follows a space,
+		// `;`, `|`, `$(` or `{`, so `"(ls | xargs rm)"`, `"echo $(rm)"`,
+		// `{rm,-rf,x}` (brace expansion runs rm) and `${rm}` all stay flagged.
+		// At worst the exemption covers `(rm)` or `(x,rm)` in a shell string,
+		// which run rm with no operand or no command named rm at all.
+		const before = code.slice(0, match.index ?? 0);
+		const listElement = /[([,]\s*$/u.test(before) && /^\s*[,)\]}]/u.test(after);
+		if (/^\s*(=>|=[^=])/u.test(after) || /^\.\w/u.test(after) || listElement) continue;
 		flags.add(match[0]);
 	}
 	return [...flags].sort();
@@ -2940,6 +3173,133 @@ function evalChdirScope(masked: string, site: EvalCwdSiteMatch): EvalChdirScope 
  * one spawn in the session directory, another in `/` — there is no single
  * directory this payload runs in, and the answer is "ask", not one of the two.
  */
+/** Words that can rebind a name without writing `name =`: a namespace written
+ *  through as a dict or an object (`globals()`, `setattr`, `globalThis`,
+ *  `f.__globals__`, `gc.get_referrers`), code built or loaded at run time
+ *  (`exec`, `pickle`, `constructor`, node's `vm`), a star import, and a JS
+ *  `with` block that puts an object's keys in scope. Every dunder counts but a
+ *  few that only name a module or file. Tested against the RAW text, since an
+ *  f-string, `${}` or `#{}` interpolation runs code the mask hides. */
+const EVAL_NAME_REBINDERS = /(?<![\w$])(?:globals|locals|vars|exec|eval|setattr|__setattr__|__dict__|__builtins__|builtins|f_globals|f_locals|binding|local_variable_set|globalThis|window|global|Reflect|getattr|__getattribute__|__import__|importlib|inspect|ctypes|Function|setTimeout|setInterval|vm|this|send|public_send|__send__|instance_eval|class_eval|module_eval|instance_exec|const_set|define_method|gc|pickle|cPickle|marshal|dill|cloudpickle|shelve|jsonpickle|runpy|constructor|runInThisContext|runInNewContext|runInContext|TOPLEVEL_BINDING|ObjectSpace|modules|_getframe|currentframe|tb_frame|gi_frame|cr_frame|ag_frame|f_back|methodcaller|pdb|bdb|profile|cProfile|trace|doctest|timeit)(?![\w$])|\bimport\s+__main__|\bfrom\s+__main__\b|(?<![\w$.])compile\s*\(|__(?!(?:name|main|file|init|future|doc|version)__)\w+__|\bimport\s*\*|\bwith\s*\(/u;
+
+/** A Ruby heredoc opener, `=begin` block or percent literal: text maskCodeText
+ *  leaves visible although Ruby never runs it as code. */
+const EVAL_UNMASKED_RUBY_TEXT = /<<[~-]?(?:["'`]?[A-Za-z_])|^=begin\b|%[qQwWiIrsx]?[^\w\s(\[{<]/mu;
+
+/** Whether every use of `name` the mask hides is a bare interpolation read
+ *  (`f"{wt}/a"`, `${wt}`, `#{wt}`). Anything else can change it out of sight:
+ *  Ruby strings are mutable (`"#{repo << '/x'}"`), JS can destructure into a
+ *  name (`${[repo] = ["/"]}`), and the mask can take code for a string (a
+ *  regex literal `/"/` opens one) or for a comment (`//` is floor division
+ *  to Python, so `n = 1 // 2; [repo] = ["/"]` is code it blanked). Even a
+ *  plain mention refuses, since the scan cannot tell plain text from code it
+ *  misread as text. */
+function hiddenUsesAreReads(masked: string, code: string, name: string): boolean {
+	for (const match of code.matchAll(new RegExp(`(?<![\\w$])${name}(?![\\w$])`, "gu"))) {
+		const at = match.index ?? 0;
+		if (masked[at] === code[at]) continue;
+		if (masked[at] !== MASK_FILL) return false;
+		if (code[at - 1] !== "{" || code[at + name.length] !== "}") return false;
+	}
+	return true;
+}
+
+/** Whether a `\u` escape or a non-ASCII character in `code` becomes an ASCII
+ *  identifier character once decoded or NFKC-folded (`\u0065`, `ｅ`, `ﬁ`). */
+function spellsAsciiIdentifier(code: string): boolean {
+	const identifier = /[A-Za-z0-9_$]/u;
+	for (const escape of code.matchAll(/\\u\{([0-9a-fA-F]+)\}|\\u([0-9a-fA-F]{4})/gu)) {
+		const point = Number.parseInt(escape[1] ?? escape[2] ?? "", 16);
+		if (point <= 0x10ffff && identifier.test(String.fromCodePoint(point))) return true;
+	}
+	for (const char of code.matchAll(/[^\x00-\x7f]/gu)) {
+		if (identifier.test(char[0].normalize("NFKC"))) return true;
+	}
+	return false;
+}
+
+/** Whether the masked text before `at` puts it at the top level of the
+ *  payload: no bracket left open, and not the body of a braceless `if (…)`,
+ *  `else` or `do` on the line before. */
+function atPayloadTopLevel(masked: string, at: number): boolean {
+	let depth = 0;
+	for (let i = 0; i < at; i += 1) {
+		const char = masked[i];
+		if (char === "(" || char === "[" || char === "{") depth += 1;
+		else if (char === ")" || char === "]" || char === "}") depth -= 1;
+	}
+	if (depth !== 0) return false;
+	const previous = masked.slice(0, at).trimEnd();
+	return previous === "" || !(/[)\\:,=+\-*/%&|^!<>?]$/u.test(previous) || /\b(?:else|do)$/u.test(previous));
+}
+
+/**
+ * The directory text a bare name in a cwd argument stands for, or null.
+ *
+ * `repo = "/x"` then `subprocess.run([...], cwd=repo)` names /x as plainly as
+ * the literal does, but only when nothing else can change what `repo` holds.
+ * Deny-by-default: the name must be bound exactly once, by a top-level,
+ * unconditional `name = "<plain literal>"` line (`const`/`let`/`var` allowed)
+ * written before the site, and every other use of it must be a cwd read
+ * (`cwd=name`, `chdir=name`, `.chdir(name)`). Any other use (a parameter, a
+ * loop target, `global name`, `obj.name`, a second assignment) and any word
+ * that could rebind it unseen leaves the cwd unreadable, as before.
+ */
+function constantCwdText(masked: string, code: string, name: string, siteAt: number): string | null {
+	if (!/^[A-Za-z_][\w]*$/u.test(name) || EVAL_NAME_REBINDERS.test(code)) return null;
+	// The scans match the name's ASCII spelling, and code can spell it other
+	// ways: a JS identifier escape (`r\u0065po = "/"`) and Python's NFKC
+	// folding (`ｒｅｐｏ = "/"` binds `repo`), inside an interpolation too
+	// (`${r\u0065po = "/"}`, `f"{(ｒｅｐｏ := '/')}"`). Any escape or character
+	// in the raw text that decodes or folds to an ASCII identifier character
+	// refuses; an accent, an arrow or an emoji in a message does not. Code
+	// outside strings that holds a non-ASCII character or an escape refuses too.
+	if (/[^\x00-\x7f]|\\u/u.test(masked) || spellsAsciiIdentifier(code)) return null;
+	// Ruby text the mask does not hide (a heredoc body, `=begin` block or `%q|…|`
+	// literal) could hold a line that reads as the binding but never runs.
+	if (EVAL_UNMASKED_RUBY_TEXT.test(code)) return null;
+	// The mask hides string bodies, and an interpolation inside one can write
+	// the name (`f"{(repo := '/')}"`, `${repo = "/"}`, `"#{repo = '/'}"`). So
+	// count writes in the raw text too: the one binding must be the only one.
+	const writes = new RegExp(`(?<![\\w$])${name}\\s*(?:\\*\\*|//|<<|>>|[-+*/%&|^:])?=(?!=)|(?<![\\w$])${name}\\s*(?:\\+\\+|--)|(?:\\+\\+|--)\\s*${name}(?![\\w$])`, "gu");
+	if ((code.match(writes) ?? []).length !== 1) return null;
+	const sites = evalCwdSites(masked);
+	let binding: string | null = null;
+	let span: [number, number] = [0, 0];
+	for (const match of masked.matchAll(new RegExp(`(?<![\\w$])[.:]?${name}(?![\\w$])`, "gu"))) {
+		const at = match.index ?? 0;
+		if (match[0] !== name) return null;
+		const lineStart = masked.lastIndexOf("\n", at - 1) + 1;
+		const head = masked.slice(lineStart, at);
+		const after = masked.slice(at + name.length);
+		const assignment = /^\s*=(?!=)\s*/u.exec(after);
+		if (assignment && /^(?:(?:const|let|var)\s+)?$/u.test(head)) {
+			if (binding !== null || at > siteAt || !atPayloadTopLevel(masked, lineStart)) return null;
+			const valueStart = at + name.length + assignment[0].length;
+			const lineEnd = masked.indexOf("\n", valueStart);
+			const tail = masked.slice(valueStart, lineEnd === -1 ? masked.length : lineEnd).replace(/[\s;]+$/u, "");
+			span = [valueStart, valueStart + tail.length];
+			binding = cwdLiteralText(code.slice(...span));
+			if (binding === null) return null;
+			continue;
+		}
+		// A read counts only inside a spawn or chdir call's own arguments: a
+		// top-level `cwd = repo` in Ruby aliases the same mutable string, and
+		// `cwd.replace("/")` would then change what `repo` holds.
+		const shaped = /(?:(?<![\w$.])(?:cwd|chdir)\s*=|\.chdir\(\s*)$/u.test(masked.slice(Math.max(0, at - 40), at)) && /^\s*[,)\n]/u.test(`${after}\n`);
+		const read = shaped && sites.some(site => site.argEnd !== -1 && at >= site.argStart && at < site.argEnd);
+		if (!read) return null;
+	}
+	if (binding === null) return null;
+	// The binding's own literal may spell the name (`wt = "/tmp/wt"`); every
+	// other raw spelling counts. An attribute or symbol spelling anywhere,
+	// interpolations included (`f"{importlib.import_module('__main__').repo}"`,
+	// `:repo`), can be a write.
+	const rest = code.slice(0, span[0]) + " ".repeat(span[1] - span[0]) + code.slice(span[1]);
+	if (new RegExp(`(?<![\\w$])[.:]${name}(?![\\w$])`, "u").test(rest)) return null;
+	return hiddenUsesAreReads(masked, rest, name) ? binding : null;
+}
+
 export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
 	const masked = maskCodeText(code);
 	const sites = evalCwdSites(masked);
@@ -2974,18 +3334,15 @@ export function evalSpawnCwd(code: string, sessionCwd: string): EvalSpawnCwd {
 			perSite.push(current);
 			continue;
 		}
-		if (argument.kind === "dynamic") {
-			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${argument.detail})`;
-			continue;
-		}
-		const literal = cwdLiteralText(argument.value);
+		const source = argument.kind === "dynamic" ? argument.detail : argument.value;
+		const literal = (argument.kind === "value" ? cwdLiteralText(argument.value) : null) ?? constantCwdText(masked, code, source.trim(), site.at);
 		if (literal === null) {
-			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${truncated(argument.value, 60)})`;
+			if (opaque === "") opaque = `${site.name}: the cwd is not a literal (${truncated(source, 60)})`;
 			continue;
 		}
 		const resolved = resolveSpawnCwdLiteral(literal, current);
 		if (resolved === null) {
-			if (opaque === "") opaque = `${site.name}: ${truncated(argument.value, 60)} does not name a directory`;
+			if (opaque === "") opaque = `${site.name}: ${truncated(source, 60)} does not name a directory`;
 			continue;
 		}
 		if (site.kind === "chdir") {
@@ -3440,6 +3797,19 @@ function scanWrapperOptions(wrapper: string, words: string[], start: number): Wr
 	return { next: index, cwdChange };
 }
 
+/** Whether `command`'s leading options include `-v` or `-V`: bash then only
+ *  describes how each name resolves and runs none of them, so the words after
+ *  are names, not a program. Only `-p`, `-v` and `-V` (alone or bundled) count;
+ *  anything else falls through to the wrapper grammar, which fails closed. */
+function isCommandLookup(words: readonly string[], start: number): boolean {
+	for (let index = start; index < words.length; index++) {
+		const word = words[index];
+		if (!/^-[pvV]+$/u.test(word)) return false;
+		if (/[vV]/u.test(word)) return true;
+	}
+	return false;
+}
+
 /**
  * The interpreter a segment's own verb names, with the words after it.
  * Wrappers are parsed from their own option grammars: guessing that any number
@@ -3447,6 +3817,19 @@ function scanWrapperOptions(wrapper: string, words: string[], start: number): Wr
  * wrapper will not execute.
  */
 function interpreterInvocation(segment: string[]): InterpreterInvocation {
+	const head = commandHead(segment);
+	if (head === null || "opaque" in head) return head;
+	const verb = interpreterName(segment[head.index]);
+	if (!verb) return null;
+	return { verb, rest: segment.slice(head.index + 1), cwdChanges: head.cwdChanges, stdinOwner: head.stdinOwner };
+}
+
+/** Where a segment's own verb sits once wrappers are stepped through, or why
+ *  wrapper parsing stopped. Null when there is no verb, or when `command -v`
+ *  only looks the names up. */
+type CommandHead = { index: number; cwdChanges?: string[]; stdinOwner?: "wrapper" } | { opaque: string } | null;
+
+function commandHead(segment: string[]): CommandHead {
 	let i = 0;
 	let cwdChanges: string[] | undefined;
 	let stdinOwner: "wrapper" | undefined;
@@ -3461,6 +3844,7 @@ function interpreterInvocation(segment: string[]): InterpreterInvocation {
 			continue;
 		}
 		const wrapper = commandBasename(word);
+		if (wrapper === "command" && isCommandLookup(segment, i + 1)) return null;
 		if (WRAPPER_COMMANDS.has(wrapper)) {
 			const options = scanWrapperOptions(wrapper, segment, i + 1);
 			if ("opaque" in options) return options;
@@ -3476,9 +3860,7 @@ function interpreterInvocation(segment: string[]): InterpreterInvocation {
 		break;
 	}
 	if (i >= segment.length) return null;
-	const verb = interpreterName(segment[i]);
-	if (!verb) return null;
-	return { verb, rest: segment.slice(i + 1), cwdChanges, stdinOwner };
+	return { index: i, cwdChanges, stdinOwner };
 }
 
 function interpretersInSegment(segment: string[], rawStage: string): Array<{ verb: string; codeText: string | null }> {
@@ -3778,29 +4160,62 @@ function hasBundledSyntaxOnlyFlag(word: string, grammar: InterpreterFlagGrammar 
 	return false;
 }
 
-/** True when the interpreter's main file is only parsed, not executed. */
+/** Short options that change only what a syntax check prints (verbose, warnings,
+ *  xtrace), alone or bundled with the check itself (`ruby -cw`, `bash -vn`). */
+const SYNTAX_CHECK_COMPANION = /^-[vwWx]+$/u;
+
+/** Whether a bundle (`-vn`, `-cw`) holds the syntax-only letter and nothing but
+ *  companion letters. A bundle that mixes in any other letter is not a check. */
+function isSyntaxOnlyBundle(word: string, grammar: InterpreterFlagGrammar | undefined): boolean {
+	if (!hasBundledSyntaxOnlyFlag(word, grammar)) return false;
+	return [...word.slice(1)].every(letter => grammar?.syntaxOnly?.test(`-${letter}`) || /[vwWx]/u.test(letter));
+}
+
+/**
+ * True when the interpreter's main file is only parsed, not executed.
+ *
+ * Every option before the program counts, not only the first syntax-only one:
+ * a later option can undo the check (`bash -n +n x.sh`, `zsh -n -i x.sh`,
+ * `zsh -n -o exec x.sh`, `bash -n +o noexec x.sh` and `node -c --no-check x.js`
+ * all run x on this machine). So the check holds only when every other option
+ * is a companion that changes the output alone. Any other option, a `+`
+ * option, or a value-taking one reads the bodies, which is the safe direction.
+ */
 function interpreterSyntaxOnly(segment: string[]): boolean {
 	const invocation = interpreterInvocation(segment);
 	if (!invocation || "opaque" in invocation) return false;
 	const { verb, rest } = invocation;
 	const grammar = INTERPRETER_FLAG_GRAMMAR[verb] ?? INTERPRETER_FLAG_GRAMMAR[verb.replace(/[\d.]+$/u, "")];
+	let checks = false;
+	let other = false;
 	for (let i = 0; i < rest.length; i++) {
 		const word = rest[i];
-		if (word === "--") return false;
-		if (!word.startsWith("-") || word === "-") return false;
+		if (word.startsWith("+")) return false;
+		if (word === "--" || !word.startsWith("-") || word === "-") break;
 		const flag = splitAttachedFlagValue(word);
-		if (hasBundledSyntaxOnlyFlag(word, grammar)) return true;
-		if (grammar?.syntaxOnly?.test(flag.name)) return true;
 		if (verb.startsWith("python") && (flag.name === "-m" || flag.name === "--module")) {
 			return rest[i + 1] === "py_compile";
 		}
-		if (grammar?.value?.test(flag.name) || grammar?.file?.test(flag.name)) {
+		if (SHARED_INLINE_FLAG.test(flag.name) || grammar?.inline.test(flag.name)) return false;
+		if (flag.attached === undefined && grammar?.syntaxOnly?.test(flag.name)) {
+			checks = true;
+			continue;
+		}
+		if (isSyntaxOnlyBundle(word, grammar)) {
+			checks = true;
+			continue;
+		}
+		if (SYNTAX_CHECK_COMPANION.test(word)) continue;
+		// A preload (`node --check -r x.js`) runs, and interpreterProgramRefs
+		// reads it as a loader whatever this returns; it does not undo the check.
+		if (grammar?.file?.test(flag.name)) {
 			if (flag.attached === undefined) i++;
 			continue;
 		}
-		if (SHARED_INLINE_FLAG.test(flag.name) || grammar?.inline.test(flag.name)) return false;
+		other = true;
+		if (grammar?.value?.test(flag.name) && flag.attached === undefined) i++;
 	}
-	return false;
+	return checks && !other;
 }
 
 /** Whether an interpreter has no separate program and will execute stdin. */
@@ -3960,28 +4375,224 @@ function shellBodyHeredocRefusal(verb: string, body: string): string | null {
 	return `script body blocked: ${verb} body contains a heredoc or here-string whose executed payload cannot be scanned safely`;
 }
 
+/** The programs one command runs, or why the reader stops on it. */
+type CommandScriptRefs = { invocation: InterpreterInvocation; refs: InterpreterProgramRef[] } | { refusal: string };
+
+/**
+ * Every program word one command hands an interpreter: its operands, and a
+ * redirected stdin the interpreter executes. `redirects` is the parse's own
+ * redirect list for this command, or null when the command was read from text
+ * alone and carries none the reader could pair.
+ */
+function commandScriptRefs(words: string[], redirects: ShellRedirect[] | null): CommandScriptRefs {
+	const invocation = interpreterInvocation(words);
+	if (invocation !== null && "opaque" in invocation) return { refusal: invocation.opaque };
+	const syntaxOnly = interpreterSyntaxOnly(words);
+	const refs = interpreterProgramRefs(words).filter(ref => !syntaxOnly || ref.loader === true);
+	const flow = redirects !== null && redirects.length > 0 ? redirectedStdinFlow(redirects) : null;
+	const stdin = syntaxOnly || flow === null ? null : interpreterReadsRedirectedStdin(words);
+	if (stdin !== null && flow !== null) {
+		if (flow.kind === "unknown") return { refusal: "script body blocked: redirected stdin descriptor could not be resolved" };
+		if (flow.kind === "file") {
+			const target = flow.target;
+			if (!target.literal && !SHELL_WORD_EXPANSION.test(target.value)) {
+				return { refusal: `script body blocked: redirected stdin target ${target.source} is not literal` };
+			}
+			refs.push({ verb: stdin.verb, operand: target.value, arm: "stdin" });
+		}
+	}
+	return { invocation, refs };
+}
+
+/** The directory one program word is resolved from: its segment's directory
+ *  with the invocation's own `env -C` changes applied. Null when unknown. */
+function scriptRefDir(ref: InterpreterProgramRef, invocation: InterpreterInvocation, base: string | null): string | null {
+	let dir = base;
+	if (ref.arm !== "stdin" && invocation && !("opaque" in invocation) && invocation.cwdChanges) {
+		for (const change of invocation.cwdChanges) {
+			if (dir === null) break;
+			if (SHELL_WORD_EXPANSION.test(change) || change.startsWith("~")) dir = null;
+			else dir = resolveToCwd(change, dir);
+		}
+	}
+	return dir;
+}
+
+/** One program word, as both readers name it: the file the read would open.
+ *  Two refs share a key only when they resolve to the same path, so a parse
+ *  pass ref is never passed over for a text pass ref that read another file. */
+function scriptRefKey(ref: InterpreterProgramRef, dir: string | null): string {
+	let target: string;
+	try {
+		target = dir === null ? `?\0${ref.operand}` : resolveToCwd(ref.operand, dir);
+	} catch {
+		target = `?\0${ref.operand}\0${dir}`;
+	}
+	return `${ref.arm}\0${ref.verb}\0${target}`;
+}
+
+
+/**
+ * The verb word of a parsed command when the shell expands it, so the reader
+ * cannot name the program: a brace (`pyth{on3,}`, `{cd,dir}`), a glob, a
+ * variable (`$PY`, `cd${x}`), a substitution. `[` is the test builtin's name,
+ * not a glob. A path whose last component is plain text (`"$VENV/bin/python"`)
+ * still names its program, and the text reader already reads it by that name.
+ */
+function expandedVerb(command: ShellCommand): ShellWord | null {
+	const head = commandHead(command.words.map(word => word.value));
+	if (head === null || "opaque" in head) return null;
+	const verb = command.words[head.index];
+	if (verb === undefined || verb.fixed || verb.value === "[") return null;
+	if (!verb.literal) {
+		// Read the last component off the source, not the expanded value: only
+		// text the command spells as a plain filename names the program.
+		const slash = verb.source.lastIndexOf("/");
+		if (slash !== -1 && /^[A-Za-z0-9._+-]+["']?$/u.test(verb.source.slice(slash + 1))) return null;
+	}
+	return verb;
+}
+
+/** An `alias` definition, however it is spelled: `builtin alias`,
+ *  `command alias` and `\alias` all reach the same builtin. */
+const ALIAS_DEFINITION = (command: ShellCommand): boolean => {
+	let index = 0;
+	while (command.words[index]?.value === "builtin" || command.words[index]?.value === "command" || (index > 0 && command.words[index]?.value.startsWith("-"))) index++;
+	return command.words[index]?.value === "alias" && command.words.slice(index + 1).some(word => word.value.includes("="));
+};
+
+/**
+ * Why a parsed command's verb stops the reader, or null. The shell expands
+ * the verb before it runs it, so it may be an interpreter running a script, or
+ * a `cd` moving the shell under every program after it.
+ *
+ * A brace or glob verb (`pyth{on3,}`, `{cd,dir}`) always refuses. A variable
+ * or substituted verb refuses whenever it could be handed code: any operand
+ * (a script, `-`, a directory), any input redirect (`< p.py`, a here-string, a
+ * heredoc), or a pipe into its stdin (`cat p.py | $X`). It also refuses when
+ * the command runs any program at all, because source position is not
+ * execution order: `$X` can call a function or a `cd`. Only a bare `"$@"` or
+ * `$EDITOR` with nothing to read stays open. An alias definition makes every
+ * later word a verb the reader cannot name, in the same way.
+ */
+function expandedVerbRefusal(commands: readonly ShellCommand[], programAt: readonly number[]): string | null {
+	const programAnywhere = programAt.length > 0;
+	for (const command of commands) {
+		const offset = command.sourceOffset ?? 0;
+		if (ALIAS_DEFINITION(command)) {
+			// Any later command at all could be the alias, handed code by an
+			// operand, a redirect or a pipe.
+			if (programAnywhere || commands.some(other => (other.sourceOffset ?? 0) > offset)) {
+				return "script body blocked: the command defines an alias, so the words after it are not the programs that run";
+			}
+			continue;
+		}
+		const verb = expandedVerb(command);
+		if (verb === null) continue;
+		const index = command.words.indexOf(verb);
+		const fedInput =
+			command.words.length > index + 1 ||
+			command.join === "pipe" ||
+			command.redirects.some(redirect => redirect.direction !== "out");
+		if (verb.literal || programAnywhere || fedInput) {
+			return `script body blocked: the shell expands the command name ${verb.source}, so the classifier cannot tell which program it runs or where it leaves the shell`;
+		}
+	}
+	return null;
+}
+
+
 export function readInterpretedScriptBodies(command: string, cwd: string, limit: number): ReadScriptBodiesResult {
 	const bodies: InterpretedScriptBody[] = [];
 	let text = command;
 
 	// Discovery reads the MASKED text: a heredoc body is data to the shell (and a
 	// document written with one must not turn `python3 pkg` inside it into a
-	// program this scan insists on reading), while an ANSI-C or crossed quote
-	// span is text the shell never parses as a command either. The judged text
-	// below stays the whole command: masking is for the scan, not for the judge.
-	const masked = maskHeredocBodiesAndAnsiSpans(command).masked;
+	// program this scan insists on reading), a comment is not read at all, and
+	// an ANSI-C or crossed quote span is text the shell never parses as a
+	// command either. The judged text below stays the whole command: masking is
+	// for the scan, not for the judge.
+	const mask = maskHeredocBodiesAndAnsiSpans(command);
+	const masked = mask.masked;
+	const parsed = parseShell(command);
+	// A command the parser rejects is read from its text alone, and a text
+	// reading that lost its place (a quote it never saw close, a heredoc
+	// delimiter it could not read) blanked everything after that point: a
+	// program there was never looked for. Nothing else can vouch for the tail.
+	//
+	// A parse failure alone is not enough to trust the text either: bash runs
+	// a multi-line command line by line, so the lines before a syntax error
+	// still run (`time python3 p.py` above a stray `fi`), while everything the
+	// parse would have caught is missed. And no word test on raw text can say
+	// what a word becomes (`py\thon3`, `p"y"thon3`, `$X`, `pyth{on3,}`). A
+	// command the parser cannot read is refused.
+	if (!parsed.ok) {
+		return {
+			text,
+			bodies,
+			refusal: {
+				why: "script body blocked: the shell parser could not read the command, so the classifier cannot tell which programs it runs or from where",
+			},
+		};
+	}
+	// The walk's directories are used only when it agrees with the parse on
+	// every command that can move the shell. A `cd` in a comment, a function
+	// body or a loop is a `cd` the walk would apply in the wrong place. A
+	// function definition can also shadow the verb itself (`function cd { :;
+	// }` makes every later `cd` a no-op), so a command that defines one and
+	// moves the shell does not trust the walk at all.
+	const layout = parsed.ok ? shellLayout(command) : null;
+	const movesShell = parsed.ok && parsed.commands.some(other => commandMayChangeDirectory(other.words.map(word => word.value)));
+	const walkTrusted =
+		!parsed.ok ||
+		(layout !== null && !(movesShell && layout.functions.length > 0) && directoryChangesAgree(masked, parsed.commands, layout.deferred));
 	const segments = tokenizeShellSegments(masked);
 	// The walk resolves `cd` targets the way this reader resolves its operands:
 	// the host's `resolveToCwd` knows the internal URL schemes and the
 	// workspace-root alias that a plain `path.resolve` would silently turn into
 	// a relative-looking path. The network tier resolves config paths with
 	// `node:path` and hands the same walk its own resolver instead.
-	const dirs = segmentWorkingDirectories(masked, cwd, segments, resolveToCwd);
-	const shellAst = command.includes("<") ? parseShell(command) : null;
-	const shellCommands: ShellCommand[] = shellAst !== null && shellAst.ok
-		? shellAst.commands.filter(candidate => !candidate.nested && candidate.words.length > 0)
+	const dirs = walkTrusted ? segmentWorkingDirectories(masked, cwd, segments, resolveToCwd) : segments.map(() => null);
+	const shellCommands: ShellCommand[] = parsed.ok
+		? parsed.commands.filter(candidate => !candidate.nested && candidate.words.length > 0)
 		: [];
 	let shellCommandIndex = 0;
+
+	/** Read one program word from `base`, the directory its segment runs in.
+	 *  Returns a refusal, or null once the body is spliced in or passed over. */
+	const readRef = (ref: InterpreterProgramRef, dir: string | null): { why: string } | null => {
+		if (dir === null) {
+			// The shell's directory at this segment is not in the text (a
+			// `cd $DIR`, `cd -`, a bare `cd`, `pushd`, a target that does not
+			// exist yet, or a separator this walk and the tokenizer read
+			// differently). Reading from a guessed directory would judge a
+			// different file than the interpreter runs.
+			const scriptShaped = SCRIPT_FILE_EXTENSION.test(ref.operand) || ref.operand.includes("/");
+			if (ref.arm === "load" && !scriptShaped) return null;
+			return {
+				why:
+					`script body blocked: the working directory ${ref.verb} would run ${ref.operand} ` +
+					`from cannot be resolved from the command text`,
+			};
+		}
+		const label = ref.arm === "stdin"
+			? `\n# --- ${ref.verb} reads stdin from ${ref.operand}; body read from disk ---\n`
+			: `\n# --- ${ref.verb} runs ${ref.operand}; body read from disk ---\n`;
+		const endLabel = `\n# --- end of ${ref.operand} ---`;
+		const result = readScriptFile(ref, dir, limit - text.length - label.length - endLabel.length);
+		if (result.kind === "skip") return null;
+		if (result.kind === "refuse") return { why: result.why };
+		const heredocRefusal = shellBodyHeredocRefusal(ref.verb, result.body);
+		if (heredocRefusal !== null) return { why: heredocRefusal };
+		bodies.push({ verb: ref.verb, operand: ref.operand, body: result.body });
+		text += `${label}${result.body}${endLabel}`;
+		return null;
+	};
+
+	// Every program word the text pass looked at, read or passed over, with
+	// the directory it was resolved from. The parse pass below reads only what
+	// is left: the same word from the same directory is the same file.
+	const considered = new Map<string, number>();
 	for (let index = 0; index < segments.length; index++) {
 		const segment = segments[index];
 		if (segment.length === 0) continue;
@@ -3995,7 +4606,7 @@ export function readInterpretedScriptBodies(command: string, cwd: string, limit:
 		}
 		const head = segment[headIndex];
 		let shellCommand: ShellCommand | undefined;
-		if (head !== undefined && shellAst !== null && shellAst.ok) {
+		if (head !== undefined && parsed.ok) {
 			for (let candidateIndex = shellCommandIndex; candidateIndex < shellCommands.length; candidateIndex++) {
 				const candidate = shellCommands[candidateIndex];
 				if (commandBasename(candidate.words[0]?.value.toLowerCase() ?? "") !== commandBasename(head.toLowerCase())) continue;
@@ -4006,7 +4617,7 @@ export function readInterpretedScriptBodies(command: string, cwd: string, limit:
 		}
 
 		const redirectAt = segment.findIndex(word => word === "<" || word === "<>");
-		if (redirectAt !== -1 && (shellAst === null || !shellAst.ok || shellCommand === undefined)) {
+		if (redirectAt !== -1 && (!parsed.ok || shellCommand === undefined)) {
 			if (interpreterInvocation(segment.slice(0, redirectAt))) {
 				return {
 					text,
@@ -4017,75 +4628,59 @@ export function readInterpretedScriptBodies(command: string, cwd: string, limit:
 		}
 
 		const hasRedirects = (shellCommand?.redirects.length ?? 0) > 0;
-		const interpreterWords = hasRedirects && shellCommand
-			? shellCommand.words.map(word => word.value)
-			: segment;
-		const invocation = interpreterInvocation(interpreterWords);
-		if (invocation !== null && "opaque" in invocation) {
-			return { text, bodies, refusal: { why: invocation.opaque } };
+		const found = hasRedirects && shellCommand
+			? commandScriptRefs(shellCommand.words.map(word => word.value), shellCommand.redirects)
+			: commandScriptRefs(segment, null);
+		if ("refusal" in found) return { text, bodies, refusal: { why: found.refusal } };
+		for (const ref of found.refs) {
+			const dir = scriptRefDir(ref, found.invocation, dirs[index]);
+			const key = scriptRefKey(ref, dir);
+			considered.set(key, (considered.get(key) ?? 0) + 1);
+			const refusal = readRef(ref, dir);
+			if (refusal !== null) return { text, bodies, refusal };
 		}
-		const syntaxOnly = interpreterSyntaxOnly(interpreterWords);
-		const refs = interpreterProgramRefs(interpreterWords).filter(ref => !syntaxOnly || ref.loader === true);
-		const flow = hasRedirects && shellCommand ? redirectedStdinFlow(shellCommand.redirects) : null;
-		const stdin = syntaxOnly || flow === null ? null : interpreterReadsRedirectedStdin(interpreterWords);
-		if (stdin !== null && flow !== null) {
-			if (flow.kind === "unknown") {
-				return {
-					text,
-					bodies,
-					refusal: { why: "script body blocked: redirected stdin descriptor could not be resolved" },
-				};
-			}
-			if (flow.kind === "file") {
-				const target = flow.target;
-				if (!target.literal && !SHELL_WORD_EXPANSION.test(target.value)) {
-					return {
-						text,
-						bodies,
-						refusal: { why: `script body blocked: redirected stdin target ${target.source} is not literal` },
-					};
-				}
-				refs.push({ verb: stdin.verb, operand: target.value, arm: "stdin" });
-			}
-		}
+	}
 
-		for (const ref of refs) {
-			let dir = dirs[index];
-			if (ref.arm !== "stdin" && invocation && !("opaque" in invocation) && invocation.cwdChanges) {
-				for (const change of invocation.cwdChanges) {
-					if (dir === null) break;
-					if (SHELL_WORD_EXPANSION.test(change) || change.startsWith("~")) dir = null;
-					else dir = resolveToCwd(change, dir);
-				}
+	// The parse is the second reader, and it decides what the text pass missed.
+	// The text pass finds a program only where the tokenizer puts it at the head
+	// of a segment, so an interpreter after `then`, `do`, `time` or `!`, inside
+	// a quoted `"$(…)"` or backticks, or in an unquoted heredoc body that runs
+	// its substitutions, was never an interpreter to it. Every program word the
+	// parse finds that the text pass did not consider is read here, from the
+	// directory the walk gives the command's own offset.
+	const parsedRefs: Array<{ command: ShellCommand; invocation: InterpreterInvocation; refs: InterpreterProgramRef[] }> = [];
+	for (const parsedCommand of parsed.commands) {
+		if (parsedCommand.words.length === 0) continue;
+		const found = commandScriptRefs(parsedCommand.words.map(word => word.value), parsedCommand.redirects);
+		if ("refusal" in found) return { text, bodies, refusal: { why: found.refusal } };
+		if (found.refs.length > 0) parsedRefs.push({ command: parsedCommand, ...found });
+	}
+	const cwdAt = walkTrusted ? segmentCwdLookup(masked, cwd, resolveToCwd) : () => null;
+	const expanded = expandedVerbRefusal(parsed.commands, parsedRefs.map(entry => entry.command.sourceOffset ?? 0));
+	if (expanded !== null) return { text, bodies, refusal: { why: expanded } };
+	// A function definition can shadow any verb, `cd` and the interpreter
+	// included, and its body runs wherever it is called, so neither the walk
+	// nor the source order says where a program in such a command runs.
+	if (parsedRefs.length > 0 && (layout === null || layout.functions.length > 0)) {
+		return {
+			text,
+			bodies,
+			refusal: { why: "script body blocked: the command defines a shell function, so the classifier cannot tell which program runs where" },
+		};
+	}
+	for (const entry of parsedRefs) {
+		const offset = entry.command.sourceOffset;
+		const base = offset === undefined ? null : cwdAt(offset);
+		for (const ref of entry.refs) {
+			const dir = scriptRefDir(ref, entry.invocation, base);
+			const key = scriptRefKey(ref, dir);
+			const left = considered.get(key) ?? 0;
+			if (left > 0) {
+				considered.set(key, left - 1);
+				continue;
 			}
-			if (dir === null) {
-				// The shell's directory at this segment is not in the text (a
-				// `cd $DIR`, `cd -`, a bare `cd`, `pushd`, or a separator this
-				// walk and the tokenizer read differently). Reading from a guessed
-				// directory would judge a different file than the interpreter runs.
-				const scriptShaped = SCRIPT_FILE_EXTENSION.test(ref.operand) || ref.operand.includes("/");
-				if (ref.arm === "load" && !scriptShaped) continue;
-				return {
-					text,
-					bodies,
-					refusal: {
-						why:
-							`script body blocked: the working directory ${ref.verb} would run ${ref.operand} ` +
-							`from cannot be resolved from the command text`,
-					},
-				};
-			}
-			const label = ref.arm === "stdin"
-				? `\n# --- ${ref.verb} reads stdin from ${ref.operand}; body read from disk ---\n`
-				: `\n# --- ${ref.verb} runs ${ref.operand}; body read from disk ---\n`;
-			const endLabel = `\n# --- end of ${ref.operand} ---`;
-			const result = readScriptFile(ref, dir, limit - text.length - label.length - endLabel.length);
-			if (result.kind === "skip") continue;
-			if (result.kind === "refuse") return { text, bodies, refusal: { why: result.why } };
-			const heredocRefusal = shellBodyHeredocRefusal(ref.verb, result.body);
-			if (heredocRefusal !== null) return { text, bodies, refusal: { why: heredocRefusal } };
-			bodies.push({ verb: ref.verb, operand: ref.operand, body: result.body });
-			text += `${label}${result.body}${endLabel}`;
+			const refusal = readRef(ref, dir);
+			if (refusal !== null) return { text, bodies, refusal };
 		}
 	}
 	return { text, bodies, refusal: null };
@@ -4518,7 +5113,7 @@ export function matchModerateRiskTokens(
 			flags.add("mkfs");
 			return true;
 		}
-		if (MODERATE_RISK_TOKENS.has(w)) {
+		if (MODERATE_RISK_TOKENS.has(w) || PRIVILEGE_VERBS.has(w)) {
 			flags.add(w);
 			return true;
 		}
@@ -4561,7 +5156,7 @@ export function matchModerateRiskTokens(
 			if (rmForcesDialog(words.slice(1), effectiveCwd)) flags.add(verb);
 			continue;
 		}
-		if (MODERATE_RISK_TOKENS.has(verb)) {
+		if (MODERATE_RISK_TOKENS.has(verb) || PRIVILEGE_VERBS.has(verb)) {
 			flags.add(verb);
 			continue;
 		}
@@ -4686,7 +5281,14 @@ export function matchModerateRiskTokens(
 function addSubstitutionFlags(text: string, flags: Set<string>): void {
 	for (const span of substitutionSpans(text)) {
 		for (const token of MODERATE_RISK_TOKENS) {
-			if (new RegExp(`\\b${token}\\b`, "iu").test(span)) flags.add(token);
+			// A shell word runs on through `-` and `.`: `wp eval-file`, `--rm` and
+			// `rm.sh` name other words, and the top-level verb scan reads them
+			// the same way. `\b` matched `eval` inside a PHP comment's
+			// `` `wp eval-file` `` and blocked the run on a SAFE. A `${…}`
+			// expansion breaks that rule: `${x:-rm}` and `${x-rm}` expand to
+			// `rm` after a `-`, so a span that holds one keeps the plain `\b`.
+			const boundary = span.includes("${") ? `\\b${token}\\b` : `(?<![\\w.-])${token}(?![\\w.-])`;
+			if (new RegExp(boundary, "iu").test(span)) flags.add(token);
 		}
 		if (/^mkfs\b|^mkfs\./iu.test(span.trim())) flags.add("mkfs");
 	}
@@ -5155,6 +5757,13 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	const transcript = readTranscript();
 	const userWords = transcript.flatMap(entry => (entry.from === "user" ? [entry.text] : entry.from === "ask" ? [entry.userAnswer] : []));
 	if (userWords.length === 0) return skip("no user words");
+	// Stage 2 resolves bare names and reads PYTHON* against the gate's own
+	// environment. The host runs every call of a session in one shell, so once
+	// a call may have changed that shell (an export, an alias, a function, an
+	// .envrc the host loads), the names the reviewer is shown can resolve
+	// elsewhere. The same latch that stops the TMPDIR read (#176) applies.
+	const shellSession = sessionIdOf(ctx);
+	if (shellSession === undefined || shellEnvTouched.has(shellSession) || shellPrefixSet(process.env)) return skip("the session's shell may resolve names differently than the gate");
 	const programs = scriptsForReview(command, input.startCwd);
 	if (programs.kind === "refuse") return skip(`unread script: ${programs.why}`);
 	const scripts = programs.scripts;
@@ -5931,7 +6540,7 @@ export default function (pi: ExtensionAPI) {
 		// `startCwd` with the unmodified text, like the push and network tiers.
 		let deleteTargets: DeleteTarget[] | undefined;
 		try {
-			deleteTargets = language === "shell" ? measureDeleteTargets(command, startCwd) : undefined;
+			deleteTargets = language === "shell" ? measureDeleteTargets(command, startCwd, gateTempRoots(), shellTmpdirIfNamed(command, [cwd, startCwd], sessionIdOf(ctx))) : undefined;
 		} catch {
 			deleteTargets = undefined;
 		}
@@ -6139,7 +6748,7 @@ export default function (pi: ExtensionAPI) {
 				// (same rule and regex as matchModerateRiskTokens), so joining
 				// makes the redactor see the logical argument, then the newline
 				// flatten below cannot re-expose it.
-				cmd: truncated(redactSecrets(line.cmd.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120),
+				cmd: truncated(redactCommand(line.cmd.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120),
 			};
 			fs.appendFileSync(decisionsLogPath(), `${JSON.stringify(record)}\n`, { mode: 0o600 });
 			fs.chmodSync(decisionsLogPath(), 0o600);
@@ -6361,6 +6970,14 @@ export default function (pi: ExtensionAPI) {
 		const evalCode = isEval && typeof event.input?.code === "string" ? event.input.code : "";
 		if (isBash && command.trim() === "") return;
 		if (isEval && evalCode.trim() === "") return;
+		// The host runs bash calls in one persistent shell, so this command may
+		// leave TMPDIR or IFS changed for the next one (#176).
+		// So can the host's direnv preflight: it prepends `unset -v NAME` for a
+		// variable a repo's `.envrc` removes, to a command that reads quiet.
+		if (isBash && (touchesShellEnv(command) || directoriesHostRunsIn(command, event.input, ctx.cwd).some(hasEnvrcAbove))) {
+			const touchedSession = sessionIdOf(ctx);
+			if (touchedSession !== undefined) shellEnvTouched.add(touchedSession);
+		}
 
 		// Agent-authored operator context (issue #31): every tool call may carry
 		// it; BashToolInput does not declare the field, so read it off the raw
@@ -6425,9 +7042,12 @@ export default function (pi: ExtensionAPI) {
 		// One object for the fields every line of this tool call shares. A
 		// function, not a constant, because the floor is computed per call and
 		// the ids are not: both are fixed by the time any line is written.
-		const auditFields = (): Pick<DecisionRecord, "userMessageIds" | "floor"> => ({
+		/** Set by the bash path's critical scan: non-shell bodies a pattern matched. */
+		let criticalBodies: string[] | undefined;
+		const auditFields = (): Pick<DecisionRecord, "userMessageIds" | "floor" | "criticalBodies"> => ({
 			...(auditUserMessageIds ? { userMessageIds: auditUserMessageIds } : {}),
 			...(floorShadow ? { floor: floorShadow } : {}),
+			...(criticalBodies ? { criticalBodies } : {}),
 		});
 		/** Whether a command's directory can move before or while it runs.
 		 *
@@ -6972,7 +7592,7 @@ export default function (pi: ExtensionAPI) {
 			const networkProvenanceForCache = measureNetworkProvenance(judgedCommand, startCwd);
 			// A delete target swapped for a link between two calls lands somewhere
 			// else (#166), so the measured landing rides in the key too.
-			const deleteTargetsForCache = measureDeleteTargets(judgedCommand, startCwd);
+			const deleteTargetsForCache = measureDeleteTargets(judgedCommand, startCwd, gateTempRoots(), shellTmpdirIfNamed(judgedCommand, [cwd, startCwd], sessionIdOf(ctx)));
 			const cacheKey = JSON.stringify([
 				config.typesafeModel, judgeBackendFor(config.judgeBackend).id, CLASSIFIER_POLICY_HASH, cwd, env.key, pty, timeout, async, judgedCommand,
 				reviewEvidenceFingerprint,
@@ -7006,13 +7626,37 @@ export default function (pi: ExtensionAPI) {
 			// approval mode: the mode cannot be trusted to imply a human, because
 			// a per-session `autoApprove` (wrapper.ts:189-192) forces `yolo`
 			// without appearing in settings at all.
-			if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(judgedCommand))) {
+			// The scan reads the raw command with its message operands blanked
+			// and each spliced body on its own (critical-scan.ts). A hit in a
+			// JavaScript or Python body refuses here, unrecorded, when the body
+			// names a process API or no judge will run. Otherwise it goes to the
+			// judge with the hit in its state.
+			// Message blanking trusts that `git` is git: not once an earlier call in
+			// this session (or this one) may have redefined the shell, and not for
+			// a call with no session to track.
+			const scanSession = sessionIdOf(ctx);
+			const criticalScan = scanCriticalPatterns(command, script.bodies, scanSession !== undefined && !shellEnvTouched.has(scanSession));
+			if (criticalScan.judgedBodies.length > 0) {
+				recordExtras.criticalPatternInScriptBody = { bodies: criticalScan.judgedBodies, note: CRITICAL_BODY_NOTE };
+				criticalBodies = criticalScan.judgedBodies;
+			}
+			// Every path below that returns before `classify` is judge-off: a
+			// static prompt rule, `tools.approval.bash: prompt` with no rule,
+			// classification disabled, or the session paused. (Dry-run runs
+			// nothing and mirrors the live path, so it is not one.)
+			const judgeOff =
+				!config.enabled ||
+				sessionOff.has(ctx.sessionManager.getSessionId()) ||
+				rule?.approval === "prompt" ||
+				(!rule && policy.bashPolicy === "prompt");
+			if (criticalScan.critical || criticalScan.unrecorded || (criticalBodies !== undefined && judgeOff)) {
 				const replay = replayDecision({ tool: "bash", command: judgedCommand, cwd, riskFlags: ["critical"], maxCommandLength: config.maxCommandLength });
 				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: replay.layer, ...lead, why: "critical pattern: matches a built-in dangerous-command pattern", cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
 				// A critical hit is a refusal (issue #30): the pattern itself is the
 				// memory, so a rewording that dodges the pattern meets it at the
-				// classifier.
-				addRefusal(ctx, judgedCommand, "matches a built-in dangerous-command pattern", { source: "critical", cwd, userMessageId: newestUserId });
+				// classifier. A non-shell body hit is not: the same file refuses on
+				// every call anyway, and a record would outlive a fixed file.
+				if (criticalScan.critical) addRefusal(ctx, judgedCommand, "matches a built-in dangerous-command pattern", { source: "critical", cwd, userMessageId: newestUserId });
 				return refuse(ctx, target, "critical", "matches a built-in dangerous-command pattern", "bash", "", { ...auditFields(), ...follows });
 			}
 
@@ -7155,7 +7799,7 @@ export default function (pi: ExtensionAPI) {
 			// line: a `--password` value on the continued line is otherwise on a
 			// marker-less line of its own, and flattening it back onto the flag
 			// would strand the real value after the REDACTED marker.
-			const logCommand = truncated(redactSecrets(judgedCommand.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120);
+			const logCommand = truncated(redactCommand(judgedCommand.replace(/\\\r?\n/gu, "")).replace(/\s+/gu, " ").trim(), 120);
 			if (!dryRun) pi.logger.info(
 				`classifier: verdict=${judgement.verdict}` +
 					` cached=${cached ? 1 : 0} reason="${judgement.reason}" cmd="${logCommand}"`,
@@ -7179,6 +7823,10 @@ export default function (pi: ExtensionAPI) {
 				for (const body of script.bodies) {
 					if (hasInterpreterCodeRisk(body.body)) flags.push(`${body.verb} runs ${body.operand}`);
 				}
+				// A critical pattern in a JavaScript or Python body: no process
+				// API was found by name, which is not proof none is reached, so a
+				// SAFE alone does not release it.
+				for (const body of criticalBodies ?? []) flags.push(`critical pattern in ${body}`);
 				const lifts =
 					prior !== undefined &&
 					(priorRefusalLifts(prior, judgement, judgedCommand, cwd, userMessagesSince(ctx, prior.userMessageId).map(message => message.text)) ||
