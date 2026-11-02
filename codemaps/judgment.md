@@ -3,11 +3,11 @@
 # L2 judgment: jev.ts, jev-judge.ts, decision-order.ts, authorization.ts
 
 ```
-buildJevState ─► state ─┐
-jevQuestions  ─► battery┴► judgeBattery (jev-judge) ─► JevAnswers ─► deriveJevDecision ─► JevDecision
-                             └ judgeBatteryUnderDeadline (deadline aborts the request)       (live, jev-v2.18)
-shadow: judgeJevV3 = jev-v3.8 battery ∥ judgeAuthorization ─► deriveAuthorization
-        ─► deriveDecisionOrder(risk, authorization, literalMatch, overlay, headless) ─► OrderedDecision
+judgeJevV3UnderDeadline (live, jev-v3.9; one deadline aborts both requests)
+  ├ judgeBattery(jev-v3.9 battery over buildJevState)          ─► JevAnswers (risk)
+  └ judgeAuthorization(over buildAuthorizationState, no command) ─► deriveAuthorization (failure/late → none)
+deriveDecisionOrder(risk, authorization, literalMatch, overlay, headless)
+  └ reads deriveJevDecision(risk) for branches 3, 6, 7 ─► OrderedDecision ─► Judgement
 ```
 
 ## jev.ts (2579 lines): state, battery, policy, derivation, provenance
@@ -15,7 +15,7 @@ shadow: judgeJevV3 = jev-v3.8 battery ∥ judgeAuthorization ─► deriveAuthor
 | Export | Line | Kind | Called by |
 |---|---|---|---|
 | `JEV_POLICY_VERSION` = `jev-v2.18` | 99 | const | index (`CLASSIFIER_POLICY_VERSION`), eval/run |
-| `JEV_V3_POLICY_VERSION` = `jev-v3.8` | 107 | const | jev-judge (`judgeJevV3`), eval/run |
+| `JEV_V3_POLICY_VERSION` = `jev-v3.9` | 122 | const | index (`CLASSIFIER_POLICY_VERSION`, hash), jev-judge, eval/run (default battery) |
 | `DEFAULT_JEV_MODEL` = `jev-latest` | 116 | const | eval/run |
 | `JEV_GATING_HAZARDS` (6) | 134 | const | `deriveJevDecision`, decision-order |
 | `JEV_DESCRIPTIVE_HAZARDS` (3) | 153 | const | reported only, never gate |
@@ -33,7 +33,7 @@ shadow: judgeJevV3 = jev-v3.8 battery ∥ judgeAuthorization ─► deriveAuthor
 | `measureDeleteTargets(cmd, startCwd, roots?, shellTmpdir?)` | 2881 | fn | index `classify` (shell only) + bash cache key (#166); `shellTmpdir` from index `shellTmpdirFor` lets a leading `$TMPDIR` operand measure (#176) |
 | `gateTempRoots()` | 2340 | fn | `measureDeleteTargets` default: real `/tmp`, `/private/tmp`, `os.tmpdir()`; never `/` or a root holding home |
 | `parseDockerPortState`, `parseComposeServices`, `isLoopbackHost` | 943/981/1262 | fn | network tier, tests |
-| `buildJevState(input)` | 2470 | fn | index `classify`, `shadowJevV3`, eval/run |
+| `buildJevState(input)` | 2470 | fn | index `classify`, eval/run |
 | `deriveJevDecision(answers, policy)` | 2629 | **pure verdict** | index `judgementFrom`, decision-order, eval/run |
 | `JevUnavailableError` | 2731 | class | thrown by jev-judge on every failure |
 
@@ -87,9 +87,8 @@ Every hazard ≥ `hazardReview` (descriptive included) lands in `decision.hazard
 | `judgeBackendFor(config)` | 245 | → `{id, judge()}`; id joins signature + cache key | index, internal |
 | `noFollowFetch` | 291 | forces `redirect:"manual"` for the endpoint kind | `endpointBackend` |
 | `judgeBattery(signal, opts)` | 354 | one call; `toJevAnswers` validates every field | eval/run, internal |
-| `judgeBatteryUnderDeadline(opts)` | 388 | → `answered` / `failed` / `deadline`; the deadline aborts the request | index `classify` |
-| `judgeAuthorization(signal, opts)` | 490 | authorization question over a separate state | `judgeJevV3` |
-| `judgeJevV3(signal, opts)` | 521 | v3 risk ∥ authorization; an authorization failure → `undefined` | index `shadowJevV3` |
+| `judgeAuthorization(signal, opts)` | 490 | authorization question over a separate state | `judgeJevV3UnderDeadline`, eval/run |
+| `judgeJevV3UnderDeadline(opts)` | 455 | v3 risk ∥ authorization under one deadline → `answered` / `failed` / `deadline`; a failed or late authorization → `undefined` | index `classify` |
 
 Internals: `resolveHostJudge` (619) calls host `resolveJudge` with `purpose`;
 `endpointBackend` (318) builds a `NativeJudge`; `answeredNatively` (484) decides
@@ -98,33 +97,35 @@ openrouter-decisions, workers-ai-systemone, openai-decisions) reads as a
 distribution and only a keyword bridge is one-hot. Every failure path throws
 `JevUnavailableError`.
 
-## decision-order.ts (93 lines): jev-v3 order, shadow only
+## decision-order.ts: jev-v3 order, the live verdict since #116
 
-`deriveDecisionOrder(input, policy)` (line 51), called only by index `shadowJevV3`. Input:
+`deriveDecisionOrder(input, policy)`, the live verdict: index `classify`, eval/run. Input:
 `{risk, authorization, literal, overlayFlags, headless}`. `reasonCode` = `jev-v3:<branch>:<code>`.
+`overlayFlags` = the list the gate blocks a SAFE on (moderate-risk tokens, lookalikes, script-body
+markers, critical body patterns), computed before classify.
 
 | Branch | Condition | Verdict |
 |---|---|---|
 | 1 | `state_contains_injection` ≥ hazardReview | UNSAFE |
-| 2 | one-hot and (gating ≥ review or unsafe ≥ floor) | UNSAFE, no refusal |
+| 2 | one-hot risk answer | UNSAFE (gating ≥ review or unsafe ≥ floor) else UNSURE; no refusal, never SAFE |
 | 3 | v2 says SAFE, no overlay flags | SAFE |
-| 4 | `namedFirm` + literal match + no overlay (not headless with block-band risk) | SAFE |
-| 5 | authorization `named` or `goal` | UNSURE (reviewer not built) |
-| 6 | overlay flags, v2 not UNSAFE | UNSURE |
-| 7 | otherwise | v2 verdict |
+| 4 | v2 not UNSAFE, `namedFirm`, literal match, no overlay | SAFE |
+| 5 | v2 not UNSAFE, authorization `named` or `goal` | UNSURE (stage 2 reviews it) |
+| 6 | overlay flags, authorization `none`, v2 not UNSAFE | v2 verdict (a SAFE then blocks `flagged`) |
+| 7 | otherwise | v2 verdict, refusal intact |
 
 ## authorization.ts (957 lines): action summary + authorization question
 
 | Export | Line | Called by |
 |---|---|---|
 | `ACTION_KINDS` (read, write, delete, run-code, network, git-publish, branch-delete, merge, deploy, secret-read, privilege, other) | 46 | — |
-| `summarizeActions({command, taintedVars})` | 449 | index `shadowJevV3` |
+| `summarizeActions({command, taintedVars})` | 449 | index `classify` |
 | `JEV_AUTHORIZATION_LEVELS` = none/goal/named | 779 | — |
 | `jevAuthorizationQuestions()` | 802 | jev-judge `judgeAuthorization` |
 | `AUTHORIZATION_VERSION` = `jev-auth-v2`, `jevAuthorizationHash()` | 818/820 | — |
-| `buildAuthorizationState(input)` | 851 | index `shadowJevV3` (no command text in it) |
+| `buildAuthorizationState(input)` | 851 | index `classify` (no command text in it) |
 | `DEFAULT_AUTHORIZATION_POLICY` `{namedMinProbability: 0.8}` | 926 | index |
-| `deriveAuthorization(answer, policy)` | 950 | index `shadowJevV3`; missing or one-hot → `none` |
+| `deriveAuthorization(answer, policy)` | 950 | index `classify`; missing or one-hot → `none` |
 
 It reads tool grammar through `arity.ts` `toolGrammar` and secret detection through floor.ts
 (`secretPathIn`, `secretStoreRead`, `secretVariableNames`). Targets are capped (64 chars, 8 per

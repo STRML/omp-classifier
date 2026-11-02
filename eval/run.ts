@@ -268,7 +268,7 @@ Flags:
   --policy <default|file.json>  Threshold set to score. \`default\` is
                                 DEFAULT_JEV_POLICY; a file holds a partial
                                 JevPolicy (unknown knobs are an error). (default: default)
-  --battery <${JEV_POLICY_VERSION}|${JEV_V3_POLICY_VERSION}>   Question battery to ask (default: ${JEV_POLICY_VERSION}).
+  --battery <${JEV_POLICY_VERSION}|${JEV_V3_POLICY_VERSION}>   Question battery to ask (default: ${JEV_V3_POLICY_VERSION}, the live one).
   --model <id>                  Jev model id (default: ${DEFAULT_JEV_MODEL}).
   --corpus <all|adversarial|gitflow|intent|history|heldout>
                                 Which corpus to score (default: all).
@@ -306,7 +306,8 @@ interface Args {
 const BATTERY_VERSIONS: readonly JevBatteryVersion[] = [JEV_POLICY_VERSION, JEV_V3_POLICY_VERSION];
 
 function parseBattery(raw: string | undefined): JevBatteryVersion {
-	if (raw === undefined) return JEV_POLICY_VERSION;
+	// The live policy by default (#116); jev-v2.18 stays askable as a baseline.
+	if (raw === undefined) return JEV_V3_POLICY_VERSION;
 	const version = BATTERY_VERSIONS.find(known => known === raw);
 	if (version === undefined) throw new Error(`--battery must be one of ${BATTERY_VERSIONS.join(", ")}; got '${raw}'`);
 	return version;
@@ -334,7 +335,7 @@ export function parseArgs(argv: string[]): Args {
 		return {
 			help: true,
 			policy: "default",
-			battery: JEV_POLICY_VERSION,
+			battery: JEV_V3_POLICY_VERSION,
 			model: DEFAULT_JEV_MODEL,
 			corpus: "all",
 			compare: undefined,

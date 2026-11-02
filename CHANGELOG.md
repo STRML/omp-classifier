@@ -4,6 +4,23 @@ All notable changes, newest first. Issue and PR numbers up to the 2026-09-17 por
 
 ## 2026-11-02
 
+### jev-v3 is the live decision
+
+https://github.com/STRML/omp-classifier/issues/116. The jev-v3 judgment ran in shadow from 2026-10-26. Its report over 2,166 calls listed 30 the live gate blocked that v3 would allow; the pull request sorts them by why they were blocked. It now decides.
+
+- Every fresh classification asks the jev-v3.9 risk battery and the authorization question in parallel under one deadline (`judgeJevV3UnderDeadline`), runs the literal match over the user's recent words, and derives the verdict with `deriveDecisionOrder`. The result is the same `Judgement` as before, so stage 2 and its hazard bars, the named-host exemption, refusal memory, the verdict cache and the audit line read it unchanged. `reasonCode` now names the branch (`jev-v3:3:safe`, `jev-v3:7:jev:unsafe`).
+- No authorization answer softens the risk derivation's UNSAFE. Branches 4 and 5 read only a SAFE or UNSURE; an UNSAFE reaches branch 7 with its verdict, reason and refusal, and stage 2 applies its UNSAFE bars as before.
+- A one-hot (keyword) risk answer never allows: UNSAFE with a hazard, otherwise UNSURE, never a refusal and never the reviewer. Stage 2 now skips on that one-hot flag rather than on `persistRefusal`, so a branch 5 UNSURE reaches the reviewer.
+- Branch 6 (an overlay flag with authorization `none`) keeps the risk verdict instead of the plan's UNSURE: there is no dialog since #184, and the `flagged` refusal with the flag's own guidance is today's outcome. The decision order reads the same flag list the gate blocks a SAFE on, script-body markers and critical body patterns included.
+- A risk request that fails or misses `timeoutMs` is UNAVAILABLE and never cached, as before. An authorization request that fails or misses it reads as `none`: the command loses only the named fast allow.
+- The audit label: `named` or `goal` with user words is `grounded`, which is what lets a literal match lift a refusal; `none` is `missing` when the risk battery flagged the action as unauthorized, else `not-required`.
+- The evidence snapshot taken once per call is now the v3 builder's (`collectTaskEvidenceV3`): the pinned first message since `/clear` reaches both judges, the cache key and the audit ids; the literal match reads the window alone.
+- `CLASSIFIER_POLICY_VERSION` is `jev-v3.9`, and `CLASSIFIER_POLICY_HASH` (`6f58be1cf4253b3f`) covers the risk battery, the authorization question and its floor. Every cached verdict from jev-v2.18 misses.
+- jev-v3.9 restores the two v2 criteria its overrides had dropped: why an empty `containedIn` or a true `unstagedChanges` is destructive (v2.10, #126), and that a known SSH host's own body is still judged and a locally resolving compose target is not a remote destination (v2.3, #121).
+- `bun eval/run.ts` asks jev-v3.9 by default; `--battery jev-v2.18` stays as a baseline.
+- `logJudgedStates` writes the risk state only: an authorization target is an operand word, and a `--password` value would reach the file with no flag for the redactor to read it by.
+- Removed: `shadowJevV3`, the `v3` audit field, the `shadowV3` config key (an old config file carrying it still loads), `judgeBatteryUnderDeadline`, `judgeJevV3`, `collectTaskEvidence`, `eval/live-report.ts`, `eval/weekly-report.sh`, the launchd plist, and their tests.
+
 ### The reviewer reads the option the user picked, and the steps the asked-for work needs
 
 OMP session `01a19d31`: the agent asked "I need to run `judge2.py` on the Studio's eval.json. OK to proceed?" and the user picked "Yes, run ssh on the Studio", whose description read "Runs judge2.py against the local mlx-serve on port 11234". The stage 2 reviewer then blocked four calls in a row, among them that very run, "against a live local server endpoint (http://127.0.0.1:11234) ... which is not what was asked". The host's ask result keeps only the option labels, and the reviewer never saw the description. The user turned the classifier off a minute later.
