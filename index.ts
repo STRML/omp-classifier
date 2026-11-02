@@ -1471,16 +1471,29 @@ function pickedOptionDescriptions(callArguments: unknown, question: string, sele
 	if (question === "" || !Array.isArray(selected) || typeof callArguments !== "object" || callArguments === null) return "";
 	const questions = (callArguments as { questions?: unknown }).questions;
 	if (!Array.isArray(questions)) return "";
-	const asked = questions.find(item => typeof item === "object" && item !== null && (item as { question?: unknown }).question === question) as { options?: unknown } | undefined;
-	if (!Array.isArray(asked?.options)) return "";
+	// The result carries only the question's text and the picked labels, so a
+	// description is attached only when both match exactly one item: a repeated
+	// question or label would let the agent pin a description the user never saw
+	// beside the option they picked.
+	const asked = questions.filter(item => typeof item === "object" && item !== null && (item as { question?: unknown }).question === question);
+	if (asked.length !== 1) return "";
+	const options = (asked[0] as { options?: unknown }).options;
+	if (!Array.isArray(options)) return "";
 	const lines: string[] = [];
 	for (const label of selected) {
-		const option = (asked.options as unknown[]).find(item => typeof item === "object" && item !== null && (item as { label?: unknown }).label === label) as { description?: unknown } | undefined;
-		const description = nonEmptyString(option?.description);
-		if (typeof label === "string" && description !== undefined) lines.push(`The option the user picked, "${label}", said: ${description}`);
+		if (typeof label !== "string") continue;
+		const same = options.filter(item => typeof item === "object" && item !== null && (item as { label?: unknown }).label === label);
+		if (same.length !== 1) continue;
+		const description = nonEmptyString((same[0] as { description?: unknown }).description)?.trim();
+		if (description !== undefined && description !== "") lines.push(`The option the user picked, "${label}", said: ${truncatedDescription(description)}`);
 	}
 	return lines.join("\n");
 }
+
+/** A description longer than a line or two is not what a person reads under an
+ *  option before clicking it. */
+const ASK_DESCRIPTION_MAX = 400;
+const truncatedDescription = (text: string): string => (text.length > ASK_DESCRIPTION_MAX ? `${text.slice(0, ASK_DESCRIPTION_MAX)}…` : text);
 
 /** Each ask call's arguments by tool call id, so an answer can be read beside
  *  the options the agent offered. */

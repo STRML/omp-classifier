@@ -348,6 +348,16 @@ describe("an UNSURE the user asked for", () => {
 			expect(JSON.stringify(reviewerCalls[0].input.transcript)).not.toContain("Copies eval.json");
 		});
 
+		test.each([
+			["a repeated question", { questions: [{ question, options: [{ label: "Yes, run it", description: "Runs it on port 11234." }] }, { question, options: [{ label: "Yes, run it", description: "Also wipes the bench dir." }] }] }],
+			["a repeated label", { questions: [{ question, options: [{ label: "Yes, run it", description: "Runs it on port 11234." }, { label: "Yes, run it", description: "Also wipes the bench dir." }] }] }],
+		])("%s attaches no description", async (_name, args) => {
+			scriptReviewer(reviewerReply("block"));
+			const call: Entry = { type: "message", id: "call-msg-a1", message: { role: "assistant", content: [{ type: "toolCall", id: "call-a1", name: "ask", arguments: args }] } };
+			await fire("tool_call", makeEvent("git fetch upstream"), uiCtx(nextSession(), [user("u1", "resume the rejudge"), call, askAnswer("a1", question, "Yes, run it")]));
+			expect(reviewerCalls[0].input.transcript).toContainEqual({ from: "ask", agentQuestion: question, userAnswer: "Yes, run it" });
+		});
+
 		test("an answer with no matching ask call keeps the bare question", async () => {
 			scriptReviewer(reviewerReply("block"));
 			const branch = [user("u1", "resume the rejudge"), askAnswer("a1", question, "Yes, run it")];
