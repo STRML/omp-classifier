@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { setShellInspectorForTest, type ShellInspectReport, type ShellInspector } from "../shell-state";
+import { fromHostReport, reportRefusal, setShellInspectorForTest, type ShellInspectReport, type ShellInspector } from "../shell-state";
 import {
 	fire,
 	jevUnsureAnswer,
@@ -184,6 +184,35 @@ describe("the reviewed command's own text", () => {
 		const result = await fire("tool_call", makeEvent(command), uiCtx(nextSession()));
 		expect(reviewerCalls.length).toBe(before);
 		expect(result).toBeDefined();
+	});
+});
+
+describe("the host's report as pi-natives ships it", () => {
+	const base = { fingerprint: "a".repeat(64), hooks: [], optionsChanged: [], exportsChanged: [], snapshotChanged: false };
+
+	test("resolution arrives as a list and is read per name", () => {
+		const report = fromHostReport({
+			...base,
+			home: os.homedir(),
+			path: "/usr/bin",
+			resolution: [
+				{ name: "tar", kind: "file", path: "/usr/bin/tar" },
+				{ name: "git", kind: "builtin", usable: true },
+				{ name: "ls", kind: "alias", text: "ls -G" },
+			],
+		});
+		expect(report.resolution).toEqual({ tar: { kind: "file", path: "/usr/bin/tar" }, git: { kind: "builtin", usable: true }, ls: { kind: "alias", text: "ls -G" } });
+	});
+
+	test("a file entry without a path, or a builtin without usable, cannot pass", () => {
+		const report = fromHostReport({ ...base, resolution: [{ name: "tar", kind: "file" }, { name: "git", kind: "builtin" }] });
+		expect(report.resolution.tar).toEqual({ kind: "missing" });
+		expect(report.resolution.git).toEqual({ kind: "builtin", usable: false });
+	});
+
+	test("an unset HOME or PATH never matches the gate's", () => {
+		const report = fromHostReport({ ...base, resolution: [{ name: "tar", kind: "file", path: onGatePath("tar") }] });
+		expect(reportRefusal(report, ["tar"], () => onGatePath("tar"), process.env.PATH)).toContain("HOME");
 	});
 });
 

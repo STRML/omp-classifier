@@ -67,11 +67,62 @@ export function setShellInspectorForTest(inspector: ShellInspector | null | unde
 	override = inspector;
 }
 
+/** One entry of the host's report as pi-natives ships it. */
+interface HostResolution {
+	name: string;
+	kind: ShellResolution["kind"];
+	text?: string;
+	path?: string;
+	usable?: boolean;
+}
+
+/** The report as `inspectShellSession` returns it: resolution as a list, HOME and PATH optional. */
+interface HostReport extends Omit<ShellInspectReport, "resolution" | "home" | "path"> {
+	resolution: HostResolution[];
+	home?: string;
+	path?: string;
+}
+
+/** One host entry as the gate reads it; a field the kind needs and lacks reads as missing. */
+function fromHost(entry: HostResolution): ShellResolution {
+	switch (entry.kind) {
+		case "alias":
+			return { kind: "alias", text: entry.text ?? "" };
+		case "builtin":
+			return { kind: "builtin", usable: entry.usable === true };
+		case "hashed":
+		case "file":
+			return entry.path === undefined ? { kind: "missing" } : { kind: entry.kind, path: entry.path };
+		case "keyword":
+		case "special":
+		case "function":
+		case "missing":
+			return { kind: entry.kind };
+		default:
+			return { kind: "missing" };
+	}
+}
+
+/** The host's report in the gate's shape. An unset HOME or PATH never matches the gate's. */
+export function fromHostReport(report: HostReport): ShellInspectReport {
+	return {
+		...report,
+		resolution: Object.fromEntries(report.resolution.map(entry => [entry.name, fromHost(entry)])),
+		home: report.home ?? "",
+		path: report.path ?? "",
+	};
+}
+
 /** The host's inspector, or undefined when the installed host has none. */
 export function hostInspector(): ShellInspector | undefined {
 	if (override !== undefined) return override ?? undefined;
 	const candidate = (bashExecutor as Record<string, unknown>).inspectShellSession;
-	return typeof candidate === "function" ? (candidate as ShellInspector) : undefined;
+	if (typeof candidate !== "function") return undefined;
+	const inspect = candidate as (sessionKey: string, names: string[]) => Promise<HostReport | undefined>;
+	return async (sessionKey, names) => {
+		const report = await inspect(sessionKey, names);
+		return report === undefined ? undefined : fromHostReport(report);
+	};
 }
 
 /** Bash inputs that run somewhere the token is never checked. */
