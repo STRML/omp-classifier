@@ -11,6 +11,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { gateResolve } from "../stage-two";
 import { fromHostReport, reportRefusal, setShellInspectorForTest, shellStateToken, type ShellInspectReport, type ShellInspector } from "../shell-state";
 import {
 	fire,
@@ -190,6 +191,25 @@ describe("the live shell rules the review out", () => {
 		expect(result?.input?.shellState?.files.map(file => file.path)).toEqual([link]);
 	});
 
+	test("a host that never answers skips the review inside the handler budget", async () => {
+		setShellInspectorForTest(() => new Promise(() => {}));
+		scriptReviewer(reviewerReply("allow", "unpack the archive into extract/"));
+		const before = reviewerCalls.length;
+		const result = await fire("tool_call", makeEvent(UNSURE_TAR), uiCtx(nextSession()));
+		expect(reviewerCalls.length).toBe(before);
+		expect(refusalOf(result).layer).toBe("unsure");
+		expect(String(reviewerAudit()?.skipped)).toContain("in time");
+	}, 40_000);
+
+	test("a relative hash entry never matches: the host resolves it against the run's cwd", async () => {
+		setShellInspectorForTest(inspector(cleanReport({ resolution: { tar: { kind: "hashed", path: "./tar" } } })));
+		scriptReviewer(reviewerReply("allow", "unpack the archive into extract/"));
+		const before = reviewerCalls.length;
+		await fire("tool_call", makeEvent(UNSURE_TAR), uiCtx(nextSession()));
+		expect(reviewerCalls.length).toBe(before);
+		expect(String(reviewerAudit()?.skipped)).toContain("hashed ./tar");
+	});
+
 	test("a usable builtin matches whatever the gate found on PATH", async () => {
 		setShellInspectorForTest(inspector(cleanReport({ resolution: { tar: { kind: "builtin", usable: true } } })));
 		scriptReviewer(reviewerReply("allow", "unpack the archive into extract/"));
@@ -243,6 +263,24 @@ describe("the host's report as pi-natives ships it", () => {
 	test("an unset HOME or PATH never matches the gate's", () => {
 		const report = fromHostReport({ ...base, resolution: [{ name: "tar", kind: "file", path: onGatePath("tar") }] });
 		expect(reportRefusal(report, ["tar"], () => onGatePath("tar"), process.env.PATH)).toContain("HOME");
+	});
+});
+
+describe("the gate's PATH lookup", () => {
+	test("skips a file the user cannot execute, as the shell does", () => {
+		const a = path.join(dir, "a");
+		const b = path.join(dir, "b");
+		fs.mkdirSync(a);
+		fs.mkdirSync(b);
+		fs.writeFileSync(path.join(a, "zzfoo"), "#!/bin/sh\necho A\n", { mode: 0o001 });
+		fs.writeFileSync(path.join(b, "zzfoo"), "#!/bin/sh\necho B\n", { mode: 0o755 });
+		const saved = process.env.PATH;
+		process.env.PATH = `${a}${path.delimiter}${b}`;
+		try {
+			expect(gateResolve("zzfoo", dir)).toBe(path.join(b, "zzfoo"));
+		} finally {
+			process.env.PATH = saved;
+		}
 	});
 });
 

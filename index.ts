@@ -5747,12 +5747,20 @@ async function shellStateGate(input: StageTwoInput, sessionKey: string | undefin
 	if (own !== undefined) return { skip: own };
 	const words = commandWords(command);
 	if (words === undefined) return { skip: "the command's words could not be read" };
-	let report: ShellInspectReport | undefined;
+	// The host reads the shell without waiting on a busy session, but nothing
+	// here may outlast the handler's budget: a slow answer skips the review.
+	const budget = HANDLER_BUDGET_MS - HANDLER_MARGIN_MS - (Date.now() - input.started);
+	if (budget <= 0) return { skip: "no time is left to inspect the session's shell" };
+	let report: ShellInspectReport | undefined | "late";
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
-		report = await inspect(sessionKey, words);
+		report = await Promise.race([inspect(sessionKey, words), new Promise<"late">(resolve => (timer = setTimeout(() => resolve("late"), budget)))]);
 	} catch {
 		return { skip: "the session's shell state is unavailable" };
+	} finally {
+		clearTimeout(timer);
 	}
+	if (report === "late") return { skip: "the session's shell did not answer in time" };
 	if (report === undefined) return { skip: "the session's shell cannot be inspected (no shell yet, or it is busy)" };
 	const why = reportRefusal(report, words, word => gateResolve(word, startCwd), process.env.PATH);
 	return why === undefined ? { report, words } : { skip: why };

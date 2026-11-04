@@ -208,6 +208,9 @@ const KEYWORD_VERBS = new Set(["[[", "(("]);
  * agreeing realpaths prove nothing about it.
  */
 function samePath(live: string, gate: string, isSystemProgram: (file: string) => boolean): boolean {
+	// A relative path (`hash -p ./x tar`) resolves against the run's cwd, which
+	// the host sets after the check: it names no file the gate can vouch for.
+	if (!path.isAbsolute(live)) return false;
 	if (path.resolve(live) === path.resolve(gate)) return true;
 	if (!isSystemProgram(live)) return false;
 	try {

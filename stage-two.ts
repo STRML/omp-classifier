@@ -140,8 +140,12 @@ function onPath(name: string): string | undefined {
 		if (dir === "") continue;
 		const candidate = path.join(dir, name);
 		try {
-			const stat = fs.statSync(candidate);
-			if (stat.isFile() && (stat.mode & 0o111) !== 0) return candidate;
+			// The shell runs the first file the user can execute, as access(X_OK)
+			// says; a file with some exec bit the user lacks is skipped, and so is
+			// the gate's read of it (`chmod 001` on the first hit runs the next).
+			if (!fs.statSync(candidate).isFile()) continue;
+			fs.accessSync(candidate, fs.constants.X_OK);
+			return candidate;
 		} catch {
 			// Not in this directory.
 		}
