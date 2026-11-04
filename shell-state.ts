@@ -188,7 +188,10 @@ function resolutionMatches(word: string, live: ShellResolution | undefined, gate
 	// in process), whatever file the gate found on PATH. A disabled one falls
 	// through to a PATH search the gate did not make.
 	if (live.kind === "builtin") return live.usable;
-	if (live.kind === "file") return gate !== undefined && gate !== "builtin" && samePath(live.path, gate);
+	// The shell hashes every PATH lookup, so a hash entry is the normal state
+	// of any name run before; it matches when it names the gate's file
+	// (`hash -p ./x tar` names another one).
+	if (live.kind === "file" || live.kind === "hashed") return gate !== undefined && gate !== "builtin" && samePath(live.path, gate);
 	if (live.kind === "keyword") return KEYWORD_VERBS.has(word);
 	return false;
 }

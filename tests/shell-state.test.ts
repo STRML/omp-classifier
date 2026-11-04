@@ -160,6 +160,13 @@ describe("the live shell rules the review out", () => {
 		expect(String(reviewerAudit()?.skipped)).toContain(mentions);
 	});
 
+	test("a hash entry for the gate's own file is a match: the shell hashes every lookup", async () => {
+		setShellInspectorForTest(inspector(cleanReport({ resolution: { tar: { kind: "hashed", path: onGatePath("tar") } } })));
+		scriptReviewer(reviewerReply("allow", "unpack the archive into extract/"));
+		const result = (await fire("tool_call", makeEvent(UNSURE_TAR), uiCtx(nextSession()))) as { input?: Record<string, unknown> } | undefined;
+		expect(result?.input?.shellState).toBeDefined();
+	});
+
 	test("a usable builtin matches whatever the gate found on PATH", async () => {
 		setShellInspectorForTest(inspector(cleanReport({ resolution: { tar: { kind: "builtin", usable: true } } })));
 		scriptReviewer(reviewerReply("allow", "unpack the archive into extract/"));
