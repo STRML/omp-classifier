@@ -83,7 +83,7 @@ function rootOwnedChain(target: string): boolean {
  * (`/usr/../tmp/x`, a user-writable `/opt/homebrew`), and neither does a
  * root-owned target behind a link in a user-writable directory.
  */
-function isSystemProgram(value: string): boolean {
+export function isSystemProgram(value: string): boolean {
 	const expanded = expandHome(value);
 	if (!path.isAbsolute(expanded) || expanded.split("/").includes("..")) return false;
 	try {
@@ -140,13 +140,25 @@ function onPath(name: string): string | undefined {
 		if (dir === "") continue;
 		const candidate = path.join(dir, name);
 		try {
-			const stat = fs.statSync(candidate);
-			if (stat.isFile() && (stat.mode & 0o111) !== 0) return candidate;
+			// The shell runs the first file the user can execute, as access(X_OK)
+			// says; a file with some exec bit the user lacks is skipped, and so is
+			// the gate's read of it (`chmod 001` on the first hit runs the next).
+			if (!fs.statSync(candidate).isFile()) continue;
+			fs.accessSync(candidate, fs.constants.X_OK);
+			return candidate;
 		} catch {
 			// Not in this directory.
 		}
 	}
 	return undefined;
+}
+
+/** The file the gate reads a command word as: a path resolved from `dir`, or
+ *  a bare name on the gate's PATH. Undefined when PATH has a relative entry,
+ *  since the gate cannot tell which file a bare name runs then. */
+export function gateResolve(word: string, dir: string): string | undefined {
+	if (isPathWord(word)) return path.resolve(dir, expandHome(word));
+	return pathHasRelativeEntry() ? undefined : onPath(word);
 }
 
 /** Whether a file is text a shell or interpreter runs, rather than a binary. */

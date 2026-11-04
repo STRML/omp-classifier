@@ -118,7 +118,8 @@ import { deriveDecisionOrder } from "./decision-order";
 import { literalMatch } from "./literal-match";
 import { redactCommand, redactSecrets, redactValue } from "./redact";
 import { quotesUserWords, reviewerModelCall, runReviewer, type ReviewerOutcome, type ReviewerTranscriptEntry } from "./reviewer";
-import { forgetReviewerBlocks, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged, withoutFilterForKey, withoutOutputFilter } from "./stage-two";
+import { forgetReviewerBlocks, gateResolve, isSystemProgram, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged, withoutFilterForKey, withoutOutputFilter } from "./stage-two";
+import { commandStateRefusal, commandWords, hostInspector, reportRefusal, SHELL_STATE_FIELD, shellStateToken, unboundRoute, type ShellInspectReport, type ShellStateToken, type TokenFile } from "./shell-state";
 import { formatTrustPolicyPin, normalizeTrustPolicyPin, pinUserInstructionFiles, resolvePinnedUserPolicy, type TrustPolicyPin, type TrustedPolicyDocument } from "./trust-policy";
 import {
 	buildJevState,
@@ -5721,6 +5722,48 @@ export interface StageTwoInput {
 	/** This session's standing refusal of the command's target. A model refusal
 	 *  sends a stage-1 SAFE to the reviewer too, since only its allow can lift it. */
 	priorRefusal?: Refusal;
+	/** The bash call's raw input: its route (`pty`, `async`, `name`) decides
+	 *  whether the host can check a shell-state token at all. */
+	rawInput?: Record<string, unknown>;
+}
+
+/**
+ * Why stage 2 may not review on this session's shell, or undefined; on
+ * undefined, `report` is what the allow binds to. A host without
+ * `inspectShellSession` keeps the PR #225 latch.
+ */
+async function shellStateGate(input: StageTwoInput, sessionKey: string | undefined): Promise<{ skip: string } | { report?: ShellInspectReport; words: string[] }> {
+	const { command, startCwd } = input;
+	const inspect = hostInspector();
+	if (inspect === undefined) {
+		if (sessionKey === undefined || shellEnvTouched.has(sessionKey) || shellPrefixSet(process.env)) return { skip: "the session's shell may resolve names differently than the gate" };
+		return { words: [] };
+	}
+	if (sessionKey === undefined || shellPrefixSet(process.env)) return { skip: "the session's shell may resolve names differently than the gate" };
+	if (directoriesHostRunsIn(command, input.rawInput, startCwd).some(hasEnvrcAbove)) return { skip: "an .envrc the host loads can change the shell" };
+	const route = unboundRoute(input.rawInput);
+	if (route !== undefined) return { skip: route };
+	const own = commandStateRefusal(command, touchesShellEnv);
+	if (own !== undefined) return { skip: own };
+	const words = commandWords(command);
+	if (words === undefined) return { skip: "the command's words could not be read" };
+	// The host reads the shell without waiting on a busy session, but nothing
+	// here may outlast the handler's budget: a slow answer skips the review.
+	const budget = HANDLER_BUDGET_MS - HANDLER_MARGIN_MS - (Date.now() - input.started);
+	if (budget <= 0) return { skip: "no time is left to inspect the session's shell" };
+	let report: ShellInspectReport | undefined | "late";
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		report = await Promise.race([inspect(sessionKey, words), new Promise<"late">(resolve => (timer = setTimeout(() => resolve("late"), budget)))]);
+	} catch {
+		return { skip: "the session's shell state is unavailable" };
+	} finally {
+		clearTimeout(timer);
+	}
+	if (report === "late") return { skip: "the session's shell did not answer in time" };
+	if (report === undefined) return { skip: "the session's shell cannot be inspected (no shell yet, or it is busy)" };
+	const why = reportRefusal(report, words, word => gateResolve(word, startCwd), process.env.PATH);
+	return why === undefined ? { report, words } : { skip: why };
 }
 
 /**
@@ -5732,7 +5775,7 @@ export interface StageTwoInput {
  * outcome keeps the stage-1 judgement, so a reviewer that is missing, slow,
  * wrong-shaped or quoting words the user never wrote leaves the block in place.
  */
-async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; audit?: ReviewerAudit; userQuote?: string }> {
+async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; audit?: ReviewerAudit; userQuote?: string; shellState?: ShellStateToken }> {
 	const { ctx, judgement, command, cwd, config } = input;
 	const model = config.reviewerModel;
 	const refusedSafe = judgement.verdict === "SAFE" && input.priorRefusal?.source === "model";
@@ -5758,9 +5801,11 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	// environment. The host runs every call of a session in one shell, so once
 	// a call may have changed that shell (an export, an alias, a function, an
 	// .envrc the host loads), the names the reviewer is shown can resolve
-	// elsewhere. The same latch that stops the TMPDIR read (#176) applies.
-	const shellSession = sessionIdOf(ctx);
-	if (shellSession === undefined || shellEnvTouched.has(shellSession) || shellPrefixSet(process.env)) return skip("the session's shell may resolve names differently than the gate");
+	// elsewhere. A host that can report its shell (`inspectShellSession`)
+	// answers that per call, and the allow is bound to what it reported; an
+	// older host keeps the latch that stops the TMPDIR read (#176).
+	const shellGate = await shellStateGate(input, sessionIdOf(ctx));
+	if ("skip" in shellGate) return skip(shellGate.skip);
 	const programs = scriptsForReview(command, input.startCwd);
 	if (programs.kind === "refuse") return skip(`unread script: ${programs.why}`);
 	const scripts = programs.scripts;
@@ -5800,10 +5845,24 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 		return { judgement: { ...judgement, reason: `${judgement.reason}; the stage 2 reviewer blocked it` }, audit };
 	}
 	if (!scriptsUnchanged(scripts)) return { judgement, audit: { failed: "a script changed after it was read", model: outcome.model, ms: outcome.ms } };
+	// The allow holds only for the shell and the files it was judged on: the
+	// host checks both again under the session lock before it submits.
+	let shellState: ShellStateToken | undefined;
+	if (shellGate.report !== undefined) {
+		const programFiles: TokenFile[] = shellGate.words.flatMap(word => {
+			const live = shellGate.report?.resolution[word];
+			// A root-owned chain is a file no one but root can swap.
+			return (live?.kind === "file" || live?.kind === "hashed") && !isSystemProgram(live.path) ? [{ file: live.path }] : [];
+		});
+		const reviewedFiles: TokenFile[] = scripts.flatMap(script => (script.file === undefined ? [] : [{ file: script.file, ...(script.sha256 === undefined ? {} : { reviewed: script.sha256 }) }]));
+		shellState = shellStateToken(shellGate.report, [...reviewedFiles, ...programFiles]);
+		if (shellState === undefined) return { judgement, audit: { failed: "a file the review read could not be hashed", model: outcome.model, ms: outcome.ms } };
+	}
 	return {
 		judgement: { ...judgement, verdict: "SAFE", reason: `the stage 2 reviewer allowed what stage 1 judged ${judgement.verdict} (${judgement.reason})`, reasonCode: "reviewer:allow", noCache: true },
 		audit,
 		userQuote,
+		...(shellState === undefined ? {} : { shellState }),
 	};
 }
 
@@ -7535,6 +7594,14 @@ export default function (pi: ExtensionAPI) {
 				return refuse(ctx, target, "critical", "matches a built-in dangerous-command pattern", "bash", "", { ...auditFields(), ...follows });
 			}
 
+			// The shell-state token is the gate's own field: the gate sets it on a
+			// reviewer allow and the host trusts it. One the model wrote is
+			// refused before any judgment, so no path can pass it through.
+			if (SHELL_STATE_FIELD in (event.input as Record<string, unknown>)) {
+				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "environment", ...lead, why: `the call sets the reserved ${SHELL_STATE_FIELD} field`, cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
+				return refuse(ctx, target, "environment", `the call sets the reserved \`${SHELL_STATE_FIELD}\` field, which only the gate writes`, "bash", "", { ...auditFields(), ...follows });
+			}
+
 			// An `env` override selects which program runs (`PATH`, `BASH_ENV`,
 			// `LD_PRELOAD`, `GIT_PAGER`). It therefore outranks a static
 			// prompt/narrow-allow rule that only judged the command string. Env
@@ -7680,7 +7747,7 @@ export default function (pi: ExtensionAPI) {
 			// Stage 2 runs after the cache, on a fresh or a cached UNSURE or UNSAFE, and
 			// what it allows is never cached: the next call reviews again. Dry run
 			// reports the stage-1 decision and pays for no review.
-			const reviewed = dryRun ? { judgement: stage1 } : await stageTwo({ ctx, judgement: stage1, command, cwd, startCwd, config, started, trustedPolicy: trustedPolicySnapshot.documents, ...(prior === undefined ? {} : { priorRefusal: prior }) });
+			const reviewed = dryRun ? { judgement: stage1 } : await stageTwo({ ctx, judgement: stage1, command, cwd, startCwd, config, started, trustedPolicy: trustedPolicySnapshot.documents, rawInput: event.input as Record<string, unknown>, ...(prior === undefined ? {} : { priorRefusal: prior }) });
 			const judgement = reviewed.judgement;
 			const reviewerAudit = reviewed.audit === undefined ? {} : { reviewer: reviewed.audit };
 			// Every resolved decision is logged so prompt/auto-run behavior is
@@ -7721,6 +7788,9 @@ export default function (pi: ExtensionAPI) {
 					// A lift runs this call only: the record stays, and the next
 					// call meets the same check.
 					logDecisionFor(ctx, { tool: "bash", decision: "allow", layer: cached ? "cached" : "verdict", ...lead, why: prior === undefined ? judgement.reason : `${judgement.reason} (runs past the refusal of "${prior.loggableTarget}": the user named it since)`, cmd: judgedCommand, cwd, verdict: "SAFE", cached: cached ? 1 : 0, ms: Date.now() - started, ...(judgement.modelId ? { modelId: judgement.modelId } : {}), ...(judgement.reasonCode ? { reasonCode: judgement.reasonCode } : {}), ...(judgement.jev ? { jev: judgement.jev } : {}), ...auditFields(), ...judgementAudit(judgement), ...reviewerAudit });
+					// A reviewer allow runs only on the shell and files it was judged
+					// on: the host checks the token under the session lock.
+					if ("shellState" in reviewed && reviewed.shellState !== undefined) return { input: { ...event.input, [SHELL_STATE_FIELD]: reviewed.shellState } };
 					return;
 				}
 				// A SAFE on a target this session already refused is not a clean
