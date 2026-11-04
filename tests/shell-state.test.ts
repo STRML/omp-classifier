@@ -167,6 +167,29 @@ describe("the live shell rules the review out", () => {
 		expect(result?.input?.shellState).toBeDefined();
 	});
 
+	test("a user-writable link to the gate's file does not match: it can be re-pointed after the review", async () => {
+		const link = path.join(dir, "tar-link");
+		fs.symlinkSync(onGatePath("tar"), link);
+		setShellInspectorForTest(inspector(cleanReport({ resolution: { tar: { kind: "hashed", path: link } } })));
+		scriptReviewer(reviewerReply("allow", "unpack the archive into extract/"));
+		const before = reviewerCalls.length;
+		const result = await fire("tool_call", makeEvent(UNSURE_TAR), uiCtx(nextSession()));
+		expect(reviewerCalls.length).toBe(before);
+		expect(refusalOf(result).layer).toBe("unsure");
+	});
+
+	test("a script reached through a link rides in the token by the path the shell opens", async () => {
+		const real = path.join(dir, "real.sh");
+		fs.writeFileSync(real, "#!/bin/bash\ntar -xf archive.tar -C extract\n");
+		fs.chmodSync(real, 0o755);
+		const link = path.join(dir, "unpack.sh");
+		fs.symlinkSync(real, link);
+		setShellInspectorForTest(inspector(cleanReport({ resolution: { "./unpack.sh": { kind: "file", path: link } } })));
+		scriptReviewer(reviewerReply("allow", "unpack the archive into extract/"));
+		const result = (await fire("tool_call", makeEvent("./unpack.sh"), uiCtx(nextSession()))) as { input?: { shellState?: { files: { path: string }[] } } } | undefined;
+		expect(result?.input?.shellState?.files.map(file => file.path)).toEqual([link]);
+	});
+
 	test("a usable builtin matches whatever the gate found on PATH", async () => {
 		setShellInspectorForTest(inspector(cleanReport({ resolution: { tar: { kind: "builtin", usable: true } } })));
 		scriptReviewer(reviewerReply("allow", "unpack the archive into extract/"));

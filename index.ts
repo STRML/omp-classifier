@@ -5846,7 +5846,7 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 			// A root-owned chain is a file no one but root can swap.
 			return (live?.kind === "file" || live?.kind === "hashed") && !isSystemProgram(live.path) ? [live.path] : [];
 		});
-		shellState = shellStateToken(shellGate.report, [...scripts.flatMap(script => (script.realPath === undefined ? [] : [script.realPath])), ...programFiles]);
+		shellState = shellStateToken(shellGate.report, [...scripts.flatMap(script => (script.file === undefined ? [] : [script.file])), ...programFiles]);
 		if (shellState === undefined) return { judgement, audit: { failed: "a file the review read could not be hashed", model: outcome.model, ms: outcome.ms } };
 	}
 	return {

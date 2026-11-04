@@ -23,6 +23,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { hiddenArithmetic, parseShell } from "./shell-ast";
+import { isSystemProgram } from "./stage-two";
 
 /** How the live shell would run one command word. */
 export type ShellResolution =
@@ -191,7 +192,7 @@ function resolutionMatches(word: string, live: ShellResolution | undefined, gate
 	// The shell hashes every PATH lookup, so a hash entry is the normal state
 	// of any name run before; it matches when it names the gate's file
 	// (`hash -p ./x tar` names another one).
-	if (live.kind === "file" || live.kind === "hashed") return gate !== undefined && gate !== "builtin" && samePath(live.path, gate);
+	if (live.kind === "file" || live.kind === "hashed") return gate !== undefined && gate !== "builtin" && samePath(live.path, gate, isSystemProgram);
 	if (live.kind === "keyword") return KEYWORD_VERBS.has(word);
 	return false;
 }
@@ -199,11 +200,20 @@ function resolutionMatches(word: string, live: ShellResolution | undefined, gate
 /** Synthetic verbs the parser reports for compound expressions. */
 const KEYWORD_VERBS = new Set(["[[", "(("]);
 
-function samePath(a: string, b: string): boolean {
+/**
+ * Whether the shell's path `live` is the file the gate read as `gate`. The
+ * literal paths must agree, or `live` must be a root-owned system program
+ * whose links resolve to the same file: a user-writable link (`hash -p ./link
+ * tar` with `./link -> /usr/bin/tar`) can be re-pointed after the review, so
+ * agreeing realpaths prove nothing about it.
+ */
+function samePath(live: string, gate: string, isSystemProgram: (file: string) => boolean): boolean {
+	if (path.resolve(live) === path.resolve(gate)) return true;
+	if (!isSystemProgram(live)) return false;
 	try {
-		return fs.realpathSync(a) === fs.realpathSync(b);
+		return fs.realpathSync(live) === fs.realpathSync(gate);
 	} catch {
-		return path.resolve(a) === path.resolve(b);
+		return false;
 	}
 }
 
@@ -242,7 +252,10 @@ export function shellStateToken(report: ShellInspectReport, files: readonly stri
 	const hashed: { path: string; sha256: string }[] = [];
 	for (const file of new Set(files)) {
 		try {
-			hashed.push({ path: fs.realpathSync(file), sha256: sha256(file) });
+			// The literal path the shell opens, not its realpath: the host follows
+			// the links again at run time, so a link re-pointed after the review
+			// hashes differently and the run is refused.
+			hashed.push({ path: path.resolve(file), sha256: sha256(file) });
 		} catch {
 			return undefined;
 		}
