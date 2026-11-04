@@ -83,7 +83,7 @@ function rootOwnedChain(target: string): boolean {
  * (`/usr/../tmp/x`, a user-writable `/opt/homebrew`), and neither does a
  * root-owned target behind a link in a user-writable directory.
  */
-function isSystemProgram(value: string): boolean {
+export function isSystemProgram(value: string): boolean {
 	const expanded = expandHome(value);
 	if (!path.isAbsolute(expanded) || expanded.split("/").includes("..")) return false;
 	try {
@@ -147,6 +147,14 @@ function onPath(name: string): string | undefined {
 		}
 	}
 	return undefined;
+}
+
+/** The file the gate reads a command word as: a path resolved from `dir`, or
+ *  a bare name on the gate's PATH. Undefined when PATH has a relative entry,
+ *  since the gate cannot tell which file a bare name runs then. */
+export function gateResolve(word: string, dir: string): string | undefined {
+	if (isPathWord(word)) return path.resolve(dir, expandHome(word));
+	return pathHasRelativeEntry() ? undefined : onPath(word);
 }
 
 /** Whether a file is text a shell or interpreter runs, rather than a binary. */
