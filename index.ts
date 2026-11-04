@@ -119,7 +119,7 @@ import { literalMatch } from "./literal-match";
 import { redactCommand, redactSecrets, redactValue } from "./redact";
 import { quotesUserWords, reviewerModelCall, runReviewer, type ReviewerOutcome, type ReviewerTranscriptEntry } from "./reviewer";
 import { forgetReviewerBlocks, gateResolve, isSystemProgram, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged, withoutFilterForKey, withoutOutputFilter } from "./stage-two";
-import { commandStateRefusal, commandWords, hostInspector, reportRefusal, SHELL_STATE_FIELD, shellStateToken, unboundRoute, type ShellInspectReport, type ShellStateToken } from "./shell-state";
+import { commandStateRefusal, commandWords, hostInspector, reportRefusal, SHELL_STATE_FIELD, shellStateToken, unboundRoute, type ShellInspectReport, type ShellStateToken, type TokenFile } from "./shell-state";
 import { formatTrustPolicyPin, normalizeTrustPolicyPin, pinUserInstructionFiles, resolvePinnedUserPolicy, type TrustPolicyPin, type TrustedPolicyDocument } from "./trust-policy";
 import {
 	buildJevState,
@@ -5841,12 +5841,13 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	// host checks both again under the session lock before it submits.
 	let shellState: ShellStateToken | undefined;
 	if (shellGate.report !== undefined) {
-		const programFiles = shellGate.words.flatMap(word => {
+		const programFiles: TokenFile[] = shellGate.words.flatMap(word => {
 			const live = shellGate.report?.resolution[word];
 			// A root-owned chain is a file no one but root can swap.
-			return (live?.kind === "file" || live?.kind === "hashed") && !isSystemProgram(live.path) ? [live.path] : [];
+			return (live?.kind === "file" || live?.kind === "hashed") && !isSystemProgram(live.path) ? [{ file: live.path }] : [];
 		});
-		shellState = shellStateToken(shellGate.report, [...scripts.flatMap(script => (script.file === undefined ? [] : [script.file])), ...programFiles]);
+		const reviewedFiles: TokenFile[] = scripts.flatMap(script => (script.file === undefined ? [] : [{ file: script.file, ...(script.sha256 === undefined ? {} : { reviewed: script.sha256 }) }]));
+		shellState = shellStateToken(shellGate.report, [...reviewedFiles, ...programFiles]);
 		if (shellState === undefined) return { judgement, audit: { failed: "a file the review read could not be hashed", model: outcome.model, ms: outcome.ms } };
 	}
 	return {

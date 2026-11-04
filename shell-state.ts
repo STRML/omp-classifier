@@ -247,18 +247,35 @@ function describe(live: ShellResolution | undefined): string {
 
 const sha256 = (file: string): string => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 
-/** The token for an allow: the fingerprint and the hash of every file the decision read. */
-export function shellStateToken(report: ShellInspectReport, files: readonly string[]): ShellStateToken | undefined {
-	const hashed: { path: string; sha256: string }[] = [];
-	for (const file of new Set(files)) {
+/** A file the allow depends on; `reviewed` is the digest of the bytes the reviewer read. */
+export interface TokenFile {
+	file: string;
+	reviewed?: string;
+}
+
+/**
+ * The token for an allow: the fingerprint and a hash for every file the
+ * decision depends on. A reviewed script carries the digest of the bytes the
+ * reviewer read, never a fresh read, and a fresh read that differs voids the
+ * allow. A program file nobody read is hashed now.
+ */
+export function shellStateToken(report: ShellInspectReport, files: readonly TokenFile[]): ShellStateToken | undefined {
+	const hashed = new Map<string, string>();
+	for (const { file, reviewed } of files) {
+		// The literal path the shell opens, not its realpath: the host follows
+		// the links again at run time, so a link re-pointed after the review
+		// hashes differently and the run is refused.
+		const literal = path.resolve(file);
+		let now: string;
 		try {
-			// The literal path the shell opens, not its realpath: the host follows
-			// the links again at run time, so a link re-pointed after the review
-			// hashes differently and the run is refused.
-			hashed.push({ path: path.resolve(file), sha256: sha256(file) });
+			now = sha256(file);
 		} catch {
 			return undefined;
 		}
+		if (reviewed !== undefined && now !== reviewed) return undefined;
+		const digest = reviewed ?? now;
+		if (hashed.has(literal) && hashed.get(literal) !== digest) return undefined;
+		hashed.set(literal, digest);
 	}
-	return { state: report.fingerprint, files: hashed };
+	return { state: report.fingerprint, files: [...hashed].map(([file, digest]) => ({ path: file, sha256: digest })) };
 }

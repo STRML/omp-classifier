@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { fromHostReport, reportRefusal, setShellInspectorForTest, type ShellInspectReport, type ShellInspector } from "../shell-state";
+import { fromHostReport, reportRefusal, setShellInspectorForTest, shellStateToken, type ShellInspectReport, type ShellInspector } from "../shell-state";
 import {
 	fire,
 	jevUnsureAnswer,
@@ -243,6 +243,28 @@ describe("the host's report as pi-natives ships it", () => {
 	test("an unset HOME or PATH never matches the gate's", () => {
 		const report = fromHostReport({ ...base, resolution: [{ name: "tar", kind: "file", path: onGatePath("tar") }] });
 		expect(reportRefusal(report, ["tar"], () => onGatePath("tar"), process.env.PATH)).toContain("HOME");
+	});
+});
+
+describe("the token binds the bytes the reviewer read", () => {
+	const sha = (text: string): string => require("node:crypto").createHash("sha256").update(text).digest("hex");
+
+	test("a reviewed script rides with the digest the reviewer saw", () => {
+		const file = path.join(dir, "a.sh");
+		fs.writeFileSync(file, "echo reviewed\n");
+		expect(shellStateToken(cleanReport(), [{ file, reviewed: sha("echo reviewed\n") }])?.files).toEqual([{ path: file, sha256: sha("echo reviewed\n") }]);
+	});
+
+	test("a script swapped after the review voids the allow", () => {
+		const file = path.join(dir, "a.sh");
+		fs.writeFileSync(file, "echo swapped\n");
+		expect(shellStateToken(cleanReport(), [{ file, reviewed: sha("echo reviewed\n") }])).toBeUndefined();
+	});
+
+	test("one path listed with two digests voids the allow", () => {
+		const file = path.join(dir, "a.sh");
+		fs.writeFileSync(file, "echo reviewed\n");
+		expect(shellStateToken(cleanReport(), [{ file, reviewed: sha("echo reviewed\n") }, { file, reviewed: sha("other") }])).toBeUndefined();
 	});
 });
 
