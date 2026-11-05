@@ -15,6 +15,7 @@ import { gateResolve, withSearchPath } from "../stage-two";
 import { fromHostReport, reportRefusal, setShellInspectorForTest, shellStateToken, type ShellInspectReport, type ShellInspector } from "../shell-state";
 import {
 	fire,
+	jevSafeAnswer,
 	jevUnsureAnswer,
 	loadPlugin,
 	makeCtx,
@@ -381,11 +382,32 @@ describe("routes and the token field", () => {
 		expect(result).toBeDefined();
 	});
 
-	test("a shellState the model wrote itself is refused before judgment", async () => {
+	// The loop bakes the gate's revised input into the assistant message
+	// (pi-agent-core agent-loop.ts), so the model sees the token in its own
+	// history and copies it into its next call. The gate drops it and judges
+	// the call as if it were absent.
+	const copied = { shellState: { state: "0".repeat(64), files: [] } };
+
+	test("a copied shellState on a SAFE call is dropped, and the call runs", async () => {
 		setShellInspectorForTest(inspector(cleanReport()));
-		const result = await fire("tool_call", makeEvent("ls", { shellState: { state: "0".repeat(64), files: [] } }), uiCtx(nextSession()));
-		expect(refusalOf(result).layer).toBeDefined();
-		expect(calls).toHaveLength(0);
+		setJevAnswer(jevSafeAnswer());
+		const result = (await fire("tool_call", makeEvent("ls extract", copied), uiCtx(nextSession()))) as { block?: boolean; input?: Record<string, unknown> } | undefined;
+		expect(result?.block).toBeUndefined();
+		expect(result?.input).toEqual({ command: "ls extract" });
+	});
+
+	test("a copied shellState on a reviewed call is replaced by the gate's own", async () => {
+		setShellInspectorForTest(inspector(cleanReport()));
+		scriptReviewer(reviewerReply("allow", "unpack the archive into extract/"));
+		const result = (await fire("tool_call", makeEvent(UNSURE_TAR, copied), uiCtx(nextSession()))) as { input?: Record<string, unknown> } | undefined;
+		expect(result?.input?.shellState).toEqual({ state: "f".repeat(64), files: [] });
+	});
+
+	test("a copied shellState never lifts a block", async () => {
+		setShellInspectorForTest(inspector(cleanReport()));
+		scriptReviewer(reviewerReply("block"));
+		const result = await fire("tool_call", makeEvent(UNSURE_TAR, copied), uiCtx(nextSession()));
+		expect(refusalOf(result).layer).toBe("unsure");
 	});
 
 	test("a host without the API keeps the old latch", async () => {
