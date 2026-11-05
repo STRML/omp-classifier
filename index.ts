@@ -118,7 +118,7 @@ import { deriveDecisionOrder } from "./decision-order";
 import { literalMatch } from "./literal-match";
 import { redactCommand, redactSecrets, redactValue } from "./redact";
 import { quotesUserWords, reviewerModelCall, runReviewer, type ReviewerOutcome, type ReviewerTranscriptEntry } from "./reviewer";
-import { forgetReviewerBlocks, gateResolve, isSystemProgram, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged, withoutFilterForKey, withoutOutputFilter } from "./stage-two";
+import { forgetReviewerBlocks, gateResolve, isSystemProgram, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged, withoutFilterForKey, withoutOutputFilter, withSearchPath } from "./stage-two";
 import { commandStateRefusal, commandWords, hostInspector, reportRefusal, SHELL_STATE_FIELD, shellStateToken, unboundRoute, type ShellInspectReport, type ShellStateToken, type TokenFile } from "./shell-state";
 import { formatTrustPolicyPin, normalizeTrustPolicyPin, pinUserInstructionFiles, resolvePinnedUserPolicy, type TrustPolicyPin, type TrustedPolicyDocument } from "./trust-policy";
 import {
@@ -5762,7 +5762,9 @@ async function shellStateGate(input: StageTwoInput, sessionKey: string | undefin
 	}
 	if (report === "late") return { skip: "the session's shell did not answer in time" };
 	if (report === undefined) return { skip: "the session's shell cannot be inspected (no shell yet, or it is busy)" };
-	const why = reportRefusal(report, words, word => gateResolve(word, startCwd), process.env.PATH);
+	// Names resolve on the PATH the shell reported, not omp's own.
+	const live = report;
+	const why = reportRefusal(report, words, word => withSearchPath(live.path, () => gateResolve(word, startCwd)));
 	return why === undefined ? { report, words } : { skip: why };
 }
 
@@ -5806,7 +5808,8 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	// older host keeps the latch that stops the TMPDIR read (#176).
 	const shellGate = await shellStateGate(input, sessionIdOf(ctx));
 	if ("skip" in shellGate) return skip(shellGate.skip);
-	const programs = scriptsForReview(command, input.startCwd);
+	// The scripts the reviewer reads are the files the live shell would run.
+	const programs = withSearchPath(shellGate.report?.path, () => scriptsForReview(command, input.startCwd));
 	if (programs.kind === "refuse") return skip(`unread script: ${programs.why}`);
 	const scripts = programs.scripts;
 	const sessionId = ctx.sessionManager.getSessionId();

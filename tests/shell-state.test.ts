@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { gateResolve } from "../stage-two";
+import { gateResolve, withSearchPath } from "../stage-two";
 import { fromHostReport, reportRefusal, setShellInspectorForTest, shellStateToken, type ShellInspectReport, type ShellInspector } from "../shell-state";
 import {
 	fire,
@@ -145,7 +145,7 @@ describe("the live shell rules the review out", () => {
 		["an option differs", () => inspector(cleanReport({ optionsChanged: ["xtrace"] })), "xtrace"],
 		["the snapshot changed", () => inspector(cleanReport({ snapshotChanged: true })), "snapshot"],
 		["HOME moved", () => inspector(cleanReport({ home: "/tmp/7" })), "HOME"],
-		["PATH moved", () => inspector(cleanReport({ path: "7" })), "PATH"],
+		["PATH has a relative entry", () => inspector(cleanReport({ path: "7" })), "relative PATH entry"],
 		["tar is a function", () => inspector(cleanReport({ resolution: { tar: { kind: "function" } } })), "function"],
 		["tar is an alias", () => inspector(cleanReport({ resolution: { tar: { kind: "alias", text: "./x" } } })), "alias"],
 		["tar is hashed elsewhere", () => inspector(cleanReport({ resolution: { tar: { kind: "hashed", path: "/tmp/x/tar" } } })), "hashed"],
@@ -262,7 +262,72 @@ describe("the host's report as pi-natives ships it", () => {
 
 	test("an unset HOME or PATH never matches the gate's", () => {
 		const report = fromHostReport({ ...base, resolution: [{ name: "tar", kind: "file", path: onGatePath("tar") }] });
-		expect(reportRefusal(report, ["tar"], () => onGatePath("tar"), process.env.PATH)).toContain("HOME");
+		expect(reportRefusal(report, ["tar"], () => onGatePath("tar"))).toContain("HOME");
+	});
+});
+
+describe("the gate resolves names on the live shell's PATH", () => {
+	// A real session's PATH comes from the rc snapshot, so it never equals the
+	// PATH omp was launched with: duplicates, another order, extra entries.
+	test("a PATH that differs in order and duplicates still reaches the reviewer", async () => {
+		const tarDir = path.dirname(onGatePath("tar"));
+		const live = [tarDir, path.join(dir, "absent"), process.env.PATH ?? "", tarDir].join(path.delimiter);
+		setShellInspectorForTest(inspector(cleanReport({ path: live })));
+		scriptReviewer(reviewerReply("allow", "unpack the archive into extract/"));
+		const before = reviewerCalls.length;
+		const result = (await fire("tool_call", makeEvent(UNSURE_TAR), uiCtx(nextSession()))) as { input?: Record<string, unknown> } | undefined;
+		expect(reviewerCalls.length).toBe(before + 1);
+		expect(result?.input?.shellState).toEqual({ state: "f".repeat(64), files: [] });
+	});
+
+	test("a tar earlier on the live PATH is the file the gate judges", async () => {
+		const bin = path.join(dir, "bin");
+		fs.mkdirSync(bin);
+		const shadow = path.join(bin, "tar");
+		fs.writeFileSync(shadow, "#!/bin/sh\necho shadow tar\n", { mode: 0o755 });
+		const live = `${bin}${path.delimiter}${process.env.PATH ?? ""}`;
+		setShellInspectorForTest(inspector(cleanReport({ path: live, resolution: { tar: { kind: "file", path: shadow } } })));
+		scriptReviewer(reviewerReply("allow", "unpack the archive into extract/"));
+		const before = reviewerCalls.length;
+		const result = await fire("tool_call", makeEvent(UNSURE_TAR), uiCtx(nextSession()));
+		// On omp's PATH the gate would have judged /usr/bin/tar; on the shell's it
+		// meets the shadow, and a local script run by name is never reviewed.
+		expect(refusalOf(result).layer).toBe("unsure");
+		expect(reviewerCalls.length).toBe(before);
+		expect(String(reviewerAudit()?.skipped)).toContain("local script run by name");
+	});
+
+	test("a live tar the gate's own PATH would not find is still a mismatch when the report disagrees", async () => {
+		const bin = path.join(dir, "bin");
+		fs.mkdirSync(bin);
+		fs.writeFileSync(path.join(bin, "tar"), "#!/bin/sh\necho shadow tar\n", { mode: 0o755 });
+		const live = `${bin}${path.delimiter}${process.env.PATH ?? ""}`;
+		setShellInspectorForTest(inspector(cleanReport({ path: live })));
+		scriptReviewer(reviewerReply("allow", "unpack the archive into extract/"));
+		const before = reviewerCalls.length;
+		const result = await fire("tool_call", makeEvent(UNSURE_TAR), uiCtx(nextSession()));
+		expect(refusalOf(result).layer).toBe("unsure");
+		expect(reviewerCalls.length).toBe(before);
+	});
+
+	test("a relative entry in the live PATH skips the review", async () => {
+		setShellInspectorForTest(inspector(cleanReport({ path: `.${path.delimiter}${process.env.PATH ?? ""}` })));
+		scriptReviewer(reviewerReply("allow", "unpack the archive into extract/"));
+		const before = reviewerCalls.length;
+		const result = await fire("tool_call", makeEvent(UNSURE_TAR), uiCtx(nextSession()));
+		expect(refusalOf(result).layer).toBe("unsure");
+		expect(reviewerCalls.length).toBe(before);
+		expect(String(reviewerAudit()?.skipped)).toContain("relative PATH entry");
+	});
+
+	test("the scope ends with the call, and a promise is refused", () => {
+		const bin = path.join(dir, "bin");
+		fs.mkdirSync(bin);
+		fs.writeFileSync(path.join(bin, "zzscoped"), "#!/bin/sh\n", { mode: 0o755 });
+		expect(withSearchPath(bin, () => gateResolve("zzscoped", dir))).toBe(path.join(bin, "zzscoped"));
+		expect(gateResolve("zzscoped", dir)).toBeUndefined();
+		expect(() => withSearchPath(bin, () => Promise.resolve(1))).toThrow();
+		expect(gateResolve("zzscoped", dir)).toBeUndefined();
 	});
 });
 

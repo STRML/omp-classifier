@@ -221,16 +221,18 @@ function samePath(live: string, gate: string, isSystemProgram: (file: string) =>
 }
 
 /**
- * Why the live shell's report rules the review out, or undefined.
- * `gatePath` is the PATH the gate resolves bare names with.
+ * Why the live shell's report rules the review out, or undefined. `gate`
+ * resolves names on the shell's own PATH (`withSearchPath`), so a PATH that
+ * differs from omp's (the rc snapshot reorders and repeats entries) is no
+ * reason to skip; a word that runs another file is.
  */
-export function reportRefusal(report: ShellInspectReport, words: readonly string[], gate: GateResolution, gatePath: string | undefined): string | undefined {
+export function reportRefusal(report: ShellInspectReport, words: readonly string[], gate: GateResolution): string | undefined {
 	if (report.snapshotChanged) return "the shell snapshot changed after the session started";
 	if (report.exportsChanged.length > 0) return `exported ${listed(report.exportsChanged)} changed in the session's shell`;
 	if (report.hooks.length > 0) return `the session's shell runs code on its own (${listed(report.hooks)})`;
 	if (report.optionsChanged.length > 0) return `the session's shell has options set (${listed(report.optionsChanged)})`;
 	if (report.home !== os.homedir()) return "the session's shell has a different HOME";
-	if (gatePath !== undefined && report.path !== gatePath) return "the session's shell has a different PATH";
+	if (report.path.split(path.delimiter).some(entry => !path.isAbsolute(entry))) return "the session's shell has an empty or relative PATH entry";
 	for (const word of words) {
 		if (!resolutionMatches(word, report.resolution[word], gate(word))) return `\`${word}\` runs ${describe(report.resolution[word])} in the session's shell`;
 	}

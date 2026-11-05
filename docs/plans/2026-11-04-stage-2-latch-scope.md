@@ -91,8 +91,8 @@ inspect(names) on live shell ─┬─ mismatch ─▶ skip
      meaning depends on shell state that the shape checks cannot read;
    - `inspectShellSession` returns `undefined` or throws;
    - `snapshotChanged`, or `exportsChanged` is non-empty;
-   - `home` differs from `os.homedir()`, or `path` differs from the gate's
-     `process.env.PATH`, for the env the gate resolves names with;
+   - `home` differs from `os.homedir()`, or `path` has an empty or relative
+     entry (names resolve on that `path`; see the 2026-11-05 amendment);
    - any program word, wrapper or interpreter the shape checks resolved has a
      `resolution` other than `file:<the path onPath returned>` (or `builtin`
      for a name the gate treats as a builtin).
@@ -137,6 +137,16 @@ run-time check cannot close. The plan takes these changes:
    that finds no core is refused, so it never sources the snapshot.
 7. **The gate strips any incoming `shellState`** on every return path. It sets
    the field only on its own allow.
+
+## Amendment 2026-11-05: names resolve on the live PATH
+
+The first live run skipped with "the session's shell has a different PATH".
+A session's PATH comes from the rc snapshot, so it never equals the PATH omp
+was launched with (it repeats and reorders entries). Requiring equality ruled
+out every session. The gate now resolves bare names, wrappers and scripts on
+the PATH the shell reported (`withSearchPath`), drops the equality check, and
+skips only when that PATH has an empty or relative entry. A word still has to
+resolve to the same file in both lookups.
 
 Two limitations are accepted and documented:
 

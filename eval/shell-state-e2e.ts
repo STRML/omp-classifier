@@ -13,7 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { commandStateRefusal, fromHostReport, reportRefusal, shellStateToken } from "../shell-state";
-import { gateResolve } from "../stage-two";
+import { gateResolve, withSearchPath } from "../stage-two";
 import { touchesShellEnv } from "../index";
 
 const nativesPath = process.env.OMP_NATIVES;
@@ -41,7 +41,7 @@ async function gate(command: string): Promise<{ decision: string; token?: unknow
 	const raw = await shell.inspect(words);
 	if (raw === null) return { decision: "skip: no shell yet" };
 	const report = fromHostReport(raw);
-	const why = reportRefusal(report, words, word => gateResolve(word, dir), report.path);
+	const why = reportRefusal(report, words, word => withSearchPath(report.path, () => gateResolve(word, dir)));
 	if (why !== undefined) return { decision: `skip: ${why}` };
 	return { decision: "review", token: shellStateToken(report, []) };
 }
