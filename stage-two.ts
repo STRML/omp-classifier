@@ -130,13 +130,36 @@ const isPathWord = (value: string): boolean => value.includes("/") || value.star
  *  the command's own directory, after any `cd`, so the gate cannot tell which
  *  file a bare name runs (https://github.com/STRML/omp-classifier/issues/206). */
 function pathHasRelativeEntry(): boolean {
-	return (process.env.PATH ?? "").split(path.delimiter).some(dir => !path.isAbsolute(dir));
+	return searchPath().split(path.delimiter).some(dir => !path.isAbsolute(dir));
 }
 
-/** A bare name as the gate's PATH resolves it. Callers that vouch for a bare
+let livePath: string | undefined;
+
+/** The PATH bare names resolve on: the live shell's inside `withSearchPath`,
+ *  else the gate's own. */
+const searchPath = (): string => livePath ?? process.env.PATH ?? "";
+
+/**
+ * Run `fn` with bare names resolved on `value`, the PATH the session's shell
+ * reported, so the gate reads the file that shell would run. `fn` must be
+ * synchronous: the scope ends when it returns, and a promise would outlive it.
+ */
+export function withSearchPath<T>(value: string | undefined, fn: () => T): T {
+	const saved = livePath;
+	livePath = value;
+	try {
+		const result = fn();
+		if (result instanceof Promise) throw new TypeError("withSearchPath takes a synchronous function");
+		return result;
+	} finally {
+		livePath = saved;
+	}
+}
+
+/** A bare name as the search PATH resolves it. Callers that vouch for a bare
  *  name check `pathHasRelativeEntry` first: this lookup skips those entries. */
 function onPath(name: string): string | undefined {
-	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+	for (const dir of searchPath().split(path.delimiter)) {
 		if (dir === "") continue;
 		const candidate = path.join(dir, name);
 		try {
@@ -154,7 +177,7 @@ function onPath(name: string): string | undefined {
 }
 
 /** The file the gate reads a command word as: a path resolved from `dir`, or
- *  a bare name on the gate's PATH. Undefined when PATH has a relative entry,
+ *  a bare name on the search PATH. Undefined when PATH has a relative entry,
  *  since the gate cannot tell which file a bare name runs then. */
 export function gateResolve(word: string, dir: string): string | undefined {
 	if (isPathWord(word)) return path.resolve(dir, expandHome(word));

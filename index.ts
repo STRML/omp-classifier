@@ -87,7 +87,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
+import type { ToolCallEvent, ToolCallEventResult } from "@oh-my-pi/pi-coding-agent";
 import { cfgBashPatterns } from "@oh-my-pi/pi-coding-agent/exec/settings";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { cfgToolsApproval } from "@oh-my-pi/pi-coding-agent/tools/settings";
@@ -118,7 +118,7 @@ import { deriveDecisionOrder } from "./decision-order";
 import { literalMatch } from "./literal-match";
 import { redactCommand, redactSecrets, redactValue } from "./redact";
 import { quotesUserWords, reviewerModelCall, runReviewer, type ReviewerOutcome, type ReviewerTranscriptEntry } from "./reviewer";
-import { forgetReviewerBlocks, gateResolve, isSystemProgram, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged, withoutFilterForKey, withoutOutputFilter } from "./stage-two";
+import { forgetReviewerBlocks, gateResolve, isSystemProgram, rememberReviewerBlock, reviewerBlocked, reviewerBlockKey, scriptsForReview, scriptsUnchanged, withoutFilterForKey, withoutOutputFilter, withSearchPath } from "./stage-two";
 import { commandStateRefusal, commandWords, hostInspector, reportRefusal, SHELL_STATE_FIELD, shellStateToken, unboundRoute, type ShellInspectReport, type ShellStateToken, type TokenFile } from "./shell-state";
 import { formatTrustPolicyPin, normalizeTrustPolicyPin, pinUserInstructionFiles, resolvePinnedUserPolicy, type TrustPolicyPin, type TrustedPolicyDocument } from "./trust-policy";
 import {
@@ -5728,6 +5728,19 @@ export interface StageTwoInput {
 }
 
 /**
+ * The bash event without a `shellState` the model wrote, or undefined when it
+ * has none. The loop bakes the gate's revised input into the assistant
+ * message, so the model sees the token in its history and copies it into its
+ * next call. Only the gate sets the field, on its own allow.
+ */
+function withoutCopiedToken(event: ToolCallEvent): ToolCallEvent | undefined {
+	const input = event.input as Record<string, unknown>;
+	if (event.toolName !== "bash" || !(SHELL_STATE_FIELD in input)) return undefined;
+	const { [SHELL_STATE_FIELD]: _dropped, ...rest } = input;
+	return { ...event, input: rest } as ToolCallEvent;
+}
+
+/**
  * Why stage 2 may not review on this session's shell, or undefined; on
  * undefined, `report` is what the allow binds to. A host without
  * `inspectShellSession` keeps the PR #225 latch.
@@ -5762,7 +5775,9 @@ async function shellStateGate(input: StageTwoInput, sessionKey: string | undefin
 	}
 	if (report === "late") return { skip: "the session's shell did not answer in time" };
 	if (report === undefined) return { skip: "the session's shell cannot be inspected (no shell yet, or it is busy)" };
-	const why = reportRefusal(report, words, word => gateResolve(word, startCwd), process.env.PATH);
+	// Names resolve on the PATH the shell reported, not omp's own.
+	const live = report;
+	const why = reportRefusal(report, words, word => withSearchPath(live.path, () => gateResolve(word, startCwd)));
 	return why === undefined ? { report, words } : { skip: why };
 }
 
@@ -5806,7 +5821,8 @@ async function stageTwo(input: StageTwoInput): Promise<{ judgement: Judgement; a
 	// older host keeps the latch that stops the TMPDIR read (#176).
 	const shellGate = await shellStateGate(input, sessionIdOf(ctx));
 	if ("skip" in shellGate) return skip(shellGate.skip);
-	const programs = scriptsForReview(command, input.startCwd);
+	// The scripts the reviewer reads are the files the live shell would run.
+	const programs = withSearchPath(shellGate.report?.path, () => scriptsForReview(command, input.startCwd));
 	if (programs.kind === "refuse") return skip(`unread script: ${programs.why}`);
 	const scripts = programs.scripts;
 	const sessionId = ctx.sessionManager.getSessionId();
@@ -7594,14 +7610,6 @@ export default function (pi: ExtensionAPI) {
 				return refuse(ctx, target, "critical", "matches a built-in dangerous-command pattern", "bash", "", { ...auditFields(), ...follows });
 			}
 
-			// The shell-state token is the gate's own field: the gate sets it on a
-			// reviewer allow and the host trusts it. One the model wrote is
-			// refused before any judgment, so no path can pass it through.
-			if (SHELL_STATE_FIELD in (event.input as Record<string, unknown>)) {
-				logDecisionFor(ctx, { tool: "bash", decision: "block", layer: "environment", ...lead, why: `the call sets the reserved ${SHELL_STATE_FIELD} field`, cmd: judgedCommand, cwd, verdict: null, cached: 0, ms: Date.now() - started, ...auditFields() });
-				return refuse(ctx, target, "environment", `the call sets the reserved \`${SHELL_STATE_FIELD}\` field, which only the gate writes`, "bash", "", { ...auditFields(), ...follows });
-			}
-
 			// An `env` override selects which program runs (`PATH`, `BASH_ENV`,
 			// `LD_PRELOAD`, `GIT_PAGER`). It therefore outranks a static
 			// prompt/narrow-allow rule that only judged the command string. Env
@@ -7869,10 +7877,17 @@ export default function (pi: ExtensionAPI) {
 			};
 		}
 	};
-	pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext) => {
-		const result = await handleToolCall(event, ctx);
-		if (result !== undefined && "block" in result && result.block === true) rememberRefusedCall(event.toolCallId);
-		return result;
+	pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> => {
+		const copied = withoutCopiedToken(event);
+		const result: ToolCallEventResult | undefined = await handleToolCall(copied ?? event, ctx);
+		if (result?.block === true) {
+			rememberRefusedCall(event.toolCallId);
+			return result;
+		}
+		// The host would enforce a token the model copied: every allow of such a
+		// call runs on the input without it, unless the gate set its own.
+		if (copied === undefined || result?.input !== undefined) return result;
+		return { ...result, input: copied.input as Record<string, unknown> };
 	});
 
 	// Session boundaries: delete only this runner's entries. The extension module

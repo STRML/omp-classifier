@@ -91,8 +91,8 @@ inspect(names) on live shell ─┬─ mismatch ─▶ skip
      meaning depends on shell state that the shape checks cannot read;
    - `inspectShellSession` returns `undefined` or throws;
    - `snapshotChanged`, or `exportsChanged` is non-empty;
-   - `home` differs from `os.homedir()`, or `path` differs from the gate's
-     `process.env.PATH`, for the env the gate resolves names with;
+   - `home` differs from `os.homedir()`, or `path` has an empty or relative
+     entry (names resolve on that `path`; see the 2026-11-05 amendment);
    - any program word, wrapper or interpreter the shape checks resolved has a
      `resolution` other than `file:<the path onPath returned>` (or `builtin`
      for a name the gate treats as a builtin).
@@ -138,6 +138,25 @@ run-time check cannot close. The plan takes these changes:
 7. **The gate strips any incoming `shellState`** on every return path. It sets
    the field only on its own allow.
 
+## Amendment 2026-11-05: names resolve on the live PATH
+
+The first live run skipped with "the session's shell has a different PATH".
+A session's PATH comes from the rc snapshot, so it never equals the PATH omp
+was launched with (it repeats and reorders entries). Requiring equality ruled
+out every session. The gate now resolves bare names, wrappers and scripts on
+the PATH the shell reported (`withSearchPath`), drops the equality check, and
+skips only when that PATH has an empty or relative entry. A word still has to
+resolve to the same file in both lookups.
+
+The same live run found that the loop writes the gate's revised input back
+into the assistant message (`pi-agent-core` `agent-loop.ts`,
+`toolCall.arguments = beforeResult.args`). The model then sees `shellState`
+in its history and copies it into the next call. Refusing that call (the
+first cut of amendment 7) turned every reviewer allow into a refusal on the
+following call, so the gate now strips a copied token and judges the call
+without it. An allow returns the stripped input, so the host never enforces a
+token the gate did not set on this call.
+
 Two limitations are accepted and documented:
 
 - A later extension's `tool_call` handler can replace the input and drop the
@@ -167,7 +186,7 @@ Two limitations are accepted and documented:
 | host without the API (upstream omp, older fork) | today's latch | n/a | today's reasons |
 | inspect throws, or the stage 2 deadline expires while it waits on the lock | skip | n/a | "shell state unavailable" |
 | `shellState` on a non-bash tool or a malformed value | the bash tool rejects malformed values; other tools ignore it | n/a | tool error |
-| the model writes `shellState` into its own bash input | the gate strips any incoming `shellState` before judging, and sets it only on its own allow | n/a | n/a |
+| the model writes or copies `shellState` into its own bash input | the gate strips it before judging, returns the stripped input on an allow, and sets the field only on its own allow | n/a | the call's own verdict |
 
 ## Tests
 
